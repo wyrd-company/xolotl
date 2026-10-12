@@ -305,9 +305,10 @@ impl KeyManager {
     /// Issue a key. The key is written to the vault only; the response shows
     /// where the client reads it.
     pub async fn issue(&self, req: IssueRequest) -> Result<KeyInfo> {
-        anyhow::ensure!(self.policy(&req.policy).is_some(), "policy {:?} does not exist", req.policy);
         anyhow::ensure!(valid_name(&req.name), "key name must be lowercase letters, digits, '-' or '_' (max 63)");
         let _writes = self.writes.lock().await;
+        // Checked under the lock, so a concurrent delete_policy can't slip in between.
+        anyhow::ensure!(self.policy(&req.policy).is_some(), "policy {:?} does not exist", req.policy);
         let id = format!("{}/{}", req.policy, req.name);
         let (existing, version) = self.secrets.get_versioned(&key_path(&id)).await?;
         let was_revoked = existing.as_ref().is_some_and(|m| m.get("revoked").and_then(Value::as_bool).unwrap_or(false));
@@ -593,6 +594,37 @@ mod tests {
         reload.await.unwrap();
         revoke.await.unwrap();
         assert!(km.authenticate(&key).await.is_none(), "revoked key must stay revoked");
+    }
+
+    #[tokio::test]
+    async fn issue_waits_for_a_queued_policy_delete() {
+        let store = Arc::new(crate::secrets::testing::GatedStore::default());
+        let s: Secrets = store.clone();
+        let km = Arc::new(KeyManager::new(s.clone()));
+        km.put_policy(Policy { name: "dev".into(), providers: vec!["claude".into()], ..Default::default() }, &known()).await.unwrap();
+
+        // A paused reload holds the lock; a policy delete queues, then an issue.
+        store.arm("get", "admin");
+        let reload = tokio::spawn({
+            let km = km.clone();
+            async move { km.reload().await.unwrap() }
+        });
+        store.reached.notified().await;
+        let delete = tokio::spawn({
+            let km = km.clone();
+            async move { km.delete_policy("dev").await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let issue = tokio::spawn({
+            let km = km.clone();
+            async move { km.issue(IssueRequest { policy: "dev".into(), name: "a".into(), ..Default::default() }).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        store.release.notify_one();
+        reload.await.unwrap();
+        delete.await.unwrap().unwrap();
+        assert!(issue.await.unwrap().is_err(), "no key is issued under a deleted policy");
+        assert!(s.get("keys/dev/a").await.unwrap().is_none());
     }
 
     #[tokio::test]

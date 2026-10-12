@@ -315,8 +315,9 @@ pub fn relay(resp: reqwest::Response, accounting: Option<Accounting>) -> Respons
     out
 }
 
-/// Relay a stream whose first chunks were already read (peeked).
-pub fn relay_stream<S>(
+/// Relay an SSE stream whose first chunks were already read (peeked). The
+/// caller knows the body is SSE even when upstream sent no `Content-Type`.
+pub fn relay_sse<S>(
     status: u16,
     headers: &reqwest::header::HeaderMap,
     prefix: Vec<Bytes>,
@@ -327,12 +328,12 @@ where
     S: Stream<Item = reqwest::Result<Bytes>> + Unpin + Send + 'static,
 {
     use futures::StreamExt;
-    let sse = is_sse(headers);
     let combined = futures::stream::iter(prefix.into_iter().map(Ok)).chain(rest);
-    let stream = TapStream::new(Box::pin(combined), sse, status, accounting);
+    let stream = TapStream::new(Box::pin(combined), true, status, accounting);
     let mut out = Response::new(Body::from_stream(stream));
     *out.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     *out.headers_mut() = forward_response_headers(headers);
+    out.headers_mut().entry(header::CONTENT_TYPE).or_insert(HeaderValue::from_static("text/event-stream"));
     out
 }
 

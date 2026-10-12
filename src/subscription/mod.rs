@@ -656,7 +656,10 @@ impl Subscriptions {
                 self.observe_headers(&account.id, provider, resp.headers()).await;
 
                 if (200..300).contains(&status) {
-                    if provider == SubProvider::Codex && proxy::is_sse(resp.headers()) {
+                    // Codex always streams (`prepare` forces `stream: true`) except
+                    // on /compact, and the backend may omit the Content-Type.
+                    let codex_stream = provider == SubProvider::Codex && (!path.ends_with("/compact") || proxy::is_sse(resp.headers()));
+                    if codex_stream {
                         // Quota errors can arrive as the first events of a 200 stream;
                         // peek so we can still fail over before the client sees bytes.
                         let resp_headers = resp.headers().clone();
@@ -679,7 +682,7 @@ impl Subscriptions {
                         let _ = self.db.record_account_result(&account.id, None).await;
                         self.pin_session(session.as_deref(), &account.id);
                         accounting.record.account_id = Some(account.id.clone());
-                        return proxy::relay_stream(status, &resp_headers, prefix, stream, Some(accounting));
+                        return proxy::relay_sse(status, &resp_headers, prefix, stream, Some(accounting));
                     }
                     let _ = self.db.record_account_result(&account.id, None).await;
                     self.pin_session(session.as_deref(), &account.id);

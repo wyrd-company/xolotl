@@ -575,3 +575,48 @@ async fn api_call_does_not_follow_redirects() {
     assert_eq!(status, 307, "the redirect is returned, not followed");
     assert!(elsewhere.received_requests().await.unwrap().is_empty());
 }
+
+// Live Codex streams can arrive without a Content-Type.
+
+#[tokio::test]
+async fn codex_headerless_stream_is_accounted() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
+    Mock::given(path("/backend-api/codex/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(SSE_OK.as_bytes()))
+        .mount(&server)
+        .await;
+    let resp = subs.execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), None, None).await;
+    assert_eq!(resp.headers()["content-type"], "text/event-stream");
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("response.completed"));
+    // The request log is written in the background.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let s = subs.db.usage_summary("account", 0).await.unwrap();
+    let row = s.iter().find(|r| r.key.as_deref() == Some(a.id.as_str())).unwrap();
+    assert_eq!((row.input_tokens, row.output_tokens), (5, 1));
+}
+
+#[tokio::test]
+async fn codex_headerless_stream_quota_error_fails_over() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
+    subs.save_account(codex_cred("acct-b", "tok-b")).await.unwrap();
+    subs.db.set_account_priority(&a.id, 10).await.unwrap();
+    let in_stream_error =
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"usage_limit_reached\",\"resets_in_seconds\":120}}\n\n";
+    Mock::given(header("authorization", "Bearer tok-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(in_stream_error.as_bytes()))
+        .mount(&server)
+        .await;
+    Mock::given(header("authorization", "Bearer tok-b"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(SSE_OK.as_bytes()))
+        .mount(&server)
+        .await;
+    let (status, body) = run(&subs, SubProvider::Codex, "/v1/responses", HeaderMap::new(), responses_body()).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"delta\":\"hi\""), "{body}");
+    assert!(subs.db.get_account(&a.id).await.unwrap().unwrap().cooling_down(now()));
+}
