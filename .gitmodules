@@ -1,0 +1,15 @@
+[submodule ".references/CLIProxyAPI"]
+	path = .references/CLIProxyAPI
+	url = git@github.com:router-for-me/CLIProxyAPI.git
+[submodule ".references/bifrost"]
+	path = .references/bifrost
+	url = git@github.com:maximhq/bifrost.git
+[submodule ".references/opencodex"]
+	path = .references/opencodex
+	url = git@github.com:lidge-jun/opencodex.git
+[submodule ".references/litellm"]
+	path = .references/litellm
+	url = git@github.com:BerriAI/litellm.git
+[submodule ".references/t3code"]
+	path = .references/t3code
+	url = git@github.com:pingdotgg/t3code.git

@@ -1,0 +1,326 @@
+---
+title: OpenAI Chat Completions API with AI Gateway
+product: vercel
+url: /docs/ai-gateway/sdks-and-apis/openai-chat-completions
+canonical_url: "https://vercel.com/docs/ai-gateway/sdks-and-apis/openai-chat-completions"
+last_updated: 2026-10-07
+type: reference
+prerequisites:
+  - /docs/ai-gateway/sdks-and-apis
+  - /docs/ai-gateway
+related:
+  - /docs/ai-gateway/sdks-and-apis/openai-chat-completions/chat-completions
+  - /docs/ai-gateway/sdks-and-apis/openai-chat-completions/streaming
+  - /docs/ai-gateway/sdks-and-apis/openai-chat-completions/images
+  - /docs/ai-gateway/sdks-and-apis/openai-chat-completions/tool-calling
+  - /docs/ai-gateway/sdks-and-apis/openai-chat-completions/structured-outputs
+summary: Use OpenAI SDKs with the AI Gateway Chat Completions API. Configure the base URL and authentication for chat, streaming, tool calling, and embeddings.
+install_vercel_plugin: npx plugins add vercel/vercel-plugin
+---
+
+# OpenAI Chat Completions API with AI Gateway
+
+AI Gateway provides OpenAI Chat Completions API endpoints, letting you use multiple AI providers through a familiar interface. You can use existing OpenAI client libraries, switch to AI Gateway with a URL change, and keep your current tools and workflows without code rewrites.
+
+
+<!-- docsgraph:related -->
+## Related pages
+
+> **For AI agents:** Follow these links to understand how this page connects to the rest of the Vercel ecosystem. For the full cross-link map (inbound, outbound, prerequisites, and semantic neighbors), see the .graph.md link below.
+
+- [Claude Sonnet 5.5 now available on AI Gateway](https://vercel.com/changelog/claude-sonnet-5-5-now-available-on-ai-gateway?from=related&source_path=%2Fdocs%2Fai-gateway%2Fsdks-and-apis%2Fopenai-chat-completions&source_site=vercel-docs&relationship=related)
+- [Glyph Cluster is now available in stealth for free on AI Gateway](https://vercel.com/changelog/glyph-cluster-is-now-available-in-stealth-for-free-on-ai-gateway?from=related&source_path=%2Fdocs%2Fai-gateway%2Fsdks-and-apis%2Fopenai-chat-completions&source_site=vercel-docs&relationship=related)
+- [GPT-6.1 Sol now available on AI Gateway](https://vercel.com/changelog/gpt-6-1-sol-now-available-on-ai-gateway?from=related&source_path=%2Fdocs%2Fai-gateway%2Fsdks-and-apis%2Fopenai-chat-completions&source_site=vercel-docs&relationship=related)
+- [Mistral Large 4 now available on AI Gateway](https://vercel.com/changelog/mistral-large-4-now-available-on-ai-gateway?from=related&source_path=%2Fdocs%2Fai-gateway%2Fsdks-and-apis%2Fopenai-chat-completions&source_site=vercel-docs&relationship=related)
+- [Service tiers now available on AI Gateway](https://vercel.com/changelog/service-tiers-now-available-on-ai-gateway?from=related&source_path=%2Fdocs%2Fai-gateway%2Fsdks-and-apis%2Fopenai-chat-completions&source_site=vercel-docs&relationship=related)
+- [OpenAI Responses API with AI Gateway](https://vercel.com/docs/ai-gateway/sdks-and-apis/responses?from=related&source_path=%2Fdocs%2Fai-gateway%2Fsdks-and-apis%2Fopenai-chat-completions&source_site=vercel-docs&relationship=related) — Use the OpenAI Responses API with AI Gateway to generate text, call tools, stream tokens, and more across any supported
+- [AI Gateway](https://vercel.com/docs/agent-resources/vercel-mcp/tools/ai-gateway?from=related&source_path=%2Fdocs%2Fai-gateway%2Fsdks-and-apis%2Fopenai-chat-completions&source_site=vercel-docs&relationship=related) — Vercel MCP tools for ai gateway.
+- [AI SDK with AI Gateway](https://vercel.com/docs/ai-gateway/sdks-and-apis/ai-sdk?from=related&source_path=%2Fdocs%2Fai-gateway%2Fsdks-and-apis%2Fopenai-chat-completions&source_site=vercel-docs&relationship=related) — Build AI-powered TypeScript applications using the AI SDK with AI Gateway for unified access to 200+ models.
+- [AI Gateway Tool Use and Function Calling](https://vercel.com/docs/ai-gateway/inputs-and-tools/tool-use?from=related&source_path=%2Fdocs%2Fai-gateway%2Fsdks-and-apis%2Fopenai-chat-completions&source_site=vercel-docs&relationship=related) — Connect AI Gateway models to application tools with AI SDK 7, Python, Chat Completions, Messages, and Responses examples
+
+Full cross-link map for this page: [/docs/ai-gateway/sdks-and-apis/openai-chat-completions.graph.md](/docs/ai-gateway/sdks-and-apis/openai-chat-completions.graph.md?from=related&source_path=%2Fdocs%2Fai-gateway%2Fsdks-and-apis%2Fopenai-chat-completions&source_site=vercel-docs&relationship=graph)
+<!-- /docsgraph:related -->
+
+The Chat Completions API implements the same specification as the [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat).
+
+## Base URL
+
+The Chat Completions API is available at the following base URL:
+
+```
+https://ai-gateway.vercel.sh/v1
+```
+
+## Authentication
+
+The Chat Completions API supports the same authentication methods as the main AI Gateway:
+
+- **API key**: Use your AI Gateway API key with the `Authorization: Bearer <token>` header
+- **OIDC token**: Use your Vercel OIDC token with the `Authorization: Bearer <token>` header
+
+You only need to use one of these forms of authentication. If an API key is specified it will take precedence over any OIDC token, even if the API key is invalid.
+
+## Supported endpoints
+
+The AI Gateway supports the following Chat Completions API endpoints:
+
+- [`GET /models`](#list-models) - List available models
+- [`GET /models/{model}`](#retrieve-model) - Retrieve a specific model
+- [`POST /chat/completions`](/docs/ai-gateway/sdks-and-apis/openai-chat-completions/chat-completions) - Create chat completions, with support for [streaming](/docs/ai-gateway/sdks-and-apis/openai-chat-completions/streaming), [file attachments](/docs/ai-gateway/sdks-and-apis/openai-chat-completions/images), [tool calling](/docs/ai-gateway/sdks-and-apis/openai-chat-completions/tool-calling), and [structured outputs](/docs/ai-gateway/sdks-and-apis/openai-chat-completions/structured-outputs)
+- [`POST /embeddings`](/docs/ai-gateway/sdks-and-apis/openai-chat-completions/embeddings) - Generate vector embeddings
+
+The same base URL also serves the [OpenAI-Compatible Decisions API](/docs/ai-gateway/sdks-and-apis/openai-decisions) for predicate, choice, and score questions.
+
+For advanced features, see:
+
+- [Reasoning](/docs/ai-gateway/sdks-and-apis/openai-chat-completions/reasoning) - Control how much a model thinks before answering
+- [File attachments](/docs/ai-gateway/sdks-and-apis/openai-chat-completions/images) - Send images and PDF documents to a model
+- [Advanced configuration](/docs/ai-gateway/sdks-and-apis/openai-chat-completions/advanced) - Provider options, model fallbacks, BYOK, and prompt caching
+- [Image generation](/docs/ai-gateway/sdks-and-apis/openai-chat-completions/image-generation) - Generate images using multimodal models
+- [Direct REST API usage](/docs/ai-gateway/sdks-and-apis/openai-chat-completions/rest-api) - Use the API without client libraries
+
+## Integration with existing tools
+
+You can use the AI Gateway's Chat Completions API with existing tools and
+libraries like the [OpenAI client libraries](https://platform.openai.com/docs/libraries) and [AI SDK](https://ai-sdk.dev/). Point your existing
+client to the AI Gateway's base URL and use your AI Gateway [API key](/docs/ai-gateway/authentication-and-byok#api-key) or [OIDC token](/docs/ai-gateway/authentication-and-byok#oidc-token) for authentication.
+
+### OpenAI client libraries
+
+#### TypeScript
+
+```typescript filename="client.ts"
+import OpenAI from 'openai';
+
+const openai = new OpenAI({
+  apiKey: process.env.AI_GATEWAY_API_KEY,
+  baseURL: 'https://ai-gateway.vercel.sh/v1',
+});
+
+const response = await openai.chat.completions.create({
+  model: 'anthropic/claude-opus-5',
+  messages: [{ role: 'user', content: 'Hello, world!' }],
+});
+```
+
+#### Python
+
+```python filename="client.py"
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.getenv('AI_GATEWAY_API_KEY'),
+    base_url='https://ai-gateway.vercel.sh/v1'
+)
+
+response = client.chat.completions.create(
+    model='anthropic/claude-opus-5',
+    messages=[
+        {'role': 'user', 'content': 'Hello, world!'}
+    ]
+)
+```
+
+#### cURL
+
+```bash filename="client.sh"
+curl -X POST "https://ai-gateway.vercel.sh/v1/chat/completions" \
+  -H "Authorization: Bearer $AI_GATEWAY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "anthropic/claude-opus-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello, world!"
+      }
+    ]
+  }'
+```
+
+### AI SDK
+
+For compatibility with [AI SDK](https://ai-sdk.dev/) and AI Gateway, install the [@ai-sdk/openai-compatible](https://ai-sdk.dev/providers/openai-compatible-providers) package.
+
+```typescript filename="client.ts"
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+import { generateText } from 'ai';
+
+const gateway = createOpenAICompatible({
+  name: 'openai',
+  apiKey: process.env.AI_GATEWAY_API_KEY,
+  baseURL: 'https://ai-gateway.vercel.sh/v1',
+});
+
+const response = await generateText({
+  model: gateway('anthropic/claude-opus-5'),
+  prompt: 'Hello, world!',
+});
+```
+
+## List models
+
+Retrieve a list of all available models that can be used with the AI Gateway.
+
+Endpoint
+
+```
+GET /models
+```
+
+Example request
+
+#### TypeScript
+
+```typescript filename="list-models.ts"
+import OpenAI from 'openai';
+
+const openai = new OpenAI({
+  apiKey: process.env.AI_GATEWAY_API_KEY,
+  baseURL: 'https://ai-gateway.vercel.sh/v1',
+});
+
+const models = await openai.models.list();
+console.log(models);
+```
+
+#### Python
+
+```python filename="list-models.py"
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.getenv('AI_GATEWAY_API_KEY'),
+    base_url='https://ai-gateway.vercel.sh/v1'
+)
+
+models = client.models.list()
+print(models)
+```
+
+#### cURL
+
+```bash filename="list-models.sh"
+curl -X GET "https://ai-gateway.vercel.sh/v1/models" \
+  -H "Authorization: Bearer $AI_GATEWAY_API_KEY"
+```
+
+Response format
+
+The response follows the OpenAI API format:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "anthropic/claude-opus-5",
+      "object": "model",
+      "created": 1677610602,
+      "owned_by": "anthropic"
+    },
+    {
+      "id": "openai/gpt-6-astra",
+      "object": "model",
+      "created": 1677610602,
+      "owned_by": "openai"
+    }
+  ]
+}
+```
+
+## Retrieve model
+
+Retrieve details about a specific model.
+
+Endpoint
+
+```
+GET /models/{model}
+```
+
+Parameters
+
+- `model` (required): The model ID to retrieve (e.g., `anthropic/claude-opus-5`)
+
+Example request
+
+#### TypeScript
+
+```typescript filename="retrieve-model.ts"
+import OpenAI from 'openai';
+
+const openai = new OpenAI({
+  apiKey: process.env.AI_GATEWAY_API_KEY,
+  baseURL: 'https://ai-gateway.vercel.sh/v1',
+});
+
+const model = await openai.models.retrieve('anthropic/claude-opus-5');
+console.log(model);
+```
+
+#### Python
+
+```python filename="retrieve-model.py"
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.getenv('AI_GATEWAY_API_KEY'),
+    base_url='https://ai-gateway.vercel.sh/v1'
+)
+
+model = client.models.retrieve('anthropic/claude-opus-5')
+print(model)
+```
+
+#### cURL
+
+```bash filename="retrieve-model.sh"
+curl -X GET "https://ai-gateway.vercel.sh/v1/models/anthropic/claude-opus-5" \
+  -H "Authorization: Bearer $AI_GATEWAY_API_KEY"
+```
+
+Response format
+
+```json
+{
+  "id": "anthropic/claude-opus-5",
+  "object": "model",
+  "created": 1677610602,
+  "owned_by": "anthropic"
+}
+```
+
+## Error handling
+
+The API returns standard HTTP status codes and error responses:
+
+### Common error codes
+
+- `400 Bad Request`: Invalid request parameters
+- `401 Unauthorized`: Invalid or missing authentication
+- `403 Forbidden`: Insufficient permissions
+- `404 Not Found`: Model or endpoint not found
+- `429 Too Many Requests`: Rate limit exceeded
+- `500 Internal Server Error`: Server error
+
+### Error response format
+
+```json
+{
+  "error": {
+    "message": "Invalid request: missing required parameter 'model'",
+    "type": "invalid_request_error",
+    "param": "model",
+    "code": "missing_parameter"
+  }
+}
+```
+
+
+---
+
+[View full sitemap](/docs/sitemap)
