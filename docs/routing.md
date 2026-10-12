@@ -31,6 +31,7 @@ There are three LLM wire formats: Anthropic Messages (`/v1/messages`), OpenAI Re
 - **Native** when its provider speaks the endpoint's format. Native always wins: a provider that speaks several formats is never translated.
 - **Translated** otherwise, from the best format the provider speaks: Responses, then Messages, then Chat. Responses and Messages carry reasoning between turns; Chat does not.
 - **Not at all** for `/v1/messages/count_tokens` and `/v1/responses/compact`. Only the three main endpoints are translated.
+- **Not at all** for Claude subscription accounts (`claude`) on any endpoint but their own: they serve only the Claude Code API path, `/v1/messages`. Anthropic models on other providers (Vercel, OpenCode Go, a `[catalog.wires]` override) are translated like any other. A policy that wants a Claude model on every endpoint can alias it to both, e.g. `["claude/claude-haiku-5-5", "opencode-go/claude-haiku-5-5"]`; targets that can't serve the endpoint are skipped.
 
 `GET /v1/models` and `xolotl policies view` list, for every name, the endpoints its first target is served on natively (`endpoints`) and through translation (`translated_endpoints`).
 
@@ -48,7 +49,7 @@ Other `POST /v1/*` endpoints (embeddings, OCR, …) have no wire format. They ar
 | Parallel tool calls | Chat streams may interleave the argument deltas of parallel calls, so calls from a Chat provider are assembled per `index` and sent on whole when the choice finishes. |
 | Tool results | Messages `tool_result`, Responses `function_call_output` and Chat `tool` messages map to each other. Images in a tool result go to Chat as a user message after the tool message. |
 | Reasoning | Upstream reasoning is returned as thinking blocks, reasoning items or `reasoning_content`. Its replay state (Anthropic signature, OpenAI encrypted content) travels through the client's slot for the other kind, tagged `xolotl.openai.` or `xolotl.anthropic.`, so a later turn can replay it to the provider that issued it. Reasoning a provider didn't issue is dropped. |
-| Reasoning effort | Chat `reasoning_effort`, Responses `reasoning.effort` and Messages `thinking` / `output_config.effort` map to each other. Claude accounts get adaptive thinking with an effort; other Messages servers get a `budget_tokens` budget. Thinking is left off when the last assistant turn called tools without a signed thinking block (Claude rejects that), and when a tool is forced. |
+| Reasoning effort | Chat `reasoning_effort`, Responses `reasoning.effort` and Messages `thinking` / `output_config.effort` map to each other. A Messages provider gets a `budget_tokens` thinking budget. Thinking is left off when the last assistant turn called tools without a signed thinking block (Claude rejects that), and when a tool is forced. |
 | Images | Base64 and URL images, in messages and tool results. |
 | Usage | Recorded from the upstream response before translation, so the request log and metrics are unchanged. The client gets it in its own shape; Chat streams include it when `stream_options.include_usage` is set. |
 | Errors | Upstream errors keep their status and headers (`retry-after`) and get the client's error envelope. A 2xx JSON body that reports a failure (a `failed` Responses object, an error body) is an error too: 502 for a non-streaming client, an error event for a streaming one. A stream that fails or ends early ends with an error event. |
@@ -92,7 +93,7 @@ For `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`, `/v1/responses
 
 1. Authorize with the `proxy` scope; parse the body and read `model`.
 2. Look the name up in the view. If it's not found: 404.
-3. Keep the targets the endpoint reaches, natively or through translation. If none (only `count_tokens` and `compact` can't be translated): 400 naming the endpoints the model *is* served on.
+3. Keep the targets the endpoint reaches, natively or through translation. If none (`count_tokens`, `compact`, or a Claude subscription account off `/v1/messages`): 400 naming the endpoints the model *is* served on.
 4. Try each target in order. A 429 or 5xx moves on to the next target; the last target's response is returned. A translated target gets the request in its own format, and its response is translated back.
    - **Pool targets:** `model` is rewritten to the provider's name and the request goes to the pool ([Subscription accounts](subscriptions.md)).
    - **Gateway targets:** the provider's key is injected (Bearer, plus `x-api-key` on `/v1/messages`). For Mistral, a few OpenAI parameter spellings it rejects are rewritten.

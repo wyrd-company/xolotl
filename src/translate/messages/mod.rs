@@ -6,8 +6,6 @@ use super::ir::{
     Image, Opaque, Part, Reasoning, Request, Role, ToolCall, ToolChoice, ToolResult, arguments_object, budget_for_effort, effort_for_budget,
 };
 
-use super::UpstreamInfo;
-
 mod response;
 
 pub use response::{StreamDecoder, StreamEncoder, decode_response, encode_response, error_body, failure};
@@ -191,7 +189,7 @@ fn tool_turn_lacks_thinking(r: &Request) -> bool {
     })
 }
 
-pub fn encode_request(r: &Request, model: &str, up: UpstreamInfo) -> Result<Value, String> {
+pub fn encode_request(r: &Request, model: &str) -> Result<Value, String> {
     if r.response_format.is_some() {
         return Err("structured output (response_format / text.format) can't be translated to /v1/messages".into());
     }
@@ -255,19 +253,10 @@ pub fn encode_request(r: &Request, model: &str, up: UpstreamInfo) -> Result<Valu
         out.insert("stop_sequences".into(), json!(r.stop));
     }
     let effort = r.effort.as_deref().filter(|e| *e != "none" && !forced && !tool_turn_lacks_thinking(r));
-    let budget = effort.and_then(budget_for_effort);
-    match (effort, budget) {
+    // Messages providers other than Anthropic's own API take a thinking budget.
+    match effort.and_then(budget_for_effort) {
         // Thinking rejects sampling parameters.
-        (Some(e), _) if up.adaptive_thinking => {
-            let effort = match e {
-                "minimal" => "low",
-                "xhigh" | "max" => "high",
-                other => other,
-            };
-            out.insert("thinking".into(), json!({"type": "adaptive"}));
-            out.insert("output_config".into(), json!({"effort": effort}));
-        }
-        (Some(_), Some(budget)) => {
+        Some(budget) => {
             max_tokens = max_tokens.max(budget + 4096);
             out.insert("thinking".into(), json!({"type": "enabled", "budget_tokens": budget}));
         }

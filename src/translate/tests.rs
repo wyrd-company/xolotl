@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use super::*;
 
 fn translate(client: Wire, upstream: Wire, body: Value) -> (Value, Translation) {
-    request(client, upstream, &body, "up-model", UpstreamInfo::default()).unwrap()
+    request(client, upstream, &body, "up-model").unwrap()
 }
 
 fn upstream_response(status: u16, content_type: &str, body: impl Into<String>) -> Response {
@@ -143,12 +143,12 @@ fn responses_request_to_messages() {
 }
 
 #[test]
-fn thinking_is_adaptive_for_anthropic_and_off_for_unsigned_tool_turns() {
+fn thinking_takes_a_budget_and_is_off_for_unsigned_tool_turns() {
     let body = json!({"model": "m", "reasoning_effort": "xhigh", "messages": [{"role": "user", "content": "hi"}]});
-    let up = UpstreamInfo { adaptive_thinking: true };
-    let (out, _) = request(Wire::Chat, Wire::Messages, &body, "m", up).unwrap();
-    assert_eq!(out["thinking"], json!({"type": "adaptive"}));
-    assert_eq!(out["output_config"], json!({"effort": "high"}));
+    let (out, _) = request(Wire::Chat, Wire::Messages, &body, "m").unwrap();
+    assert_eq!(out["thinking"], json!({"type": "enabled", "budget_tokens": 32768}));
+    assert_eq!(out["max_tokens"], 32768 + 4096, "max_tokens leaves room above the budget");
+    assert!(out.get("output_config").is_none());
 
     // A tool turn from a Chat client has no signed thinking to replay.
     let body = json!({"model": "m", "reasoning_effort": "high", "temperature": 0.2, "top_p": 0.9, "messages": [
@@ -157,7 +157,7 @@ fn thinking_is_adaptive_for_anthropic_and_off_for_unsigned_tool_turns() {
         {"role": "tool", "tool_call_id": "a.b", "content": "r1"},
         {"role": "user", "content": "and?"},
     ]});
-    let (out, _) = request(Wire::Chat, Wire::Messages, &body, "m", up).unwrap();
+    let (out, _) = request(Wire::Chat, Wire::Messages, &body, "m").unwrap();
     assert!(out.get("thinking").is_none(), "{out}");
     assert_eq!(out["temperature"], 0.2);
     assert!(out.get("top_p").is_none(), "only one sampling parameter");
@@ -180,8 +180,7 @@ fn forced_tools_turn_thinking_off_and_tool_results_lead_the_user_turn() {
             {"type": "function_call_output", "call_id": "c1", "output": "r"},
         ],
     });
-    let up = UpstreamInfo { adaptive_thinking: true };
-    let (out, _) = request(Wire::Responses, Wire::Messages, &body, "m", up).unwrap();
+    let (out, _) = request(Wire::Responses, Wire::Messages, &body, "m").unwrap();
     assert!(out.get("thinking").is_none(), "Claude rejects thinking with a forced tool: {out}");
     assert_eq!(out["tool_choice"], json!({"type": "any"}));
     let user = out["messages"][1]["content"].as_array().unwrap();
@@ -191,10 +190,10 @@ fn forced_tools_turn_thinking_off_and_tool_results_lead_the_user_turn() {
     // A forced tool alone turns thinking off; the same request unforced keeps it.
     let mut body = json!({"model": "m", "reasoning": {"effort": "high"}, "input": "hi",
         "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}]});
-    let (out, _) = request(Wire::Responses, Wire::Messages, &body, "m", up).unwrap();
-    assert_eq!(out["thinking"], json!({"type": "adaptive"}));
+    let (out, _) = request(Wire::Responses, Wire::Messages, &body, "m").unwrap();
+    assert_eq!(out["thinking"], json!({"type": "enabled", "budget_tokens": 24576}));
     body["tool_choice"] = json!({"type": "function", "name": "f"});
-    let (out, _) = request(Wire::Responses, Wire::Messages, &body, "m", up).unwrap();
+    let (out, _) = request(Wire::Responses, Wire::Messages, &body, "m").unwrap();
     assert!(out.get("thinking").is_none(), "{out}");
     assert_eq!(out["tool_choice"], json!({"type": "tool", "name": "f"}));
 }
@@ -233,14 +232,14 @@ fn chat_and_responses_requests_map_structured_output() {
         "response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}, "strict": true}}});
     let (out, _) = translate(Wire::Chat, Wire::Responses, body.clone());
     assert_eq!(out["text"]["format"], json!({"type": "json_schema", "name": "x", "schema": {"type": "object"}, "strict": true}));
-    let err = request(Wire::Chat, Wire::Messages, &body, "m", UpstreamInfo::default()).unwrap_err();
+    let err = request(Wire::Chat, Wire::Messages, &body, "m").unwrap_err();
     assert!(err.contains("structured output"), "{err}");
 }
 
 #[test]
 fn responses_previous_response_id_is_rejected() {
     let body = json!({"model": "m", "input": "hi", "previous_response_id": "resp_1"});
-    let err = request(Wire::Responses, Wire::Chat, &body, "m", UpstreamInfo::default()).unwrap_err();
+    let err = request(Wire::Responses, Wire::Chat, &body, "m").unwrap_err();
     assert!(err.contains("previous_response_id"));
 }
 

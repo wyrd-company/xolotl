@@ -43,14 +43,6 @@ pub struct ClientInfo {
     pub include_usage: bool,
 }
 
-/// Upstream details that change how a request is encoded.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UpstreamInfo {
-    /// Anthropic's own API: thinking uses `adaptive` with an effort level.
-    /// Other Messages servers get a `budget_tokens` thinking budget.
-    pub adaptive_thinking: bool,
-}
-
 /// One translated exchange: built from the request, applied to the response.
 #[derive(Debug, Clone)]
 pub struct Translation {
@@ -64,7 +56,7 @@ pub struct Translation {
 
 /// Translate a request body from `client` to `upstream` format for
 /// `upstream_model`. The error is a message for a 400 response.
-pub fn request(client: Wire, upstream: Wire, body: &Value, upstream_model: &str, up: UpstreamInfo) -> Result<(Value, Translation), String> {
+pub fn request(client: Wire, upstream: Wire, body: &Value, upstream_model: &str) -> Result<(Value, Translation), String> {
     let mut info = ClientInfo { model: body.get("model").and_then(Value::as_str).unwrap_or_default().to_string(), ..Default::default() };
     let mut req = match client {
         Wire::Messages => messages::decode_request(body)?,
@@ -73,7 +65,7 @@ pub fn request(client: Wire, upstream: Wire, body: &Value, upstream_model: &str,
     };
     let renamed = if upstream == Wire::Messages { HashMap::new() } else { shorten_tool_names(&mut req) };
     let out = match upstream {
-        Wire::Messages => messages::encode_request(&req, upstream_model, up)?,
+        Wire::Messages => messages::encode_request(&req, upstream_model)?,
         Wire::Responses => responses::encode_request(&req, upstream_model),
         Wire::Chat => chat::encode_request(&req, upstream_model),
     };

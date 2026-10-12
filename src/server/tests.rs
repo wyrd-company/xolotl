@@ -267,7 +267,7 @@ async fn messages_client_reaches_codex_through_translation() {
 }
 
 #[tokio::test]
-async fn chat_client_reaches_claude_through_translation() {
+async fn claude_accounts_serve_only_the_claude_code_path() {
     let h = harness().await;
     h.account(Credential {
         provider: SubProvider::Claude,
@@ -277,11 +277,12 @@ async fn chat_client_reaches_claude_through_translation() {
         ..Default::default()
     })
     .await;
+    h.account(Credential { provider: SubProvider::OpencodeGo, api_key: Some("ocg-key".into()), ..Default::default() }).await;
     Mock::given(method("POST"))
-        .and(path("/v1/messages"))
-        .and(header("authorization", "Bearer claude-tok"))
+        .and(path("/zen/go/v1/messages"))
+        .and(header("x-api-key", "ocg-key"))
         .and(body_partial_json(
-            json!({"model": "claude-opus-5", "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}),
+            json!({"model": "claude-haiku-5-5", "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}),
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "msg_1", "type": "message", "role": "assistant", "content": [{"type": "text", "text": "hello"}],
@@ -289,19 +290,34 @@ async fn chat_client_reaches_claude_through_translation() {
         })))
         .mount(&h.upstream)
         .await;
-    let key = h.key(policy("p")).await;
-    let body = json!({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]});
-    let (status, out) = h.call("POST", "/v1/chat/completions", Some(&key), Some(body)).await;
+    let mut p = policy("p");
+    p.aliases.insert("haiku".into(), AliasTargets::Many(vec!["claude/claude-haiku-5-5".into(), "opencode-go/claude-haiku-5-5".into()]));
+    let key = h.key(p).await;
+    let chat = |model: &str| json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
+
+    // A Claude subscription account is never translated: the other endpoints get a 400 naming the Messages path.
+    for (path, body) in
+        [("/v1/chat/completions", chat("claude-opus-5")), ("/v1/responses", json!({"model": "claude-opus-5", "input": "hi"}))]
+    {
+        let (status, out) = h.call("POST", path, Some(&key), Some(body)).await;
+        assert_eq!(status, 400, "{path}: {out}");
+        assert!(out["error"]["message"].as_str().unwrap().contains("/v1/messages"), "{out}");
+    }
+    let (_, models) = h.call("GET", "/v1/models", Some(&key), None).await;
+    let opus = models["data"].as_array().unwrap().iter().find(|m| m["id"] == "claude-opus-5").unwrap().clone();
+    assert_eq!((opus["endpoints"].clone(), opus["translated_endpoints"].clone()), (json!(["/v1/messages"]), json!([])));
+
+    // The same model family on another provider is translated.
+    let (status, out) = h.call("POST", "/v1/chat/completions", Some(&key), Some(chat("opencode-go/claude-haiku-5-5"))).await;
     assert_eq!(status, 200, "{out}");
     assert_eq!(out["object"], "chat.completion");
     assert_eq!(out["choices"][0]["message"]["content"], "hello");
     assert_eq!(out["usage"]["total_tokens"], 5);
-
-    // Errors come back in the client's envelope, with the upstream status.
-    let (status, out) =
-        h.call("POST", "/v1/chat/completions", Some(&key), Some(json!({"model": "claude-haiku-5-5", "messages": []}))).await;
-    assert_eq!(status, 404, "{out}");
-    assert!(out["error"]["message"].is_string() && out.get("type").is_none(), "{out}");
+    // An alias over both skips the Claude account off the Claude Code path.
+    let (status, out) = h.call("POST", "/v1/chat/completions", Some(&key), Some(chat("haiku"))).await;
+    assert_eq!(status, 200, "{out}");
+    let claude_calls = h.upstream.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/v1/messages").count();
+    assert_eq!(claude_calls, 0, "nothing reached the Claude account");
 }
 
 #[tokio::test]

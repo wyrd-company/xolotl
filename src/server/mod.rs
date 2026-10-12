@@ -28,7 +28,7 @@ use crate::policy::{Target, View};
 use crate::proxy::{self, forward_request_headers};
 use crate::secrets::Secrets;
 use crate::subscription::{SubProvider, Subscriptions};
-use crate::translate::{self, UpstreamInfo};
+use crate::translate;
 use crate::vault::VaultClient;
 
 #[derive(Clone)]
@@ -276,8 +276,7 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
     for (i, target) in usable.iter().enumerate() {
         let (resp, translation) = match (wire, route(target)) {
             (Some(client), Some(Route::Translated(upstream))) => {
-                let info = UpstreamInfo { adaptive_thinking: pool(&target.provider) == Some(SubProvider::Claude) };
-                let (body, t) = match translate::request(client, upstream, &json, &target.model, info) {
+                let (body, t) = match translate::request(client, upstream, &json, &target.model) {
                     Ok(x) => x,
                     Err(msg) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", msg),
                 };

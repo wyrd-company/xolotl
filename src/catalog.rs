@@ -171,12 +171,14 @@ impl ModelCatalog {
     /// How `provider/model` is reached on `path`, an endpoint of format
     /// `wire`. A native format always wins. Only the main endpoint of each
     /// format is translated, so `count_tokens` and `compact` are native only.
+    /// Claude subscription accounts are never translated: they serve only the
+    /// Claude Code API path. Anthropic models on other providers are.
     pub fn route(&self, provider: &str, model: &str, wire: Wire, path: &str) -> Option<Route> {
         let native = self.wires(provider, model);
         if native.contains(&wire) {
             return Some(Route::Native);
         }
-        if path != wire.path() {
+        if path != wire.path() || provider == SubProvider::Claude.as_str() {
             return None;
         }
         TRANSLATION_PREFERENCE.into_iter().find(|w| native.contains(w)).map(Route::Translated)
@@ -232,7 +234,11 @@ mod tests {
         ]);
         let c = ModelCatalog::new(cfg, kinds);
         assert_eq!(c.route("claude", "m", Wire::Messages, "/v1/messages"), Some(Route::Native));
-        assert_eq!(c.route("claude", "m", Wire::Chat, "/v1/chat/completions"), Some(Route::Translated(Wire::Messages)));
+        // Claude subscription accounts stay on the Claude Code path; other Messages providers translate.
+        assert_eq!(c.route("claude", "m", Wire::Chat, "/v1/chat/completions"), None);
+        assert_eq!(c.route("claude", "m", Wire::Responses, "/v1/responses"), None);
+        assert_eq!(c.endpoints("claude", "m"), (vec!["/v1/messages"], vec![]));
+        assert_eq!(c.route("opencode-go", "minimax-m3", Wire::Chat, "/v1/chat/completions"), Some(Route::Translated(Wire::Messages)));
         assert_eq!(c.route("codex", "m", Wire::Messages, "/v1/messages"), Some(Route::Translated(Wire::Responses)));
         assert_eq!(c.route("llamacpp", "m", Wire::Responses, "/v1/responses"), Some(Route::Translated(Wire::Chat)));
         assert_eq!(c.route("both", "m", Wire::Responses, "/v1/responses"), Some(Route::Translated(Wire::Messages)));
