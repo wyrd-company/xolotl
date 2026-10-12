@@ -1,0 +1,64 @@
+# Xolotl example configuration. Every section is optional; defaults shown.
+
+[server]
+listen = "0.0.0.0:8317"
+max_body_bytes = 67108864      # 64 MiB (OCR / batch uploads)
+upstream_timeout_secs = 600    # max idle time while reading an upstream response
+
+[database]
+# Runtime state only (cooldowns, usage snapshots, request log). No secrets.
+path = "/data/xolotl.db"
+retention_days = 90
+
+[vault]
+# OpenBao / Vault. Env: BAO_ADDR, BAO_CACERT, BAO_NAMESPACE.
+address = "https://bao.example.lan:8200"
+mount = "secret"        # KV v2 mount
+prefix = "xolotl"       # all secrets live under secret/xolotl/...
+# ca_cert = "/etc/xolotl/bao-ca.pem"
+
+[vault.approle]
+mount = "approle"
+# Env: XOLOTL_VAULT_ROLE_ID / XOLOTL_VAULT_SECRET_ID, or files:
+role_id_file = "/run/secrets/xolotl_role_id"
+secret_id_file = "/run/secrets/xolotl_secret_id"
+
+[telemetry]
+# OTLP/HTTP base; /v1/traces, /v1/metrics, /v1/logs are appended.
+# OpenObserve: http://openobserve:5080/api/<org>. Env: OTEL_EXPORTER_OTLP_ENDPOINT.
+# Headers can also be stored in the vault secret `xolotl/telemetry`.
+otlp_endpoint = "http://openobserve:5080/api/default"
+service_name = "xolotl"
+log_format = "json"     # or "pretty"
+log_filter = "info"
+metrics_interval_secs = 30
+
+[telemetry.otlp_headers]
+# Authorization = "Basic ..."   # prefer the vault secret instead
+
+[subscription]
+strategy = "round-robin"   # round-robin | fill-first | least-used
+usage_poll_secs = 300
+max_attempts = 3           # accounts tried per request
+default_cooldown_secs = 60
+refresh_margin_secs = 300
+soft_limit_percent = 95.0  # accounts above this are used last
+session_affinity_secs = 3600
+
+# Gateway providers are addressed as <name>/<model> and passthrough /<name>/...
+# API keys come from the vault secret providers/<name> (field api_key).
+[gateway.providers.vercel]
+kind = "vercel"
+
+[gateway.providers.mistral]
+kind = "mistral"
+
+[gateway.providers.llamacpp]
+kind = "openai-compatible"
+base_url = "http://llama.example.lan:8080"
+no_auth = true
+
+# Aliases with ordered fallbacks.
+[[gateway.models]]
+name = "fast"
+targets = ["vercel/openai/gpt-5-mini", "mistral/mistral-small-latest"]
