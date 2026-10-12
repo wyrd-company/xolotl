@@ -38,7 +38,7 @@ Other `POST /v1/*` endpoints (embeddings, OCR, …) have no wire format. They ar
 
 ## Translation
 
-`src/translate/` turns a request in the client's format into a format-neutral request (`ir.rs`), encodes that in the upstream's format, and turns the upstream response back into the client's format. Each format has one module (`messages.rs`, `responses.rs`, `chat.rs`) with a request decoder and encoder, a response decoder and encoder, and a stream decoder and encoder. Streams are decoded into events (block start, delta, stop, finish, error) and re-encoded as they arrive.
+`src/translate/` turns a request in the client's format into a format-neutral request (`ir.rs`), encodes that in the upstream's format, and turns the upstream response back into the client's format. Each format has one module (`messages/`, `responses/`, `chat/`): `mod.rs` decodes and encodes requests, `response.rs` decodes and encodes responses and streams. Streams are decoded into events (block start, delta, stop, finish, error) and re-encoded as they arrive.
 
 | Concern | Behaviour |
 |---|---|
