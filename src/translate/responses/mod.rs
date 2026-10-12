@@ -75,32 +75,7 @@ pub fn decode_request(v: &Value, info: &mut ClientInfo) -> Result<Request, Strin
         _ => {}
     }
     for t in v.get("tools").and_then(Value::as_array).into_iter().flatten() {
-        let name = t.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
-        let description = t.get("description").and_then(Value::as_str).map(str::to_string);
-        match t.get("type").and_then(Value::as_str) {
-            Some("function") => r.tools.push(Tool {
-                name,
-                description,
-                parameters: t.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object"})),
-            }),
-            Some("custom") => {
-                // Keep the input grammar where the model can read it.
-                let format = t.get("format").filter(|f| f.get("type").and_then(Value::as_str) == Some("grammar"));
-                let description = match (description, format) {
-                    (d, Some(f)) => Some(format!(
-                        "{}\n\nThe `{CUSTOM_INPUT}` argument must follow this {} grammar:\n{}",
-                        d.unwrap_or_default(),
-                        f.get("syntax").and_then(Value::as_str).unwrap_or("formal"),
-                        f.get("definition").and_then(Value::as_str).unwrap_or_default()
-                    )),
-                    (d, None) => d,
-                };
-                info.custom_tools.insert(name.clone());
-                r.tools.push(Tool { name, description, parameters: custom_parameters() });
-            }
-            // Hosted tools (web search, file search, shell, ...) have no counterpart.
-            _ => {}
-        }
+        decode_tool(t, None, &mut r, info);
     }
     r.tool_choice = match v.get("tool_choice") {
         Some(Value::String(s)) => match s.as_str() {
@@ -110,7 +85,7 @@ pub fn decode_request(v: &Value, info: &mut ClientInfo) -> Result<Request, Strin
             _ => None,
         },
         Some(o @ Value::Object(_)) if matches!(o.get("type").and_then(Value::as_str), Some("function" | "custom")) => {
-            o.get("name").and_then(Value::as_str).map(|n| ToolChoice::Tool(n.to_string()))
+            o.get("name").and_then(Value::as_str).map(|n| ToolChoice::Tool(qualify(o.get("namespace").and_then(Value::as_str), n)))
         }
         _ => None,
     };
@@ -124,6 +99,59 @@ pub fn decode_request(v: &Value, info: &mut ClientInfo) -> Result<Request, Strin
         _ => None,
     });
     Ok(r)
+}
+
+/// The flat name of a tool in a namespace, as CLIProxyAPI spells it:
+/// `<namespace>__<name>`. MCP names (`mcp__...`) and names already carrying
+/// the namespace stay as they are.
+fn qualify(namespace: Option<&str>, name: &str) -> String {
+    match namespace.map(str::trim).filter(|n| !n.is_empty()) {
+        None => name.to_string(),
+        Some(_) if name.starts_with("mcp__") => name.to_string(),
+        Some(ns) if name == ns || name.starts_with(&format!("{ns}__")) => name.to_string(),
+        Some(ns) if ns.ends_with("__") => format!("{ns}{name}"),
+        Some(ns) => format!("{ns}__{name}"),
+    }
+}
+
+/// One client tool; a namespace contributes each of its tools under a
+/// qualified name, remembered so calls go back with their namespace.
+fn decode_tool(t: &Value, namespace: Option<&str>, r: &mut Request, info: &mut ClientInfo) {
+    let plain = t.get("name").and_then(Value::as_str).unwrap_or_default();
+    let name = qualify(namespace, plain);
+    if let Some(ns) = namespace
+        && name != plain
+    {
+        info.namespaced.insert(name.clone(), (ns.to_string(), plain.to_string()));
+    }
+    let description = t.get("description").and_then(Value::as_str).map(str::to_string);
+    match t.get("type").and_then(Value::as_str) {
+        Some("function") => {
+            r.tools.push(Tool { name, description, parameters: t.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object"})) })
+        }
+        Some("namespace") => {
+            for child in t.get("tools").and_then(Value::as_array).into_iter().flatten() {
+                decode_tool(child, Some(plain), r, info);
+            }
+        }
+        Some("custom") => {
+            // Keep the input grammar where the model can read it.
+            let format = t.get("format").filter(|f| f.get("type").and_then(Value::as_str) == Some("grammar"));
+            let description = match (description, format) {
+                (d, Some(f)) => Some(format!(
+                    "{}\n\nThe `{CUSTOM_INPUT}` argument must follow this {} grammar:\n{}",
+                    d.unwrap_or_default(),
+                    f.get("syntax").and_then(Value::as_str).unwrap_or("formal"),
+                    f.get("definition").and_then(Value::as_str).unwrap_or_default()
+                )),
+                (d, None) => d,
+            };
+            info.custom_tools.insert(name.clone());
+            r.tools.push(Tool { name, description, parameters: custom_parameters() });
+        }
+        // Hosted tools (web search, file search, shell, ...) have no counterpart.
+        _ => {}
+    }
 }
 
 fn decode_item(item: &Value, r: &mut Request) {
@@ -148,13 +176,11 @@ fn decode_item(item: &Value, r: &mut Request) {
             let opaque = Opaque::from_encrypted(&s("encrypted_content"));
             r.push(Role::Assistant, vec![Part::Reasoning(Reasoning { text, opaque })]);
         }
-        "function_call" => {
-            r.push(Role::Assistant, vec![Part::ToolCall(ToolCall { id: s("call_id"), name: s("name"), arguments: s("arguments") })])
+        "function_call" | "custom_tool_call" => {
+            let name = qualify(item.get("namespace").and_then(Value::as_str), &s("name"));
+            let arguments = if kind == "function_call" { s("arguments") } else { json!({CUSTOM_INPUT: s("input")}).to_string() };
+            r.push(Role::Assistant, vec![Part::ToolCall(ToolCall { id: s("call_id"), name, arguments })]);
         }
-        "custom_tool_call" => r.push(
-            Role::Assistant,
-            vec![Part::ToolCall(ToolCall { id: s("call_id"), name: s("name"), arguments: json!({CUSTOM_INPUT: s("input")}).to_string() })],
-        ),
         "function_call_output" | "custom_tool_call_output" => r.push(
             Role::User,
             vec![Part::ToolResult(ToolResult { call_id: s("call_id"), content: decode_content(item.get("output")), is_error: false })],

@@ -37,6 +37,8 @@ pub struct ClientInfo {
     /// Responses `custom` (free-form input) tools; their calls go back as
     /// `custom_tool_call` items.
     pub custom_tools: HashSet<String>,
+    /// Responses namespace tools, flattened: qualified name -> (namespace, name).
+    pub namespaced: HashMap<String, (String, String)>,
     /// Chat clients get a usage chunk only when they ask for one.
     pub include_usage: bool,
 }

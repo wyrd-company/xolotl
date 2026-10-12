@@ -98,14 +98,26 @@ fn output_item(b: &Block, info: &ClientInfo) -> Value {
             }
             item
         }
-        Block::ToolCall(c) if info.custom_tools.contains(&c.name) => json!({
-            "id": new_id("ctc_"), "type": "custom_tool_call", "status": "completed",
-            "call_id": c.id, "name": c.name, "input": custom_input(&c.arguments),
-        }),
-        Block::ToolCall(c) => json!({
-            "id": new_id("fc_"), "type": "function_call", "status": "completed",
-            "call_id": c.id, "name": c.name, "arguments": c.arguments,
-        }),
+        Block::ToolCall(c) => {
+            let mut item = if info.custom_tools.contains(&c.name) {
+                json!({"id": new_id("ctc_"), "type": "custom_tool_call", "status": "completed", "call_id": c.id, "input": custom_input(&c.arguments)})
+            } else {
+                json!({"id": new_id("fc_"), "type": "function_call", "status": "completed", "call_id": c.id, "arguments": c.arguments})
+            };
+            set_name(&mut item, &c.name, info);
+            item
+        }
+    }
+}
+
+/// A tool call's name, split back into namespace and name for namespace tools.
+fn set_name(item: &mut Value, name: &str, info: &ClientInfo) {
+    match info.namespaced.get(name) {
+        Some((ns, plain)) => {
+            item["name"] = json!(plain);
+            item["namespace"] = json!(ns);
+        }
+        None => item["name"] = json!(name),
     }
 }
 
@@ -292,15 +304,14 @@ impl StreamEncoder {
             }
             Start::ToolCall { id: call_id, name } => {
                 let call = ToolCall { id: call_id.clone(), name: name.clone(), arguments: String::new() };
-                let (id, item) = if self.custom(&call) {
+                let (id, mut item) = if self.custom(&call) {
                     let id = new_id("ctc_");
-                    let item = json!({"id": id, "type": "custom_tool_call", "status": "in_progress", "call_id": call_id, "name": name, "input": ""});
-                    (id, item)
+                    (id.clone(), json!({"id": id, "type": "custom_tool_call", "status": "in_progress", "call_id": call_id, "input": ""}))
                 } else {
                     let id = new_id("fc_");
-                    let item = json!({"id": id, "type": "function_call", "status": "in_progress", "call_id": call_id, "name": name, "arguments": ""});
-                    (id, item)
+                    (id.clone(), json!({"id": id, "type": "function_call", "status": "in_progress", "call_id": call_id, "arguments": ""}))
                 };
+                set_name(&mut item, name, &self.info);
                 (Block::ToolCall(call), id, item)
             }
         };

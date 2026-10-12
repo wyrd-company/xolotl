@@ -504,6 +504,54 @@ async fn interleaved_parallel_chat_tool_calls_keep_their_identity() {
 }
 
 #[tokio::test]
+async fn namespaced_tools_round_trip_through_messages() {
+    let tools = json!([
+        {"type": "namespace", "name": "alpha", "description": "Alpha tools", "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]},
+        {"type": "namespace", "name": "beta", "tools": [
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            {"type": "custom", "name": "edit"},
+        ]},
+    ]);
+    let body = json!({
+        "model": "fast", "tools": tools, "tool_choice": {"type": "function", "namespace": "beta", "name": "lookup"},
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "function_call", "call_id": "c1", "namespace": "alpha", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "found"},
+        ],
+    });
+    let (out, t) = translate(Wire::Responses, Wire::Messages, body);
+    let names: Vec<&str> = out["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["alpha__lookup", "beta__lookup", "beta__edit"]);
+    assert_eq!(out["tool_choice"], json!({"type": "tool", "name": "beta__lookup"}));
+    assert_eq!(out["messages"][1]["content"][0]["name"], "alpha__lookup");
+
+    // Returned calls go back to the client with their namespace, streamed or not.
+    let upstream = json!({
+        "content": [
+            {"type": "tool_use", "id": "t1", "name": "beta__lookup", "input": {}},
+            {"type": "tool_use", "id": "t2", "name": "beta__edit", "input": {"input": "patch"}},
+        ],
+        "stop_reason": "tool_use", "usage": {"input_tokens": 1, "output_tokens": 1},
+    });
+    let (_, _, body) = run(t.clone(), upstream_response(200, "application/json", upstream.to_string())).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((v["output"][0]["namespace"].as_str(), v["output"][0]["name"].as_str()), (Some("beta"), Some("lookup")));
+    assert_eq!(v["output"][1]["type"], "custom_tool_call");
+    assert_eq!((v["output"][1]["namespace"].as_str(), v["output"][1]["name"].as_str()), (Some("beta"), Some("edit")));
+    assert_eq!(v["output"][1]["input"], "patch");
+
+    let mut t = t;
+    t.stream = true;
+    let (_, _, body) = run(t, upstream_response(200, "application/json", upstream.to_string())).await;
+    let evs = events(&body);
+    let added = of_type(&evs, "response.output_item.added");
+    assert_eq!((added[0]["item"]["namespace"].as_str(), added[0]["item"]["name"].as_str()), (Some("beta"), Some("lookup")));
+    let done = of_type(&evs, "response.output_item.done");
+    assert_eq!(done[1]["item"]["namespace"], "beta");
+}
+
+#[tokio::test]
 async fn failed_json_responses_become_client_errors() {
     let failed = json!({"status": "failed", "output": [], "error": {"code": "server_error", "message": "provider failed"}}).to_string();
     let (_, t) = translate(Wire::Messages, Wire::Responses, json!({"model": "fast", "messages": []}));
