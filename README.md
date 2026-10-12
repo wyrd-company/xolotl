@@ -53,6 +53,8 @@
 
 ## Usage
 
+Design notes (architecture, routing, accounts, keys, releases, known limitations) are in [`docs/`](docs/README.md).
+
 ### 1. OpenBao
 
 Xolotl reads and writes everything secret in a KV v2 mount under one prefix (default `secret/xolotl/`) and logs in with AppRole:
