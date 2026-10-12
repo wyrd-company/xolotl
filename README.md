@@ -184,13 +184,13 @@ wire_api = "responses"
 | Request | Goes to |
 |---|---|
 | `POST /v1/messages`, `/v1/responses`, `/v1/chat/completions`, other `POST /v1/*` | the target the key's policy resolves `model` to (alias, plain name or `provider/model`) |
-| `GET /v1/models` | the policy's names; with `anthropic-version` (Claude Code), only those reachable over `/v1/messages` |
+| `GET /v1/models` | the policy's names, each with its native and translated endpoints; in Anthropic's shape when the request carries `anthropic-version` (Claude Code) |
 | `/opencode-go/<path>` (any method) | OpenCode Go API through the account pool (load balancing, failover, usage) |
 | `/<provider>/<path>` (any method) | raw passthrough with the gateway provider's key, e.g. `POST /mistral/v1/ocr`, `/mistral/v1/batch/jobs`, `/mistral/v1/files`, `GET /vercel/v1/credits`, `/vercel/v1/generation?id=` |
 | `/v0/management/{auth-files,api-call,reset-quota}` | T3Code hubs (CLIProxyAPI-compatible) |
 | `/admin/...` | CLI |
 
-Passthroughs strip the client's credentials and inject the provider's. There is no format translation: a model is only reachable on endpoints its provider speaks (Claude: Messages, Codex: Responses, OpenCode Go: per model, Vercel: all three, others: Chat; override with `[catalog.wires]`). A request on the wrong endpoint gets a 400 naming the right one.
+Passthroughs strip the client's credentials and inject the provider's. Every model is reachable on all three LLM endpoints: a provider that speaks the endpoint's format gets the request as is, any other gets it translated between Anthropic Messages, OpenAI Responses and Chat Completions (Claude speaks Messages, Codex Responses, OpenCode Go per model, Vercel all three, others Chat; override with `[catalog.wires]`). So Claude Code can use Codex models and Codex CLI can use Claude. `count_tokens` and `/v1/responses/compact` are not translated; on a model that doesn't speak them they get a 400 naming the endpoints it does speak.
 
 Account pools refresh OAuth tokens before they expire and once more on a 401. Refresh tokens are single-use, so a rotated credential that can't be written to OpenBao keeps serving from memory, is retried every 15 s and on shutdown, and shows as `UNSAVED` in `xolotl accounts list` (metric `xolotl.vault.unsaved_credentials`). Run a single instance: refreshes are serialized per account in-process only. An account whose quota is exhausted (429 / `usage_limit_reached`, including when it arrives inside a 200 stream) cools down until its reset time and the request moves to the next account. Strategy is `round-robin`, `fill-first` or `least-used`. A session (Codex `session_id`, Claude Code session id) stays on one account to keep prompt caches warm. Usage windows are polled from each provider and also read from response headers.
 
