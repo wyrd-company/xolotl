@@ -9,18 +9,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  intentional:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-      - uses: wyrd-company/intentional@0.1.6
-        with:
-          command: check
-          intentional-version: 0.1.6
-
   check:
     runs-on: ubuntu-latest
     steps:

@@ -10,7 +10,7 @@ Versions are managed with [Intentional](https://github.com/wyrd-company/intentio
 - **Tags:** the template is `{version}`, giving plain tags like `0.1.0`, as the project README asks.
 - **Bump mapping:** `pre-1-0-bump-mapping: component`, so before 1.0 a `minor` intent bumps the minor version (`0.0.0` → `0.1.0`) and is listed under Features. With Intentional's default mapping, getting `0.1.0` would take a `major` intent listed under "Breaking".
 
-The baseline is `0.0.0`, the version in `Cargo.toml`. `intentional tag --baseline` creates it, and until the tag exists the CI check fails with `missing-baseline`.
+The baseline is `0.0.0`, the version in `Cargo.toml`. `intentional tag --baseline` creates it; until the tag exists, `intentional check` (and so a release) fails with `missing-baseline`.
 
 The first release is one intent, `.intentional/intents/lucky-otter-1aef.md` (`xolotl: minor`).
 
@@ -37,9 +37,10 @@ Intentional finds tags by name, so the release history survives a squash merge o
 ## CI (`.github/workflows/ci.yml`)
 
 On pushes to `main` and on pull requests:
-- `intentional check`, via the `wyrd-company/intentional@0.1.6` action;
 - `cargo fmt --check`, `clippy -D warnings` and `cargo test`;
 - a Docker build.
+
+Intentional is not checked here. `intentional check` only validates the config and intent files (it doesn't require a change to carry an intent), so it runs once, as the release gate. A malformed intent therefore shows up when a release is cut, not on the PR that added it.
 
 ## Release workflow (`.github/workflows/release.yml`)
 

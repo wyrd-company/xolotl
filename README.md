@@ -233,4 +233,4 @@ intentional tag --plan release-plan.json
 git push origin main --follow-tags
 ```
 
-CI runs `intentional check`. The release workflow only deploys a tag that is an Intentional release record (annotated, `baseline: false`, matching `Cargo.toml` and `CHANGELOG.md`): it tests, publishes `ghcr.io/<repo>:<version>` (amd64 + arm64) and a GitHub release with a Linux binary. Baseline records are skipped and any other tag is refused.
+Intentional is checked only at release time: the release workflow runs `intentional check` and only deploys a tag that is an Intentional release record (annotated, `baseline: false`, matching `Cargo.toml` and `CHANGELOG.md`): it tests, publishes `ghcr.io/<repo>:<version>` (amd64 + arm64) and a GitHub release with a Linux binary. Baseline records are skipped and any other tag is refused.
