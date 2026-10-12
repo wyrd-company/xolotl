@@ -9,6 +9,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::*;
 use crate::config::{Endpoints, SubscriptionConfig};
 use crate::secrets::MemoryStore;
+use crate::secrets::SecretStore;
+use crate::secrets::testing::GatedStore;
 
 async fn setup(server: &MockServer, strategy: Strategy) -> (Arc<Subscriptions>, Secrets) {
     let secrets: Secrets = Arc::new(MemoryStore::default());
@@ -27,7 +29,10 @@ async fn setup(server: &MockServer, strategy: Strategy) -> (Arc<Subscriptions>, 
         ..Default::default()
     };
     let db = Db::in_memory().await.unwrap();
-    (Arc::new(Subscriptions::new(cfg, db, secrets.clone(), reqwest::Client::new())), secrets)
+    (
+        Arc::new(Subscriptions::new(cfg, db, secrets.clone(), crate::proxy::upstream_client(std::time::Duration::from_secs(30)).unwrap())),
+        secrets,
+    )
 }
 
 fn codex_cred(acct: &str, token: &str) -> Credential {
@@ -391,57 +396,22 @@ async fn sync_loads_accounts_from_vault() {
 }
 
 /// A store whose writes can be made to fail, standing in for an OpenBao outage.
-#[derive(Default)]
-struct FlakyStore {
-    inner: MemoryStore,
-    fail_writes: std::sync::atomic::AtomicBool,
-}
-
-impl FlakyStore {
-    fn check(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.fail_writes.load(std::sync::atomic::Ordering::SeqCst), "vault unavailable");
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::secrets::SecretStore for FlakyStore {
-    async fn get(&self, key: &str) -> anyhow::Result<Option<serde_json::Map<String, Value>>> {
-        self.inner.get(key).await
-    }
-    async fn put(&self, key: &str, data: serde_json::Map<String, Value>) -> anyhow::Result<()> {
-        self.check()?;
-        self.inner.put(key, data).await
-    }
-    async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        self.inner.delete(key).await
-    }
-    async fn list(&self, dir: &str) -> anyhow::Result<Vec<String>> {
-        self.inner.list(dir).await
-    }
-    async fn get_versioned(&self, key: &str) -> anyhow::Result<(Option<serde_json::Map<String, Value>>, u64)> {
-        self.inner.get_versioned(key).await
-    }
-    async fn put_cas(&self, key: &str, data: serde_json::Map<String, Value>, cas: u64) -> anyhow::Result<u64> {
-        self.check()?;
-        self.inner.put_cas(key, data, cas).await
-    }
-    async fn destroy_versions(&self, key: &str, versions: &[u64]) -> anyhow::Result<()> {
-        self.inner.destroy_versions(key, versions).await
-    }
-}
-
 #[tokio::test]
 async fn refreshed_credentials_survive_vault_outage() {
     let server = MockServer::start().await;
-    let store = Arc::new(FlakyStore::default());
+    let store = Arc::new(GatedStore::default());
     let secrets: Secrets = store.clone();
     let uri = server.uri();
     let cfg = SubscriptionConfig {
         endpoints: Endpoints { codex_backend: format!("{uri}/backend-api"), codex_auth: uri.clone(), ..Default::default() },
         ..Default::default()
     };
-    let subs = Subscriptions::new(cfg, Db::in_memory().await.unwrap(), secrets.clone(), reqwest::Client::new());
+    let subs = Subscriptions::new(
+        cfg,
+        Db::in_memory().await.unwrap(),
+        secrets.clone(),
+        crate::proxy::upstream_client(std::time::Duration::from_secs(30)).unwrap(),
+    );
     let mut cred = codex_cred("acct-a", "old");
     cred.expires_at = Some(now() - 10);
     let a = subs.save_account(cred).await.unwrap();
@@ -460,7 +430,7 @@ async fn refreshed_credentials_survive_vault_outage() {
         .await;
 
     // Vault goes down: the refresh still serves the request from memory.
-    store.fail_writes.store(true, std::sync::atomic::Ordering::SeqCst);
+    store.set_fail_writes(true);
     let (status, _) = run(&subs, SubProvider::Codex, "/v1/responses", HeaderMap::new(), responses_body()).await;
     assert_eq!(status, 200);
     let view = subs.accounts(None).await.unwrap();
@@ -474,7 +444,7 @@ async fn refreshed_credentials_survive_vault_outage() {
     assert_eq!(status, 200);
 
     // Vault is back: the next flush saves the rotated credential.
-    store.fail_writes.store(false, std::sync::atomic::Ordering::SeqCst);
+    store.set_fail_writes(false);
     assert_eq!(subs.flush_unsaved().await, 0);
     let stored: Credential = get_typed(&*secrets, &format!("accounts/codex/{}", a.id)).await.unwrap().unwrap();
     assert_eq!(stored.access_token, "fresh");
@@ -484,4 +454,124 @@ async fn refreshed_credentials_survive_vault_outage() {
     // A periodic re-sync must not overwrite the fresh in-memory credential either.
     subs.sync().await.unwrap();
     assert_eq!(subs.credential(&a.id, None).await.unwrap().access_token, "fresh");
+}
+
+/// Subscriptions over a gated store, with Codex endpoints on the mock server.
+async fn gated(server: &MockServer) -> (Arc<Subscriptions>, Arc<GatedStore>) {
+    let store = Arc::new(GatedStore::default());
+    let uri = server.uri();
+    let cfg = SubscriptionConfig {
+        endpoints: Endpoints { codex_backend: format!("{uri}/backend-api"), codex_auth: uri.clone(), ..Default::default() },
+        ..Default::default()
+    };
+    let http = crate::proxy::upstream_client(std::time::Duration::from_secs(30)).unwrap();
+    (Arc::new(Subscriptions::new(cfg, Db::in_memory().await.unwrap(), store.clone(), http)), store)
+}
+
+/// Token endpoint that hands out `gen1`, `gen2`, ... on successive refreshes.
+async fn mount_refreshes(server: &MockServer, n: usize) {
+    for i in (1..=n).rev() {
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token": format!("gen{i}"), "refresh_token": format!("rt{i}"), "expires_in": 3600})),
+            )
+            .up_to_n_times(1)
+            .with_priority(i as u8)
+            .mount(server)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn removed_account_stays_removed_after_inflight_refresh() {
+    let server = MockServer::start().await;
+    let (subs, store) = gated(&server).await;
+    mount_refreshes(&server, 1).await;
+    let mut cred = codex_cred("acct-a", "old");
+    cred.expires_at = Some(now() - 10);
+    let id = subs.save_account(cred).await.unwrap().id;
+    let key = format!("accounts/codex/{id}");
+
+    // A refresh pauses on its vault write while the account is removed.
+    store.arm("put", &key);
+    let refresh = tokio::spawn({
+        let subs = subs.clone();
+        let id = id.clone();
+        async move { subs.credential(&id, None).await }
+    });
+    store.reached.notified().await;
+    let remove = tokio::spawn({
+        let subs = subs.clone();
+        let id = id.clone();
+        async move { subs.remove_account(&id).await.unwrap() }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    store.release.notify_one();
+    let _ = refresh.await.unwrap();
+    assert!(remove.await.unwrap());
+
+    subs.sync().await.unwrap();
+    assert!(store.get(&key).await.unwrap().is_none(), "vault record stays deleted");
+    assert!(subs.accounts(None).await.unwrap().is_empty(), "account does not come back");
+    assert!(subs.credential(&id, None).await.is_err());
+}
+
+#[tokio::test]
+async fn delayed_flush_does_not_overwrite_a_newer_refresh() {
+    let server = MockServer::start().await;
+    let (subs, store) = gated(&server).await;
+    mount_refreshes(&server, 2).await;
+    let mut cred = codex_cred("acct-a", "old");
+    cred.expires_at = Some(now() - 10);
+    let id = subs.save_account(cred).await.unwrap().id;
+    let key = format!("accounts/codex/{id}");
+
+    // gen1 is refreshed while the vault is down, so it is only in memory.
+    store.set_fail_writes(true);
+    assert_eq!(subs.credential(&id, None).await.unwrap().access_token, "gen1");
+    assert_eq!(subs.unsaved_count(), 1);
+    store.set_fail_writes(false);
+
+    // The retry pauses on its write; meanwhile gen1 is rejected and refreshed to gen2.
+    store.arm("put", &key);
+    let flush = tokio::spawn({
+        let subs = subs.clone();
+        async move { subs.flush_unsaved().await }
+    });
+    store.reached.notified().await;
+    let refresh = tokio::spawn({
+        let subs = subs.clone();
+        let id = id.clone();
+        async move { subs.credential(&id, Some("gen1")).await.unwrap() }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    store.release.notify_one();
+    flush.await.unwrap();
+    assert_eq!(refresh.await.unwrap().access_token, "gen2");
+
+    let stored: Credential = get_typed(&*store, &key).await.unwrap().unwrap();
+    assert_eq!(stored.access_token, "gen2", "vault keeps the newest credential");
+    assert_eq!(stored.refresh_token.as_deref(), Some("rt2"));
+    assert_eq!(subs.unsaved_count(), 0);
+}
+
+#[tokio::test]
+async fn api_call_does_not_follow_redirects() {
+    let server = MockServer::start().await;
+    let elsewhere = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
+    Mock::given(path("/backend-api/redirect"))
+        .respond_with(ResponseTemplate::new(307).insert_header("location", format!("{}/steal", elsewhere.uri())))
+        .mount(&server)
+        .await;
+    Mock::given(path("/steal")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&elsewhere).await;
+    let mut h = HashMap::new();
+    h.insert("x-probe-token".to_string(), "$TOKEN$".to_string());
+    let url = format!("{}/backend-api/redirect", server.uri());
+    let (status, _, _) = subs.api_call(&a, "POST", &url, &h, Some("token=$TOKEN$")).await.unwrap();
+    assert_eq!(status, 307, "the redirect is returned, not followed");
+    assert!(elsewhere.received_requests().await.unwrap().is_empty());
 }

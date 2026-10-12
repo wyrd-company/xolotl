@@ -48,7 +48,7 @@ pub enum Command {
         #[arg(long, short, env = "XOLOTL_CONFIG")]
         config: Option<PathBuf>,
     },
-    /// Validate a configuration file.
+    /// Validate a configuration file and print it with credentials redacted.
     CheckConfig {
         #[arg(long, short, env = "XOLOTL_CONFIG")]
         config: Option<PathBuf>,
@@ -237,7 +237,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Serve { config } => serve(config).await,
         Command::CheckConfig { config } => {
             let cfg = Config::load(config.as_deref())?;
-            println!("{}", toml::to_string_pretty(&cfg)?);
+            println!("{}", toml::to_string_pretty(&cfg.redacted())?);
             Ok(())
         }
         Command::Keys { remote, cmd } => keys(Client::new(&remote)?, cmd).await,
@@ -313,11 +313,7 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
     let guard = telemetry::init(&cfg.telemetry, extra_headers)?;
 
     let db = Db::open(&cfg.database.path).await?;
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(cfg.server.upstream_timeout_secs))
-        .pool_idle_timeout(Duration::from_secs(90))
-        .build()?;
+    let http = crate::proxy::upstream_client(Duration::from_secs(cfg.server.upstream_timeout_secs))?;
 
     let keys = Arc::new(KeyManager::new(secrets.clone()));
     let (policies, n) = keys.reload().await.context("loading policies and client keys from the vault")?;

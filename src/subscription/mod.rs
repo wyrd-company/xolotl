@@ -187,7 +187,13 @@ pub struct Subscriptions {
     db: Db,
     secrets: Secrets,
     http: reqwest::Client,
-    creds: RwLock<HashMap<String, Arc<tokio::sync::Mutex<Credential>>>>,
+    /// Each account's credential behind its own lock. Every write of an
+    /// account's credential to the vault happens while holding that lock, and
+    /// a lock that is no longer in this map (account removed or replaced) is
+    /// stale: holders must not write through it.
+    creds: RwLock<HashMap<String, CredLock>>,
+    /// Serializes changes to the set of accounts (sync, save, remove).
+    membership: tokio::sync::Mutex<()>,
     rr: Mutex<HashMap<SubProvider, usize>>,
     affinity: Mutex<HashMap<String, (String, Instant)>>,
     /// Accounts whose refreshed credential has not reached the vault yet.
@@ -195,6 +201,8 @@ pub struct Subscriptions {
     unsaved: Mutex<HashSet<String>>,
     pub flows: Flows,
 }
+
+type CredLock = Arc<tokio::sync::Mutex<Credential>>;
 
 pub fn auth_index(account_id: &str) -> String {
     hex::encode(&Sha256::digest(format!("xolotl:{account_id}").as_bytes())[..8])
@@ -212,6 +220,7 @@ impl Subscriptions {
             secrets,
             http,
             creds: RwLock::new(HashMap::new()),
+            membership: tokio::sync::Mutex::new(()),
             rr: Mutex::new(HashMap::new()),
             affinity: Mutex::new(HashMap::new()),
             unsaved: Mutex::new(HashSet::new()),
@@ -224,6 +233,7 @@ impl Subscriptions {
     /// Load every account credential from the vault and make sure each has a
     /// state row. Safe to call repeatedly.
     pub async fn sync(&self) -> Result<usize> {
+        let _membership = self.membership.lock().await;
         let mut fresh = HashMap::new();
         for provider in SubProvider::ALL {
             for id in self.secrets.list(&format!("accounts/{provider}")).await? {
@@ -273,21 +283,52 @@ impl Subscriptions {
             Some(ext) => format!("{}-{}", cred.provider, &hex::encode(Sha256::digest(ext.as_bytes()))[..10]),
             None => format!("{}-{}", cred.provider, crate::keys::random_id(10)),
         };
+        let _membership = self.membership.lock().await;
+        // Wait for any refresh of the previous login to finish, so it can't
+        // overwrite this one; its lock then goes stale.
+        let previous = self.creds.read().get(&id).cloned();
+        let _old = match &previous {
+            Some(l) => Some(l.lock().await),
+            None => None,
+        };
         self.persist(&id, &cred).await?;
         self.db.upsert_account(&self.row_for(&id, &cred)).await?;
         // A fresh login supersedes a previous auth failure.
         self.db.mark_auth_failed(&id, false, None).await?;
         self.creds.write().insert(id.clone(), Arc::new(tokio::sync::Mutex::new(cred)));
+        if self.unsaved.lock().remove(&id) {
+            self.report_unsaved();
+        }
         self.db.get_account(&id).await?.context("account vanished after save")
     }
 
     pub async fn remove_account(&self, id: &str) -> Result<bool> {
+        let _membership = self.membership.lock().await;
         let Some(row) = self.db.get_account(id).await? else { return Ok(false) };
+        // Wait for an in-flight refresh or retry to finish writing, then make
+        // its lock stale so nothing writes the account back afterwards.
+        let lock = self.creds.read().get(id).cloned();
+        let _guard = match &lock {
+            Some(l) => Some(l.lock().await),
+            None => None,
+        };
+        self.creds.write().remove(id);
+        if self.unsaved.lock().remove(id) {
+            self.report_unsaved();
+        }
         self.secrets.delete(&format!("accounts/{}/{id}", row.provider)).await?;
         self.db.delete_account(id).await?;
-        self.creds.write().remove(id);
-        self.unsaved.lock().remove(id);
         Ok(true)
+    }
+
+    /// Lock an account's credential. Fails if the account was removed or
+    /// replaced while waiting, so a stale holder never writes to the vault.
+    async fn lock_current(&self, id: &str) -> Result<tokio::sync::OwnedMutexGuard<Credential>> {
+        let lock = self.creds.read().get(id).cloned().with_context(|| format!("no credential loaded for account {id}"))?;
+        let guard = lock.clone().lock_owned().await;
+        let current = self.creds.read().get(id).is_some_and(|l| Arc::ptr_eq(l, &lock));
+        anyhow::ensure!(current, "account {id} was removed or replaced");
+        Ok(guard)
     }
 
     pub async fn accounts(&self, provider: Option<SubProvider>) -> Result<Vec<AccountView>> {
@@ -327,8 +368,7 @@ impl Subscriptions {
     /// `force_if_token`, refresh if the current token is still that one
     /// (i.e. nobody refreshed it since it was rejected upstream).
     pub async fn credential(&self, id: &str, force_if_token: Option<&str>) -> Result<Credential> {
-        let lock = self.creds.read().get(id).cloned().with_context(|| format!("no credential loaded for account {id}"))?;
-        let mut cred = lock.lock().await;
+        let mut cred = self.lock_current(id).await?;
         if !cred.provider.uses_oauth() {
             return Ok(cred.clone());
         }
@@ -407,12 +447,17 @@ impl Subscriptions {
     pub async fn flush_unsaved(&self) -> usize {
         let ids: Vec<String> = self.unsaved.lock().iter().cloned().collect();
         for id in ids {
-            let Some(lock) = self.creds.read().get(&id).cloned() else {
-                // Account removed meanwhile.
+            // Hold the account's lock through the write, so a concurrent
+            // refresh can't save a newer credential that this one overwrites.
+            let Ok(cred) = self.lock_current(&id).await else {
+                // Removed or replaced meanwhile; nothing left to save.
                 self.unsaved.lock().remove(&id);
                 continue;
             };
-            let cred = lock.lock().await.clone();
+            if !self.unsaved.lock().contains(&id) {
+                // A refresh saved a newer credential while we waited.
+                continue;
+            }
             match self.persist(&id, &cred).await {
                 Ok(()) => {
                     self.unsaved.lock().remove(&id);

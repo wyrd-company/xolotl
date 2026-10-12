@@ -299,6 +299,20 @@ impl Config {
         Ok(cfg)
     }
 
+    /// A copy that is safe to print: credentials and header values replaced.
+    pub fn redacted(&self) -> Config {
+        const HIDDEN: &str = "<redacted>";
+        let mut c = self.clone();
+        for v in [&mut c.vault.approle.role_id, &mut c.vault.approle.secret_id].into_iter().flatten() {
+            *v = HIDDEN.into();
+        }
+        let headers = c.telemetry.otlp_headers.values_mut().chain(c.gateway.providers.values_mut().flat_map(|p| p.headers.values_mut()));
+        for v in headers {
+            *v = HIDDEN.into();
+        }
+        c
+    }
+
     fn apply_env(&mut self) {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         if let Some(v) = env("XOLOTL_LISTEN").and_then(|v| v.parse().ok()) {
@@ -364,6 +378,21 @@ mod tests {
         let cfg: Config = toml::from_str(raw).unwrap();
         cfg.validate().unwrap();
         assert!(cfg.gateway.providers.contains_key("llamacpp"));
+    }
+
+    #[test]
+    fn redacted_hides_credentials() {
+        let mut cfg: Config = toml::from_str(
+            "[vault.approle]\nrole_id = \"role\"\nsecret_id = \"s3cret\"\n[telemetry.otlp_headers]\nAuthorization = \"Basic abc\"\n\
+             [gateway.providers.local]\nkind = \"openai-compatible\"\nbase_url = \"http://x\"\nheaders = { X-Key = \"hdr\" }\n",
+        )
+        .unwrap();
+        cfg.vault.approle.secret_id_file = Some("/run/secret_id".into());
+        let out = toml::to_string_pretty(&cfg.redacted()).unwrap();
+        for secret in ["role", "s3cret", "Basic abc", "hdr"] {
+            assert!(!out.contains(&format!("\"{secret}\"")), "{secret} leaked:\n{out}");
+        }
+        assert!(out.contains("/run/secret_id"), "file paths are not secret");
     }
 
     #[test]

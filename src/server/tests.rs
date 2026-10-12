@@ -57,7 +57,7 @@ async fn harness() -> Harness {
         opencode_go: format!("{uri}/zen/go"),
     };
     let db = Db::in_memory().await.unwrap();
-    let http = reqwest::Client::new();
+    let http = crate::proxy::upstream_client(std::time::Duration::from_secs(30)).unwrap();
     let keys = Arc::new(KeyManager::new(secrets.clone()));
     keys.reload().await.unwrap();
     let subs = Arc::new(Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone()));
@@ -264,6 +264,20 @@ async fn passthroughs_swap_credentials() {
     let restricted = h.key(Policy { name: "r".into(), providers: vec!["claude".into()], ..Default::default() }).await;
     assert_eq!(h.call("GET", "/llama/v1/props", Some(&restricted), None).await.0, 403);
     assert_eq!(h.call("GET", "/opencode-go/v1/models", Some(&restricted), None).await.0, 403);
+}
+
+#[tokio::test]
+async fn client_credentials_never_reach_upstream() {
+    let h = harness().await;
+    Mock::given(method("GET")).and(path("/llama/v1/props")).respond_with(ResponseTemplate::new(200)).mount(&h.upstream).await;
+    // The bootstrap token sent as x-management-key authenticates the request
+    // and must be stripped like the other client credential headers.
+    let (status, body) = h.call_with("GET", "/llama/v1/props", &[("x-management-key", h.admin.as_str())], None).await;
+    assert_eq!(status, 200, "{body}");
+    let reqs = h.upstream.received_requests().await.unwrap();
+    let sent = &reqs.last().unwrap().headers;
+    assert!(sent.get("x-management-key").is_none(), "client credential forwarded upstream");
+    assert_eq!(sent.get("authorization").unwrap(), "Bearer llama-key");
 }
 
 #[tokio::test]

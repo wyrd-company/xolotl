@@ -24,6 +24,7 @@ const STRIP_REQUEST: &[&str] = &[
     "host",
     "authorization",
     "x-api-key",
+    "x-management-key",
     "x-goog-api-key",
     "api-key",
     "content-length",
@@ -56,6 +57,19 @@ const STRIP_RESPONSE: &[&str] = &[
     "alt-svc",
     "content-length",
 ];
+
+/// The HTTP client for every upstream call. Redirects are never followed:
+/// requests carry provider credentials (and `api-call` puts account tokens in
+/// arbitrary headers), which must not reach another origin. A proxied 3xx is
+/// relayed to the client as is.
+pub fn upstream_client(read_timeout: std::time::Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(read_timeout)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()
+}
 
 pub fn forward_request_headers(src: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::with_capacity(src.len());

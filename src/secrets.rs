@@ -112,6 +112,89 @@ impl SecretStore for MemoryStore {
     }
 }
 
+/// Test stores for failure and race scenarios.
+#[cfg(test)]
+pub mod testing {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    /// An in-memory store that can fail every write, and pause once at a
+    /// chosen read or write until the test releases it.
+    #[derive(Default)]
+    pub struct GatedStore {
+        pub inner: MemoryStore,
+        pub fail_writes: AtomicBool,
+        gate: Mutex<Option<(&'static str, String)>>,
+        /// Notified when the armed operation is reached (and paused).
+        pub reached: tokio::sync::Notify,
+        /// Notify to let the paused operation continue.
+        pub release: tokio::sync::Notify,
+    }
+
+    impl GatedStore {
+        /// Pause the next `op` (`"get"` or `"put"`) on `key`.
+        pub fn arm(&self, op: &'static str, key: &str) {
+            *self.gate.lock() = Some((op, key.to_string()));
+        }
+
+        pub fn set_fail_writes(&self, fail: bool) {
+            self.fail_writes.store(fail, Ordering::SeqCst);
+        }
+
+        async fn pass(&self, op: &'static str, key: &str) {
+            let hit = {
+                let mut g = self.gate.lock();
+                let hit = g.as_ref().is_some_and(|(o, k)| *o == op && k == key);
+                if hit {
+                    *g = None;
+                }
+                hit
+            };
+            if hit {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+        }
+
+        fn writable(&self) -> Result<()> {
+            anyhow::ensure!(!self.fail_writes.load(Ordering::SeqCst), "vault unavailable");
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SecretStore for GatedStore {
+        async fn get(&self, key: &str) -> Result<Option<Map<String, Value>>> {
+            self.pass("get", key).await;
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, data: Map<String, Value>) -> Result<()> {
+            self.pass("put", key).await;
+            self.writable()?;
+            self.inner.put(key, data).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, dir: &str) -> Result<Vec<String>> {
+            self.inner.list(dir).await
+        }
+        async fn get_versioned(&self, key: &str) -> Result<(Option<Map<String, Value>>, u64)> {
+            self.pass("get", key).await;
+            self.inner.get_versioned(key).await
+        }
+        async fn put_cas(&self, key: &str, data: Map<String, Value>, cas: u64) -> Result<u64> {
+            self.pass("put", key).await;
+            self.writable()?;
+            self.inner.put_cas(key, data, cas).await
+        }
+        async fn destroy_versions(&self, key: &str, versions: &[u64]) -> Result<()> {
+            self.inner.destroy_versions(key, versions).await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

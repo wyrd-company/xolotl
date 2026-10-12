@@ -135,6 +135,11 @@ pub struct KeyManager {
     secrets: Secrets,
     state: RwLock<State>,
     last_miss_reload: Mutex<Option<Instant>>,
+    /// Held by reloads and by every key or policy change, from the vault read
+    /// to the cache update, so a reload never publishes a snapshot read before
+    /// a change that finished while it was running (e.g. bringing back a
+    /// revoked key).
+    writes: tokio::sync::Mutex<()>,
 }
 
 fn key_path(client_id: &str) -> String {
@@ -151,11 +156,12 @@ fn valid_name(name: &str) -> bool {
 
 impl KeyManager {
     pub fn new(secrets: Secrets) -> Self {
-        Self { secrets, state: RwLock::new(State::default()), last_miss_reload: Mutex::new(None) }
+        Self { secrets, state: RwLock::new(State::default()), last_miss_reload: Mutex::new(None), writes: tokio::sync::Mutex::new(()) }
     }
 
     /// Reload policies, key records and the bootstrap token from the vault.
     pub async fn reload(&self) -> Result<(usize, usize)> {
+        let _writes = self.writes.lock().await;
         let mut fresh = State::default();
         for name in self.secrets.list("policies").await? {
             if name.ends_with('/') {
@@ -264,6 +270,7 @@ impl KeyManager {
     pub async fn put_policy(&self, mut policy: Policy, known: &BTreeSet<String>) -> Result<Arc<Policy>> {
         policy.normalize();
         policy.validate(known)?;
+        let _writes = self.writes.lock().await;
         let data = match serde_json::to_value(&policy)? {
             Value::Object(m) => m,
             _ => unreachable!("policy serializes to an object"),
@@ -275,6 +282,7 @@ impl KeyManager {
     }
 
     pub async fn delete_policy(&self, name: &str) -> Result<()> {
+        let _writes = self.writes.lock().await;
         let in_use = self.state.read().keys.values().any(|e| !e.revoked && e.info.policy == name);
         anyhow::ensure!(!in_use, "policy {name} still has keys; revoke them first");
         self.secrets.delete(&format!("policies/{name}")).await?;
@@ -299,6 +307,7 @@ impl KeyManager {
     pub async fn issue(&self, req: IssueRequest) -> Result<KeyInfo> {
         anyhow::ensure!(self.policy(&req.policy).is_some(), "policy {:?} does not exist", req.policy);
         anyhow::ensure!(valid_name(&req.name), "key name must be lowercase letters, digits, '-' or '_' (max 63)");
+        let _writes = self.writes.lock().await;
         let id = format!("{}/{}", req.policy, req.name);
         let (existing, version) = self.secrets.get_versioned(&key_path(&id)).await?;
         let was_revoked = existing.as_ref().is_some_and(|m| m.get("revoked").and_then(Value::as_bool).unwrap_or(false));
@@ -321,6 +330,7 @@ impl KeyManager {
 
     /// Replace a key. The old key keeps working for `grace_secs`.
     pub async fn rotate(&self, client_id: &str, grace_secs: i64) -> Result<KeyInfo> {
+        let _writes = self.writes.lock().await;
         let (mut record, version) = self.fetch(client_id).await?;
         let now = Utc::now();
         let old = record.api_key.replace(new_key());
@@ -337,6 +347,7 @@ impl KeyManager {
     }
 
     pub async fn set_disabled(&self, client_id: &str, disabled: bool) -> Result<KeyInfo> {
+        let _writes = self.writes.lock().await;
         let (mut record, version) = self.fetch(client_id).await?;
         record.disabled = disabled;
         self.write(client_id, &record, version).await?;
@@ -346,6 +357,7 @@ impl KeyManager {
     /// Write a revocation marker as the latest version and destroy the data
     /// of every earlier version. Metadata stays so versions never repeat.
     pub async fn revoke(&self, client_id: &str) -> Result<()> {
+        let _writes = self.writes.lock().await;
         let (record, version) = self.fetch(client_id).await?;
         let marker = KeyRecord {
             api_key: None,
@@ -553,6 +565,34 @@ mod tests {
         km.reload().await.unwrap();
         let p = km.authenticate("boot").await.unwrap();
         assert!(p.client_id().is_none() && p.has_scope(Scope::Admin));
+    }
+
+    #[tokio::test]
+    async fn reload_does_not_restore_a_revoked_key() {
+        let store = Arc::new(crate::secrets::testing::GatedStore::default());
+        let s: Secrets = store.clone();
+        let km = Arc::new(KeyManager::new(s.clone()));
+        km.put_policy(Policy { name: "dev".into(), providers: vec!["claude".into()], ..Default::default() }, &known()).await.unwrap();
+        km.issue(IssueRequest { policy: "dev".into(), name: "a".into(), ..Default::default() }).await.unwrap();
+        let key = vault_key(&s, "dev/a").await;
+
+        // A reload reads the live key, then pauses on its last read.
+        store.arm("get", "admin");
+        let reload = tokio::spawn({
+            let km = km.clone();
+            async move { km.reload().await.unwrap() }
+        });
+        store.reached.notified().await;
+        // Revoke while the reload holds its stale snapshot.
+        let revoke = tokio::spawn({
+            let km = km.clone();
+            async move { km.revoke("dev/a").await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        store.release.notify_one();
+        reload.await.unwrap();
+        revoke.await.unwrap();
+        assert!(km.authenticate(&key).await.is_none(), "revoked key must stay revoked");
     }
 
     #[tokio::test]

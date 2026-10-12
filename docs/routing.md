@@ -85,3 +85,5 @@ Errors use the shape of the endpoint that was called: Anthropic-style on `/v1/me
 | `/opencode-go/<path>` | Any method, to OpenCode Go through the account pool, so load balancing, failover and usage tracking still apply. The body is always buffered, because failover may resend it. |
 
 Both require the policy to allow the provider.
+
+Upstream redirects are never followed, on any route: a 3xx is relayed to the client as is, so provider credentials and account tokens never reach another origin.
