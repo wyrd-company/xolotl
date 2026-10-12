@@ -468,6 +468,41 @@ fn short_names_are_stable_and_valid() {
     assert_ne!(a, short_name(&"x".repeat(101)));
     assert!(short_name("mcp.server/tool").chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
 }
+
+#[tokio::test]
+async fn interleaved_parallel_chat_tool_calls_keep_their_identity() {
+    let chunks = [
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "id": "call_a", "type": "function", "function": {"name": "first", "arguments": ""}},
+            {"index": 1, "id": "call_b", "type": "function", "function": {"name": "second", "arguments": ""}},
+        ]}}]}),
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"x\":"}}]}}]}),
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 1, "function": {"arguments": "{\"y\":2}"}}]}}]}),
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "1}"}}]}}]}),
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+    ];
+    let stream: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect::<String>() + "data: [DONE]\n\n";
+
+    let (_, t) = translate(Wire::Responses, Wire::Chat, json!({"model": "fast", "input": "hi"}));
+    let (_, _, body) = run(t, upstream_response(200, "text/event-stream", stream.clone())).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let calls: Vec<(&str, &str, &str)> = v["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| (o["call_id"].as_str().unwrap(), o["name"].as_str().unwrap(), o["arguments"].as_str().unwrap()))
+        .collect();
+    assert_eq!(calls, [("call_a", "first", "{\"x\":1}"), ("call_b", "second", "{\"y\":2}")]);
+
+    let (_, t) = translate(Wire::Messages, Wire::Chat, json!({"model": "fast", "stream": true, "messages": []}));
+    let (_, _, body) = run(t, upstream_response(200, "text/event-stream", stream)).await;
+    let evs = events(&body);
+    let starts: Vec<&Value> = of_type(&evs, "content_block_start").into_iter().map(|e| &e["content_block"]).collect();
+    assert_eq!(starts.len(), 2);
+    assert_eq!((starts[0]["id"].as_str(), starts[0]["name"].as_str()), (Some("call_a"), Some("first")));
+    assert_eq!((starts[1]["id"].as_str(), starts[1]["name"].as_str()), (Some("call_b"), Some("second")));
+}
+
 #[tokio::test]
 async fn failed_json_responses_become_client_errors() {
     let failed = json!({"status": "failed", "output": [], "error": {"code": "server_error", "message": "provider failed"}}).to_string();

@@ -1,5 +1,7 @@
 //! OpenAI Chat Completions (`/v1/chat/completions`) responses, JSON and streamed.
 
+use std::collections::BTreeMap;
+
 use super::*;
 use crate::translate::ir::{Block, Emitter, Event, Response, Start, StopReason};
 use crate::translate::sse::{SseEvent, frame};
@@ -105,24 +107,44 @@ pub fn encode_response(r: &Response, info: &ClientInfo) -> Value {
 enum Open {
     Text,
     Reasoning,
-    Tool(u64),
 }
 
-/// Chat completion chunks -> [`Event`]s. Tool calls are taken to arrive one
-/// after another, as OpenAI, llama.cpp and Vercel send them.
+/// A tool call assembled from its deltas.
+#[derive(Default)]
+struct PendingCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Chat completion chunks -> [`Event`]s. Text and reasoning stream through;
+/// tool calls are assembled per `index`, since parallel calls may interleave
+/// their deltas, and emitted whole when the choice finishes.
 #[derive(Default)]
 pub struct StreamDecoder {
     em: Emitter,
     open: Option<Open>,
+    calls: BTreeMap<u64, PendingCall>,
     stop: Option<StopReason>,
     usage: Usage,
 }
 
 impl StreamDecoder {
-    fn ensure(&mut self, want: Open, start: impl FnOnce() -> Start) {
+    fn ensure(&mut self, want: Open) {
         if self.open != Some(want) {
-            self.em.start(start());
+            self.em.start(if want == Open::Text { Start::Text } else { Start::Reasoning });
             self.open = Some(want);
+        }
+    }
+
+    fn flush_calls(&mut self) {
+        self.em.stop();
+        self.open = None;
+        for (index, c) in std::mem::take(&mut self.calls) {
+            let id = if c.id.is_empty() { format!("call_{index}") } else { c.id };
+            self.em.start(Start::ToolCall { id, name: c.name });
+            self.em.delta(&c.arguments);
+            self.em.stop();
         }
     }
 
@@ -151,24 +173,27 @@ impl Decoder for StreamDecoder {
         if let Some(choice) = v.pointer("/choices/0") {
             let delta = choice.get("delta").unwrap_or(&Value::Null);
             if let Some(t) = reasoning_of(delta) {
-                self.ensure(Open::Reasoning, || Start::Reasoning);
+                self.ensure(Open::Reasoning);
                 self.em.delta(t);
             }
             if let Some(t) = delta.get("content").and_then(Value::as_str).filter(|t| !t.is_empty()) {
-                self.ensure(Open::Text, || Start::Text);
+                self.ensure(Open::Text);
                 self.em.delta(t);
             }
             for c in delta.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
-                let index = c.get("index").and_then(Value::as_u64).unwrap_or(0);
-                let s = |p: &str| c.pointer(p).and_then(Value::as_str).unwrap_or_default().to_string();
-                let id = Some(s("/id")).filter(|id| !id.is_empty()).unwrap_or_else(|| format!("call_{index}"));
-                self.ensure(Open::Tool(index), || Start::ToolCall { id, name: s("/function/name") });
-                self.em.delta(&s("/function/arguments"));
+                let s = |p: &str| c.pointer(p).and_then(Value::as_str).unwrap_or_default();
+                let call = self.calls.entry(c.get("index").and_then(Value::as_u64).unwrap_or(0)).or_default();
+                if call.id.is_empty() {
+                    call.id = s("/id").to_string();
+                }
+                if call.name.is_empty() {
+                    call.name = s("/function/name").to_string();
+                }
+                call.arguments.push_str(s("/function/arguments"));
             }
             if let Some(r) = choice.get("finish_reason").and_then(Value::as_str) {
                 self.stop = Some(stop_reason(r));
-                self.em.stop();
-                self.open = None;
+                self.flush_calls();
             }
         }
         self.em.take()
