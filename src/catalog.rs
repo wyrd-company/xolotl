@@ -146,11 +146,14 @@ impl ModelCatalog {
 
     /// Wire formats that reach `provider/model`.
     pub fn wires(&self, provider: &str, model: &str) -> Vec<Wire> {
+        // Claude subscription accounts speak only Messages; overrides don't apply.
+        if provider == SubProvider::Claude.as_str() {
+            return vec![Wire::Messages];
+        }
         if let Some(w) = self.cfg.wires.get(&format!("{provider}/{model}")).or_else(|| self.cfg.wires.get(provider)) {
             return w.clone();
         }
         match provider {
-            "claude" => vec![Wire::Messages],
             "codex" => vec![Wire::Responses],
             "opencode-go" => {
                 if OPENCODE_GO_MESSAGES.contains(&model) {
@@ -174,11 +177,14 @@ impl ModelCatalog {
     /// Claude subscription accounts are never translated: they serve only the
     /// Claude Code API path. Anthropic models on other providers are.
     pub fn route(&self, provider: &str, model: &str, wire: Wire, path: &str) -> Option<Route> {
+        if provider == SubProvider::Claude.as_str() {
+            return (wire == Wire::Messages).then_some(Route::Native);
+        }
         let native = self.wires(provider, model);
         if native.contains(&wire) {
             return Some(Route::Native);
         }
-        if path != wire.path() || provider == SubProvider::Claude.as_str() {
+        if path != wire.path() {
             return None;
         }
         TRANSLATION_PREFERENCE.into_iter().find(|w| native.contains(w)).map(Route::Translated)
@@ -221,6 +227,21 @@ mod tests {
         assert!(models.contains_key("vercel") && models.contains_key("opencode-go"));
         assert_eq!(Wire::for_path("/v1/messages/count_tokens"), Some(Wire::Messages));
         assert_eq!(Wire::for_path("/v1/embeddings"), None);
+    }
+
+    #[test]
+    fn claude_accounts_ignore_wire_overrides() {
+        let mut cfg = CatalogConfig::default();
+        cfg.wires.insert("claude".into(), vec![Wire::Chat, Wire::Responses]);
+        cfg.wires.insert("claude/m".into(), vec![Wire::Chat]);
+        let c = ModelCatalog::new(cfg, BTreeMap::new());
+        for model in ["m", "other"] {
+            assert_eq!(c.wires("claude", model), vec![Wire::Messages]);
+            assert_eq!(c.route("claude", model, Wire::Messages, "/v1/messages"), Some(Route::Native));
+            assert_eq!(c.route("claude", model, Wire::Chat, "/v1/chat/completions"), None);
+            assert_eq!(c.route("claude", model, Wire::Responses, "/v1/responses"), None);
+            assert_eq!(c.endpoints("claude", model), (vec!["/v1/messages"], vec![]));
+        }
     }
 
     #[test]

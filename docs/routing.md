@@ -24,7 +24,7 @@ There are three LLM wire formats: Anthropic Messages (`/v1/messages`), OpenAI Re
 | `vercel` kind | all three |
 | other gateway providers | Chat |
 
-`[catalog.wires]` overrides this for a provider (`llamacpp = ["chat", "messages"]`) or a single model (`"opencode-go/new-model" = ["messages"]`).
+`[catalog.wires]` overrides this for a provider (`llamacpp = ["chat", "messages"]`) or a single model (`"opencode-go/new-model" = ["messages"]`). Claude subscription accounts can't be overridden: a `claude` or `claude/<model>` key fails config validation.
 
 `ModelCatalog::route` decides how a target is reached on an endpoint:
 

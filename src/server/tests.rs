@@ -268,7 +268,11 @@ async fn messages_client_reaches_codex_through_translation() {
 
 #[tokio::test]
 async fn claude_accounts_serve_only_the_claude_code_path() {
-    let h = harness().await;
+    let mut h = harness().await;
+    // A wire override can't put Claude accounts on another endpoint (config validation also rejects it).
+    let mut catalog = h.state.cfg.catalog.clone();
+    catalog.wires.insert("claude".into(), vec![Wire::Chat, Wire::Responses]);
+    h.state.catalog = Arc::new(ModelCatalog::new(catalog, h.state.gateway.kinds()));
     h.account(Credential {
         provider: SubProvider::Claude,
         access_token: "claude-tok".into(),
