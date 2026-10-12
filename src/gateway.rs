@@ -1,8 +1,8 @@
 //! AI gateway: API-key upstream providers (Vercel AI Gateway, Mistral, any
-//! OpenAI-compatible server such as llama.cpp) addressed as
-//! `<provider>/<model>`, with model aliases and fallbacks, plus a raw
-//! passthrough (`/<provider>/...`) for provider-specific APIs such as Mistral
-//! OCR / batch / files and Vercel's credits / generation / report endpoints.
+//! OpenAI-compatible server such as llama.cpp), plus a raw passthrough
+//! (`/<provider>/...`) for provider-specific APIs such as Mistral OCR / batch /
+//! files and Vercel's credits / generation / report endpoints. Model naming,
+//! aliases and fallbacks are handled by client policies.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -10,48 +10,37 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
-use bytes::Bytes;
 use parking_lot::RwLock;
 use serde_json::{Value, json};
 
 use crate::config::{GatewayConfig, ProviderConfig, ProviderKind};
 use crate::db::Db;
+use crate::policy::Target;
 use crate::proxy::{self, Accounting, set_header};
 use crate::secrets::Secrets;
 
 const KEY_TTL: Duration = Duration::from_secs(300);
-const MODELS_TTL: Duration = Duration::from_secs(600);
 
 pub struct Gateway {
     providers: BTreeMap<String, ProviderConfig>,
-    aliases: HashMap<String, Vec<String>>,
     secrets: Secrets,
     http: reqwest::Client,
     db: Db,
     keys: RwLock<HashMap<String, (Option<String>, Instant)>>,
-    models: RwLock<Option<(Vec<Value>, Instant)>>,
-}
-
-/// A resolved upstream target.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Target {
-    pub provider: String,
-    pub model: String,
 }
 
 impl Gateway {
     pub fn new(cfg: &GatewayConfig, secrets: Secrets, http: reqwest::Client, db: Db) -> Self {
         let providers = cfg.providers.iter().filter(|(_, p)| p.is_enabled()).map(|(k, v)| (k.clone(), v.clone())).collect();
-        let aliases = cfg.models.iter().map(|a| (a.name.clone(), a.targets.clone())).collect();
-        Self { providers, aliases, secrets, http, db, keys: RwLock::new(HashMap::new()), models: RwLock::new(None) }
+        Self { providers, secrets, http, db, keys: RwLock::new(HashMap::new()) }
     }
 
     pub fn has_provider(&self, name: &str) -> bool {
         self.providers.contains_key(name)
     }
 
-    pub fn provider_names(&self) -> impl Iterator<Item = &String> {
-        self.providers.keys()
+    pub fn kinds(&self) -> BTreeMap<String, ProviderKind> {
+        self.providers.iter().map(|(k, v)| (k.clone(), v.kind)).collect()
     }
 
     fn base_url(p: &ProviderConfig) -> String {
@@ -63,25 +52,6 @@ impl Gateway {
         };
         let base = base.trim_end_matches('/');
         base.strip_suffix("/v1").unwrap_or(base).to_string()
-    }
-
-    /// Resolve a client model name: an alias, or `<provider>/<model>` for a
-    /// configured gateway provider (split on the first `/` only, so
-    /// `vercel/anthropic/claude-x` targets model `anthropic/claude-x`).
-    pub fn resolve(&self, model: &str) -> Option<Vec<Target>> {
-        if let Some(targets) = self.aliases.get(model) {
-            return Some(targets.iter().filter_map(|t| self.split(t)).collect());
-        }
-        self.split(model).map(|t| vec![t])
-    }
-
-    fn split(&self, s: &str) -> Option<Target> {
-        let (p, m) = s.split_once('/')?;
-        (self.has_provider(p) && !m.is_empty()).then(|| Target { provider: p.to_string(), model: m.to_string() })
-    }
-
-    pub fn is_alias(&self, model: &str) -> bool {
-        self.aliases.contains_key(model)
     }
 
     async fn api_key(&self, name: &str) -> Result<Option<String>> {
@@ -138,80 +108,34 @@ impl Gateway {
         Ok(resp)
     }
 
-    /// Unified JSON endpoint (`/v1/chat/completions`, `/v1/embeddings`,
-    /// `/v1/ocr`, `/v1/responses`, `/v1/messages`, ...): try each target in
-    /// order, falling back on rate limits, server errors and transport errors.
+    /// Send a JSON request (`/v1/chat/completions`, `/v1/embeddings`,
+    /// `/v1/ocr`, `/v1/responses`, `/v1/messages`, ...) to one target.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
-        targets: &[Target],
+        target: &Target,
         method: Method,
         path: &str,
         headers: HeaderMap,
-        body: Value,
+        mut body: Value,
         client_id: Option<&str>,
         requested_model: &str,
     ) -> Response {
-        let mut last: Option<(Target, u16, reqwest::header::HeaderMap, Bytes)> = None;
-        for (i, target) in targets.iter().enumerate() {
-            let is_last = i + 1 == targets.len();
-            let mut b = body.clone();
-            if let Some(obj) = b.as_object_mut() {
-                obj.insert("model".into(), Value::String(target.model.clone()));
-                if self.providers.get(&target.provider).is_some_and(|p| p.kind == ProviderKind::Mistral) {
-                    normalize_mistral(path, obj);
-                }
-            }
-            let accounting = || {
-                let mut a = Accounting::new(
-                    self.db.clone(),
-                    &target.provider,
-                    path,
-                    client_id,
-                    Some(&format!("{}/{}", target.provider, target.model)),
-                );
-                a.record.model = Some(if requested_model.contains('/') {
-                    requested_model.to_string()
-                } else {
-                    format!("{}/{}", target.provider, target.model)
-                });
-                a
-            };
-            let started = accounting();
-            let resp = self
-                .send(
-                    &target.provider,
-                    method.clone(),
-                    path,
-                    headers.clone(),
-                    reqwest::Body::from(serde_json::to_vec(&b).unwrap_or_default()),
-                )
-                .await;
-            match resp {
-                Err(e) => {
-                    tracing::warn!(provider = %target.provider, error = %e, "gateway upstream request failed");
-                    if is_last && last.is_none() {
-                        started.finish(502, Default::default());
-                        return proxy::error_response(StatusCode::BAD_GATEWAY, "api_error", format!("{}: {e:#}", target.provider));
-                    }
-                }
-                Ok(r) => {
-                    let status = r.status().as_u16();
-                    let retryable = status == 429 || (500..600).contains(&status);
-                    if !retryable || is_last {
-                        return proxy::relay(r, Some(started));
-                    }
-                    tracing::info!(provider = %target.provider, status, "falling back to next target");
-                    let h = r.headers().clone();
-                    let bytes = r.bytes().await.unwrap_or_default();
-                    started.finish(status, Default::default());
-                    last = Some((target.clone(), status, h, bytes));
-                }
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("model".into(), Value::String(target.model.clone()));
+            if self.providers.get(&target.provider).is_some_and(|p| p.kind == ProviderKind::Mistral) {
+                normalize_mistral(path, obj);
             }
         }
-        match last {
-            Some((_, status, h, bytes)) => proxy::relay_buffered(status, &h, bytes, None),
-            None => proxy::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", "no usable target"),
+        let accounting = Accounting::new(self.db.clone(), &target.provider, path, client_id, Some(requested_model));
+        let bytes = serde_json::to_vec(&body).unwrap_or_default();
+        match self.send(&target.provider, method, path, headers, reqwest::Body::from(bytes)).await {
+            Ok(r) => proxy::relay(r, Some(accounting)),
+            Err(e) => {
+                tracing::warn!(provider = %target.provider, error = %e, "gateway upstream request failed");
+                accounting.finish(502, Default::default());
+                proxy::error_response(StatusCode::BAD_GATEWAY, "api_error", format!("{}: {e:#}", target.provider))
+            }
         }
     }
 
@@ -238,38 +162,18 @@ impl Gateway {
         }
     }
 
-    /// Aggregated model list (`<provider>/<id>` plus aliases), cached.
-    pub async fn list_models(&self) -> Vec<Value> {
-        if let Some((m, at)) = self.models.read().as_ref()
-            && at.elapsed() < MODELS_TTL
-        {
-            return m.clone();
-        }
-        let mut out = Vec::new();
-        for name in self.providers.keys() {
-            let resp = self.send(name, Method::GET, "/v1/models", HeaderMap::new(), reqwest::Body::from(Vec::new())).await;
-            let body = match resp {
-                Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or(Value::Null),
-                Ok(r) => {
-                    tracing::debug!(provider = %name, status = %r.status(), "model list unavailable");
-                    continue;
-                }
-                Err(e) => {
-                    tracing::debug!(provider = %name, error = %e, "model list unavailable");
-                    continue;
-                }
-            };
-            for m in body.get("data").and_then(Value::as_array).into_iter().flatten() {
-                if let Some(id) = m.get("id").and_then(Value::as_str) {
-                    out.push(json!({"id": format!("{name}/{id}"), "object": "model", "owned_by": name}));
-                }
-            }
-        }
-        for alias in self.aliases.keys() {
-            out.push(json!({"id": alias, "object": "model", "owned_by": "xolotl"}));
-        }
-        *self.models.write() = Some((out.clone(), Instant::now()));
-        out
+    /// The provider's model ids from `GET /v1/models`.
+    pub async fn fetch_models(&self, name: &str) -> Result<Vec<String>> {
+        let resp = self.send(name, Method::GET, "/v1/models", HeaderMap::new(), reqwest::Body::from(Vec::new())).await?;
+        anyhow::ensure!(resp.status().is_success(), "model list returned {}", resp.status());
+        let body: Value = resp.json().await?;
+        Ok(body
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect())
     }
 }
 
@@ -295,60 +199,42 @@ fn normalize_mistral(path: &str, obj: &mut serde_json::Map<String, Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ModelAlias;
     use crate::secrets::MemoryStore;
     use std::sync::Arc;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    async fn gateway(servers: &[(&str, &MockServer)], aliases: Vec<ModelAlias>) -> Gateway {
+    async fn gateway(name: &str, s: &MockServer) -> Gateway {
         let secrets: Secrets = Arc::new(MemoryStore::default());
-        let mut cfg = GatewayConfig { providers: BTreeMap::new(), models: aliases };
-        for (name, s) in servers {
-            cfg.providers.insert(
-                name.to_string(),
-                ProviderConfig { kind: ProviderKind::OpenaiCompatible, base_url: Some(format!("{}/v1", s.uri())), ..Default::default() },
-            );
-            secrets
-                .put(&format!("providers/{name}"), json!({"api_key": format!("key-{name}")}).as_object().unwrap().clone())
-                .await
-                .unwrap();
-        }
+        let mut cfg = GatewayConfig { providers: BTreeMap::new() };
+        cfg.providers.insert(
+            name.to_string(),
+            ProviderConfig { kind: ProviderKind::OpenaiCompatible, base_url: Some(format!("{}/v1", s.uri())), ..Default::default() },
+        );
+        secrets.put(&format!("providers/{name}"), json!({"api_key": format!("key-{name}")}).as_object().unwrap().clone()).await.unwrap();
         Gateway::new(&cfg, secrets, reqwest::Client::new(), Db::in_memory().await.unwrap())
     }
 
     #[tokio::test]
-    async fn resolves_nested_models_and_aliases() {
+    async fn injects_key_and_target_model() {
         let s = MockServer::start().await;
-        let g = gateway(
-            &[("vercel", &s)],
-            vec![ModelAlias { name: "fast".into(), targets: vec!["vercel/openai/gpt-5-mini".into(), "nope/x".into()] }],
-        )
-        .await;
-        assert_eq!(g.resolve("vercel/anthropic/claude-x").unwrap()[0].model, "anthropic/claude-x");
-        assert!(g.resolve("claude-sonnet").is_none());
-        assert!(g.resolve("unknown/x").is_none());
-        let fast = g.resolve("fast").unwrap();
-        assert_eq!(fast.len(), 1, "unknown providers in aliases are dropped");
-        assert_eq!(fast[0].provider, "vercel");
-    }
-
-    #[tokio::test]
-    async fn falls_back_on_429_and_injects_key() {
-        let a = MockServer::start().await;
-        let b = MockServer::start().await;
-        Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(ResponseTemplate::new(429)).mount(&a).await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .and(header("authorization", "Bearer key-b"))
             .and(body_partial_json(json!({"model": "m2"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"usage": {"prompt_tokens": 1, "completion_tokens": 2}})))
-            .mount(&b)
+            .mount(&s)
             .await;
-        let g = gateway(&[("a", &a), ("b", &b)], vec![ModelAlias { name: "x".into(), targets: vec!["a/m1".into(), "b/m2".into()] }]).await;
-        let targets = g.resolve("x").unwrap();
-        let resp = g.execute(&targets, Method::POST, "/v1/chat/completions", HeaderMap::new(), json!({"model": "x"}), None, "x").await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "m2"}, {"id": "m3"}]})))
+            .mount(&s)
+            .await;
+        let g = gateway("b", &s).await;
+        let t = Target { provider: "b".into(), model: "m2".into() };
+        let resp = g.execute(&t, Method::POST, "/v1/chat/completions", HeaderMap::new(), json!({"model": "x"}), None, "x").await;
         assert_eq!(resp.status(), 200);
+        assert_eq!(g.fetch_models("b").await.unwrap(), vec!["m2", "m3"]);
     }
 
     #[test]

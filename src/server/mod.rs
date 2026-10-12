@@ -19,10 +19,12 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use tower_http::trace::TraceLayer;
 
+use crate::catalog::{ModelCatalog, Wire};
 use crate::config::Config;
 use crate::db::Db;
 use crate::gateway::Gateway;
 use crate::keys::{KeyManager, Principal, Scope};
+use crate::policy::{Target, View};
 use crate::proxy::{self, forward_request_headers};
 use crate::secrets::Secrets;
 use crate::subscription::{SubProvider, Subscriptions};
@@ -36,7 +38,15 @@ pub struct AppState {
     pub keys: Arc<KeyManager>,
     pub subs: Arc<Subscriptions>,
     pub gateway: Arc<Gateway>,
+    pub catalog: Arc<ModelCatalog>,
     pub vault: Option<VaultClient>,
+}
+
+impl AppState {
+    /// The model names a principal's policy exposes right now.
+    pub fn view(&self, p: &Principal) -> View {
+        p.policy.resolve(&self.catalog.models())
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -55,6 +65,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/{*rest}", post(unified))
         .nest("/v0/management", management::router())
         .nest("/admin", admin::router())
+        .route("/opencode-go/{*rest}", any(opencode_go_passthrough))
         .route("/{provider}/{*rest}", any(passthrough))
         .layer(DefaultBodyLimit::max(max_body))
         .layer(
@@ -87,7 +98,8 @@ async fn shutdown_signal() {
     tracing::info!("shutting down");
 }
 
-/// Background maintenance: reload keys and accounts, poll usage, prune logs.
+/// Background maintenance: reload keys and accounts, refresh the model
+/// catalog, poll usage, prune logs.
 pub fn spawn_background(state: AppState) {
     let s = state.clone();
     tokio::spawn(async move {
@@ -101,6 +113,14 @@ pub fn spawn_background(state: AppState) {
             if let Err(e) = s.subs.sync().await {
                 tracing::warn!(error = %e, "account sync failed");
             }
+        }
+    });
+    let s = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(s.cfg.catalog.refresh_secs.max(60)));
+        loop {
+            tick.tick().await;
+            s.catalog.refresh(&s.subs, &s.gateway).await;
         }
     });
     let poll = state.cfg.subscription.usage_poll_secs;
@@ -148,11 +168,11 @@ pub fn presented_key(headers: &HeaderMap) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-pub fn authorize(state: &AppState, headers: &HeaderMap, scope: Scope) -> Result<Principal, Response> {
+pub async fn authorize(state: &AppState, headers: &HeaderMap, scope: Scope) -> Result<Principal, Response> {
     let Some(key) = presented_key(headers) else {
         return Err(json_error(StatusCode::UNAUTHORIZED, "missing API key"));
     };
-    match state.keys.authenticate(&key) {
+    match state.keys.authenticate(&key).await {
         Some(p) if p.has_scope(scope) => Ok(p),
         Some(_) => Err(json_error(StatusCode::FORBIDDEN, "key lacks the required scope")),
         None => Err(json_error(StatusCode::UNAUTHORIZED, "invalid API key")),
@@ -195,15 +215,12 @@ async fn websocket_unsupported() -> Response {
     json_error(StatusCode::UPGRADE_REQUIRED, "websocket transport is not supported; use HTTP")
 }
 
-fn pool_allows(p: &Principal, pool: SubProvider, model: &str) -> bool {
-    p.allows_model(model) || p.allows_model(&format!("{}/{}", pool.as_str(), model.trim_start_matches(&format!("{}/", pool.as_str()))))
+fn pool(provider: &str) -> Option<SubProvider> {
+    provider.parse().ok()
 }
 
-/// Route a JSON request by its `model`:
-/// - an alias or `<gateway-provider>/<model>` goes to the gateway,
-/// - `opencode-go/<model>` goes to the OpenCode Go account pool,
-/// - otherwise `/v1/messages*` goes to the Claude pool and `/v1/responses*`
-///   to the Codex pool.
+/// Route a JSON request by its `model` through the caller's policy view,
+/// trying an alias's targets in order (falling back on 429 / 5xx).
 async fn route_json(state: &AppState, principal: Principal, path: &str, headers: HeaderMap, body: Bytes) -> Response {
     let anthropic = path.starts_with("/v1/messages");
     let err = |status: StatusCode, kind: &str, msg: String| {
@@ -216,37 +233,65 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
     let Some(model) = json.get("model").and_then(Value::as_str).map(str::to_string) else {
         return err(StatusCode::BAD_REQUEST, "invalid_request_error", "missing `model`".into());
     };
+    let known = state.catalog.known_providers();
+    let Some(targets) = state.view(&principal).lookup(&principal.policy, &known, &model) else {
+        return err(StatusCode::NOT_FOUND, "not_found_error", format!("model {model:?} is not available to this key"));
+    };
+
+    // Without format translation, only targets that speak this endpoint's format qualify.
+    let wire = Wire::for_path(path);
+    let (usable, unusable): (Vec<Target>, Vec<Target>) = targets.into_iter().partition(|t| match wire {
+        Some(w) => state.catalog.wires(&t.provider, &t.model).contains(&w),
+        // Pools only serve the LLM endpoints.
+        None => pool(&t.provider).is_none(),
+    });
+    if usable.is_empty() {
+        let hint = unusable
+            .first()
+            .map(|t| {
+                let paths: Vec<&str> = state.catalog.wires(&t.provider, &t.model).iter().map(|w| w.path()).collect();
+                format!(" ({} is served via {})", t.qualified(), paths.join(", "))
+            })
+            .unwrap_or_default();
+        return err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("model {model:?} is not available on {path}{hint}"));
+    }
+
     let fwd = forward_request_headers(&headers);
     let client_id = principal.client_id().map(str::to_string);
-
-    if let Some(targets) = state.gateway.resolve(&model) {
-        if !principal.allows_model(&model) {
-            return err(StatusCode::FORBIDDEN, "permission_error", format!("model {model} is not allowed for this key"));
+    let last = usable.len() - 1;
+    for (i, target) in usable.iter().enumerate() {
+        let resp = match pool(&target.provider) {
+            Some(p) => {
+                let mut b = json.clone();
+                b["model"] = Value::String(target.model.clone());
+                let bytes = Bytes::from(serde_json::to_vec(&b).unwrap_or_default());
+                state.subs.execute(p, Method::POST, path, fwd.clone(), bytes, client_id.as_deref(), Some(&model)).await
+            }
+            None => state.gateway.execute(target, Method::POST, path, fwd.clone(), json.clone(), client_id.as_deref(), &model).await,
+        };
+        let status = resp.status().as_u16();
+        if i < last && (status == 429 || status >= 500) {
+            tracing::info!(target = %target.qualified(), status, "falling back to next alias target");
+            continue;
         }
-        return state.gateway.execute(&targets, Method::POST, path, fwd, json, client_id.as_deref(), &model).await;
+        return resp;
     }
-    let pool = if model.starts_with("opencode-go/") {
-        SubProvider::OpencodeGo
-    } else if anthropic {
-        SubProvider::Claude
-    } else if path.starts_with("/v1/responses") {
-        SubProvider::Codex
-    } else {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            format!("unknown model {model:?}: use <provider>/<model> with a configured provider, or an alias"),
-        );
-    };
-    if !pool_allows(&principal, pool, &model) {
-        return err(StatusCode::FORBIDDEN, "permission_error", format!("model {model} is not allowed for this key"));
-    }
-    state.subs.execute(pool, Method::POST, path, fwd, body, client_id.as_deref(), Some(&model)).await
+    unreachable!("loop returns on the last target")
 }
 
 async fn llm(State(state): State<AppState>, req: Request, path: &'static str) -> Response {
+    llm_dynamic(state, req, path).await
+}
+
+/// Any other `POST /v1/...` JSON endpoint (chat/completions, embeddings, ocr...).
+async fn unified(State(state): State<AppState>, Path(rest): Path<String>, req: Request) -> Response {
+    let path = format!("/v1/{rest}");
+    llm_dynamic(state, req, &path).await
+}
+
+async fn llm_dynamic(state: AppState, req: Request, path: &str) -> Response {
     let (parts, body) = req.into_parts();
-    let principal = match authorize(&state, &parts.headers, Scope::Proxy) {
+    let principal = match authorize(&state, &parts.headers, Scope::Proxy).await {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -257,39 +302,68 @@ async fn llm(State(state): State<AppState>, req: Request, path: &'static str) ->
     route_json(&state, principal, path, parts.headers, body).await
 }
 
-/// Any other `POST /v1/...` JSON endpoint (chat/completions, embeddings, ocr...).
-async fn unified(State(state): State<AppState>, Path(rest): Path<String>, req: Request) -> Response {
-    let path = format!("/v1/{rest}");
-    let (parts, body) = req.into_parts();
-    let principal = match authorize(&state, &parts.headers, Scope::Proxy) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
-    let body = match axum::body::to_bytes(body, state.cfg.server.max_body_bytes).await {
-        Ok(b) => b,
-        Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
-    };
-    route_json(&state, principal, &path, parts.headers, body).await
-}
-
+/// The caller's model list. With `anthropic-version` (Claude Code), only
+/// names reachable over `/v1/messages`, in Anthropic's shape.
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let principal = match authorize(&state, &headers, Scope::Proxy) {
+    let principal = match authorize(&state, &headers, Scope::Proxy).await {
         Ok(p) => p,
         Err(r) => return r,
     };
-    // Claude Code asks with anthropic-version; serve the Claude account's list.
+    let view = state.view(&principal);
     if headers.contains_key("anthropic-version") {
-        let fwd = forward_request_headers(&headers);
-        return state.subs.execute(SubProvider::Claude, Method::GET, "/v1/models", fwd, Bytes::new(), principal.client_id(), None).await;
+        let data: Vec<Value> = view
+            .names
+            .iter()
+            .filter(|(_, ts)| ts.iter().any(|t| state.catalog.wires(&t.provider, &t.model).contains(&Wire::Messages)))
+            .map(|(name, _)| json!({"id": name, "type": "model", "display_name": name, "created_at": "1970-01-01T00:00:00Z"}))
+            .collect();
+        let first = data.first().map(|m| m["id"].clone()).unwrap_or(Value::Null);
+        let last = data.last().map(|m| m["id"].clone()).unwrap_or(Value::Null);
+        return Json(json!({"data": data, "has_more": false, "first_id": first, "last_id": last})).into_response();
     }
-    let data: Vec<Value> = state
-        .gateway
-        .list_models()
-        .await
-        .into_iter()
-        .filter(|m| m.get("id").and_then(Value::as_str).is_some_and(|id| principal.allows_model(id)))
+    let data: Vec<Value> = view
+        .names
+        .iter()
+        .map(|(name, ts)| json!({"id": name, "object": "model", "owned_by": ts.first().map(|t| t.provider.as_str()).unwrap_or("")}))
         .collect();
     Json(json!({"object": "list", "data": data})).into_response()
+}
+
+/// Read a passthrough body: JSON bodies are buffered so their `model` can be
+/// checked against the policy; anything else streams.
+async fn passthrough_body(
+    state: &AppState,
+    principal: &Principal,
+    provider: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<(Option<Bytes>, Option<String>, Option<Body>), Response> {
+    let is_json = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.starts_with("application/json"));
+    if !principal.policy.allows_provider(provider) {
+        return Err(json_error(StatusCode::FORBIDDEN, format!("this key may not use {provider}")));
+    }
+    if !is_json {
+        return Ok((None, None, Some(body)));
+    }
+    let bytes = axum::body::to_bytes(body, state.cfg.server.max_body_bytes)
+        .await
+        .map_err(|_| json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?;
+    let model = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string));
+    if let Some(m) = &model
+        && !principal.policy.allows_model(provider, m)
+    {
+        return Err(json_error(StatusCode::FORBIDDEN, format!("model {m} is not allowed for this key")));
+    }
+    Ok((Some(bytes), model, None))
+}
+
+fn path_and_query(rest: &str, uri: &axum::http::Uri) -> String {
+    let mut path = format!("/{rest}");
+    if let Some(q) = uri.query() {
+        path.push('?');
+        path.push_str(q);
+    }
+    path
 }
 
 /// `/<provider>/<rest>`: raw passthrough to a gateway provider.
@@ -298,44 +372,51 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
         return json_error(StatusCode::NOT_FOUND, "not found");
     }
     let (parts, body) = req.into_parts();
-    let principal = match authorize(&state, &parts.headers, Scope::Proxy) {
+    let principal = match authorize(&state, &parts.headers, Scope::Proxy).await {
         Ok(p) => p,
         Err(r) => return r,
     };
-    let mut path = format!("/{rest}");
-    if let Some(q) = parts.uri.query() {
-        path.push('?');
-        path.push_str(q);
-    }
+    let (bytes, model, stream) = match passthrough_body(&state, &principal, &provider, &parts.headers, body).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let path = path_and_query(&rest, &parts.uri);
     let fwd = forward_request_headers(&parts.headers);
-    let is_json =
-        parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.starts_with("application/json"));
+    let label = model.map(|m| format!("{provider}/{m}"));
+    let upstream = match (bytes, stream) {
+        (Some(b), _) => reqwest::Body::from(b),
+        (None, Some(s)) => reqwest::Body::wrap_stream(s.into_data_stream()),
+        (None, None) => reqwest::Body::from(Vec::new()),
+    };
+    state.gateway.passthrough(&provider, parts.method, &path, fwd, upstream, principal.client_id(), label.as_deref()).await
+}
 
-    if is_json {
-        let bytes = match axum::body::to_bytes(body, state.cfg.server.max_body_bytes).await {
+/// `/opencode-go/<rest>`: raw OpenCode Go API through the account pool
+/// (load balancing, failover and usage tracking still apply).
+async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path<String>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let principal = match authorize(&state, &parts.headers, Scope::Proxy).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let provider = SubProvider::OpencodeGo.as_str();
+    let (bytes, model, stream) = match passthrough_body(&state, &principal, provider, &parts.headers, body).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    // Failover may resend the body, so it is always buffered here.
+    let bytes = match (bytes, stream) {
+        (Some(b), _) => b,
+        (None, Some(s)) => match axum::body::to_bytes(s, state.cfg.server.max_body_bytes).await {
             Ok(b) => b,
             Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
-        };
-        let model = serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .and_then(|v| v.get("model").and_then(Value::as_str).map(|m| format!("{provider}/{m}")));
-        let allowed = match &model {
-            Some(m) => principal.allows_model(m),
-            None => principal.allows_model(&format!("{provider}/*")),
-        };
-        if !allowed {
-            return json_error(StatusCode::FORBIDDEN, "model is not allowed for this key");
-        }
-        return state
-            .gateway
-            .passthrough(&provider, parts.method, &path, fwd, reqwest::Body::from(bytes), principal.client_id(), model.as_deref())
-            .await;
-    }
-    if !principal.allows_model(&format!("{provider}/*")) {
-        return json_error(StatusCode::FORBIDDEN, "this key may not use the raw provider API");
-    }
-    let stream = Body::new(body).into_data_stream();
-    state.gateway.passthrough(&provider, parts.method, &path, fwd, reqwest::Body::wrap_stream(stream), principal.client_id(), None).await
+        },
+        (None, None) => Bytes::new(),
+    };
+    let path = path_and_query(&rest, &parts.uri);
+    let fwd = forward_request_headers(&parts.headers);
+    let label = model.map(|m| format!("{provider}/{m}"));
+    state.subs.execute(SubProvider::OpencodeGo, parts.method, &path, fwd, bytes, principal.client_id(), label.as_deref()).await
 }
 
 #[cfg(test)]

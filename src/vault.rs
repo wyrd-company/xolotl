@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::RwLock;
 
 use crate::config::VaultConfig;
-use crate::secrets::SecretStore;
+use crate::secrets::{Conflict, SecretStore};
 
 #[derive(Clone)]
 pub struct VaultClient {
@@ -197,6 +197,49 @@ impl SecretStore for VaultClient {
                 .unwrap_or_default()),
             s => Err(anyhow!("vault list {dir}: {s}: {}", errors(&body))),
         }
+    }
+
+    async fn get_versioned(&self, key: &str) -> Result<(Option<Map<String, Value>>, u64)> {
+        let path = format!("{}/data/{}", self.inner.kv_mount, self.full_path(key));
+        let (status, body) = self.request(Method::GET, &path, None).await?;
+        match status {
+            StatusCode::NOT_FOUND => {
+                // A destroyed/deleted latest version still has metadata and a version.
+                let version = body.pointer("/data/metadata/version").and_then(Value::as_u64).unwrap_or(0);
+                Ok((None, version))
+            }
+            s if s.is_success() => {
+                let version = body.pointer("/data/metadata/version").and_then(Value::as_u64).unwrap_or(0);
+                let data = body.pointer("/data/data").and_then(Value::as_object).cloned();
+                Ok((data, version))
+            }
+            s => Err(anyhow!("vault read {key}: {s}: {}", errors(&body))),
+        }
+    }
+
+    async fn put_cas(&self, key: &str, data: Map<String, Value>, cas: u64) -> Result<u64> {
+        let path = format!("{}/data/{}", self.inner.kv_mount, self.full_path(key));
+        let req = json!({ "options": { "cas": cas }, "data": data });
+        let (status, body) = self.request(Method::POST, &path, Some(&req)).await?;
+        if status == StatusCode::BAD_REQUEST && errors(&body).contains("check-and-set") {
+            return Err(Conflict(key.to_string()).into());
+        }
+        if !status.is_success() {
+            anyhow::bail!("vault write {key}: {status}: {}", errors(&body));
+        }
+        Ok(body.pointer("/data/version").and_then(Value::as_u64).unwrap_or(cas + 1))
+    }
+
+    async fn destroy_versions(&self, key: &str, versions: &[u64]) -> Result<()> {
+        if versions.is_empty() {
+            return Ok(());
+        }
+        let path = format!("{}/destroy/{}", self.inner.kv_mount, self.full_path(key));
+        let (status, body) = self.request(Method::POST, &path, Some(&json!({ "versions": versions }))).await?;
+        if !status.is_success() {
+            anyhow::bail!("vault destroy {key}: {status}: {}", errors(&body));
+        }
+        Ok(())
     }
 }
 

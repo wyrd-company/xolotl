@@ -273,6 +273,14 @@ pub fn import(data: &Value) -> anyhow::Result<Credential> {
     })
 }
 
+pub fn models_request(http: &reqwest::Client, ep: &Endpoints, cred: &Credential) -> reqwest::RequestBuilder {
+    http.get(format!("{}/v1/models?limit=1000", ep.claude_api.trim_end_matches('/')))
+        .bearer_auth(&cred.access_token)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("anthropic-beta", format!("{OAUTH_BETA},{CLAUDE_CODE_BETA}"))
+        .header("user-agent", DEFAULT_UA)
+}
+
 pub fn usage_request(http: &reqwest::Client, ep: &Endpoints, cred: &Credential) -> reqwest::RequestBuilder {
     http.get(format!("{}/api/oauth/usage", ep.claude_api.trim_end_matches('/')))
         .bearer_auth(&cred.access_token)

@@ -772,6 +772,57 @@ impl Subscriptions {
         }
     }
 
+    // --------------------------------------------------------------- models
+
+    /// The models the provider serves, asked with the first account that answers.
+    /// Empty when the pool has no usable accounts.
+    pub async fn fetch_models(&self, provider: SubProvider, codex_client_version: &str) -> Result<Vec<String>> {
+        let rows = self.db.list_accounts(Some(provider.as_str())).await?;
+        let ep = &self.cfg.endpoints;
+        let mut last_err = None;
+        for row in rows.into_iter().filter(|r| r.enabled && !r.auth_failed) {
+            let cred = match self.credential(&row.id, None).await {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            let req = match provider {
+                SubProvider::Claude => claude::models_request(&self.http, ep, &cred),
+                SubProvider::Codex => codex::models_request(&self.http, ep, &cred, codex_client_version),
+                SubProvider::OpencodeGo => {
+                    self.http.get(format!("{}/v1/models", ep.opencode_go.trim_end_matches('/'))).bearer_auth(cred.bearer())
+                }
+            };
+            let result: Result<Value> = async {
+                let resp = req.timeout(Duration::from_secs(15)).send().await?;
+                anyhow::ensure!(resp.status().is_success(), "model list returned {}", resp.status());
+                Ok(resp.json().await?)
+            }
+            .await;
+            match result {
+                Ok(body) => {
+                    return Ok(match provider {
+                        SubProvider::Codex => codex::parse_models(&body),
+                        _ => body
+                            .get("data")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+                            .collect(),
+                    });
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(Vec::new()),
+        }
+    }
+
     // ------------------------------------------------------ management call
 
     /// T3Code hubs `api-call`: send a request to the provider with the

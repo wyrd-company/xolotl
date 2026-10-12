@@ -62,12 +62,13 @@ bao auth enable approle
 bao policy write xolotl - <<'HCL'
 path "secret/data/xolotl/*"     { capabilities = ["create", "read", "update", "delete"] }
 path "secret/metadata/xolotl/*" { capabilities = ["list", "read", "delete"] }
+path "secret/destroy/xolotl/*"  { capabilities = ["update"] }
 HCL
 bao write auth/approle/role/xolotl token_policies=xolotl token_ttl=1h token_max_ttl=24h
 bao read -field=role_id auth/approle/role/xolotl/role-id
 bao write -f -field=secret_id auth/approle/role/xolotl/secret-id
 
-# Bootstrap admin token (used by the CLI and as a management key)
+# Bootstrap admin token (used by the CLI)
 bao kv put secret/xolotl/admin token="$(openssl rand -base64 32)"
 # Optional: OTLP headers for OpenObserve
 bao kv put secret/xolotl/telemetry Authorization="Basic ..."
@@ -79,7 +80,8 @@ bao kv put secret/xolotl/telemetry Authorization="Basic ..."
 | `telemetry` | OTLP header values |
 | `providers/<name>` | `api_key` for gateway providers |
 | `accounts/<provider>/<id>` | OAuth tokens / API key for subscription accounts (rewritten on refresh) |
-| `clients/<id>` | downstream client key records (SHA-256 hash only) |
+| `policies/<policy>` | client key policy |
+| `keys/<policy>/<client>` | client key record, including `api_key`, for that client to read |
 
 Runtime state (cooldowns, usage snapshots, request log) lives in SQLite. It contains no secrets and is rebuilt from OpenBao if lost.
 
@@ -112,25 +114,51 @@ xolotl accounts disable|enable|reset|remove <id>
 # Gateway provider keys
 echo "$VERCEL_KEY" | xolotl providers set-key vercel
 
-# Downstream client keys
-xolotl keys issue --name devcontainer --model 'claude-*' --model 'codex/*' --ttl 90d
-xolotl keys issue --name t3code --scope management
+# Models, policies and client keys
+xolotl models --refresh            # what each provider serves
+xolotl policies put examples/policies/devcontainer.toml
+xolotl policies view devcontainer  # the names a key under this policy sees, and where they route
+xolotl keys issue --policy devcontainer --name laptop --ttl 90d
 xolotl keys list
-xolotl keys rotate <id> --grace 1h
-xolotl keys revoke <id>
+xolotl keys rotate devcontainer/laptop --grace 1h
+xolotl keys revoke devcontainer/laptop
 
 xolotl usage --group-by client --since 7d
 ```
 
 Imported tokens keep rotating on refresh. Stop using the same login in the local CLI afterwards, or one side ends up with a dead refresh token.
 
-### 4. Point clients at it
+### 4. Policies and client keys
+
+Every client key belongs to a policy (see [`examples/policies/devcontainer.toml`](examples/policies/devcontainer.toml)):
+
+- `providers`: which providers the key may use (`claude`, `codex`, `opencode-go`, gateway provider names, or `*`).
+- `allow_models` / `deny_models`: globs matched against `model` or `provider/model`; deny wins.
+- `precedence` and `winners`: who owns a model name served by several providers. The winner serves the plain name (`claude-haiku-5-5`), the others drop it. Without a `precedence` list the order is `claude`, `codex`, `opencode-go`, then gateway providers alphabetically.
+- `aliases`: extra names, each a `provider/model` or a list tried in order on 429/5xx. Use them to bring back a model that lost its plain name.
+- `scopes`: `proxy` (default), `management` (T3Code hubs), `admin`.
+
+The explicit `provider/model` form always works for any model the policy allows, even one that lost its plain name. `GET /v1/models` lists the plain names and aliases.
+
+Keys are issued into the vault and never printed. A client reads its own key with a Vault policy scoped to its record:
+
+```hcl
+path "secret/data/xolotl/keys/devcontainer/laptop" { capabilities = ["read"] }
+```
+
+```sh
+export XOLOTL_API_KEY=$(bao kv get -field=api_key secret/xolotl/keys/devcontainer/laptop)
+```
+
+Revoking writes a marker as the latest version and destroys the earlier versions. Writes use check-and-set, so an instance with stale data can't overwrite a key changed elsewhere. Unknown keys trigger a reload (at most every 10 s), so keys issued by another instance work quickly.
+
+### 5. Point clients at it
 
 **Claude Code**
 
 ```sh
 export ANTHROPIC_BASE_URL=http://xolotl:8317
-export ANTHROPIC_AUTH_TOKEN=xol_...      # or ANTHROPIC_API_KEY
+export ANTHROPIC_AUTH_TOKEN=$XOLOTL_API_KEY      # or ANTHROPIC_API_KEY
 ```
 
 **Codex CLI** (`~/.codex/config.toml`)
@@ -145,22 +173,22 @@ env_key = "XOLOTL_API_KEY"
 wire_api = "responses"
 ```
 
-**T3Code hubs**: add a CLIProxyAPI usage source with URL `http://xolotl:8317` and a management-scoped key.
+**T3Code hubs**: add a CLIProxyAPI usage source with URL `http://xolotl:8317` and a key whose policy has the `management` scope.
 
-**Anything else** (OpenAI-compatible SDKs): base URL `http://xolotl:8317/v1`, model `<provider>/<model>` (e.g. `vercel/anthropic/claude-opus-5`, `mistral/mistral-large-latest`, `llamacpp/qwen3`, `opencode-go/kimi-k3`) or an alias from `[[gateway.models]]`.
+**Anything else** (OpenAI-compatible SDKs): base URL `http://xolotl:8317/v1` and any model name the key's policy exposes.
 
 ### Routing
 
 | Request | Goes to |
 |---|---|
-| `model` is an alias or `<gateway provider>/<model>` | that gateway provider (aliases fall back in order on 429/5xx) |
-| `model` is `opencode-go/<model>` | OpenCode Go account pool |
-| `POST /v1/messages`, `/v1/messages/count_tokens`, other models | Claude account pool |
-| `POST /v1/responses`, `/v1/responses/compact`, other models | Codex account pool |
-| `GET /v1/models` | gateway model list, or Claude's list when `anthropic-version` is sent |
-| `/<provider>/<path>` (any method) | raw passthrough with the provider key, e.g. `POST /mistral/v1/ocr`, `/mistral/v1/batch/jobs`, `/mistral/v1/files`, `GET /vercel/v1/credits`, `/vercel/v1/generation?id=` |
+| `POST /v1/messages`, `/v1/responses`, `/v1/chat/completions`, other `POST /v1/*` | the target the key's policy resolves `model` to (alias, plain name or `provider/model`) |
+| `GET /v1/models` | the policy's names; with `anthropic-version` (Claude Code), only those reachable over `/v1/messages` |
+| `/opencode-go/<path>` (any method) | OpenCode Go API through the account pool (load balancing, failover, usage) |
+| `/<provider>/<path>` (any method) | raw passthrough with the gateway provider's key, e.g. `POST /mistral/v1/ocr`, `/mistral/v1/batch/jobs`, `/mistral/v1/files`, `GET /vercel/v1/credits`, `/vercel/v1/generation?id=` |
 | `/v0/management/{auth-files,api-call,reset-quota}` | T3Code hubs (CLIProxyAPI-compatible) |
 | `/admin/...` | CLI |
+
+Passthroughs strip the client's credentials and inject the provider's. There is no format translation: a model is only reachable on endpoints its provider speaks (Claude: Messages, Codex: Responses, OpenCode Go: per model, Vercel: all three, others: Chat; override with `[catalog.wires]`). A request on the wrong endpoint gets a 400 naming the right one.
 
 Account pools refresh OAuth tokens before they expire and once more on a 401. An account whose quota is exhausted (429 / `usage_limit_reached`, including when it arrives inside a 200 stream) cools down until its reset time and the request moves to the next account. Strategy is `round-robin`, `fill-first` or `least-used`. A session (Codex `session_id`, Claude Code session id) stays on one account to keep prompt caches warm. Usage windows are polled from each provider and also read from response headers.
 

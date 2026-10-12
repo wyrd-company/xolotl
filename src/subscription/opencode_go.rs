@@ -10,14 +10,10 @@ use crate::config::Endpoints;
 use crate::db::UsageWindow;
 use crate::proxy::set_header;
 
+/// Any path under the base: the unified endpoints and the `/opencode-go/...`
+/// passthrough both land here.
 pub fn upstream_url(ep: &Endpoints, path: &str) -> Option<String> {
-    let base = ep.opencode_go.trim_end_matches('/');
-    match path {
-        "/v1/chat/completions" | "/v1/messages" | "/v1/messages/count_tokens" | "/v1/responses" | "/v1/models" => {
-            Some(format!("{base}{path}"))
-        }
-        _ => None,
-    }
+    path.starts_with('/').then(|| format!("{}{path}", ep.opencode_go.trim_end_matches('/')))
 }
 
 pub fn prepare(headers: &mut HeaderMap, body: &mut Value, cred: &Credential, path: &str) {

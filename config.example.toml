@@ -58,7 +58,17 @@ kind = "openai-compatible"
 base_url = "http://llama.example.lan:8080"
 no_auth = true
 
-# Aliases with ordered fallbacks.
-[[gateway.models]]
-name = "fast"
-targets = ["vercel/openai/gpt-5-mini", "mistral/mistral-small-latest"]
+# Model catalog: discovered from each provider, plus static entries. Client
+# key policies (stored in the vault) decide which of these names a key sees.
+[catalog]
+refresh_secs = 600
+codex_client_version = "0.160.0"   # Codex filters its model roster by client version
+
+[catalog.static_models]
+# llamacpp = ["qwen3-coder"]
+
+[catalog.wires]
+# Endpoint formats a provider/model is reachable on (no translation is done).
+# Defaults: claude=messages, codex=responses, opencode-go per model,
+# vercel=chat+responses+messages, others=chat.
+# llamacpp = ["chat", "messages"]

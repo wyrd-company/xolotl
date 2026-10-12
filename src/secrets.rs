@@ -6,7 +6,8 @@
 //! - `telemetry`                    OTLP header values
 //! - `providers/<name>`             `{ api_key }` upstream gateway provider keys
 //! - `accounts/<provider>/<id>`     OAuth credentials for subscription accounts
-//! - `clients/<id>`                 downstream client key records (hash only)
+//! - `policies/<name>`               client key policies
+//! - `keys/<policy>/<client>`       client key records (readable by that client)
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -24,7 +25,19 @@ pub trait SecretStore: Send + Sync {
     async fn delete(&self, key: &str) -> Result<()>;
     /// Direct children of `dir`; sub-directories end with `/`.
     async fn list(&self, dir: &str) -> Result<Vec<String>>;
+    /// Latest version's data and its version number (0 when absent).
+    async fn get_versioned(&self, key: &str) -> Result<(Option<Map<String, Value>>, u64)>;
+    /// Check-and-set write: succeeds only if the current version is `cas`
+    /// (0 = must not exist). Returns the new version; `Conflict` on mismatch.
+    async fn put_cas(&self, key: &str, data: Map<String, Value>, cas: u64) -> Result<u64>;
+    /// Permanently destroy the data of the given versions (metadata is kept).
+    async fn destroy_versions(&self, key: &str, versions: &[u64]) -> Result<()>;
 }
+
+/// A check-and-set write lost a race with another writer.
+#[derive(Debug, thiserror::Error)]
+#[error("secret {0} was changed concurrently; reload and retry")]
+pub struct Conflict(pub String);
 
 pub type Secrets = Arc<dyn SecretStore>;
 
@@ -42,18 +55,23 @@ pub async fn put_typed<T: Serialize>(store: &dyn SecretStore, key: &str, value: 
     }
 }
 
+/// Latest version number and data of one in-memory secret.
+type Versioned = (u64, Option<Map<String, Value>>);
+
 #[derive(Default)]
 pub struct MemoryStore {
-    data: Mutex<BTreeMap<String, Map<String, Value>>>,
+    data: Mutex<BTreeMap<String, Versioned>>,
 }
 
 #[async_trait::async_trait]
 impl SecretStore for MemoryStore {
     async fn get(&self, key: &str) -> Result<Option<Map<String, Value>>> {
-        Ok(self.data.lock().get(key.trim_matches('/')).cloned())
+        Ok(self.data.lock().get(key.trim_matches('/')).and_then(|(_, d)| d.clone()))
     }
     async fn put(&self, key: &str, data: Map<String, Value>) -> Result<()> {
-        self.data.lock().insert(key.trim_matches('/').to_string(), data);
+        let mut m = self.data.lock();
+        let e = m.entry(key.trim_matches('/').to_string()).or_insert((0, None));
+        *e = (e.0 + 1, Some(data));
         Ok(())
     }
     async fn delete(&self, key: &str) -> Result<()> {
@@ -69,12 +87,28 @@ impl SecretStore for MemoryStore {
                     Some((d, _)) => format!("{d}/"),
                     None => rest.to_string(),
                 };
-                if out.last() != Some(&entry) && !out.contains(&entry) {
+                if !out.contains(&entry) {
                     out.push(entry);
                 }
             }
         }
         Ok(out)
+    }
+    async fn get_versioned(&self, key: &str) -> Result<(Option<Map<String, Value>>, u64)> {
+        Ok(self.data.lock().get(key.trim_matches('/')).cloned().map(|(v, d)| (d, v)).unwrap_or((None, 0)))
+    }
+    async fn put_cas(&self, key: &str, data: Map<String, Value>, cas: u64) -> Result<u64> {
+        let mut m = self.data.lock();
+        let e = m.entry(key.trim_matches('/').to_string()).or_insert((0, None));
+        if e.0 != cas {
+            return Err(Conflict(key.to_string()).into());
+        }
+        *e = (e.0 + 1, Some(data));
+        Ok(e.0)
+    }
+    async fn destroy_versions(&self, _key: &str, _versions: &[u64]) -> Result<()> {
+        // Only the latest version is kept in memory.
+        Ok(())
     }
 }
 

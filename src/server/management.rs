@@ -25,12 +25,12 @@ fn err(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(json!({"error": msg.into()}))).into_response()
 }
 
-fn check(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
-    authorize(state, headers, Scope::Management).map(|_| ()).map_err(|_| err(StatusCode::UNAUTHORIZED, "invalid management key"))
+async fn check(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    authorize(state, headers, Scope::Management).await.map(|_| ()).map_err(|_| err(StatusCode::UNAUTHORIZED, "invalid management key"))
 }
 
 async fn auth_files(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(r) = check(&state, &headers) {
+    if let Err(r) = check(&state, &headers).await {
         return r;
     }
     let accounts = match state.subs.accounts(None).await {
@@ -105,7 +105,7 @@ struct ApiCallRequest {
 }
 
 async fn api_call(State(state): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
-    if let Err(r) = check(&state, &headers) {
+    if let Err(r) = check(&state, &headers).await {
         return r;
     }
     let Ok(req) = serde_json::from_slice::<ApiCallRequest>(&body) else {
@@ -168,7 +168,7 @@ struct ResetQuota {
 }
 
 async fn reset_quota(State(state): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
-    if let Err(r) = check(&state, &headers) {
+    if let Err(r) = check(&state, &headers).await {
         return r;
     }
     let Ok(req) = serde_json::from_slice::<ResetQuota>(&body) else {

@@ -251,6 +251,29 @@ pub fn usage_request(http: &reqwest::Client, ep: &Endpoints, cred: &Credential) 
     req
 }
 
+/// The model roster; upstream filters it by the client version it is told.
+pub fn models_request(http: &reqwest::Client, ep: &Endpoints, cred: &Credential, client_version: &str) -> reqwest::RequestBuilder {
+    let mut url = url::Url::parse(&format!("{}/codex/models", ep.codex_backend.trim_end_matches('/'))).expect("valid url");
+    url.query_pairs_mut().append_pair("client_version", client_version);
+    let mut req = http.get(url);
+    for (k, v) in usage_headers(cred) {
+        req = req.header(k, v);
+    }
+    req
+}
+
+/// `{"models":[{"slug","supported_in_api","visibility"}]}` -> usable slugs.
+pub fn parse_models(body: &Value) -> Vec<String> {
+    body.get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("supported_in_api").and_then(Value::as_bool).unwrap_or(true))
+        .filter(|m| m.get("visibility").and_then(Value::as_str) != Some("hide"))
+        .filter_map(|m| m.get("slug").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
 pub fn window_name(secs: Option<i64>, fallback: &str) -> String {
     match secs {
         Some(s) if s >= 28 * 86_400 => "monthly".into(),
@@ -395,6 +418,15 @@ mod tests {
         assert_eq!(w[0].name, "5h");
         assert_eq!(w[1].name, "7d");
         assert_eq!(w[1].used_percent, 100.0);
+    }
+
+    #[test]
+    fn model_roster() {
+        let body = json!({"models": [
+            {"slug": "gpt-6-codex", "supported_in_api": true},
+            {"slug": "hidden", "supported_in_api": true, "visibility": "hide"},
+            {"slug": "internal", "supported_in_api": false}]});
+        assert_eq!(parse_models(&body), vec!["gpt-6-codex"]);
     }
 
     #[test]

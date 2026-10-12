@@ -10,10 +10,11 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 
+use crate::catalog::ModelCatalog;
 use crate::config::Config;
 use crate::db::Db;
 use crate::gateway::Gateway;
-use crate::keys::{KeyManager, Scope};
+use crate::keys::KeyManager;
 use crate::secrets::Secrets;
 use crate::server::{self, AppState};
 use crate::subscription::{SubProvider, Subscriptions};
@@ -59,6 +60,21 @@ pub enum Command {
         #[command(subcommand)]
         cmd: KeysCmd,
     },
+    /// Manage client key policies (provider/model access, precedence, aliases).
+    Policies {
+        #[command(flatten)]
+        remote: Remote,
+        #[command(subcommand)]
+        cmd: PoliciesCmd,
+    },
+    /// Show the model catalog discovered from all providers.
+    Models {
+        #[command(flatten)]
+        remote: Remote,
+        /// Re-discover before printing.
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Manage subscription accounts.
     Accounts {
         #[command(flatten)]
@@ -100,28 +116,28 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum KeysCmd {
-    /// Issue a new key (printed once).
+    /// Issue a key into the vault at keys/<policy>/<name>. The key is never
+    /// printed; the client reads it from the vault with its own Vault policy.
     Issue {
         #[arg(long)]
+        policy: String,
+        #[arg(long)]
         name: String,
-        /// Repeatable; defaults to proxy.
-        #[arg(long = "scope", value_enum)]
-        scopes: Vec<Scope>,
-        /// Allowed model glob, repeatable (e.g. `claude-*`, `vercel/*`). Default: all.
-        #[arg(long = "model")]
-        models: Vec<String>,
+        #[arg(long, default_value = "")]
+        description: String,
         /// Expire after this long, e.g. 30d.
         #[arg(long)]
         ttl: Option<String>,
     },
     List,
-    /// Issue a new secret for an existing key.
+    /// Write a new key for `<policy>/<name>`.
     Rotate {
         id: String,
-        /// Keep the old secret valid this long, e.g. 1h.
+        /// Keep the old key valid this long, e.g. 1h.
         #[arg(long)]
         grace: Option<String>,
     },
+    /// Revoke `<policy>/<name>`: writes a marker and destroys old versions.
     Revoke {
         id: String,
     },
@@ -130,6 +146,25 @@ pub enum KeysCmd {
     },
     Disable {
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PoliciesCmd {
+    List,
+    Get {
+        name: String,
+    },
+    /// Create or replace a policy from a JSON or TOML file.
+    Put {
+        file: PathBuf,
+    },
+    Delete {
+        name: String,
+    },
+    /// Show the model names the policy exposes and where they route.
+    View {
+        name: String,
     },
 }
 
@@ -206,6 +241,22 @@ pub async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Keys { remote, cmd } => keys(Client::new(&remote)?, cmd).await,
+        Command::Policies { remote, cmd } => policies(Client::new(&remote)?, cmd).await,
+        Command::Models { remote, refresh } => {
+            let c = Client::new(&remote)?;
+            let v = if refresh { c.post("/admin/catalog/refresh", json!({})).await? } else { c.get("/admin/catalog").await? };
+            if c.json {
+                return c.print(v);
+            }
+            for (provider, models) in v.as_object().into_iter().flatten() {
+                let list: Vec<&str> = models.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                println!("{provider} ({}):", list.len());
+                for m in list {
+                    println!("  {m}");
+                }
+            }
+            Ok(())
+        }
         Command::Accounts { remote, cmd } => accounts(Client::new(&remote)?, cmd).await,
         Command::Auth { remote, cmd } => auth(Client::new(&remote)?, cmd).await,
         Command::Providers { remote, cmd } => {
@@ -269,31 +320,37 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
         .build()?;
 
     let keys = Arc::new(KeyManager::new(secrets.clone()));
-    let n = keys.reload().await.context("loading client keys from the vault")?;
-    tracing::info!(keys = n, "loaded client keys");
+    let (policies, n) = keys.reload().await.context("loading policies and client keys from the vault")?;
+    tracing::info!(policies, keys = n, "loaded policies and client keys");
     let subs = Arc::new(Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone()));
     let n = subs.sync().await.context("loading accounts from the vault")?;
     tracing::info!(accounts = n, "loaded subscription accounts");
     let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()));
+    let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
 
-    let state = AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, vault: Some(vault) };
+    let state = AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: Some(vault) };
     server::spawn_background(state.clone());
     let result = server::serve(state).await;
     guard.shutdown();
     result
 }
 
+fn key_path(id: &str) -> Result<String> {
+    let (policy, name) = id.split_once('/').context("key id must be <policy>/<name>")?;
+    Ok(format!("/admin/keys/{policy}/{name}"))
+}
+
 async fn keys(c: Client, cmd: KeysCmd) -> Result<()> {
     match cmd {
-        KeysCmd::Issue { name, scopes, models, ttl } => {
+        KeysCmd::Issue { policy, name, description, ttl } => {
             let ttl_secs = ttl.as_deref().map(parse_duration).transpose()?;
-            let v = c.post("/admin/keys", json!({"name": name, "scopes": scopes, "allowed_models": models, "ttl_secs": ttl_secs})).await?;
+            let v =
+                c.post("/admin/keys", json!({"policy": policy, "name": name, "description": description, "ttl_secs": ttl_secs})).await?;
             if c.json {
                 return c.print(v);
             }
-            println!("id:  {}", v["record"]["id"].as_str().unwrap_or(""));
-            println!("key: {}", v["key"].as_str().unwrap_or(""));
-            eprintln!("Store this key now; it cannot be shown again.");
+            println!("issued {}", v["client_id"].as_str().unwrap_or(""));
+            println!("vault:  <mount>/<prefix>/{}  (field api_key)", v["vault_path"].as_str().unwrap_or(""));
             Ok(())
         }
         KeysCmd::List => {
@@ -301,38 +358,82 @@ async fn keys(c: Client, cmd: KeysCmd) -> Result<()> {
             if c.json {
                 return c.print(v);
             }
-            println!("{:<12} {:<24} {:<22} {:<9} {:<20} MODELS", "ID", "NAME", "SCOPES", "STATE", "EXPIRES");
+            println!("{:<36} {:<16} {:<9} {:<17} {:<17} DESCRIPTION", "CLIENT", "POLICY", "STATE", "ROTATED", "EXPIRES");
             for k in v.as_array().into_iter().flatten() {
-                let scopes =
-                    k["scopes"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")).unwrap_or_default();
-                let models = k["allowed_models"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))
-                    .unwrap_or_default();
                 println!(
-                    "{:<12} {:<24} {:<22} {:<9} {:<20} {}",
-                    k["id"].as_str().unwrap_or(""),
-                    k["name"].as_str().unwrap_or(""),
-                    scopes,
+                    "{:<36} {:<16} {:<9} {:<17} {:<17} {}",
+                    k["client_id"].as_str().unwrap_or(""),
+                    k["policy"].as_str().unwrap_or(""),
                     if k["disabled"].as_bool().unwrap_or(false) { "disabled" } else { "active" },
-                    fmt_ts(k.get("expires_at")),
-                    if models.is_empty() { "*".into() } else { models }
+                    fmt_rfc3339(k.get("rotated_at").filter(|v| !v.is_null()).or(k.get("created_at"))),
+                    fmt_rfc3339(k.get("expires_at")),
+                    k["description"].as_str().unwrap_or("")
                 );
             }
             Ok(())
         }
         KeysCmd::Rotate { id, grace } => {
             let grace_secs = grace.as_deref().map(parse_duration).transpose()?.unwrap_or(0);
-            let v = c.post(&format!("/admin/keys/{id}/rotate"), json!({"grace_secs": grace_secs})).await?;
+            c.print(c.post(&format!("{}/rotate", key_path(&id)?), json!({"grace_secs": grace_secs})).await?)
+        }
+        KeysCmd::Revoke { id } => c.print(c.delete(&key_path(&id)?).await?),
+        KeysCmd::Enable { id } => c.print(c.post(&format!("{}/enable", key_path(&id)?), json!({})).await?),
+        KeysCmd::Disable { id } => c.print(c.post(&format!("{}/disable", key_path(&id)?), json!({})).await?),
+    }
+}
+
+async fn policies(c: Client, cmd: PoliciesCmd) -> Result<()> {
+    match cmd {
+        PoliciesCmd::List => {
+            let v = c.get("/admin/policies").await?;
             if c.json {
                 return c.print(v);
             }
-            println!("key: {}", v["key"].as_str().unwrap_or(""));
+            println!("{:<20} {:<36} {:<24} DESCRIPTION", "NAME", "PROVIDERS", "SCOPES");
+            for p in v.as_array().into_iter().flatten() {
+                let join =
+                    |k: &str| p[k].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")).unwrap_or_default();
+                println!(
+                    "{:<20} {:<36} {:<24} {}",
+                    p["name"].as_str().unwrap_or(""),
+                    join("providers"),
+                    join("scopes"),
+                    p["description"].as_str().unwrap_or("")
+                );
+            }
             Ok(())
         }
-        KeysCmd::Revoke { id } => c.print(c.delete(&format!("/admin/keys/{id}")).await?),
-        KeysCmd::Enable { id } => c.print(c.post(&format!("/admin/keys/{id}/enable"), json!({})).await?),
-        KeysCmd::Disable { id } => c.print(c.post(&format!("/admin/keys/{id}/disable"), json!({})).await?),
+        PoliciesCmd::Get { name } => c.print(c.get(&format!("/admin/policies/{name}")).await?),
+        PoliciesCmd::Put { file } => {
+            let raw = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+            let policy: Value = if file.extension().is_some_and(|e| e == "toml") {
+                serde_json::to_value(toml::from_str::<toml::Value>(&raw)?)?
+            } else {
+                serde_json::from_str(&raw)?
+            };
+            let name = policy["name"].as_str().context("policy needs a name")?.to_string();
+            c.print(c.put(&format!("/admin/policies/{name}"), policy).await?)
+        }
+        PoliciesCmd::Delete { name } => c.print(c.delete(&format!("/admin/policies/{name}")).await?),
+        PoliciesCmd::View { name } => {
+            let v = c.get(&format!("/admin/policies/{name}/view")).await?;
+            if c.json {
+                return c.print(v);
+            }
+            println!("{:<44} {:<56} ENDPOINTS", "MODEL", "ROUTES TO");
+            for m in v["models"].as_array().into_iter().flatten() {
+                let list = |k: &str| {
+                    m[k].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()
+                };
+                let name = if m["alias"].as_bool().unwrap_or(false) {
+                    format!("{} (alias)", m["name"].as_str().unwrap_or(""))
+                } else {
+                    m["name"].as_str().unwrap_or("").to_string()
+                };
+                println!("{:<44} {:<56} {}", name, list("targets"), list("endpoints"));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -460,6 +561,13 @@ pub fn parse_duration(s: &str) -> Result<i64> {
     Ok(n * mult)
 }
 
+fn fmt_rfc3339(v: Option<&Value>) -> String {
+    v.and_then(Value::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "-".into())
+}
+
 fn fmt_ts(v: Option<&Value>) -> String {
     v.and_then(Value::as_i64)
         .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
@@ -501,6 +609,9 @@ impl Client {
     }
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
         self.send(self.http.post(format!("{}{path}", self.url)).json(&body)).await
+    }
+    async fn put(&self, path: &str, body: Value) -> Result<Value> {
+        self.send(self.http.put(format!("{}{path}", self.url)).json(&body)).await
     }
     async fn delete(&self, path: &str) -> Result<Value> {
         self.send(self.http.delete(format!("{}{path}", self.url))).await

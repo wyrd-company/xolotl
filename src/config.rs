@@ -17,6 +17,26 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     pub subscription: SubscriptionConfig,
     pub gateway: GatewayConfig,
+    pub catalog: CatalogConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CatalogConfig {
+    /// How often to re-discover provider model lists.
+    pub refresh_secs: u64,
+    /// Codex filters its model roster by client version.
+    pub codex_client_version: String,
+    /// Extra models per provider, merged with discovered ones.
+    pub static_models: BTreeMap<String, Vec<String>>,
+    /// Wire-format overrides keyed by `provider` or `provider/model`.
+    pub wires: BTreeMap<String, Vec<crate::catalog::Wire>>,
+}
+
+impl Default for CatalogConfig {
+    fn default() -> Self {
+        Self { refresh_secs: 600, codex_client_version: "0.160.0".into(), static_models: BTreeMap::new(), wires: BTreeMap::new() }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -222,8 +242,6 @@ pub struct GatewayConfig {
     /// Providers keyed by the name used as a model prefix (`<name>/<model>`)
     /// and as a passthrough path prefix (`/<name>/...`).
     pub providers: BTreeMap<String, ProviderConfig>,
-    /// Model aliases with optional fallbacks.
-    pub models: Vec<ModelAlias>,
 }
 
 impl Default for GatewayConfig {
@@ -232,7 +250,7 @@ impl Default for GatewayConfig {
         for (name, kind) in [("vercel", ProviderKind::Vercel), ("mistral", ProviderKind::Mistral)] {
             providers.insert(name.to_string(), ProviderConfig { kind, ..ProviderConfig::default() });
         }
-        Self { providers, models: Vec::new() }
+        Self { providers }
     }
 }
 
@@ -265,14 +283,6 @@ impl ProviderConfig {
     pub fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
     }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelAlias {
-    pub name: String,
-    /// `<provider>/<model>` targets tried in order.
-    pub targets: Vec<String>,
 }
 
 impl Config {
@@ -331,17 +341,11 @@ impl Config {
                 "provider name {name:?} is reserved for subscription accounts"
             );
             anyhow::ensure!(
-                !["v0", "v1", "admin", "backend-api", "healthz", "readyz"].contains(&name.as_str()),
+                !["v0", "v1", "admin", "ui", "backend-api", "healthz", "readyz"].contains(&name.as_str()),
                 "provider name {name:?} collides with a built-in route"
             );
             if p.kind == ProviderKind::OpenaiCompatible {
                 anyhow::ensure!(p.base_url.is_some(), "provider {name:?}: openai-compatible providers need base_url");
-            }
-        }
-        for alias in &self.gateway.models {
-            anyhow::ensure!(!alias.targets.is_empty(), "model alias {:?} has no targets", alias.name);
-            for t in &alias.targets {
-                anyhow::ensure!(t.contains('/'), "model alias {:?}: target {t:?} must be <provider>/<model>", alias.name);
             }
         }
         anyhow::ensure!(self.subscription.max_attempts >= 1, "subscription.max_attempts must be >= 1");
