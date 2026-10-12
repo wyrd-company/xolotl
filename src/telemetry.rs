@@ -119,6 +119,7 @@ pub struct Metrics {
     pub account_usage: Gauge<f64>,
     pub account_available: Gauge<u64>,
     pub token_refreshes: Counter<u64>,
+    pub unsaved_credentials: Gauge<u64>,
 }
 
 pub fn metrics() -> &'static Metrics {
@@ -141,6 +142,10 @@ pub fn metrics() -> &'static Metrics {
                 .build(),
             account_available: meter.u64_gauge("xolotl.account.available").with_description("1 when the account can take requests").build(),
             token_refreshes: meter.u64_counter("xolotl.oauth.refreshes").build(),
+            unsaved_credentials: meter
+                .u64_gauge("xolotl.vault.unsaved_credentials")
+                .with_description("Refreshed OAuth credentials not yet written to the vault")
+                .build(),
         }
     })
 }

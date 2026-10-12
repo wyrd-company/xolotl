@@ -177,6 +177,8 @@ pub struct AccountView {
     pub auth_index: String,
     pub available: bool,
     pub expires_at: Option<i64>,
+    /// The in-memory credential is newer than the vault copy (write pending).
+    pub unsaved: bool,
     pub usage: Option<AccountUsage>,
 }
 
@@ -188,6 +190,9 @@ pub struct Subscriptions {
     creds: RwLock<HashMap<String, Arc<tokio::sync::Mutex<Credential>>>>,
     rr: Mutex<HashMap<SubProvider, usize>>,
     affinity: Mutex<HashMap<String, (String, Instant)>>,
+    /// Accounts whose refreshed credential has not reached the vault yet.
+    /// The old refresh token is already spent, so these are retried until saved.
+    unsaved: Mutex<HashSet<String>>,
     pub flows: Flows,
 }
 
@@ -209,6 +214,7 @@ impl Subscriptions {
             creds: RwLock::new(HashMap::new()),
             rr: Mutex::new(HashMap::new()),
             affinity: Mutex::new(HashMap::new()),
+            unsaved: Mutex::new(HashSet::new()),
             flows: Flows::default(),
         }
     }
@@ -280,6 +286,7 @@ impl Subscriptions {
         self.secrets.delete(&format!("accounts/{}/{id}", row.provider)).await?;
         self.db.delete_account(id).await?;
         self.creds.write().remove(id);
+        self.unsaved.lock().remove(id);
         Ok(true)
     }
 
@@ -298,6 +305,7 @@ impl Subscriptions {
                 auth_index: auth_index(&row.id),
                 available: row.enabled && !row.auth_failed && !row.cooling_down(t) && cred.is_some(),
                 expires_at,
+                unsaved: self.unsaved.lock().contains(&row.id),
                 usage,
                 row,
             });
@@ -351,12 +359,17 @@ impl Subscriptions {
                     SubProvider::OpencodeGo => {}
                 }
                 metrics().token_refreshes.add(1, &attrs("ok"));
-                // The old refresh token is now dead: persisting is critical.
-                if let Err(e) = self.persist(id, cred).await {
-                    tracing::error!(account = id, error = %e, "refreshed token could not be written to the vault");
-                }
                 self.db.mark_auth_failed(id, false, None).await?;
                 tracing::info!(account = id, "refreshed access token");
+                // The old refresh token is now spent, so the new one must reach
+                // the vault. On failure keep serving from memory and retry the
+                // write in the background (`flush_unsaved`) until it lands.
+                if let Err(e) = self.persist(id, cred).await {
+                    tracing::error!(account = id, error = %e, "refreshed token could not be written to the vault; will retry");
+                    self.mark_unsaved(id, Some(&e.to_string())).await;
+                } else if self.unsaved.lock().remove(id) {
+                    self.report_unsaved();
+                }
                 Ok(())
             }
             Err(RefreshError::Terminal(msg)) => {
@@ -372,6 +385,45 @@ impl Subscriptions {
                 if cred.expires_at.is_some_and(|e| e > now()) { Ok(()) } else { Err(anyhow!("token refresh failed: {msg}")) }
             }
         }
+    }
+
+    async fn mark_unsaved(&self, id: &str, error: Option<&str>) {
+        self.unsaved.lock().insert(id.to_string());
+        self.report_unsaved();
+        let msg = format!("refreshed credential not yet saved to the vault: {}", error.unwrap_or("write failed"));
+        let _ = self.db.record_account_result(id, Some(&msg)).await;
+    }
+
+    fn report_unsaved(&self) {
+        metrics().unsaved_credentials.record(self.unsaved.lock().len() as u64, &[]);
+    }
+
+    pub fn unsaved_count(&self) -> usize {
+        self.unsaved.lock().len()
+    }
+
+    /// Write every credential whose earlier vault write failed. Called
+    /// periodically and on shutdown; returns how many are still unsaved.
+    pub async fn flush_unsaved(&self) -> usize {
+        let ids: Vec<String> = self.unsaved.lock().iter().cloned().collect();
+        for id in ids {
+            let Some(lock) = self.creds.read().get(&id).cloned() else {
+                // Account removed meanwhile.
+                self.unsaved.lock().remove(&id);
+                continue;
+            };
+            let cred = lock.lock().await.clone();
+            match self.persist(&id, &cred).await {
+                Ok(()) => {
+                    self.unsaved.lock().remove(&id);
+                    let _ = self.db.record_account_result(&id, None).await;
+                    tracing::info!(account = %id, "refreshed credential saved to the vault");
+                }
+                Err(e) => tracing::warn!(account = %id, error = %e, "credential still not saved to the vault"),
+            }
+        }
+        self.report_unsaved();
+        self.unsaved_count()
     }
 
     // ------------------------------------------------------------ selection

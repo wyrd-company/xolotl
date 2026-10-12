@@ -389,3 +389,99 @@ async fn sync_loads_accounts_from_vault() {
     let rows = subs.db.list_accounts(Some("opencode-go")).await.unwrap();
     assert_eq!(rows[0].label, "main");
 }
+
+/// A store whose writes can be made to fail, standing in for an OpenBao outage.
+#[derive(Default)]
+struct FlakyStore {
+    inner: MemoryStore,
+    fail_writes: std::sync::atomic::AtomicBool,
+}
+
+impl FlakyStore {
+    fn check(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.fail_writes.load(std::sync::atomic::Ordering::SeqCst), "vault unavailable");
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::secrets::SecretStore for FlakyStore {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<serde_json::Map<String, Value>>> {
+        self.inner.get(key).await
+    }
+    async fn put(&self, key: &str, data: serde_json::Map<String, Value>) -> anyhow::Result<()> {
+        self.check()?;
+        self.inner.put(key, data).await
+    }
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self, dir: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list(dir).await
+    }
+    async fn get_versioned(&self, key: &str) -> anyhow::Result<(Option<serde_json::Map<String, Value>>, u64)> {
+        self.inner.get_versioned(key).await
+    }
+    async fn put_cas(&self, key: &str, data: serde_json::Map<String, Value>, cas: u64) -> anyhow::Result<u64> {
+        self.check()?;
+        self.inner.put_cas(key, data, cas).await
+    }
+    async fn destroy_versions(&self, key: &str, versions: &[u64]) -> anyhow::Result<()> {
+        self.inner.destroy_versions(key, versions).await
+    }
+}
+
+#[tokio::test]
+async fn refreshed_credentials_survive_vault_outage() {
+    let server = MockServer::start().await;
+    let store = Arc::new(FlakyStore::default());
+    let secrets: Secrets = store.clone();
+    let uri = server.uri();
+    let cfg = SubscriptionConfig {
+        endpoints: Endpoints { codex_backend: format!("{uri}/backend-api"), codex_auth: uri.clone(), ..Default::default() },
+        ..Default::default()
+    };
+    let subs = Subscriptions::new(cfg, Db::in_memory().await.unwrap(), secrets.clone(), reqwest::Client::new());
+    let mut cred = codex_cred("acct-a", "old");
+    cred.expires_at = Some(now() - 10);
+    let a = subs.save_account(cred).await.unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"access_token": "fresh", "refresh_token": "rt-new", "expires_in": 3600})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(header("authorization", "Bearer fresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SSE_OK, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    // Vault goes down: the refresh still serves the request from memory.
+    store.fail_writes.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, _) = run(&subs, SubProvider::Codex, "/v1/responses", HeaderMap::new(), responses_body()).await;
+    assert_eq!(status, 200);
+    let view = subs.accounts(None).await.unwrap();
+    assert!(view[0].unsaved, "account flagged as unsaved");
+    let stored: Credential = get_typed(&*secrets, &format!("accounts/codex/{}", a.id)).await.unwrap().unwrap();
+    assert_eq!(stored.access_token, "old", "vault still holds the spent token");
+
+    // Retries keep failing while the vault is down, without refreshing again.
+    assert_eq!(subs.flush_unsaved().await, 1);
+    let (status, _) = run(&subs, SubProvider::Codex, "/v1/responses", HeaderMap::new(), responses_body()).await;
+    assert_eq!(status, 200);
+
+    // Vault is back: the next flush saves the rotated credential.
+    store.fail_writes.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(subs.flush_unsaved().await, 0);
+    let stored: Credential = get_typed(&*secrets, &format!("accounts/codex/{}", a.id)).await.unwrap().unwrap();
+    assert_eq!(stored.access_token, "fresh");
+    assert_eq!(stored.refresh_token.as_deref(), Some("rt-new"));
+    assert!(!subs.accounts(None).await.unwrap()[0].unsaved);
+
+    // A periodic re-sync must not overwrite the fresh in-memory credential either.
+    subs.sync().await.unwrap();
+    assert_eq!(subs.credential(&a.id, None).await.unwrap().access_token, "fresh");
+}

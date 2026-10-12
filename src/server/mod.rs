@@ -123,6 +123,17 @@ pub fn spawn_background(state: AppState) {
             s.catalog.refresh(&s.subs, &s.gateway).await;
         }
     });
+    // Retry vault writes of refreshed credentials that failed earlier.
+    let s = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tick.tick().await;
+            if s.subs.unsaved_count() > 0 {
+                s.subs.flush_unsaved().await;
+            }
+        }
+    });
     let poll = state.cfg.subscription.usage_poll_secs;
     if poll > 0 {
         let s = state.clone();

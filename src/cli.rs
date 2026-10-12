@@ -330,7 +330,18 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
 
     let state = AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: Some(vault) };
     server::spawn_background(state.clone());
+    let subs = state.subs.clone();
     let result = server::serve(state).await;
+    // Last chance to save refreshed credentials whose vault write failed.
+    if subs.unsaved_count() > 0 {
+        let left = subs.flush_unsaved().await;
+        if left > 0 {
+            tracing::error!(
+                accounts = left,
+                "shutting down with refreshed credentials not saved to the vault; those accounts will need to log in again"
+            );
+        }
+    }
     guard.shutdown();
     result
 }
@@ -451,6 +462,8 @@ async fn accounts(c: Client, cmd: AccountsCmd) -> Result<()> {
                     "disabled".to_string()
                 } else if a["auth_failed"].as_bool().unwrap_or(false) {
                     "re-login".to_string()
+                } else if a["unsaved"].as_bool().unwrap_or(false) {
+                    "UNSAVED".to_string()
                 } else if a["available"].as_bool().unwrap_or(false) {
                     "ok".to_string()
                 } else {
