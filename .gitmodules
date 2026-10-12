@@ -13,3 +13,6 @@
 [submodule ".references/t3code"]
 	path = .references/t3code
 	url = git@github.com:pingdotgg/t3code.git
+[submodule ".references/cpa-plugin-registry"]
+	path = .references/cpa-plugin-registry
+	url = git@github.com:wyrd-company/cpa-plugin-registry.git
