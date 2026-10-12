@@ -552,6 +552,41 @@ async fn namespaced_tools_round_trip_through_messages() {
 }
 
 #[tokio::test]
+async fn namespace_members_with_unchanged_names_keep_their_namespace() {
+    let body = json!({"model": "fast", "stream": true, "input": "hi", "tools": [{"type": "namespace", "name": "sample_tools", "tools": [
+        {"type": "function", "name": "mcp__sample__lookup", "parameters": {"type": "object"}},
+        {"type": "function", "name": "sample_tools__find", "parameters": {"type": "object"}},
+        {"type": "custom", "name": "sample_tools"},
+    ]}]});
+    let (out, t) = translate(Wire::Responses, Wire::Messages, body);
+    let names: Vec<&str> = out["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["mcp__sample__lookup", "sample_tools__find", "sample_tools"]);
+
+    let upstream = json!({
+        "content": [
+            {"type": "tool_use", "id": "t1", "name": "mcp__sample__lookup", "input": {}},
+            {"type": "tool_use", "id": "t2", "name": "sample_tools__find", "input": {}},
+            {"type": "tool_use", "id": "t3", "name": "sample_tools", "input": {"input": "x"}},
+        ],
+        "stop_reason": "tool_use", "usage": {"input_tokens": 1, "output_tokens": 1},
+    });
+    let want = [("function_call", "mcp__sample__lookup"), ("function_call", "sample_tools__find"), ("custom_tool_call", "sample_tools")];
+    let (_, _, body) = run(t.clone(), upstream_response(200, "application/json", upstream.to_string())).await;
+    let evs = events(&body);
+    let done = of_type(&evs, "response.output_item.done");
+    let mut t = t;
+    t.stream = false;
+    let (_, _, body) = run(t, upstream_response(200, "application/json", upstream.to_string())).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    for (i, (kind, name)) in want.iter().enumerate() {
+        for item in [&done[i]["item"], &v["output"][i]] {
+            assert_eq!((item["type"].as_str(), item["name"].as_str()), (Some(*kind), Some(*name)), "{item}");
+            assert_eq!(item["namespace"], "sample_tools", "{item}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn failed_json_responses_become_client_errors() {
     let failed = json!({"status": "failed", "output": [], "error": {"code": "server_error", "message": "provider failed"}}).to_string();
     let (_, t) = translate(Wire::Messages, Wire::Responses, json!({"model": "fast", "messages": []}));

@@ -119,9 +119,8 @@ fn qualify(namespace: Option<&str>, name: &str) -> String {
 fn decode_tool(t: &Value, namespace: Option<&str>, r: &mut Request, info: &mut ClientInfo) {
     let plain = t.get("name").and_then(Value::as_str).unwrap_or_default();
     let name = qualify(namespace, plain);
-    if let Some(ns) = namespace
-        && name != plain
-    {
+    // Every namespace member is recorded, also when its name needs no prefix.
+    if let Some(ns) = namespace {
         info.namespaced.insert(name.clone(), (ns.to_string(), plain.to_string()));
     }
     let description = t.get("description").and_then(Value::as_str).map(str::to_string);
