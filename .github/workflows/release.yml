@@ -1,6 +1,8 @@
 name: release
 
-# Deploys on plain semver tags without a `v` prefix, e.g. `0.3.1`.
+# Deploys only Intentional release records: annotated `X.Y.Z` tags (no `v`)
+# created by `intentional tag --plan` on the applied release commit.
+# Baseline records are skipped; any other tag is refused.
 on:
   push:
     tags:
@@ -15,20 +17,66 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.verify.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Fetch the annotated tag object
+        run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+      - uses: wyrd-company/intentional@0.1.6
+        with:
+          command: check
+          intentional-version: 0.1.6
+      - name: Require an Intentional release record
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          refuse() { echo "::error::refusing to deploy ${tag}: $1"; exit 1; }
+
+          [[ "$(git cat-file -t "refs/tags/${tag}")" == "tag" ]] || refuse "not an annotated tag"
+          body="$(git cat-file -p "refs/tags/${tag}" | sed '1,/^$/d')"
+          [[ "$(printf '%s\n' "$body" | head -n1)" == "intentional release record" ]] || refuse "not an Intentional release record"
+          field() { printf '%s\n' "$body" | sed -n "s/^$1: //p" | head -n1; }
+
+          [[ "$(field tag-id)" == "release-unit/xolotl/primary" ]] || refuse "unexpected tag-id $(field tag-id)"
+          [[ "$(field version)" == "$tag" ]] || refuse "record version $(field version) does not match the tag"
+          case "$(field baseline)" in
+            true)
+              echo "::notice::${tag} is a baseline record; nothing to release."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            false) ;;
+            *) refuse "record has no baseline field" ;;
+          esac
+          [[ -n "$(field plan-digest)" ]] || refuse "record has no plan digest"
+
+          # The tagged commit must carry the applied release.
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          [[ "$version" == "$tag" ]] || refuse "Cargo.toml version $version is not $tag (was intentional apply committed?)"
+          grep -q "^## ${tag}\$" CHANGELOG.md || refuse "CHANGELOG.md has no ${tag} section"
+          echo "release=true" >> "$GITHUB_OUTPUT"
+
   test:
+    needs: guard
+    if: needs.guard.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Tag must match Cargo.toml version
-        run: |
-          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          test "$version" = "${GITHUB_REF_NAME}" || { echo "Cargo.toml version $version != tag ${GITHUB_REF_NAME}"; exit 1; }
       - run: cargo test --locked
 
   binary:
-    needs: test
+    needs: [guard, test]
+    if: needs.guard.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,17 +86,20 @@ jobs:
       - name: Package
         run: |
           name=xolotl-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu
-          mkdir "$name" && cp target/release/xolotl README.md LICENSE config.example.toml "$name/"
+          mkdir "$name" && cp target/release/xolotl README.md CHANGELOG.md LICENSE config.example.toml "$name/"
           tar czf "$name.tar.gz" "$name" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Release notes from the changelog
+        run: awk -v h="## ${GITHUB_REF_NAME}" '$0==h{f=1;next} /^## /{f=0} f' CHANGELOG.md > release-notes.md
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
           files: |
             xolotl-*.tar.gz
             xolotl-*.tar.gz.sha256
-          generate_release_notes: true
 
   image:
-    needs: test
+    needs: [guard, test]
+    if: needs.guard.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -209,4 +209,26 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Releases: bump `version` in `Cargo.toml`, then push a tag with the same plain version (`0.2.0`, no `v`). The workflow tests, publishes `ghcr.io/<repo>:<version>` (amd64 + arm64) and attaches a Linux binary to a GitHub release.
+### Releases
+
+Versions are managed with [Intentional](https://github.com/wyrd-company/intentional) (`cargo install intentional-cli --locked`). Tags are plain versions (`0.1.0`, no `v`); `0.0.0` is the baseline.
+
+Each user-visible change ships with an intent:
+
+```sh
+intentional add --release-unit xolotl:minor --message "Describe the change."
+```
+
+To release, on `main`:
+
+```sh
+intentional status && intentional check
+intentional plan > release-plan.json
+intentional apply                     # Cargo.toml, CHANGELOG.md, consumes intents
+cargo update -w --offline             # keep Cargo.lock in step
+git add -A && git commit -m "chore: release $(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+intentional tag --plan release-plan.json
+git push origin main --follow-tags
+```
+
+CI runs `intentional check`. The release workflow only deploys a tag that is an Intentional release record (annotated, `baseline: false`, matching `Cargo.toml` and `CHANGELOG.md`): it tests, publishes `ghcr.io/<repo>:<version>` (amd64 + arm64) and a GitHub release with a Linux binary. Baseline records are skipped and any other tag is refused.
