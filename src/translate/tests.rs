@@ -468,3 +468,31 @@ fn short_names_are_stable_and_valid() {
     assert_ne!(a, short_name(&"x".repeat(101)));
     assert!(short_name("mcp.server/tool").chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
 }
+#[tokio::test]
+async fn failed_json_responses_become_client_errors() {
+    let failed = json!({"status": "failed", "output": [], "error": {"code": "server_error", "message": "provider failed"}}).to_string();
+    let (_, t) = translate(Wire::Messages, Wire::Responses, json!({"model": "fast", "messages": []}));
+    let (status, _, body) = run(t, upstream_response(200, "application/json", failed.clone())).await;
+    assert_eq!(status, 502);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"type": "error", "error": {"type": "server_error", "message": "provider failed"}})
+    );
+
+    let (_, t) = translate(Wire::Messages, Wire::Responses, json!({"model": "fast", "stream": true, "messages": []}));
+    let (status, _, body) = run(t, upstream_response(200, "application/json", failed)).await;
+    assert_eq!(status, 200, "the stream has started");
+    let evs = events(&body);
+    assert_eq!(evs.last().unwrap(), &json!({"type": "error", "error": {"type": "server_error", "message": "provider failed"}}));
+    assert!(of_type(&evs, "message_delta").is_empty(), "no normal completion");
+
+    // Chat and Messages error bodies with a 2xx status fail the same way.
+    let (_, t) = translate(Wire::Responses, Wire::Chat, json!({"model": "fast", "input": "hi"}));
+    let (status, _, body) =
+        run(t, upstream_response(200, "application/json", json!({"error": {"type": "x", "message": "m"}}).to_string())).await;
+    assert_eq!((status, body.contains("\"m\"")), (502, true));
+    let (_, t) = translate(Wire::Chat, Wire::Messages, json!({"model": "fast", "messages": []}));
+    let (status, _, _) =
+        run(t, upstream_response(200, "application/json", messages::error_body("overloaded_error", "busy").to_string())).await;
+    assert_eq!(status, 502);
+}

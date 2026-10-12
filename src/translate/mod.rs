@@ -143,12 +143,21 @@ impl Translation {
         }
     }
 
-    fn decode_json(&self, v: &Value) -> ir::Response {
-        match self.upstream {
+    /// A JSON response, or the failure it reports despite a 2xx status.
+    fn decode_json(&self, v: &Value) -> Result<ir::Response, (String, String)> {
+        let failure = match self.upstream {
+            Wire::Messages => messages::failure(v),
+            Wire::Responses => responses::failure(v),
+            Wire::Chat => chat::failure(v),
+        };
+        if let Some(f) = failure {
+            return Err(f);
+        }
+        Ok(match self.upstream {
             Wire::Messages => messages::decode_response(v),
             Wire::Responses => responses::decode_response(v),
             Wire::Chat => chat::decode_response(v),
-        }
+        })
     }
 
     fn encode_json(&self, r: &ir::Response) -> Value {
@@ -211,7 +220,7 @@ impl Translation {
             } else {
                 let mut events = match self.read_json(body).await {
                     Ok(r) => r.events(),
-                    Err(e) => vec![Event::Error { kind: "api_error".into(), message: e }],
+                    Err((kind, message)) => vec![Event::Error { kind, message }],
                 };
                 self.restore(&mut events);
                 let mut encoder = encoder;
@@ -227,16 +236,13 @@ impl Translation {
         let collected = if sse {
             self.collect_sse(body).await
         } else {
-            match self.read_json(body).await {
-                Ok(r) => {
-                    let mut events = r.events();
-                    self.restore(&mut events);
-                    let mut c = Collector::default();
-                    events.into_iter().for_each(|e| c.push(e));
-                    c.finish()
-                }
-                Err(e) => Err(("api_error".into(), e)),
-            }
+            self.read_json(body).await.and_then(|r| {
+                let mut events = r.events();
+                self.restore(&mut events);
+                let mut c = Collector::default();
+                events.into_iter().for_each(|e| c.push(e));
+                c.finish()
+            })
         };
         match collected {
             Ok(r) => {
@@ -249,10 +255,11 @@ impl Translation {
         }
     }
 
-    async fn read_json(&self, body: Body) -> Result<ir::Response, String> {
-        let bytes = axum::body::to_bytes(body, usize::MAX).await.map_err(|e| format!("reading upstream response: {e}"))?;
-        let v: Value = serde_json::from_slice(&bytes).map_err(|e| format!("upstream sent invalid JSON: {e}"))?;
-        Ok(self.decode_json(&v))
+    async fn read_json(&self, body: Body) -> Result<ir::Response, (String, String)> {
+        let fail = |m: String| ("api_error".to_string(), m);
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.map_err(|e| fail(format!("reading upstream response: {e}")))?;
+        let v: Value = serde_json::from_slice(&bytes).map_err(|e| fail(format!("upstream sent invalid JSON: {e}")))?;
+        self.decode_json(&v)
     }
 
     /// Read a whole upstream stream into one response.

@@ -10,7 +10,7 @@ use super::UpstreamInfo;
 
 mod response;
 
-pub use response::{StreamDecoder, StreamEncoder, decode_response, encode_response, error_body};
+pub use response::{StreamDecoder, StreamEncoder, decode_response, encode_response, error_body, failure};
 
 /// `max_tokens` is required by Messages; used when the client set none.
 pub const DEFAULT_MAX_TOKENS: u64 = 32_000;

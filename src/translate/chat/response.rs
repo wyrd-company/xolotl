@@ -44,6 +44,13 @@ fn usage_json(u: &Usage) -> Value {
     })
 }
 
+/// An error body sent with a successful HTTP status.
+pub fn failure(v: &Value) -> Option<(String, String)> {
+    let e = v.get("error").filter(|e| e.is_object())?;
+    let kind = e.get("type").or_else(|| e.get("code")).and_then(Value::as_str).unwrap_or("api_error");
+    Some((kind.to_string(), e.get("message").and_then(Value::as_str).unwrap_or("upstream error").to_string()))
+}
+
 pub fn decode_response(v: &Value) -> Response {
     let mut r = Response::default();
     let choice = v.pointer("/choices/0").unwrap_or(&Value::Null);

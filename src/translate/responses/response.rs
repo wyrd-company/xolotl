@@ -65,6 +65,17 @@ fn decode_output_item(item: &Value) -> Option<Block> {
     }
 }
 
+/// A response object that failed despite a successful HTTP status.
+pub fn failure(v: &Value) -> Option<(String, String)> {
+    let error = v.get("error").filter(|e| e.is_object());
+    if v.get("status").and_then(Value::as_str) != Some("failed") && error.is_none() {
+        return None;
+    }
+    let e = error.unwrap_or(&Value::Null);
+    let kind = e.get("code").or_else(|| e.get("type")).and_then(Value::as_str).unwrap_or("api_error");
+    Some((kind.to_string(), e.get("message").and_then(Value::as_str).unwrap_or("upstream response failed").to_string()))
+}
+
 pub fn decode_response(v: &Value) -> Response {
     let blocks: Vec<Block> = v.get("output").and_then(Value::as_array).into_iter().flatten().filter_map(decode_output_item).collect();
     let saw_tool_call = blocks.iter().any(|b| matches!(b, Block::ToolCall(_)));

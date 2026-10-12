@@ -8,7 +8,7 @@ use super::ClientInfo;
 
 mod response;
 
-pub use response::{StreamDecoder, StreamEncoder, decode_response, encode_response};
+pub use response::{StreamDecoder, StreamEncoder, decode_response, encode_response, failure};
 
 /// Reasoning text: `reasoning_content` (DeepSeek, llama.cpp, Kimi) or `reasoning` (OpenRouter, Vercel).
 fn reasoning_of(v: &Value) -> Option<&str> {

@@ -50,7 +50,7 @@ Other `POST /v1/*` endpoints (embeddings, OCR, …) have no wire format. They ar
 | Reasoning effort | Chat `reasoning_effort`, Responses `reasoning.effort` and Messages `thinking` / `output_config.effort` map to each other. Claude accounts get adaptive thinking with an effort; other Messages servers get a `budget_tokens` budget. Thinking is left off when the last assistant turn called tools without a signed thinking block (Claude rejects that), and when a tool is forced. |
 | Images | Base64 and URL images, in messages and tool results. |
 | Usage | Recorded from the upstream response before translation, so the request log and metrics are unchanged. The client gets it in its own shape; Chat streams include it when `stream_options.include_usage` is set. |
-| Errors | Upstream errors keep their status and headers (`retry-after`) and get the client's error envelope. A stream that fails or ends early ends with an error event. |
+| Errors | Upstream errors keep their status and headers (`retry-after`) and get the client's error envelope. A 2xx JSON body that reports a failure (a `failed` Responses object, an error body) is an error too: 502 for a non-streaming client, an error event for a streaming one. A stream that fails or ends early ends with an error event. |
 | Rejected | Responses `previous_response_id`, and structured output (`response_format` / `text.format`) towards Messages, get a 400. |
 
 ## Policies

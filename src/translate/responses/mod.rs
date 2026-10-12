@@ -8,7 +8,7 @@ use super::ClientInfo;
 
 mod response;
 
-pub use response::{StreamDecoder, StreamEncoder, decode_response, encode_response};
+pub use response::{StreamDecoder, StreamEncoder, decode_response, encode_response, failure};
 
 /// Free-form (`custom`) tools take one string; other formats see them as a
 /// function with this single argument.
