@@ -1,8 +1,8 @@
 //! Model catalog: which models each provider serves, discovered from the
 //! providers and merged with static entries from the config, plus which wire
-//! formats (Anthropic Messages, OpenAI Responses, OpenAI Chat) reach a model.
-//! There is no format translation, so a model is only reachable on endpoints
-//! whose format its provider speaks.
+//! formats (Anthropic Messages, OpenAI Responses, OpenAI Chat) a model speaks
+//! natively, and how every LLM endpoint reaches it: natively, or through
+//! translation (`src/translate`) from a format it speaks.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -46,7 +46,22 @@ impl Wire {
             Wire::Chat => "/v1/chat/completions",
         }
     }
+
+    pub const ALL: [Wire; 3] = [Wire::Messages, Wire::Responses, Wire::Chat];
 }
+
+/// How a model is reached on an endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// The provider speaks the endpoint's format.
+    Native,
+    /// The request and response are translated to and from this format.
+    Translated(Wire),
+}
+
+/// The format a translated request is sent in, best first: Responses and
+/// Messages carry reasoning between turns, Chat does not.
+const TRANSLATION_PREFERENCE: [Wire; 3] = [Wire::Responses, Wire::Messages, Wire::Chat];
 
 /// OpenCode Go serves each model over one format (from its documentation);
 /// anything not listed uses chat completions.
@@ -152,6 +167,34 @@ impl ModelCatalog {
             },
         }
     }
+
+    /// How `provider/model` is reached on `path`, an endpoint of format
+    /// `wire`. A native format always wins. Only the main endpoint of each
+    /// format is translated, so `count_tokens` and `compact` are native only.
+    pub fn route(&self, provider: &str, model: &str, wire: Wire, path: &str) -> Option<Route> {
+        let native = self.wires(provider, model);
+        if native.contains(&wire) {
+            return Some(Route::Native);
+        }
+        if path != wire.path() {
+            return None;
+        }
+        TRANSLATION_PREFERENCE.into_iter().find(|w| native.contains(w)).map(Route::Translated)
+    }
+
+    /// The main endpoints that reach `provider/model`: (native, translated).
+    pub fn endpoints(&self, provider: &str, model: &str) -> (Vec<&'static str>, Vec<&'static str>) {
+        let mut native = Vec::new();
+        let mut translated = Vec::new();
+        for w in Wire::ALL {
+            match self.route(provider, model, w, w.path()) {
+                Some(Route::Native) => native.push(w.path()),
+                Some(Route::Translated(_)) => translated.push(w.path()),
+                None => {}
+            }
+        }
+        (native, translated)
+    }
 }
 
 #[cfg(test)]
@@ -176,5 +219,28 @@ mod tests {
         assert!(models.contains_key("vercel") && models.contains_key("opencode-go"));
         assert_eq!(Wire::for_path("/v1/messages/count_tokens"), Some(Wire::Messages));
         assert_eq!(Wire::for_path("/v1/embeddings"), None);
+    }
+
+    #[test]
+    fn native_routes_win_and_translation_prefers_responses() {
+        let mut cfg = CatalogConfig::default();
+        cfg.wires.insert("both".into(), vec![Wire::Chat, Wire::Messages]);
+        let kinds = BTreeMap::from([
+            ("vercel".to_string(), ProviderKind::Vercel),
+            ("llamacpp".to_string(), ProviderKind::OpenaiCompatible),
+            ("both".to_string(), ProviderKind::OpenaiCompatible),
+        ]);
+        let c = ModelCatalog::new(cfg, kinds);
+        assert_eq!(c.route("claude", "m", Wire::Messages, "/v1/messages"), Some(Route::Native));
+        assert_eq!(c.route("claude", "m", Wire::Chat, "/v1/chat/completions"), Some(Route::Translated(Wire::Messages)));
+        assert_eq!(c.route("codex", "m", Wire::Messages, "/v1/messages"), Some(Route::Translated(Wire::Responses)));
+        assert_eq!(c.route("llamacpp", "m", Wire::Responses, "/v1/responses"), Some(Route::Translated(Wire::Chat)));
+        assert_eq!(c.route("both", "m", Wire::Responses, "/v1/responses"), Some(Route::Translated(Wire::Messages)));
+        assert_eq!(c.route("vercel", "a/b", Wire::Messages, "/v1/messages"), Some(Route::Native));
+        // Endpoints other than the three main ones are never translated.
+        assert_eq!(c.route("codex", "m", Wire::Messages, "/v1/messages/count_tokens"), None);
+        assert_eq!(c.route("claude", "m", Wire::Responses, "/v1/responses/compact"), None);
+        assert_eq!(c.route("claude", "m", Wire::Messages, "/v1/messages/count_tokens"), Some(Route::Native));
+        assert_eq!(c.endpoints("codex", "m"), (vec!["/v1/responses"], vec!["/v1/messages", "/v1/chat/completions"]));
     }
 }

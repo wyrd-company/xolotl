@@ -196,24 +196,136 @@ async fn precedence_decides_plain_names_and_prefix_reaches_losers() {
     let (_, v) = h.call("POST", "/v1/messages", Some(&go_key), Some(body)).await;
     assert_eq!(v["from"], "opencode-go");
 
-    // Claude Code's model list only shows names reachable over /v1/messages.
+    // Claude Code's model list, in Anthropic's shape, marks translated routes.
     let auth = format!("Bearer {default_key}");
     let (status, list) = h.call_with("GET", "/v1/models", &[("authorization", &auth), ("anthropic-version", "2023-06-01")], None).await;
     assert_eq!(status, 200);
-    let ids: Vec<&str> = list["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
-    assert!(ids.contains(&"claude-haiku-5-5") && ids.contains(&"claude-opus-5"));
-    assert!(!ids.contains(&"gpt-6-codex") && !ids.contains(&"kimi-k3"), "{ids:?}");
+    let data = list["data"].as_array().unwrap();
+    let entry = |id: &str| data.iter().find(|m| m["id"] == id).unwrap_or_else(|| panic!("{id} missing from {list}")).clone();
+    assert_eq!(entry("claude-opus-5")["type"], "model");
+    assert_eq!(entry("claude-opus-5")["endpoints"], json!(["/v1/messages"]));
+    assert_eq!(entry("gpt-6-codex")["endpoints"], json!(["/v1/responses"]));
+    assert_eq!(entry("gpt-6-codex")["translated_endpoints"], json!(["/v1/messages", "/v1/chat/completions"]));
     let (_, list) = h.call("GET", "/v1/models", Some(&default_key), None).await;
-    assert!(list["data"].as_array().unwrap().iter().any(|m| m["id"] == "gpt-6-codex"));
+    let kimi = list["data"].as_array().unwrap().iter().find(|m| m["id"] == "kimi-k3").unwrap().clone();
+    assert_eq!(kimi["object"], "model");
+    assert_eq!(kimi["translated_endpoints"], json!(["/v1/messages", "/v1/responses"]));
 }
 
 #[tokio::test]
-async fn wrong_endpoint_explains_where_a_model_lives() {
+async fn untranslatable_endpoint_explains_where_a_model_lives() {
     let h = harness().await;
     let key = h.key(policy("p")).await;
-    let (status, body) = h.call("POST", "/v1/messages", Some(&key), Some(json!({"model": "gpt-6-codex"}))).await;
+    let (status, body) = h.call("POST", "/v1/messages/count_tokens", Some(&key), Some(json!({"model": "gpt-6-codex"}))).await;
     assert_eq!(status, 400);
     assert!(body.to_string().contains("/v1/responses"), "{body}");
+    assert_eq!(body["type"], "error", "Anthropic envelope on /v1/messages");
+}
+
+#[tokio::test]
+async fn messages_client_reaches_codex_through_translation() {
+    let h = harness().await;
+    h.codex_account().await;
+    let stream = [
+        json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "message"}}),
+        json!({"type": "response.output_text.delta", "delta": "from codex"}),
+        json!({"type": "response.output_item.done", "item": {"type": "message"}}),
+        json!({"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 11, "output_tokens": 5}}}),
+    ]
+    .iter()
+    .map(|e| format!("data: {e}\n\n"))
+    .collect::<String>();
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .and(header("authorization", "Bearer codex-tok"))
+        .and(body_partial_json(json!({"model": "gpt-6-codex", "stream": true, "store": false})))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream"))
+        .mount(&h.upstream)
+        .await;
+    let key = h.key(policy("p")).await;
+    let body = json!({"model": "gpt-6-codex", "max_tokens": 100, "stream": true, "system": "sys", "messages": [{"role": "user", "content": "hi"}]});
+    let (status, out) = h.call_with("POST", "/v1/messages", &[("x-api-key", &key), ("anthropic-version", "2023-06-01")], Some(body)).await;
+    assert_eq!(status, 200, "{out}");
+    let text = out.as_str().unwrap();
+    assert!(text.starts_with("event: message_start"), "{text}");
+    assert!(text.contains(r#""text":"from codex""#), "{text}");
+    assert!(text.contains(r#""stop_reason":"end_turn""#), "{text}");
+
+    // Sent in Codex's format, without the client's Anthropic headers.
+    let reqs = h.upstream.received_requests().await.unwrap();
+    let sent = reqs.iter().find(|r| r.url.path() == "/backend-api/codex/responses").unwrap();
+    assert!(sent.headers.get("anthropic-version").is_none());
+    let sent: Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(sent["input"][0]["role"], "developer");
+    assert_eq!(sent["input"][1]["content"][0], json!({"type": "input_text", "text": "hi"}));
+
+    // Usage is recorded from the upstream response, against the upstream endpoint.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let rows = h.state.db.usage_summary("model", 0).await.unwrap();
+    let row = rows.iter().find(|r| r.key.as_deref() == Some("gpt-6-codex")).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!((row.input_tokens, row.output_tokens), (11, 5));
+}
+
+#[tokio::test]
+async fn chat_client_reaches_claude_through_translation() {
+    let h = harness().await;
+    h.account(Credential {
+        provider: SubProvider::Claude,
+        access_token: "claude-tok".into(),
+        expires_at: Some(now() + 3600),
+        account_id: Some("u1".into()),
+        ..Default::default()
+    })
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("authorization", "Bearer claude-tok"))
+        .and(body_partial_json(
+            json!({"model": "claude-opus-5", "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 2, "output_tokens": 3},
+        })))
+        .mount(&h.upstream)
+        .await;
+    let key = h.key(policy("p")).await;
+    let body = json!({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]});
+    let (status, out) = h.call("POST", "/v1/chat/completions", Some(&key), Some(body)).await;
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(out["object"], "chat.completion");
+    assert_eq!(out["choices"][0]["message"]["content"], "hello");
+    assert_eq!(out["usage"]["total_tokens"], 5);
+
+    // Errors come back in the client's envelope, with the upstream status.
+    let (status, out) =
+        h.call("POST", "/v1/chat/completions", Some(&key), Some(json!({"model": "claude-haiku-5-5", "messages": []}))).await;
+    assert_eq!(status, 404, "{out}");
+    assert!(out["error"]["message"].is_string() && out.get("type").is_none(), "{out}");
+}
+
+#[tokio::test]
+async fn responses_client_reaches_a_chat_provider_through_translation() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path("/llama/v1/chat/completions"))
+        .and(header("authorization", "Bearer llama-key"))
+        .and(body_partial_json(json!({"model": "qwen3", "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": null,
+                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1},
+        })))
+        .mount(&h.upstream)
+        .await;
+    let key = h.key(policy("p")).await;
+    let body = json!({"model": "qwen3", "instructions": "sys", "input": "hi", "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}]});
+    let (status, out) = h.call("POST", "/v1/responses", Some(&key), Some(body)).await;
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(out["object"], "response");
+    assert_eq!(out["status"], "completed");
+    assert_eq!(out["output"][0]["type"], "function_call");
+    assert_eq!(out["output"][0]["call_id"], "c1");
 }
 
 #[tokio::test]

@@ -427,7 +427,7 @@ async fn policies(c: Client, cmd: PoliciesCmd) -> Result<()> {
             if c.json {
                 return c.print(v);
             }
-            println!("{:<44} {:<56} ENDPOINTS", "MODEL", "ROUTES TO");
+            println!("{:<44} {:<56} {:<36} TRANSLATED", "MODEL", "ROUTES TO", "NATIVE");
             for m in v["models"].as_array().into_iter().flatten() {
                 let list = |k: &str| {
                     m[k].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()
@@ -437,7 +437,7 @@ async fn policies(c: Client, cmd: PoliciesCmd) -> Result<()> {
                 } else {
                     m["name"].as_str().unwrap_or("").to_string()
                 };
-                println!("{:<44} {:<56} {}", name, list("targets"), list("endpoints"));
+                println!("{:<44} {:<56} {:<36} {}", name, list("targets"), list("endpoints"), list("translated_endpoints"));
             }
             Ok(())
         }
