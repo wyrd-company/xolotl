@@ -569,6 +569,12 @@ async fn failed_json_responses_become_client_errors() {
     assert_eq!(evs.last().unwrap(), &json!({"type": "error", "error": {"type": "server_error", "message": "provider failed"}}));
     assert!(of_type(&evs, "message_delta").is_empty(), "no normal completion");
 
+    // `status: failed` alone is a failure too.
+    let (_, t) = translate(Wire::Chat, Wire::Responses, json!({"model": "fast", "messages": []}));
+    let (status, _, body) = run(t, upstream_response(200, "application/json", json!({"status": "failed", "output": []}).to_string())).await;
+    assert_eq!(status, 502);
+    assert!(body.contains("upstream response failed"), "{body}");
+
     // Chat and Messages error bodies with a 2xx status fail the same way.
     let (_, t) = translate(Wire::Responses, Wire::Chat, json!({"model": "fast", "input": "hi"}));
     let (status, _, body) =
