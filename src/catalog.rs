@@ -154,7 +154,7 @@ impl ModelCatalog {
             return w.clone();
         }
         match provider {
-            "codex" => vec![Wire::Responses],
+            "codex" | "grok" => vec![Wire::Responses],
             "opencode-go" => {
                 if OPENCODE_GO_MESSAGES.contains(&model) {
                     vec![Wire::Messages]
@@ -220,6 +220,7 @@ mod tests {
         assert_eq!(c.wires("claude", "x"), vec![Wire::Messages]);
         assert_eq!(c.wires("opencode-go", "minimax-m3"), vec![Wire::Messages]);
         assert_eq!(c.wires("opencode-go", "kimi-k3"), vec![Wire::Chat]);
+        assert_eq!(c.wires("grok", "grok-build"), vec![Wire::Responses]);
         assert!(c.wires("vercel", "a/b").contains(&Wire::Messages));
         assert_eq!(c.wires("llamacpp", "q"), vec![Wire::Chat, Wire::Messages]);
         let models = c.models();

@@ -25,6 +25,7 @@ export function AddAccountPage() {
       <div className="grid gap-4 lg:grid-cols-2">
         <CodexLogin />
         <ClaudeLogin />
+        <GrokLogin />
         <OpencodeGoKey />
         <ImportLogin />
       </div>
@@ -62,7 +63,7 @@ function ExternalLink({ href, children }: { href: string; children: ReactNode })
 }
 
 /** Starts a login flow and remembers it until it completes or is reset. */
-function useFlow(provider: "codex" | "claude") {
+function useFlow(provider: "codex" | "claude" | "grok") {
   const [flow, setFlow] = useState<FlowStart | null>(null);
   const start = useAction((device: boolean) => post<FlowStart>(`/admin/auth/${provider}/start`, { device }), {
     onSuccess: (f) => setFlow(f),
@@ -104,13 +105,12 @@ function PasteCode({ flow, onDone, placeholder }: { flow: FlowStart; onDone: () 
   );
 }
 
-function CodexLogin() {
-  const { flow, setFlow, start } = useFlow("codex");
+/** A device-code flow: shows the code and polls until the server finishes the login. */
+function DeviceCode({ flow, name, onDone }: { flow: FlowStart; name: string; onDone: () => void }) {
   const loggedIn = useLoggedIn();
   const status = useQuery({
-    queryKey: ["flow", flow?.flow_id],
-    queryFn: () => get<FlowStatus>(`/admin/auth/flows/${flow!.flow_id}`),
-    enabled: !!flow && !flow.needs_code,
+    queryKey: ["flow", flow.flow_id],
+    queryFn: () => get<FlowStatus>(`/admin/auth/flows/${flow.flow_id}`),
     refetchInterval: (q) => (q.state.data?.status === "pending" || !q.state.data ? 3000 : false),
   });
 
@@ -118,14 +118,34 @@ function CodexLogin() {
     const s = status.data;
     if (s?.status === "complete") {
       loggedIn(s.email);
-      setFlow(null);
+      onDone();
     } else if (s?.status === "failed") {
-      toast.error(`Codex login failed: ${s.error}`);
-      setFlow(null);
+      toast.error(`${name} login failed: ${s.error}`);
+      onDone();
     }
     // Act once per final status.
   }, [status.data?.status]);
 
+  return (
+    <>
+      <div className="bg-background flex flex-col gap-2 rounded-md p-4">
+        <div className="text-muted-foreground text-sm">Go to</div>
+        <ExternalLink href={flow.url}>{flow.url}</ExternalLink>
+        <div className="text-muted-foreground text-sm">and enter</div>
+        <div className="font-mono text-3xl font-medium tracking-widest select-all">{flow.user_code}</div>
+      </div>
+      <div role="status" className="text-info text-sm">
+        Waiting for authorization… (the code expires after 15 minutes)
+      </div>
+      <Button variant="ghost" className="self-start" onClick={onDone}>
+        Cancel
+      </Button>
+    </>
+  );
+}
+
+function CodexLogin() {
+  const { flow, setFlow, start } = useFlow("codex");
   return (
     <Section
       title="Codex (ChatGPT)"
@@ -141,22 +161,7 @@ function CodexLogin() {
           </Button>
         </div>
       )}
-      {flow && !flow.needs_code && (
-        <>
-          <div className="bg-background flex flex-col gap-2 rounded-md p-4">
-            <div className="text-muted-foreground text-sm">Go to</div>
-            <ExternalLink href={flow.url}>{flow.url}</ExternalLink>
-            <div className="text-muted-foreground text-sm">and enter</div>
-            <div className="font-mono text-3xl font-medium tracking-widest select-all">{flow.user_code}</div>
-          </div>
-          <div role="status" className="text-info text-sm">
-            Waiting for authorization… (the code expires after 15 minutes)
-          </div>
-          <Button variant="ghost" className="self-start" onClick={() => setFlow(null)}>
-            Cancel
-          </Button>
-        </>
-      )}
+      {flow && !flow.needs_code && <DeviceCode flow={flow} name="Codex" onDone={() => setFlow(null)} />}
       {flow?.needs_code && (
         <>
           <p className="text-sm leading-relaxed">
@@ -186,6 +191,24 @@ function ClaudeLogin() {
           </Button>
           <PasteCode flow={flow} onDone={() => setFlow(null)} placeholder="CODE#STATE or the callback URL" />
         </>
+      )}
+    </Section>
+  );
+}
+
+function GrokLogin() {
+  const { flow, setFlow, start } = useFlow("grok");
+  return (
+    <Section
+      title="Grok Build (xAI)"
+      description="Device code: open the page on any device, sign in to your xAI account and confirm the code. This screen updates when you finish."
+    >
+      {!flow ? (
+        <Button className="self-start" disabled={start.isPending} onClick={() => start.mutate(true)}>
+          Start device login
+        </Button>
+      ) : (
+        <DeviceCode flow={flow} name="Grok" onDone={() => setFlow(null)} />
       )}
     </Section>
   );

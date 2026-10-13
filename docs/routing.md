@@ -20,6 +20,7 @@ There are three LLM wire formats: Anthropic Messages (`/v1/messages`), OpenAI Re
 |---|---|
 | `claude` | Messages |
 | `codex` | Responses |
+| `grok` | Responses |
 | `opencode-go` | per model: a fixed list speaks Messages, another Responses, the rest Chat |
 | `vercel` kind | all three |
 | other gateway providers | Chat |
@@ -65,7 +66,7 @@ A policy (`src/policy.rs`) is stored in OpenBao at `policies/<name>`, and every 
 2. Group the remaining models by plain name. When several providers serve the same name, one wins it:
    1. the provider in `winners[model]`, if it serves the model;
    2. otherwise, the earliest provider in `precedence`;
-   3. otherwise, the earliest in the default order: `claude`, `codex`, `opencode-go`;
+   3. otherwise, the earliest in the default order: `claude`, `codex`, `grok`, `opencode-go`;
    4. otherwise, alphabetical.
 
    Providers left out of `precedence` rank after every provider in it. The losing providers don't get the plain name.

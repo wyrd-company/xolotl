@@ -40,6 +40,7 @@ async fn harness() -> Harness {
             static_models: BTreeMap::from([
                 ("claude".to_string(), vec!["claude-haiku-5-5".to_string(), "claude-opus-5".to_string()]),
                 ("codex".to_string(), vec!["gpt-6-codex".to_string()]),
+                ("grok".to_string(), vec!["grok-build".to_string()]),
                 ("opencode-go".to_string(), vec!["claude-haiku-5-5".to_string(), "kimi-k3".to_string()]),
                 ("llama".to_string(), vec!["qwen3".to_string(), "busy".to_string()]),
             ]),
@@ -55,6 +56,8 @@ async fn harness() -> Harness {
         claude_token: format!("{uri}/v1/oauth/token"),
         claude_manual_redirect: format!("{uri}/cb"),
         opencode_go: format!("{uri}/zen/go"),
+        grok_api: format!("{uri}/grok/v1"),
+        grok_auth: uri.clone(),
     };
     let db = Db::in_memory().await.unwrap();
     let http = crate::proxy::upstream_client(std::time::Duration::from_secs(30)).unwrap();
@@ -429,6 +432,117 @@ async fn responses_route_to_codex_pool_and_websocket_gets_426() {
     let (status, body) = h.call("POST", "/v1/responses", Some(&key), Some(json!({"model": "gpt-6-codex", "input": []}))).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(h.call("GET", "/v1/responses", Some(&key), None).await.0, 426);
+}
+
+#[tokio::test]
+async fn grok_shell_gets_its_model_shape_limited_by_policy() {
+    let h = harness().await;
+    let key = h.key(Policy { name: "grok".into(), providers: vec!["grok".into(), "codex".into()], ..Default::default() }).await;
+    let auth = format!("Bearer {key}");
+    let ua = ("user-agent", "grok-shell/1.0.52 (linux; x86_64)");
+    let (status, v) = h.call_with("GET", "/v1/models", &[("authorization", &auth), ua], None).await;
+    assert_eq!(status, 200, "{v}");
+    let data = v["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2, "only the policy's names: {v}");
+    let grok = data.iter().find(|m| m["id"] == "grok-build").unwrap();
+    assert_eq!(
+        *grok,
+        json!({"id": "grok-build", "model": "grok-build", "name": "grok-build", "api_backend": "responses", "supported_in_api": true})
+    );
+    // Other clients keep the OpenAI shape.
+    let (_, v) = h.call("GET", "/v1/models", Some(&key), None).await;
+    assert_eq!(v["data"][0]["object"], "model");
+
+    // Names no target can serve on Responses are left out.
+    let key = h.key(policy("all")).await;
+    let auth = format!("Bearer {key}");
+    let (_, v) = h.call_with("GET", "/v1/models", &[("authorization", &auth), ua], None).await;
+    let ids: Vec<&str> = v["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+    for id in ["claude-opus-5", "claude-haiku-5-5"] {
+        assert!(!ids.contains(&id), "{id} belongs to the Claude pool, which serves only /v1/messages: {ids:?}");
+    }
+    for id in ["grok-build", "gpt-6-codex", "qwen3", "kimi-k3"] {
+        assert!(ids.contains(&id), "{id} reaches Responses natively or translated: {ids:?}");
+    }
+}
+
+#[tokio::test]
+async fn native_responses_clients_get_json_unless_they_stream() {
+    let h = harness().await;
+    h.account(Credential {
+        provider: SubProvider::Grok,
+        access_token: "xai-tok".into(),
+        refresh_token: Some("rt".into()),
+        expires_at: Some(now() + 3600),
+        account_id: Some("sub-1".into()),
+        ..Default::default()
+    })
+    .await;
+    let stream = [
+        json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+        json!({"type": "keepalive"}),
+        json!({"type": "response.output_item.done", "output_index": 0, "item": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi there"}]}}),
+        json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed", "output": [], "usage": {"input_tokens": 4, "output_tokens": 2}}}),
+    ]
+    .iter()
+    .map(|e| format!("data: {e}\n\n"))
+    .collect::<String>();
+    Mock::given(method("POST"))
+        .and(path("/grok/v1/responses"))
+        .and(body_partial_json(json!({"stream": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream"))
+        .mount(&h.upstream)
+        .await;
+    let key = h.key(policy("p")).await;
+    for body in [json!({"model": "grok-build", "input": "hi"}), json!({"model": "grok-build", "input": "hi", "stream": false})] {
+        let (status, out) = h.call("POST", "/v1/responses", Some(&key), Some(body.clone())).await;
+        assert_eq!(status, 200, "{out}");
+        assert!(out.is_object(), "JSON for {body}: {out}");
+        assert_eq!(out["id"], "resp_1");
+        assert_eq!(out["output"][0]["content"][0]["text"], "hi there", "{out}");
+    }
+    let (status, out) =
+        h.call("POST", "/v1/responses", Some(&key), Some(json!({"model": "grok-build", "input": "hi", "stream": true}))).await;
+    assert_eq!(status, 200);
+    let text = out.as_str().unwrap();
+    assert!(text.contains("response.completed") && text.contains(": keepalive"), "{text}");
+}
+
+#[tokio::test]
+async fn chat_client_reaches_grok_through_translation() {
+    let h = harness().await;
+    h.account(Credential {
+        provider: SubProvider::Grok,
+        access_token: "xai-tok".into(),
+        refresh_token: Some("rt".into()),
+        expires_at: Some(now() + 3600),
+        account_id: Some("sub-1".into()),
+        ..Default::default()
+    })
+    .await;
+    let stream = [
+        json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "message"}}),
+        json!({"type": "keepalive"}),
+        json!({"type": "response.output_text.delta", "delta": "from grok"}),
+        json!({"type": "response.output_item.done", "item": {"type": "message"}}),
+        json!({"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 3, "output_tokens": 2}}}),
+    ]
+    .iter()
+    .map(|e| format!("data: {e}\n\n"))
+    .collect::<String>();
+    Mock::given(method("POST"))
+        .and(path("/grok/v1/responses"))
+        .and(header("authorization", "Bearer xai-tok"))
+        .and(header("x-xai-token-auth", "xai-grok-cli"))
+        .and(body_partial_json(json!({"model": "grok-build", "stream": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream"))
+        .mount(&h.upstream)
+        .await;
+    let key = h.key(policy("p")).await;
+    let body = json!({"model": "grok-build", "messages": [{"role": "user", "content": "hi"}]});
+    let (status, out) = h.call("POST", "/v1/chat/completions", Some(&key), Some(body)).await;
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(out["choices"][0]["message"]["content"], "from grok", "{out}");
 }
 
 #[tokio::test]

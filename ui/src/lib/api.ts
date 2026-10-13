@@ -56,9 +56,9 @@ export const del = <T>(path: string) => api<T>("DELETE", path);
 
 // ---- types (mirroring the Rust structs)
 
-export type SubProvider = "claude" | "codex" | "opencode-go";
-export const SUB_PROVIDERS: SubProvider[] = ["claude", "codex", "opencode-go"];
-export const PROVIDER_NAMES: Record<SubProvider, string> = { claude: "Claude", codex: "Codex", "opencode-go": "OpenCode Go" };
+export type SubProvider = "claude" | "codex" | "grok" | "opencode-go";
+export const SUB_PROVIDERS: SubProvider[] = ["claude", "codex", "grok", "opencode-go"];
+export const PROVIDER_NAMES: Record<SubProvider, string> = { claude: "Claude", codex: "Codex", grok: "Grok", "opencode-go": "OpenCode Go" };
 
 export interface Session {
   authenticated: boolean;
