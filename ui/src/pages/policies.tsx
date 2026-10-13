@@ -350,8 +350,8 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
         <CardHeader>
           <CardTitle className="text-base">What keys under this policy see</CardTitle>
           <CardDescription>
-            Updates as you edit. <Mono>GET /v1/models</Mono> lists these names; every one is reachable on all three LLM endpoints, natively or through
-            translation.
+            Updates as you edit. <Mono>GET /v1/models</Mono> lists these names with the endpoints each is reachable on. Claude subscription accounts
+            serve only <Mono>/v1/messages</Mono> and are never translated.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
