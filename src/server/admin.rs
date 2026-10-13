@@ -423,6 +423,9 @@ async fn status(State(s): State<AppState>, h: HeaderMap) -> Res {
         "unsaved_credentials": s.subs.unsaved_count(),
         "recent_errors": s.db.recent_errors(20).await.map_err(internal)?,
         "dashboard_url": s.cfg.telemetry.dashboard_url,
+        // To show clients the full vault path of their key.
+        "vault_mount": s.cfg.vault.mount,
+        "vault_prefix": s.cfg.vault.prefix,
         "subscription": {
             "strategy": sub.strategy,
             "soft_limit_percent": sub.soft_limit_percent,

@@ -85,6 +85,9 @@ pub struct KeyInfo {
     pub rotated_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub disabled: bool,
+    /// After a rotation with grace: when the old key stops working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_expires_at: Option<DateTime<Utc>>,
 }
 
 /// The authenticated caller.
@@ -422,6 +425,7 @@ fn insert_entry(st: &mut State, id: &str, r: &KeyRecord) {
                 rotated_at: r.rotated_at,
                 expires_at: r.expires_at,
                 disabled: r.disabled,
+                previous_expires_at: previous.as_ref().map(|(_, until)| *until),
             },
             revoked: r.revoked,
             hash,
