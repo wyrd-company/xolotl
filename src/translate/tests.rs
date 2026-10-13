@@ -199,6 +199,23 @@ fn forced_tools_turn_thinking_off_and_tool_results_lead_the_user_turn() {
 }
 
 #[test]
+fn claude_models_take_adaptive_thinking_and_others_a_budget() {
+    for (effort, sent) in [("minimal", "low"), ("low", "low"), ("medium", "medium"), ("high", "high"), ("xhigh", "xhigh")] {
+        let body = json!({"model": "m", "reasoning_effort": effort, "temperature": 0.3, "messages": [{"role": "user", "content": "hi"}]});
+        for model in ["claude-haiku-5-5", "anthropic/claude-haiku-5-5"] {
+            let (out, _) = request(Wire::Chat, Wire::Messages, &body, model).unwrap();
+            assert_eq!(out["thinking"], json!({"type": "adaptive"}), "{model}");
+            assert_eq!(out["output_config"], json!({"effort": sent}), "{model} {effort}");
+            assert!(out.get("temperature").is_none());
+            assert_eq!(out["max_tokens"], messages::DEFAULT_MAX_TOKENS, "no budget to make room for");
+        }
+        let (out, _) = request(Wire::Chat, Wire::Messages, &body, "minimax-m3").unwrap();
+        assert_eq!(out["thinking"]["type"], "enabled", "{effort}");
+        assert!(out.get("output_config").is_none());
+    }
+}
+
+#[test]
 fn messages_request_to_chat() {
     let body = json!({
         "model": "m", "stream": true, "stop_sequences": ["END"],

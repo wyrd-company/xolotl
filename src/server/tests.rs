@@ -285,9 +285,12 @@ async fn claude_accounts_serve_only_the_claude_code_path() {
     Mock::given(method("POST"))
         .and(path("/zen/go/v1/messages"))
         .and(header("x-api-key", "ocg-key"))
-        .and(body_partial_json(
-            json!({"model": "claude-haiku-5-5", "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}),
-        ))
+        .and(body_partial_json(json!({
+            "model": "claude-haiku-5-5",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "msg_1", "type": "message", "role": "assistant", "content": [{"type": "text", "text": "hello"}],
             "stop_reason": "end_turn", "usage": {"input_tokens": 2, "output_tokens": 3},
@@ -297,7 +300,7 @@ async fn claude_accounts_serve_only_the_claude_code_path() {
     let mut p = policy("p");
     p.aliases.insert("haiku".into(), AliasTargets::Many(vec!["claude/claude-haiku-5-5".into(), "opencode-go/claude-haiku-5-5".into()]));
     let key = h.key(p).await;
-    let chat = |model: &str| json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
+    let chat = |model: &str| json!({"model": model, "reasoning_effort": "high", "messages": [{"role": "user", "content": "hi"}]});
 
     // A Claude subscription account is never translated: the other endpoints get a 400 naming the Messages path.
     for (path, body) in

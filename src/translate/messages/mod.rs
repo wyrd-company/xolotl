@@ -189,6 +189,14 @@ fn tool_turn_lacks_thinking(r: &Request) -> bool {
     })
 }
 
+/// Claude models take `thinking: adaptive` with an effort (`low`, `medium`,
+/// `high`, `xhigh`, `max`) and reject a `budget_tokens` budget, as OpenCode
+/// Go's Claude Haiku 5.5 does. Other models behind a Messages API (MiniMax,
+/// Qwen, local servers) take a budget.
+fn adaptive_thinking(model: &str) -> bool {
+    model.rsplit('/').next().unwrap_or(model).starts_with("claude-")
+}
+
 pub fn encode_request(r: &Request, model: &str) -> Result<Value, String> {
     if r.response_format.is_some() {
         return Err("structured output (response_format / text.format) can't be translated to /v1/messages".into());
@@ -253,10 +261,13 @@ pub fn encode_request(r: &Request, model: &str) -> Result<Value, String> {
         out.insert("stop_sequences".into(), json!(r.stop));
     }
     let effort = r.effort.as_deref().filter(|e| *e != "none" && !forced && !tool_turn_lacks_thinking(r));
-    // Messages providers other than Anthropic's own API take a thinking budget.
-    match effort.and_then(budget_for_effort) {
+    match (effort, effort.and_then(budget_for_effort)) {
         // Thinking rejects sampling parameters.
-        Some(budget) => {
+        (Some(e), _) if adaptive_thinking(model) => {
+            out.insert("thinking".into(), json!({"type": "adaptive"}));
+            out.insert("output_config".into(), json!({"effort": if e == "minimal" { "low" } else { e }}));
+        }
+        (Some(_), Some(budget)) => {
             max_tokens = max_tokens.max(budget + 4096);
             out.insert("thinking".into(), json!({"type": "enabled", "budget_tokens": budget}));
         }
