@@ -9,6 +9,7 @@ COPY ui ./
 RUN pnpm build
 
 FROM rust:1.97-slim-bookworm AS build
+ARG TARGETARCH
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -16,8 +17,8 @@ COPY migrations ./migrations
 COPY config.example.toml ./
 # Embedded into the release binary.
 COPY --from=ui /ui/dist ./ui/dist
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-target-${TARGETARCH},target=/src/target \
     cargo build --release --locked && cp target/release/xolotl /xolotl
 # An empty data directory for the runtime image, which has no shell to create it.
 RUN mkdir /data
