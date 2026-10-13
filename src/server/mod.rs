@@ -5,6 +5,8 @@
 
 mod admin;
 mod management;
+pub mod session;
+mod ui;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +43,7 @@ pub struct AppState {
     pub gateway: Arc<Gateway>,
     pub catalog: Arc<ModelCatalog>,
     pub vault: Option<VaultClient>,
+    pub sessions: Arc<session::Sessions>,
 }
 
 impl AppState {
@@ -53,6 +56,8 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     let max_body = state.cfg.server.max_body_bytes;
     Router::new()
+        .route("/", get(ui::index))
+        .route("/assets/{*path}", get(ui::asset))
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .route("/v1/models", get(models))
@@ -65,7 +70,7 @@ pub fn router(state: AppState) -> Router {
         .route("/backend-api/codex/responses/compact", post(|s, r| llm(s, r, "/v1/responses/compact")))
         .route("/v1/{*rest}", post(unified))
         .nest("/v0/management", management::router())
-        .nest("/admin", admin::router())
+        .nest("/admin", admin::router().merge(session::router()))
         .route("/opencode-go/{*rest}", any(opencode_go_passthrough))
         .route("/{provider}/{*rest}", any(passthrough))
         .layer(DefaultBodyLimit::max(max_body))
@@ -79,7 +84,9 @@ pub fn router(state: AppState) -> Router {
 pub async fn serve(state: AppState) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(state.cfg.server.listen).await?;
     tracing::info!(addr = %state.cfg.server.listen, "xolotl listening");
-    axum::serve(listener, router(state)).with_graceful_shutdown(shutdown_signal()).await?;
+    // Connection info lets the UI sign-in count failed attempts per address.
+    let app = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
     Ok(())
 }
 
@@ -180,8 +187,15 @@ pub fn presented_key(headers: &HeaderMap) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Resolve the caller from its key. Without a key, an admin route also
+/// accepts a web UI session (cookie plus CSRF header).
 pub async fn authorize(state: &AppState, headers: &HeaderMap, scope: Scope) -> Result<Principal, Response> {
     let Some(key) = presented_key(headers) else {
+        if scope == Scope::Admin
+            && let Some(p) = state.sessions.principal(headers)
+        {
+            return Ok(p);
+        }
         return Err(json_error(StatusCode::UNAUTHORIZED, "missing API key"));
     };
     match state.keys.authenticate(&key).await {

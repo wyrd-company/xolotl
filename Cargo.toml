@@ -8,6 +8,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+argon2 = "0.6.0"
 async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["macros"] }
 base64 = "0.23.1"
@@ -24,6 +25,7 @@ parking_lot = "0.12.5"
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream", "form", "http2"] }
 rpassword = "7.5.4"
+rust-embed = { version = "8.13.0", features = ["mime-guess"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.0"

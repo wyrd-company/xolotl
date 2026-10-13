@@ -85,6 +85,9 @@ pub struct KeyInfo {
     pub rotated_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub disabled: bool,
+    /// After a rotation with grace: when the old key stops working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_expires_at: Option<DateTime<Utc>>,
 }
 
 /// The authenticated caller.
@@ -422,6 +425,7 @@ fn insert_entry(st: &mut State, id: &str, r: &KeyRecord) {
                 rotated_at: r.rotated_at,
                 expires_at: r.expires_at,
                 disabled: r.disabled,
+                previous_expires_at: previous.as_ref().map(|(_, until)| *until),
             },
             revoked: r.revoked,
             hash,
@@ -444,7 +448,8 @@ pub fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+/// Constant-time comparison of equal-length secrets.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 

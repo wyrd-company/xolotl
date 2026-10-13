@@ -86,6 +86,15 @@ impl Target {
 /// Provider name -> models it currently serves.
 pub type Catalog = BTreeMap<String, BTreeSet<String>>;
 
+/// A model name several providers serve.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SharedName {
+    pub model: String,
+    /// In precedence order.
+    pub providers: Vec<String>,
+    pub winner: String,
+}
+
 /// The model names a policy exposes for a catalog.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct View {
@@ -186,8 +195,8 @@ impl Policy {
         (2, 0, provider.to_string())
     }
 
-    /// Resolve the client-visible model names for a catalog.
-    pub fn resolve(&self, catalog: &Catalog) -> View {
+    /// Every allowed model -> the allowed providers serving it, in precedence order.
+    fn by_model<'a>(&self, catalog: &'a Catalog) -> BTreeMap<&'a str, Vec<&'a str>> {
         let mut by_model: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (provider, models) in catalog {
             for m in models {
@@ -196,14 +205,35 @@ impl Policy {
                 }
             }
         }
+        for providers in by_model.values_mut() {
+            providers.sort_by_key(|p| self.rank(p));
+        }
+        by_model
+    }
+
+    /// The provider that serves a plain model name: its `winners` entry, else the first by precedence.
+    fn winner<'a>(&self, model: &str, providers: &[&'a str]) -> &'a str {
+        self.winners.get(model).and_then(|w| providers.iter().find(|p| **p == w.as_str())).copied().unwrap_or(providers[0])
+    }
+
+    /// Model names that several allowed providers serve, and which one wins each.
+    pub fn shared_names(&self, catalog: &Catalog) -> Vec<SharedName> {
+        self.by_model(catalog)
+            .into_iter()
+            .filter(|(_, providers)| providers.len() > 1)
+            .map(|(model, providers)| SharedName {
+                model: model.to_string(),
+                winner: self.winner(model, &providers).to_string(),
+                providers: providers.into_iter().map(str::to_string).collect(),
+            })
+            .collect()
+    }
+
+    /// Resolve the client-visible model names for a catalog.
+    pub fn resolve(&self, catalog: &Catalog) -> View {
         let mut view = View::default();
-        for (model, providers) in by_model {
-            let winner = self
-                .winners
-                .get(model)
-                .map(String::as_str)
-                .filter(|w| providers.contains(w))
-                .unwrap_or_else(|| providers.iter().min_by_key(|p| self.rank(p)).copied().expect("non-empty"));
+        for (model, providers) in self.by_model(catalog) {
+            let winner = self.winner(model, &providers);
             view.names.insert(model.to_string(), vec![Target { provider: winner.into(), model: model.into() }]);
         }
         // Aliases are explicit grants and shadow catalog names.
@@ -269,6 +299,11 @@ mod tests {
         assert_eq!(v.names["kimi-k3"][0].provider, "vercel");
         assert_eq!(v.names["claude-haiku-5-5"][0].provider, "opencode-go");
         assert_eq!(v.names["claude-opus-5"][0].provider, "claude", "unlisted providers keep default order");
+        let shared = p.shared_names(&catalog());
+        let haiku = shared.iter().find(|s| s.model == "claude-haiku-5-5").unwrap();
+        assert_eq!(haiku.providers, ["opencode-go", "claude"]);
+        assert_eq!(haiku.winner, "opencode-go");
+        assert!(shared.iter().all(|s| s.model != "claude-opus-5"), "one provider is not shared");
     }
 
     #[test]

@@ -20,7 +20,10 @@ pub fn router() -> Router<AppState> {
         .route("/policies", get(list_policies))
         .route("/policies/{name}", get(get_policy).put(put_policy).delete(delete_policy))
         .route("/policies/{name}/view", get(policy_view))
+        // Not under /policies/: `preview` is a valid policy name.
+        .route("/policy-preview", post(preview_policy))
         .route("/catalog", get(catalog))
+        .route("/catalog/routes", get(catalog_routes))
         .route("/catalog/refresh", post(refresh_catalog))
         .route("/keys", get(list_keys).post(issue_key))
         .route("/keys/{policy}/{name}", delete(revoke_key))
@@ -38,9 +41,11 @@ pub fn router() -> Router<AppState> {
         .route("/auth/{provider}/start", post(start_login))
         .route("/auth/flows/{id}", get(flow_status))
         .route("/auth/flows/{id}/complete", post(complete_login))
+        .route("/providers", get(list_providers))
         .route("/providers/{name}/key", post(set_provider_key))
         .route("/usage", get(usage))
         .route("/reload", post(reload))
+        .route("/status", get(status))
 }
 
 type Res = Result<Response, Response>;
@@ -96,7 +101,24 @@ async fn delete_policy(State(s): State<AppState>, h: HeaderMap, Path(name): Path
 async fn policy_view(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
     admin(&s, &h).await?;
     let policy = s.keys.policy(&name).ok_or_else(|| json_error(StatusCode::NOT_FOUND, "no such policy"))?;
-    let view = policy.resolve(&s.catalog.models());
+    ok(view_json(&s, &policy))
+}
+
+/// The view of an unsaved policy, for editing. Invalid policies get a 400
+/// naming the problem.
+async fn preview_policy(State(s): State<AppState>, h: HeaderMap, Json(mut policy): Json<Policy>) -> Res {
+    admin(&s, &h).await?;
+    policy.normalize();
+    if policy.name.is_empty() {
+        policy.name = "preview".into();
+    }
+    policy.validate(&s.catalog.known_providers()).map_err(bad)?;
+    ok(view_json(&s, &policy))
+}
+
+fn view_json(s: &AppState, policy: &Policy) -> Value {
+    let catalog = s.catalog.models();
+    let view = policy.resolve(&catalog);
     let models: Vec<Value> = view
         .names
         .iter()
@@ -112,7 +134,7 @@ async fn policy_view(State(s): State<AppState>, h: HeaderMap, Path(name): Path<S
             })
         })
         .collect();
-    ok(json!({"policy": name, "models": models}))
+    json!({"policy": policy.name, "models": models, "shared": policy.shared_names(&catalog)})
 }
 
 // ---- catalog
@@ -120,6 +142,23 @@ async fn policy_view(State(s): State<AppState>, h: HeaderMap, Path(name): Path<S
 async fn catalog(State(s): State<AppState>, h: HeaderMap) -> Res {
     admin(&s, &h).await?;
     ok(s.catalog.models())
+}
+
+/// Every catalog model with the endpoints it is reachable on, natively and
+/// through translation.
+async fn catalog_routes(State(s): State<AppState>, h: HeaderMap) -> Res {
+    admin(&s, &h).await?;
+    let rows: Vec<Value> = s
+        .catalog
+        .models()
+        .iter()
+        .flat_map(|(provider, models)| models.iter().map(move |m| (provider, m)))
+        .map(|(provider, model)| {
+            let (native, translated) = s.catalog.endpoints(provider, model);
+            json!({"provider": provider, "model": model, "endpoints": native, "translated_endpoints": translated})
+        })
+        .collect();
+    ok(rows)
 }
 
 async fn refresh_catalog(State(s): State<AppState>, h: HeaderMap) -> Res {
@@ -299,6 +338,34 @@ struct ProviderKeyReq {
     api_key: String,
 }
 
+/// Gateway providers from the config file, and whether each has a key in the vault.
+async fn list_providers(State(s): State<AppState>, h: HeaderMap) -> Res {
+    admin(&s, &h).await?;
+    let mut out = Vec::new();
+    for (name, p) in &s.cfg.gateway.providers {
+        let secret = p.secret.clone().unwrap_or_else(|| format!("providers/{name}"));
+        let has_key = if p.no_auth {
+            false
+        } else {
+            s.secrets
+                .get(&secret)
+                .await
+                .map_err(internal)?
+                .is_some_and(|m| m.get("api_key").is_some_and(|k| k.as_str().is_some_and(|k| !k.is_empty())))
+        };
+        out.push(json!({
+            "name": name,
+            "kind": p.kind,
+            "enabled": p.is_enabled(),
+            "base_url": p.base_url,
+            "no_auth": p.no_auth,
+            "secret": secret,
+            "has_key": has_key,
+        }));
+    }
+    ok(out)
+}
+
 async fn set_provider_key(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>, Json(req): Json<ProviderKeyReq>) -> Res {
     admin(&s, &h).await?;
     if !s.gateway.has_provider(&name) {
@@ -332,6 +399,41 @@ async fn usage(State(s): State<AppState>, h: HeaderMap, Query(q): Query<UsageQue
     let mut rows = s.db.usage_summary(&q.group_by, now() - q.since_secs).await.map_err(bad)?;
     let _ = &mut rows;
     ok(rows)
+}
+
+/// Health and settings for the web UI's overview.
+async fn status(State(s): State<AppState>, h: HeaderMap) -> Res {
+    admin(&s, &h).await?;
+    let database = match s.db.ping().await {
+        Ok(()) => json!({"ok": true}),
+        Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+    };
+    let vault = match &s.vault {
+        Some(v) => match v.health().await {
+            Ok(()) => json!({"ok": true}),
+            Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+        },
+        None => json!({"ok": true, "note": "in-memory store"}),
+    };
+    let sub = &s.cfg.subscription;
+    ok(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "database": database,
+        "vault": vault,
+        "catalog_refreshed_secs_ago": s.catalog.last_refresh().map(|t| t.elapsed().as_secs()),
+        "unsaved_credentials": s.subs.unsaved_count(),
+        "recent_errors": s.db.recent_errors(20).await.map_err(internal)?,
+        "dashboard_url": s.cfg.telemetry.dashboard_url,
+        // To show clients the full vault path of their key.
+        "vault_mount": s.cfg.vault.mount,
+        "vault_prefix": s.cfg.vault.prefix,
+        "subscription": {
+            "strategy": sub.strategy,
+            "soft_limit_percent": sub.soft_limit_percent,
+            "session_affinity_secs": sub.session_affinity_secs,
+            "usage_poll_secs": sub.usage_poll_secs,
+        },
+    }))
 }
 
 async fn reload(State(s): State<AppState>, h: HeaderMap) -> Res {

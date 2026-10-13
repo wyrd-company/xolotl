@@ -85,6 +85,20 @@ pub struct UsageSummary {
     pub cached_tokens: i64,
 }
 
+/// A request log row, as listed by the admin API.
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct LoggedRequest {
+    pub ts: i64,
+    pub client_id: Option<String>,
+    pub provider: String,
+    pub account_id: Option<String>,
+    pub model: Option<String>,
+    pub endpoint: String,
+    pub status: i64,
+    pub latency_ms: i64,
+    pub trace_id: Option<String>,
+}
+
 impl Db {
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -271,6 +285,17 @@ impl Db {
         Ok(())
     }
 
+    /// The latest failed requests (status 400 and up), newest first.
+    pub async fn recent_errors(&self, limit: i64) -> Result<Vec<LoggedRequest>> {
+        Ok(sqlx::query_as(
+            "SELECT ts, client_id, provider, account_id, model, endpoint, status, latency_ms, trace_id
+             FROM request_log WHERE status >= 400 ORDER BY ts DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Aggregate the request log since `since` grouped by `client`, `account`, `provider` or `model`.
     pub async fn usage_summary(&self, group_by: &str, since: i64) -> Result<Vec<UsageSummary>> {
         let column = match group_by {
@@ -373,5 +398,8 @@ mod tests {
         assert_eq!(s[0].errors, 1);
         assert_eq!(s[0].input_tokens, 30);
         assert!(db.usage_summary("bogus", 0).await.is_err());
+        let errors = db.recent_errors(10).await.unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].status, 500);
     }
 }

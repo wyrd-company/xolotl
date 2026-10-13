@@ -120,7 +120,8 @@ pub mod testing {
     use super::*;
 
     /// An in-memory store that can fail every write, and pause once at a
-    /// chosen read or write until the test releases it.
+    /// chosen read or write until the test releases it: before a `get` or
+    /// `put`, or after a `get` has read its value (`"got"`).
     #[derive(Default)]
     pub struct GatedStore {
         pub inner: MemoryStore,
@@ -133,7 +134,7 @@ pub mod testing {
     }
 
     impl GatedStore {
-        /// Pause the next `op` (`"get"` or `"put"`) on `key`.
+        /// Pause the next `op` (`"get"`, `"got"` or `"put"`) on `key`.
         pub fn arm(&self, op: &'static str, key: &str) {
             *self.gate.lock() = Some((op, key.to_string()));
         }
@@ -167,7 +168,9 @@ pub mod testing {
     impl SecretStore for GatedStore {
         async fn get(&self, key: &str) -> Result<Option<Map<String, Value>>> {
             self.pass("get", key).await;
-            self.inner.get(key).await
+            let value = self.inner.get(key).await;
+            self.pass("got", key).await;
+            value
         }
         async fn put(&self, key: &str, data: Map<String, Value>) -> Result<()> {
             self.pass("put", key).await;

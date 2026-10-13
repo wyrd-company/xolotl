@@ -1,10 +1,10 @@
 # Architecture
 
-Xolotl is a single Rust binary (`xolotl`). `xolotl serve` runs the HTTP server; every other subcommand is a CLI client of the server's `/admin` API.
+Xolotl is a single Rust binary (`xolotl`). `xolotl serve` runs the HTTP server; every other subcommand is a CLI client of the server's `/admin` API. The server also serves a web UI at `/` that uses the same API ([Web UI](web-ui.md)).
 
 ```
-clients (Claude Code, Codex CLI, SDKs, T3Code hubs, xolotl CLI)
-        │  client key (Authorization / x-api-key)
+clients (Claude Code, Codex CLI, SDKs, T3Code hubs, xolotl CLI, web UI)
+        │  client key (Authorization / x-api-key), or a web UI session
         ▼
   axum router ── authorize (keys + policy) ──┬── subscription pools: codex, claude, opencode-go
         │                                     └── gateway providers: vercel, mistral, openai-compatible
@@ -29,7 +29,7 @@ clients (Claude Code, Codex CLI, SDKs, T3Code hubs, xolotl CLI)
 
 ## Request path
 
-1. `authorize` takes the key from `Authorization` (Bearer or bare), `x-api-key` or `x-management-key`, and resolves it to a principal: client id plus policy. The bootstrap admin token resolves to an unrestricted policy.
+1. `authorize` takes the key from `Authorization` (Bearer or bare), `x-api-key` or `x-management-key`, and resolves it to a principal: client id plus policy. The bootstrap admin token resolves to an unrestricted policy. Without a key, an `/admin` route also accepts a web UI session.
 2. The route checks the scope it needs (`proxy`, `management` or `admin`).
 3. LLM endpoints resolve `model` through the policy and dispatch to a pool or a gateway provider, translating the request when the provider doesn't speak the endpoint's format ([Routing](routing.md)). Passthroughs check only the provider (and `model`, when the body is JSON).
 4. Responses are relayed as they arrive. `TapStream` (`src/proxy.rs`) reads token usage from the upstream JSON or SSE body on the way through, and `Accounting` writes the request log row and metrics when the response finishes. A translated response is translated after this tap, so usage always comes from what the upstream sent.
@@ -59,7 +59,9 @@ On graceful shutdown the server makes one last attempt to save unsaved credentia
 | `src/main.rs`, `src/cli.rs` | CLI parsing; `serve` and the admin API client |
 | `src/config.rs` | TOML config, defaults, validation |
 | `src/server/mod.rs` | Router, auth, LLM routing, passthroughs, background tasks |
-| `src/server/admin.rs` | `/admin` API used by the CLI |
+| `src/server/admin.rs` | `/admin` API used by the CLI and the web UI |
+| `src/server/session.rs`, `src/server/ui.rs` | Web UI sign-in and sessions; its static files |
+| `ui/` | Web UI source (Vite, React, Tailwind, shadcn/ui) |
 | `src/server/management.rs` | T3Code hubs endpoints (`/v0/management/*`) |
 | `src/policy.rs` | Policies and model-name resolution |
 | `src/catalog.rs` | Model catalog, wire formats and routes (native or translated) |

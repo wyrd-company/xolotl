@@ -32,6 +32,7 @@ service_name = "xolotl"
 log_format = "json"     # or "pretty"
 log_filter = "info"
 metrics_interval_secs = 30
+# dashboard_url = "https://openobserve.example.lan"   # linked from the web UI's usage page
 
 [telemetry.otlp_headers]
 # Authorization = "Basic ..."   # prefer the vault secret instead
