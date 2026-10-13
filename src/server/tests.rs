@@ -651,14 +651,21 @@ async fn ui_admin_endpoints() {
 
     // Preview an unsaved policy: the resolved names, and who wins shared names.
     let draft = json!({"name": "", "providers": ["claude", "opencode-go"], "winners": {"claude-haiku-5-5": "opencode-go"}});
-    let (status, view) = h.call("POST", "/admin/policies/preview", Some(&h.admin), Some(draft)).await;
+    let (status, view) = h.call("POST", "/admin/policy-preview", Some(&h.admin), Some(draft)).await;
     assert_eq!(status, 200, "{view}");
     let haiku = view["models"].as_array().unwrap().iter().find(|m| m["name"] == "claude-haiku-5-5").unwrap();
     assert_eq!(haiku["targets"], json!(["opencode-go/claude-haiku-5-5"]));
     assert_eq!(view["shared"], json!([{"model": "claude-haiku-5-5", "providers": ["claude", "opencode-go"], "winner": "opencode-go"}]));
-    let (status, err) = h.call("POST", "/admin/policies/preview", Some(&h.admin), Some(json!({"name": "x", "providers": ["nope"]}))).await;
+    let (status, err) = h.call("POST", "/admin/policy-preview", Some(&h.admin), Some(json!({"name": "x", "providers": ["nope"]}))).await;
     assert_eq!(status, 400);
     assert!(err["error"]["message"].as_str().unwrap().contains("unknown provider"));
+
+    // `preview` is an ordinary policy name.
+    let preview = json!({"name": "preview", "providers": ["*"]});
+    assert_eq!(h.call("PUT", "/admin/policies/preview", Some(&h.admin), Some(preview)).await.0, 200);
+    assert_eq!(h.call("GET", "/admin/policies/preview", Some(&h.admin), None).await.0, 200);
+    assert_eq!(h.call("GET", "/admin/policies/preview/view", Some(&h.admin), None).await.0, 200);
+    assert_eq!(h.call("DELETE", "/admin/policies/preview", Some(&h.admin), None).await.0, 200);
 
     // The UI page is public (the API behind it is not), with a strict CSP.
     let resp = router(h.state.clone()).oneshot(Request::builder().uri("/").body(Body::empty()).unwrap()).await.unwrap();

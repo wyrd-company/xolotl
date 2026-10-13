@@ -163,7 +163,7 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
   const debounced = useDebounced(policy, 400);
   const preview = useQuery({
     queryKey: ["policy-view", debounced],
-    queryFn: () => post<PolicyView>("/admin/policies/preview", debounced),
+    queryFn: () => post<PolicyView>("/admin/policy-preview", debounced),
     enabled: debounced.providers.length > 0,
     placeholderData: (prev) => prev,
     retry: false,

@@ -19,8 +19,9 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/policies", get(list_policies))
         .route("/policies/{name}", get(get_policy).put(put_policy).delete(delete_policy))
-        .route("/policies/preview", post(preview_policy))
         .route("/policies/{name}/view", get(policy_view))
+        // Not under /policies/: `preview` is a valid policy name.
+        .route("/policy-preview", post(preview_policy))
         .route("/catalog", get(catalog))
         .route("/catalog/routes", get(catalog_routes))
         .route("/catalog/refresh", post(refresh_catalog))

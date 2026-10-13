@@ -44,31 +44,50 @@ struct Session {
     expires: Instant,
 }
 
-/// Live sessions (keyed by the SHA-256 of the cookie value) and failed
-/// sign-in attempts per client address.
+/// Sessions keyed by the SHA-256 of the cookie value, and the password
+/// generation they were created under.
+#[derive(Default)]
+struct Live {
+    /// Bumped by every password change, together with clearing `sessions`.
+    generation: u64,
+    sessions: HashMap<String, Session>,
+}
+
+/// Live sessions and failed sign-in attempts per client address.
 #[derive(Default)]
 pub struct Sessions {
-    live: Mutex<HashMap<String, Session>>,
+    live: Mutex<Live>,
     failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
 }
 
 impl Sessions {
-    /// Start a session: (cookie value, CSRF token).
-    fn create(&self) -> (String, String) {
+    /// The current password generation. A sign-in reads it before reading
+    /// the password hash and passes it to [`Sessions::create`].
+    fn generation(&self) -> u64 {
+        self.live.lock().generation
+    }
+
+    /// Start a session: (cookie value, CSRF token). `None` if the password
+    /// changed since `generation` was read, so a sign-in checked against
+    /// the old password can't outlive the change.
+    fn create(&self, generation: u64) -> Option<(String, String)> {
+        let mut live = self.live.lock();
+        if live.generation != generation {
+            return None;
+        }
         let id = random_id(43);
         let csrf = random_id(32);
-        let mut live = self.live.lock();
         let now = Instant::now();
-        live.retain(|_, s| s.expires > now);
-        live.insert(sha256_hex(&id), Session { csrf: csrf.clone(), expires: now + SESSION_TTL });
-        (id, csrf)
+        live.sessions.retain(|_, s| s.expires > now);
+        live.sessions.insert(sha256_hex(&id), Session { csrf: csrf.clone(), expires: now + SESSION_TTL });
+        Some((id, csrf))
     }
 
     /// The CSRF token of the session named by the request's cookie.
     fn csrf(&self, headers: &HeaderMap) -> Option<String> {
         let id = cookie(headers, COOKIE)?;
         let live = self.live.lock();
-        live.get(&sha256_hex(&id)).filter(|s| s.expires > Instant::now()).map(|s| s.csrf.clone())
+        live.sessions.get(&sha256_hex(&id)).filter(|s| s.expires > Instant::now()).map(|s| s.csrf.clone())
     }
 
     /// The admin principal for a request with a live session cookie and its CSRF token.
@@ -81,13 +100,16 @@ impl Sessions {
 
     fn remove(&self, headers: &HeaderMap) {
         if let Some(id) = cookie(headers, COOKIE) {
-            self.live.lock().remove(&sha256_hex(&id));
+            self.live.lock().sessions.remove(&sha256_hex(&id));
         }
     }
 
-    /// End every session, e.g. after a password change.
-    pub fn clear(&self) {
-        self.live.lock().clear();
+    /// The password changed: end every session, and refuse sessions from
+    /// sign-ins that started before.
+    fn password_changed(&self) {
+        let mut live = self.live.lock();
+        live.generation += 1;
+        live.sessions.clear();
     }
 
     /// Seconds left in a lockout of `ip`, if any.
@@ -190,6 +212,8 @@ async fn login(State(s): State<AppState>, req: Request) -> Response {
     if let Some(secs) = s.sessions.locked(ip) {
         return json_error(StatusCode::TOO_MANY_REQUESTS, format!("too many failed attempts; try again in {} min", secs.div_ceil(60)));
     }
+    // Before reading the hash, so a password change after this point voids the sign-in.
+    let generation = s.sessions.generation();
     let hash = match stored_hash(&s).await {
         Ok(Some(h)) => h,
         Ok(None) => return json_error(StatusCode::CONFLICT, "no UI password is set; run `xolotl ui set-password`"),
@@ -202,7 +226,9 @@ async fn login(State(s): State<AppState>, req: Request) -> Response {
         return json_error(StatusCode::UNAUTHORIZED, "wrong password");
     }
     s.sessions.succeed(ip);
-    let (id, csrf) = s.sessions.create();
+    let Some((id, csrf)) = s.sessions.create(generation) else {
+        return json_error(StatusCode::CONFLICT, "the password changed while signing in; sign in again");
+    };
     tracing::info!(%ip, "UI sign-in");
     let mut resp = Json(json!({"authenticated": true, "csrf_token": csrf})).into_response();
     resp.headers_mut().insert(header::SET_COOKIE, set_cookie(&headers, &id, SESSION_TTL.as_secs()));
@@ -244,7 +270,7 @@ async fn set_password(State(s): State<AppState>, h: HeaderMap, Json(req): Json<P
         data.insert(HASH_FIELD.into(), Value::String(req.password_hash.clone()));
         match s.secrets.put_cas("admin", data, version).await {
             Ok(_) => {
-                s.sessions.clear();
+                s.sessions.password_changed();
                 tracing::info!("UI password changed");
                 return Json(json!({"stored": true})).into_response();
             }
@@ -275,6 +301,23 @@ mod tests {
         h.append(header::COOKIE, HeaderValue::from_static("a=1; xolotl_session=abc"));
         assert_eq!(cookie(&h, COOKIE).as_deref(), Some("abc"));
         assert_eq!(cookie(&h, "b"), None);
+    }
+
+    #[test]
+    fn password_change_voids_sessions_and_sign_ins_in_flight() {
+        let s = Sessions::default();
+        let (id, csrf) = s.create(s.generation()).unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, HeaderValue::from_str(&format!("{COOKIE}={id}")).unwrap());
+        h.insert(CSRF_HEADER, HeaderValue::from_str(&csrf).unwrap());
+        assert!(s.principal(&h).is_some());
+
+        // A sign-in read the generation (and then the old hash); the password changes before it finishes.
+        let before = s.generation();
+        s.password_changed();
+        assert!(s.principal(&h).is_none(), "existing sessions end");
+        assert!(s.create(before).is_none(), "the in-flight sign-in gets no session");
+        assert!(s.create(s.generation()).is_some(), "a sign-in after the change works");
     }
 
     #[test]
