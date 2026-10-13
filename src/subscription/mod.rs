@@ -1088,8 +1088,7 @@ impl Subscriptions {
                 anyhow::ensure!(Instant::now() < deadline, "device login timed out");
                 tokio::time::sleep(Duration::from_secs(interval)).await;
                 match grok::poll_device(&self.http, &dc).await? {
-                    grok::DevicePoll::Pending => {}
-                    grok::DevicePoll::SlowDown => interval = (interval + 5).min(60),
+                    poll @ (grok::DevicePoll::Pending | grok::DevicePoll::SlowDown) => interval = grok::next_interval(interval, &poll),
                     grok::DevicePoll::Done(tr) => {
                         let mut cred = Credential::default();
                         grok::apply_tokens(&mut cred, tr);

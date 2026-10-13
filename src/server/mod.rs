@@ -298,7 +298,13 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
                     send(state, target, upstream.path(), translated_headers(&fwd, upstream), body, client_id.as_deref(), &model).await;
                 (resp, Some(t))
             }
-            _ => (send(state, target, path, fwd.clone(), json.clone(), client_id.as_deref(), &model).await, None),
+            _ => {
+                let resp = send(state, target, path, fwd.clone(), json.clone(), client_id.as_deref(), &model).await;
+                let streams = json.get("stream").and_then(Value::as_bool).unwrap_or(false);
+                let grok = pool(&target.provider) == Some(SubProvider::Grok);
+                let resp = if grok && wire == Some(Wire::Responses) && !streams { collect_grok(resp).await } else { resp };
+                (resp, None)
+            }
         };
         let status = resp.status().as_u16();
         if i < last && (status == 429 || status >= 500) {
@@ -311,6 +317,29 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
         };
     }
     unreachable!("loop returns on the last target")
+}
+
+/// Grok's proxy only streams: answer a Responses client that didn't ask to
+/// stream with the collected JSON body. Translated requests are collected
+/// by the translation instead.
+async fn collect_grok(resp: Response) -> Response {
+    let sse = resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.starts_with("text/event-stream"));
+    if !resp.status().is_success() || !sse {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => return proxy::error_response(StatusCode::BAD_GATEWAY, "api_error", format!("reading upstream stream: {e}")),
+    };
+    match crate::subscription::grok::collect_response(&bytes) {
+        Ok(v) => {
+            parts.headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+            parts.headers.remove(header::CONTENT_LENGTH);
+            Response::from_parts(parts, Body::from(v.to_string()))
+        }
+        Err(msg) => proxy::error_response(StatusCode::BAD_GATEWAY, "api_error", msg),
+    }
 }
 
 /// Send a JSON request to one target: a subscription pool or a gateway provider.
@@ -387,13 +416,17 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
         let (native, translated) = ts.first().map(|t| state.catalog.endpoints(&t.provider, &t.model)).unwrap_or_default();
         (json!(native), json!(translated))
     };
-    // The Grok CLI reads its own shape; every name reaches it over Responses,
-    // natively or through translation.
+    // The Grok CLI reads its own shape and speaks only Responses: list the
+    // names some target serves there, natively or through translation.
     if crate::subscription::grok::is_grok_shell(&headers) {
+        let responses = |ts: &Vec<Target>| {
+            ts.iter().any(|t| state.catalog.route(&t.provider, &t.model, Wire::Responses, Wire::Responses.path()).is_some())
+        };
         let data: Vec<Value> = view
             .names
-            .keys()
-            .map(|name| json!({"id": name, "model": name, "name": name, "api_backend": "responses", "supported_in_api": true}))
+            .iter()
+            .filter(|(_, ts)| responses(ts))
+            .map(|(name, _)| json!({"id": name, "model": name, "name": name, "api_backend": "responses", "supported_in_api": true}))
             .collect();
         return Json(json!({"object": "list", "data": data})).into_response();
     }

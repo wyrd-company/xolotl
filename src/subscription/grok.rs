@@ -16,6 +16,7 @@ use super::{Credential, Failure, RefreshError, SubProvider};
 use crate::config::Endpoints;
 use crate::db::now;
 use crate::proxy::set_header;
+use crate::translate::sse::SseParser;
 
 pub const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
@@ -164,7 +165,8 @@ pub async fn start_device(http: &reqwest::Client, ep: &Endpoints) -> anyhow::Res
         verification_url: s("verification_uri_complete")
             .or_else(|| s("verification_uri"))
             .ok_or_else(|| anyhow::anyhow!("missing verification_uri"))?,
-        interval: n("interval").unwrap_or(5).clamp(1, 60),
+        // RFC 8628 3.5: never poll faster than the server asks (default 5 s).
+        interval: n("interval").unwrap_or(5).max(1),
         expires_in: n("expires_in").unwrap_or(900),
         token_endpoint: d.token_endpoint,
     })
@@ -174,6 +176,15 @@ pub enum DevicePoll {
     Pending,
     SlowDown,
     Done(TokenResponse),
+}
+
+/// The wait before the next poll: `slow_down` adds five seconds for good
+/// (RFC 8628 3.5).
+pub fn next_interval(interval: u64, poll: &DevicePoll) -> u64 {
+    match poll {
+        DevicePoll::SlowDown => interval.saturating_add(5),
+        _ => interval,
+    }
 }
 
 /// One device-code poll (RFC 8628).
@@ -280,6 +291,43 @@ pub fn classify(status: u16, raw: &[u8], retry_after: Option<i64>) -> Failure {
         500 | 502 | 503 | 504 | 520..=527 => Failure::Transient { retry_after },
         _ => Failure::Fatal,
     }
+}
+
+// ------------------------------------------------------------ aggregation
+
+/// The proxy only streams. For a native Responses client that didn't ask to
+/// stream, rebuild the JSON body from the stream: the terminal event's `response`,
+/// with `output` filled from `output_item.done` events when it is empty.
+pub fn collect_response(sse: &[u8]) -> Result<Value, String> {
+    let mut parser = SseParser::default();
+    let mut events = parser.feed(sse);
+    events.extend(parser.end());
+    let mut items: Vec<(i64, Value)> = Vec::new();
+    let mut terminal = None;
+    for v in events.iter().filter_map(|e| e.json()) {
+        match v.get("type").and_then(Value::as_str) {
+            Some("response.output_item.done") => {
+                if let Some(item) = v.get("item") {
+                    let index = v.get("output_index").and_then(Value::as_i64).unwrap_or(items.len() as i64);
+                    items.push((index, item.clone()));
+                }
+            }
+            Some("response.completed" | "response.incomplete" | "response.failed") => terminal = v.get("response").cloned(),
+            Some("error") => {
+                let err = v.get("error").unwrap_or(&v);
+                let msg = err.get("message").and_then(Value::as_str).unwrap_or("upstream stream reported an error");
+                return Err(msg.to_string());
+            }
+            _ => {}
+        }
+    }
+    let mut response = terminal.filter(Value::is_object).ok_or("upstream stream ended without a response")?;
+    let has_output = response.get("output").and_then(Value::as_array).is_some_and(|o| !o.is_empty());
+    if !has_output && !items.is_empty() {
+        items.sort_by_key(|(i, _)| *i);
+        response["output"] = Value::Array(items.into_iter().map(|(_, item)| item).collect());
+    }
+    Ok(response)
 }
 
 // ------------------------------------------------------------ keepalive
@@ -435,6 +483,36 @@ mod tests {
         assert_eq!(c(429, "{}"), Failure::Transient { retry_after: None });
         assert_eq!(c(503, "{}"), Failure::Transient { retry_after: None });
         assert_eq!(c(400, "{}"), Failure::Fatal);
+    }
+
+    #[test]
+    fn slow_down_keeps_adding_five_seconds() {
+        let slow = DevicePoll::SlowDown;
+        assert_eq!(next_interval(58, &slow), 63);
+        assert_eq!(next_interval(63, &slow), 68);
+        assert_eq!(next_interval(90, &DevicePoll::Pending), 90);
+        assert_eq!(next_interval(u64::MAX, &slow), u64::MAX);
+    }
+
+    #[test]
+    fn collects_a_streamed_response() {
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
+            ": keepalive\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"b\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"a\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1}}}\n\n",
+        );
+        let r = collect_response(sse.as_bytes()).unwrap();
+        assert_eq!(r["status"], "completed");
+        assert_eq!(r["output"][0]["id"], "a");
+        assert_eq!(r["output"][1]["id"], "b");
+        assert_eq!(r["usage"]["input_tokens"], 1);
+        // A completed response that carries its output keeps it.
+        let full = "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"id\":\"x\"}]}}\n\n";
+        assert_eq!(collect_response(full.as_bytes()).unwrap()["output"][0]["id"], "x");
+        assert!(collect_response(b"data: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n").unwrap_err().contains("boom"));
+        assert!(collect_response(b"data: {\"type\":\"response.created\"}\n\n").is_err());
     }
 
     #[test]

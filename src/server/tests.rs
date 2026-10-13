@@ -452,6 +452,60 @@ async fn grok_shell_gets_its_model_shape_limited_by_policy() {
     // Other clients keep the OpenAI shape.
     let (_, v) = h.call("GET", "/v1/models", Some(&key), None).await;
     assert_eq!(v["data"][0]["object"], "model");
+
+    // Names no target can serve on Responses are left out.
+    let key = h.key(policy("all")).await;
+    let auth = format!("Bearer {key}");
+    let (_, v) = h.call_with("GET", "/v1/models", &[("authorization", &auth), ua], None).await;
+    let ids: Vec<&str> = v["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+    for id in ["claude-opus-5", "claude-haiku-5-5"] {
+        assert!(!ids.contains(&id), "{id} belongs to the Claude pool, which serves only /v1/messages: {ids:?}");
+    }
+    for id in ["grok-build", "gpt-6-codex", "qwen3", "kimi-k3"] {
+        assert!(ids.contains(&id), "{id} reaches Responses natively or translated: {ids:?}");
+    }
+}
+
+#[tokio::test]
+async fn native_responses_clients_get_json_unless_they_stream() {
+    let h = harness().await;
+    h.account(Credential {
+        provider: SubProvider::Grok,
+        access_token: "xai-tok".into(),
+        refresh_token: Some("rt".into()),
+        expires_at: Some(now() + 3600),
+        account_id: Some("sub-1".into()),
+        ..Default::default()
+    })
+    .await;
+    let stream = [
+        json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+        json!({"type": "keepalive"}),
+        json!({"type": "response.output_item.done", "output_index": 0, "item": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi there"}]}}),
+        json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed", "output": [], "usage": {"input_tokens": 4, "output_tokens": 2}}}),
+    ]
+    .iter()
+    .map(|e| format!("data: {e}\n\n"))
+    .collect::<String>();
+    Mock::given(method("POST"))
+        .and(path("/grok/v1/responses"))
+        .and(body_partial_json(json!({"stream": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream"))
+        .mount(&h.upstream)
+        .await;
+    let key = h.key(policy("p")).await;
+    for body in [json!({"model": "grok-build", "input": "hi"}), json!({"model": "grok-build", "input": "hi", "stream": false})] {
+        let (status, out) = h.call("POST", "/v1/responses", Some(&key), Some(body.clone())).await;
+        assert_eq!(status, 200, "{out}");
+        assert!(out.is_object(), "JSON for {body}: {out}");
+        assert_eq!(out["id"], "resp_1");
+        assert_eq!(out["output"][0]["content"][0]["text"], "hi there", "{out}");
+    }
+    let (status, out) =
+        h.call("POST", "/v1/responses", Some(&key), Some(json!({"model": "grok-build", "input": "hi", "stream": true}))).await;
+    assert_eq!(status, 200);
+    let text = out.as_str().unwrap();
+    assert!(text.contains("response.completed") && text.contains(": keepalive"), "{text}");
 }
 
 #[tokio::test]

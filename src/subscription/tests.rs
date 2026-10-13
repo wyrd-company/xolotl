@@ -656,7 +656,7 @@ async fn mount_grok_discovery(server: &MockServer) {
 }
 
 fn grok_body() -> Bytes {
-    Bytes::from(json!({"model": "grok-build", "input": [], "include": ["reasoning.encrypted_content"]}).to_string())
+    Bytes::from(json!({"model": "grok-build", "input": [], "stream": true, "include": ["reasoning.encrypted_content"]}).to_string())
 }
 
 const GROK_SSE: &str = "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: keepalive\ndata: {\"type\":\"keepalive\",\"ts\":1}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"keepalive\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":2}}}\n\n";
@@ -710,6 +710,24 @@ async fn grok_device_login_saves_account_by_subject() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     panic!("device flow did not complete: {:?}", subs.flow_status(&start.flow_id));
+}
+
+#[tokio::test]
+async fn grok_device_interval_is_never_shortened() {
+    let server = MockServer::start().await;
+    let (_, _) = setup(&server, Strategy::FillFirst).await;
+    mount_grok_discovery(&server).await;
+    Mock::given(path("/oauth2/device/code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "device_code": "d", "user_code": "u", "verification_uri": "https://accounts.x.ai/device", "interval": 90,
+        })))
+        .mount(&server)
+        .await;
+    let ep = Endpoints { grok_auth: server.uri(), ..Default::default() };
+    let http = crate::proxy::upstream_client(std::time::Duration::from_secs(30)).unwrap();
+    let dc = grok::start_device(&http, &ep).await.unwrap();
+    assert_eq!(dc.interval, 90);
+    assert_eq!(grok::next_interval(dc.interval, &grok::DevicePoll::SlowDown), 95);
 }
 
 #[tokio::test]

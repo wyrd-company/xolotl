@@ -70,9 +70,10 @@ Codex can report a quota error as the first events of a `200` SSE stream. Xolotl
   - Requests that don't come from Claude Code get Claude Code's identifying headers.
 - **Grok:** requests go to xAI's CLI chat proxy (`cli-chat-proxy.grok.com/v1/responses`), which only serves streaming Responses. Messages and Chat clients reach it through translation; `/responses/compact` is not served.
   - Xolotl owns the identity headers (`x-xai-token-auth`, `x-grok-client-identifier`, `x-authenticateresponse`, `x-grok-client-version`, `user-agent`) and drops the client's copies. A Grok CLI client (`grok-shell` user agent) keeps its own version and user agent; anyone else sends `catalog.grok_client_version`. An upstream 426 reaches the client as a 426 naming the version that was sent.
-  - Forces `stream: true` and removes `previous_response_id`, `stop` and other parameters the proxy rejects. Without an `x-grok-conv-id` header, `prompt_cache_key` becomes the conversation id.
+  - Forces `stream: true` and removes `previous_response_id`, `stop` and other parameters the proxy rejects. A Responses client that didn't ask to stream gets the stream collected into one JSON body (the terminal event's `response`, with `output` filled from `output_item.done` events when empty); translated clients are collected by the translation. Without an `x-grok-conv-id` header, `prompt_cache_key` becomes the conversation id.
   - The proxy sends `{"type":"keepalive"}` events. They are rewritten to SSE comments (`: keepalive`) for every client, so no client or translator sees them as events.
-  - The model roster comes from the proxy's `/v1/models`; `catalog.static_models.grok` fills in when that fails. No usage endpoint is known, so Grok accounts have no usage windows; only 429 cooldowns apply.
+  - The model roster comes from the proxy's `/v1/models`; `catalog.static_models.grok` fills in when that fails. The Grok CLI's `/v1/models` lists only names some target can serve on Responses, so Claude subscription models are left out.
+  - Device-code polling never goes faster than the issuer's `interval`, and each `slow_down` adds five seconds (RFC 8628 3.5). No usage endpoint is known, so Grok accounts have no usage windows; only 429 cooldowns apply.
 - **OpenCode Go:** the API key is sent as Bearer (plus `x-api-key` on Messages). Any path is accepted, which is what the `/opencode-go/<path>` passthrough relies on.
 
 ## Usage
