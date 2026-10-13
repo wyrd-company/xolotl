@@ -598,6 +598,52 @@ async fn ui_session_needs_password_cookie_and_csrf() {
 }
 
 #[tokio::test]
+async fn ui_sign_in_checked_against_a_replaced_password_gets_no_session() {
+    use crate::secrets::SecretStore;
+    let h = harness().await;
+    let gated = Arc::new(crate::secrets::testing::GatedStore::default());
+    let old = session::hash_password("correct horse battery").unwrap();
+    gated.inner.put("admin", json!({"token": "boot", "ui_password_hash": old}).as_object().unwrap().clone()).await.unwrap();
+    let mut state = h.state.clone();
+    state.secrets = gated.clone();
+
+    // The sign-in reads the old hash, then pauses before checking it.
+    gated.arm("got", "admin");
+    let login = tokio::spawn(
+        router(state.clone()).oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/session")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"password": "correct horse battery"}).to_string()))
+                .unwrap(),
+        ),
+    );
+    gated.reached.notified().await;
+
+    // Meanwhile the password changes.
+    let new = session::hash_password("another long password").unwrap();
+    let change = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/ui/password")
+                .header("authorization", "Bearer boot")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"password_hash": new}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(change.status(), 200);
+
+    gated.release.notify_one();
+    let resp = login.await.unwrap().unwrap();
+    assert_eq!(resp.status(), 409);
+    assert!(resp.headers().get("set-cookie").is_none(), "no session for the old password");
+}
+
+#[tokio::test]
 async fn ui_logout_and_lockout() {
     let h = harness().await;
     let hash = session::hash_password("correct horse battery").unwrap();
