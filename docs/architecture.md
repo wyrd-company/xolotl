@@ -31,8 +31,8 @@ clients (Claude Code, Codex CLI, SDKs, T3Code hubs, xolotl CLI)
 
 1. `authorize` takes the key from `Authorization` (Bearer or bare), `x-api-key` or `x-management-key`, and resolves it to a principal: client id plus policy. The bootstrap admin token resolves to an unrestricted policy.
 2. The route checks the scope it needs (`proxy`, `management` or `admin`).
-3. LLM endpoints resolve `model` through the policy and dispatch to a pool or a gateway provider ([Routing](routing.md)). Passthroughs check only the provider (and `model`, when the body is JSON).
-4. Responses are relayed as they arrive. `TapStream` (`src/proxy.rs`) reads token usage from the JSON or SSE body on the way through, and `Accounting` writes the request log row and metrics when the response finishes.
+3. LLM endpoints resolve `model` through the policy and dispatch to a pool or a gateway provider, translating the request when the provider doesn't speak the endpoint's format ([Routing](routing.md)). Passthroughs check only the provider (and `model`, when the body is JSON).
+4. Responses are relayed as they arrive. `TapStream` (`src/proxy.rs`) reads token usage from the upstream JSON or SSE body on the way through, and `Accounting` writes the request log row and metrics when the response finishes. A translated response is translated after this tap, so usage always comes from what the upstream sent.
 
 ## Background tasks
 
@@ -62,11 +62,12 @@ On graceful shutdown the server makes one last attempt to save unsaved credentia
 | `src/server/admin.rs` | `/admin` API used by the CLI |
 | `src/server/management.rs` | T3Code hubs endpoints (`/v0/management/*`) |
 | `src/policy.rs` | Policies and model-name resolution |
-| `src/catalog.rs` | Model catalog and wire formats |
+| `src/catalog.rs` | Model catalog, wire formats and routes (native or translated) |
 | `src/keys.rs` | Client keys and policy storage |
 | `src/subscription/` | Account pools: `mod.rs` (selection, failover, refresh), `codex.rs`, `claude.rs`, `opencode_go.rs`, `oauth.rs` (PKCE, token errors) |
 | `src/gateway.rs` | Gateway providers |
 | `src/proxy.rs` | Header filtering, streaming relay, token usage, error shapes |
+| `src/translate/` | Translation between Messages, Responses and Chat: requests, responses and streams |
 | `src/db.rs`, `migrations/` | SQLite |
 | `src/vault.rs`, `src/secrets.rs` | OpenBao client and the `SecretStore` trait |
 | `src/telemetry.rs` | OpenTelemetry setup and metrics |

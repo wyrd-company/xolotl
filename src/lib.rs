@@ -12,4 +12,5 @@ pub mod secrets;
 pub mod server;
 pub mod subscription;
 pub mod telemetry;
+pub mod translate;
 pub mod vault;

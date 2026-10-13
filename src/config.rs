@@ -362,6 +362,12 @@ impl Config {
                 anyhow::ensure!(p.base_url.is_some(), "provider {name:?}: openai-compatible providers need base_url");
             }
         }
+        for key in self.catalog.wires.keys() {
+            anyhow::ensure!(
+                key != "claude" && !key.starts_with("claude/"),
+                "catalog.wires.{key:?}: Claude subscription accounts serve only /v1/messages; their wire formats can't be overridden"
+            );
+        }
         anyhow::ensure!(self.subscription.max_attempts >= 1, "subscription.max_attempts must be >= 1");
         anyhow::ensure!(matches!(self.telemetry.log_format.as_str(), "pretty" | "json"), "telemetry.log_format must be pretty or json");
         Ok(())
@@ -393,6 +399,17 @@ mod tests {
             assert!(!out.contains(&format!("\"{secret}\"")), "{secret} leaked:\n{out}");
         }
         assert!(out.contains("/run/secret_id"), "file paths are not secret");
+    }
+
+    #[test]
+    fn rejects_wire_overrides_for_claude_accounts() {
+        for key in ["claude", "\"claude/claude-opus-5\""] {
+            let cfg: Config = toml::from_str(&format!("[catalog.wires]\n{key} = [\"chat\"]\n")).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("/v1/messages"), "{err}");
+        }
+        let cfg: Config = toml::from_str("[catalog.wires]\nllamacpp = [\"chat\", \"messages\"]\n").unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

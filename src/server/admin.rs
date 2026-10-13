@@ -102,10 +102,12 @@ async fn policy_view(State(s): State<AppState>, h: HeaderMap, Path(name): Path<S
         .iter()
         .map(|(name, targets)| {
             let first = &targets[0];
+            let (native, translated) = s.catalog.endpoints(&first.provider, &first.model);
             json!({
                 "name": name,
                 "targets": targets.iter().map(|t| t.qualified()).collect::<Vec<_>>(),
-                "endpoints": s.catalog.wires(&first.provider, &first.model).iter().map(|w| w.path()).collect::<Vec<_>>(),
+                "endpoints": native,
+                "translated_endpoints": translated,
                 "alias": policy.aliases.contains_key(name),
             })
         })

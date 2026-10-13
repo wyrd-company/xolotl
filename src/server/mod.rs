@@ -19,7 +19,7 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use tower_http::trace::TraceLayer;
 
-use crate::catalog::{ModelCatalog, Wire};
+use crate::catalog::{ModelCatalog, Route, Wire};
 use crate::config::Config;
 use crate::db::Db;
 use crate::gateway::Gateway;
@@ -28,6 +28,7 @@ use crate::policy::{Target, View};
 use crate::proxy::{self, forward_request_headers};
 use crate::secrets::Secrets;
 use crate::subscription::{SubProvider, Subscriptions};
+use crate::translate;
 use crate::vault::VaultClient;
 
 #[derive(Clone)]
@@ -231,7 +232,9 @@ fn pool(provider: &str) -> Option<SubProvider> {
 }
 
 /// Route a JSON request by its `model` through the caller's policy view,
-/// trying an alias's targets in order (falling back on 429 / 5xx).
+/// trying an alias's targets in order (falling back on 429 / 5xx). A target
+/// whose provider doesn't speak the endpoint's format is reached through
+/// translation.
 async fn route_json(state: &AppState, principal: Principal, path: &str, headers: HeaderMap, body: Bytes) -> Response {
     let anthropic = path.starts_with("/v1/messages");
     let err = |status: StatusCode, kind: &str, msg: String| {
@@ -249,10 +252,10 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
         return err(StatusCode::NOT_FOUND, "not_found_error", format!("model {model:?} is not available to this key"));
     };
 
-    // Without format translation, only targets that speak this endpoint's format qualify.
     let wire = Wire::for_path(path);
+    let route = |t: &Target| wire.and_then(|w| state.catalog.route(&t.provider, &t.model, w, path));
     let (usable, unusable): (Vec<Target>, Vec<Target>) = targets.into_iter().partition(|t| match wire {
-        Some(w) => state.catalog.wires(&t.provider, &t.model).contains(&w),
+        Some(_) => route(t).is_some(),
         // Pools only serve the LLM endpoints.
         None => pool(&t.provider).is_none(),
     });
@@ -271,23 +274,66 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
     let client_id = principal.client_id().map(str::to_string);
     let last = usable.len() - 1;
     for (i, target) in usable.iter().enumerate() {
-        let resp = match pool(&target.provider) {
-            Some(p) => {
-                let mut b = json.clone();
-                b["model"] = Value::String(target.model.clone());
-                let bytes = Bytes::from(serde_json::to_vec(&b).unwrap_or_default());
-                state.subs.execute(p, Method::POST, path, fwd.clone(), bytes, client_id.as_deref(), Some(&model)).await
+        let (resp, translation) = match (wire, route(target)) {
+            (Some(client), Some(Route::Translated(upstream))) => {
+                let (body, t) = match translate::request(client, upstream, &json, &target.model) {
+                    Ok(x) => x,
+                    Err(msg) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", msg),
+                };
+                let resp =
+                    send(state, target, upstream.path(), translated_headers(&fwd, upstream), body, client_id.as_deref(), &model).await;
+                (resp, Some(t))
             }
-            None => state.gateway.execute(target, Method::POST, path, fwd.clone(), json.clone(), client_id.as_deref(), &model).await,
+            _ => (send(state, target, path, fwd.clone(), json.clone(), client_id.as_deref(), &model).await, None),
         };
         let status = resp.status().as_u16();
         if i < last && (status == 429 || status >= 500) {
             tracing::info!(target = %target.qualified(), status, "falling back to next alias target");
             continue;
         }
-        return resp;
+        return match translation {
+            Some(t) => t.response(resp).await,
+            None => resp,
+        };
     }
     unreachable!("loop returns on the last target")
+}
+
+/// Send a JSON request to one target: a subscription pool or a gateway provider.
+async fn send(
+    state: &AppState,
+    target: &Target,
+    path: &str,
+    headers: HeaderMap,
+    mut body: Value,
+    client_id: Option<&str>,
+    model: &str,
+) -> Response {
+    match pool(&target.provider) {
+        Some(p) => {
+            body["model"] = Value::String(target.model.clone());
+            let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
+            state.subs.execute(p, Method::POST, path, headers, bytes, client_id, Some(model)).await
+        }
+        None => state.gateway.execute(target, Method::POST, path, headers, body, client_id, model).await,
+    }
+}
+
+/// Client headers for a translated request: those of the client's own format
+/// and content negotiation don't apply upstream.
+fn translated_headers(fwd: &HeaderMap, upstream: Wire) -> HeaderMap {
+    let mut h = HeaderMap::with_capacity(fwd.len());
+    for (k, v) in fwd {
+        let name = k.as_str();
+        if name == "accept" || (upstream != Wire::Messages && name.starts_with("anthropic-")) {
+            continue;
+        }
+        h.append(k.clone(), v.clone());
+    }
+    if upstream == Wire::Messages && !h.contains_key("anthropic-version") {
+        h.insert("anthropic-version", header::HeaderValue::from_static("2023-06-01"));
+    }
+    h
 }
 
 async fn llm(State(state): State<AppState>, req: Request, path: &'static str) -> Response {
@@ -313,20 +359,30 @@ async fn llm_dynamic(state: AppState, req: Request, path: &str) -> Response {
     route_json(&state, principal, path, parts.headers, body).await
 }
 
-/// The caller's model list. With `anthropic-version` (Claude Code), only
-/// names reachable over `/v1/messages`, in Anthropic's shape.
+/// The caller's model list, in Anthropic's shape when the request carries
+/// `anthropic-version` (Claude Code). Each entry names the endpoints its first
+/// target is served on natively and through translation.
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let principal = match authorize(&state, &headers, Scope::Proxy).await {
         Ok(p) => p,
         Err(r) => return r,
     };
     let view = state.view(&principal);
+    let endpoints = |ts: &Vec<Target>| {
+        let (native, translated) = ts.first().map(|t| state.catalog.endpoints(&t.provider, &t.model)).unwrap_or_default();
+        (json!(native), json!(translated))
+    };
     if headers.contains_key("anthropic-version") {
         let data: Vec<Value> = view
             .names
             .iter()
-            .filter(|(_, ts)| ts.iter().any(|t| state.catalog.wires(&t.provider, &t.model).contains(&Wire::Messages)))
-            .map(|(name, _)| json!({"id": name, "type": "model", "display_name": name, "created_at": "1970-01-01T00:00:00Z"}))
+            .map(|(name, ts)| {
+                let (native, translated) = endpoints(ts);
+                json!({
+                    "id": name, "type": "model", "display_name": name, "created_at": "1970-01-01T00:00:00Z",
+                    "endpoints": native, "translated_endpoints": translated,
+                })
+            })
             .collect();
         let first = data.first().map(|m| m["id"].clone()).unwrap_or(Value::Null);
         let last = data.last().map(|m| m["id"].clone()).unwrap_or(Value::Null);
@@ -335,7 +391,13 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let data: Vec<Value> = view
         .names
         .iter()
-        .map(|(name, ts)| json!({"id": name, "object": "model", "owned_by": ts.first().map(|t| t.provider.as_str()).unwrap_or("")}))
+        .map(|(name, ts)| {
+            let (native, translated) = endpoints(ts);
+            json!({
+                "id": name, "object": "model", "owned_by": ts.first().map(|t| t.provider.as_str()).unwrap_or(""),
+                "endpoints": native, "translated_endpoints": translated,
+            })
+        })
         .collect();
     Json(json!({"object": "list", "data": data})).into_response()
 }
