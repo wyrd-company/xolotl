@@ -70,7 +70,8 @@ bao write auth/approle/role/xolotl token_policies=xolotl token_ttl=1h token_max_
 bao read -field=role_id auth/approle/role/xolotl/role-id
 bao write -f -field=secret_id auth/approle/role/xolotl/secret-id
 
-# Bootstrap admin token (used by the CLI)
+# Bootstrap admin token (used by the CLI). Later changes: `bao kv patch`, so the
+# web UI's password hash in the same secret is kept.
 bao kv put secret/xolotl/admin token="$(openssl rand -base64 32)"
 # Optional: OTLP headers for OpenObserve
 bao kv put secret/xolotl/telemetry Authorization="Basic ..."
@@ -78,7 +79,7 @@ bao kv put secret/xolotl/telemetry Authorization="Basic ..."
 
 | Path (under the prefix) | Contents |
 |---|---|
-| `admin` | `token`: bootstrap admin token |
+| `admin` | `token`: bootstrap admin token; `ui_password_hash`: web UI password (argon2id) |
 | `telemetry` | OTLP header values |
 | `providers/<name>` | `api_key` for gateway providers |
 | `accounts/<provider>/<id>` | OAuth tokens / API key for subscription accounts (rewritten on refresh) |
@@ -99,7 +100,17 @@ docker run -d --name xolotl -p 8317:8317 \
 
 `GET /healthz` is liveness and `GET /readyz` checks SQLite and OpenBao.
 
-### 3. Administer with the CLI
+### 3. Administer in the browser
+
+Set a password, then open `http://xolotl:8317/`:
+
+```sh
+xolotl ui set-password   # hashed locally; only the argon2id hash is stored in OpenBao
+```
+
+The web UI covers what the CLI does: accounts and logins, policies (with a live preview of the names a key sees), client keys, provider keys and the model catalog, and usage. See [Web UI](docs/web-ui.md).
+
+### 4. Administer with the CLI
 
 The CLI talks to the server's admin API (`XOLOTL_URL`, default `http://127.0.0.1:8317`, and `XOLOTL_ADMIN_TOKEN`).
 
@@ -130,7 +141,7 @@ xolotl usage --group-by client --since 7d
 
 Imported tokens keep rotating on refresh. Stop using the same login in the local CLI afterwards, or one side ends up with a dead refresh token.
 
-### 4. Policies and client keys
+### 5. Policies and client keys
 
 Every client key belongs to a policy (see [`examples/policies/devcontainer.toml`](examples/policies/devcontainer.toml)):
 
@@ -154,7 +165,7 @@ export XOLOTL_API_KEY=$(bao kv get -field=api_key secret/xolotl/keys/devcontaine
 
 Revoking writes a marker as the latest version and destroys the earlier versions. Writes use check-and-set, so an instance with stale data can't overwrite a key changed elsewhere. Unknown keys trigger a reload (at most every 10 s), so keys issued by another instance work quickly.
 
-### 5. Point clients at it
+### 6. Point clients at it
 
 **Claude Code**
 
@@ -188,7 +199,8 @@ wire_api = "responses"
 | `/opencode-go/<path>` (any method) | OpenCode Go API through the account pool (load balancing, failover, usage) |
 | `/<provider>/<path>` (any method) | raw passthrough with the gateway provider's key, e.g. `POST /mistral/v1/ocr`, `/mistral/v1/batch/jobs`, `/mistral/v1/files`, `GET /vercel/v1/credits`, `/vercel/v1/generation?id=` |
 | `/v0/management/{auth-files,api-call,reset-quota}` | T3Code hubs (CLIProxyAPI-compatible) |
-| `/admin/...` | CLI |
+| `/admin/...` | CLI and web UI |
+| `/`, `/assets/...` | web UI |
 
 Passthroughs strip the client's credentials and inject the provider's. Models are reachable on all three LLM endpoints: a provider that speaks the endpoint's format gets the request as is, any other gets it translated between Anthropic Messages, OpenAI Responses and Chat Completions (Claude speaks Messages, Codex Responses, OpenCode Go per model, Vercel all three, others Chat; override with `[catalog.wires]`). So Claude Code can use Codex models, and Codex CLI can use Anthropic models served by Vercel or OpenCode Go. Claude subscription accounts are the exception: they serve only the Claude Code API path (`/v1/messages`) and are never translated. `count_tokens` and `/v1/responses/compact` are not translated either. Such requests get a 400 naming the endpoints the model is served on.
 
@@ -209,6 +221,11 @@ Set `telemetry.otlp_endpoint` (OpenObserve: `http://openobserve:5080/api/<org>`)
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
+
+# Web UI (Vite + React + Tailwind + shadcn/ui), in ui/
+pnpm install
+pnpm dev     # proxies /admin to a xolotl on 127.0.0.1:8317 (XOLOTL_URL)
+pnpm build   # ui/dist: embedded into release builds, read from disk by debug builds
 ```
 
 ### Releases

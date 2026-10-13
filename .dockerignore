@@ -1,3 +1,5 @@
 target
 .git
 .references
+ui/node_modules
+ui/dist
