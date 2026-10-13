@@ -373,9 +373,10 @@ async fn llm_dynamic(state: AppState, req: Request, path: &str) -> Response {
     route_json(&state, principal, path, parts.headers, body).await
 }
 
-/// The caller's model list, in Anthropic's shape when the request carries
-/// `anthropic-version` (Claude Code). Each entry names the endpoints its first
-/// target is served on natively and through translation.
+/// The caller's model list: in the Grok CLI's shape for `grok-shell` clients,
+/// in Anthropic's shape when the request carries `anthropic-version` (Claude
+/// Code). Each entry names the endpoints its first target is served on
+/// natively and through translation.
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let principal = match authorize(&state, &headers, Scope::Proxy).await {
         Ok(p) => p,
@@ -386,6 +387,16 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
         let (native, translated) = ts.first().map(|t| state.catalog.endpoints(&t.provider, &t.model)).unwrap_or_default();
         (json!(native), json!(translated))
     };
+    // The Grok CLI reads its own shape; every name reaches it over Responses,
+    // natively or through translation.
+    if crate::subscription::grok::is_grok_shell(&headers) {
+        let data: Vec<Value> = view
+            .names
+            .keys()
+            .map(|name| json!({"id": name, "model": name, "name": name, "api_backend": "responses", "supported_in_api": true}))
+            .collect();
+        return Json(json!({"object": "list", "data": data})).into_response();
+    }
     if headers.contains_key("anthropic-version") {
         let data: Vec<Value> = view
             .names

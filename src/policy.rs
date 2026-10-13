@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::keys::{Scope, glob_match};
 
 /// Default precedence before any gateway providers.
-pub const DEFAULT_PRECEDENCE: &[&str] = &["claude", "codex", "opencode-go"];
+pub const DEFAULT_PRECEDENCE: &[&str] = &["claude", "codex", "grok", "opencode-go"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
@@ -25,7 +25,7 @@ pub struct Policy {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
-    /// Provider names (`claude`, `codex`, `opencode-go`, gateway provider names); `*` allows all.
+    /// Provider names (`claude`, `codex`, `grok`, `opencode-go`, gateway provider names); `*` allows all.
     pub providers: Vec<String>,
     /// Globs matched against `model` or `provider/model`. Empty allows all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -363,7 +363,7 @@ mod example_tests {
         let raw = include_str!("../examples/policies/devcontainer.toml");
         let mut p: Policy = toml::from_str(raw).unwrap();
         p.normalize();
-        let known: BTreeSet<String> = ["claude", "codex", "opencode-go", "vercel"].iter().map(|s| s.to_string()).collect();
+        let known: BTreeSet<String> = ["claude", "codex", "grok", "opencode-go", "vercel"].iter().map(|s| s.to_string()).collect();
         p.validate(&known).unwrap();
         assert_eq!(p.aliases["fast"].list().len(), 2);
     }

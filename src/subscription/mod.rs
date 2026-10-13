@@ -1,9 +1,10 @@
-//! Subscription proxy: pools of OAuth (Codex, Claude) and API-key (OpenCode
+//! Subscription proxy: pools of OAuth (Codex, Claude, Grok) and API-key (OpenCode
 //! Go) accounts with token refresh, load balancing, cooldowns on quota
 //! exhaustion, failover, and usage tracking.
 
 pub mod claude;
 pub mod codex;
+pub mod grok;
 pub mod oauth;
 pub mod opencode_go;
 
@@ -33,7 +34,7 @@ use crate::telemetry::metrics;
 use oauth::{FlowKind, FlowStart, FlowStatus, Flows, TokenResponse};
 
 /// Names that gateway providers may not use; they address the pools.
-pub const RESERVED_PROVIDER_NAMES: &[&str] = &["codex", "claude", "opencode-go"];
+pub const RESERVED_PROVIDER_NAMES: &[&str] = &["codex", "claude", "opencode-go", "grok"];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -42,16 +43,18 @@ pub enum SubProvider {
     Codex,
     Claude,
     OpencodeGo,
+    Grok,
 }
 
 impl SubProvider {
-    pub const ALL: [SubProvider; 3] = [SubProvider::Codex, SubProvider::Claude, SubProvider::OpencodeGo];
+    pub const ALL: [SubProvider; 4] = [SubProvider::Codex, SubProvider::Claude, SubProvider::OpencodeGo, SubProvider::Grok];
 
     pub fn as_str(self) -> &'static str {
         match self {
             SubProvider::Codex => "codex",
             SubProvider::Claude => "claude",
             SubProvider::OpencodeGo => "opencode-go",
+            SubProvider::Grok => "grok",
         }
     }
 
@@ -88,7 +91,7 @@ pub struct Credential {
     pub expires_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// ChatGPT account id / Anthropic account uuid.
+    /// ChatGPT account id / Anthropic account uuid / xAI `sub`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,6 +203,8 @@ pub struct Subscriptions {
     /// The old refresh token is already spent, so these are retried until saved.
     unsaved: Mutex<HashSet<String>>,
     pub flows: Flows,
+    /// Sent to Grok's chat proxy (`catalog.grok_client_version`).
+    grok_client_version: String,
 }
 
 type CredLock = Arc<tokio::sync::Mutex<Credential>>;
@@ -225,7 +230,13 @@ impl Subscriptions {
             affinity: Mutex::new(HashMap::new()),
             unsaved: Mutex::new(HashSet::new()),
             flows: Flows::default(),
+            grok_client_version: crate::config::CatalogConfig::default().grok_client_version,
         }
+    }
+
+    pub fn with_grok_client_version(mut self, version: impl Into<String>) -> Self {
+        self.grok_client_version = version.into();
+        self
     }
 
     // ---------------------------------------------------------------- store
@@ -387,6 +398,7 @@ impl Subscriptions {
         let result = match cred.provider {
             SubProvider::Codex => codex::refresh(&self.http, ep, cred).await,
             SubProvider::Claude => claude::refresh(&self.http, ep, cred).await,
+            SubProvider::Grok => grok::refresh(&self.http, ep, cred).await,
             SubProvider::OpencodeGo => return Ok(()),
         };
         let provider = cred.provider.as_str();
@@ -396,6 +408,7 @@ impl Subscriptions {
                 match cred.provider {
                     SubProvider::Codex => codex::apply_tokens(cred, tr),
                     SubProvider::Claude => claude::apply_tokens(cred, tr),
+                    SubProvider::Grok => grok::apply_tokens(cred, tr),
                     SubProvider::OpencodeGo => {}
                 }
                 metrics().token_refreshes.add(1, &attrs("ok"));
@@ -578,6 +591,7 @@ impl Subscriptions {
             SubProvider::Codex => codex::upstream_url(ep, path),
             SubProvider::Claude => claude::upstream_url(ep, path),
             SubProvider::OpencodeGo => opencode_go::upstream_url(ep, path),
+            SubProvider::Grok => grok::upstream_url(ep, path),
         };
         let Some(url) = url else {
             return self.error_for(provider, path, StatusCode::NOT_FOUND, "not_found_error", &format!("{provider} does not serve {path}"));
@@ -587,6 +601,7 @@ impl Subscriptions {
             SubProvider::Codex => codex::session_key(&headers, body_json.as_ref().unwrap_or(&Value::Null)),
             SubProvider::Claude => claude::session_key(&headers, body_json.as_ref().unwrap_or(&Value::Null)),
             SubProvider::OpencodeGo => opencode_go::session_key(&headers),
+            SubProvider::Grok => grok::session_key(&headers, body_json.as_ref().unwrap_or(&Value::Null)),
         };
         let mut accounting = Accounting::new(self.db.clone(), provider.as_str(), path, client_id, model);
         let mut tried = HashSet::new();
@@ -628,6 +643,7 @@ impl Subscriptions {
                     SubProvider::Codex => codex::prepare(&mut h, &mut b, &cred, path),
                     SubProvider::Claude => claude::prepare(&mut h, &mut b, &cred, path),
                     SubProvider::OpencodeGo => opencode_go::prepare(&mut h, &mut b, &cred, path),
+                    SubProvider::Grok => grok::prepare(&mut h, &mut b, &cred, &self.grok_client_version),
                 }
                 let mut req = self.http.request(method.clone(), &url).headers(h);
                 if body_json.is_some() {
@@ -684,6 +700,14 @@ impl Subscriptions {
                         accounting.record.account_id = Some(account.id.clone());
                         return proxy::relay_sse(status, &resp_headers, prefix, stream, Some(accounting));
                     }
+                    if provider == SubProvider::Grok && proxy::is_sse(resp.headers()) {
+                        let _ = self.db.record_account_result(&account.id, None).await;
+                        self.pin_session(session.as_deref(), &account.id);
+                        accounting.record.account_id = Some(account.id.clone());
+                        let resp_headers = resp.headers().clone();
+                        let stream = grok::KeepaliveFilter::new(resp.bytes_stream().boxed()).boxed();
+                        return proxy::relay_sse(status, &resp_headers, Vec::new(), stream, Some(accounting));
+                    }
                     let _ = self.db.record_account_result(&account.id, None).await;
                     self.pin_session(session.as_deref(), &account.id);
                     accounting.record.account_id = Some(account.id.clone());
@@ -698,6 +722,7 @@ impl Subscriptions {
                     SubProvider::Codex => codex::classify(status, &val, ra),
                     SubProvider::Claude => claude::classify(status, &resp_headers, &val, ra),
                     SubProvider::OpencodeGo => opencode_go::classify(status, ra),
+                    SubProvider::Grok => grok::classify(status, &bytes, ra),
                 };
                 metrics()
                     .upstream_errors
@@ -706,6 +731,16 @@ impl Subscriptions {
                 if failure == Failure::Auth && force.is_none() && provider.uses_oauth() {
                     force = Some(cred.access_token.clone());
                     continue;
+                }
+                if provider == SubProvider::Grok && status == 426 {
+                    let version = grok::client_version(&headers, &self.grok_client_version);
+                    let _ = self.db.record_account_result(&account.id, Some("upstream status 426")).await;
+                    accounting.record.account_id = Some(account.id.clone());
+                    accounting.finish(426, Default::default());
+                    let msg = format!(
+                        "xAI rejected Grok client version {version} as too old (426); raise catalog.grok_client_version or update the Grok CLI"
+                    );
+                    return self.error_for(provider, path, StatusCode::UPGRADE_REQUIRED, "invalid_request_error", &msg);
                 }
                 if failure == Failure::Fatal {
                     let _ = self.db.record_account_result(&account.id, None).await;
@@ -771,7 +806,7 @@ impl Subscriptions {
         let windows = match provider {
             SubProvider::Codex => codex::windows_from_headers(h),
             SubProvider::Claude => claude::windows_from_headers(h),
-            SubProvider::OpencodeGo => Vec::new(),
+            SubProvider::OpencodeGo | SubProvider::Grok => Vec::new(),
         };
         if windows.is_empty() {
             return;
@@ -811,6 +846,10 @@ impl Subscriptions {
         let row = self.db.get_account(id).await?.with_context(|| format!("unknown account {id}"))?;
         let provider: SubProvider = row.provider.parse()?;
         let mut cred = self.credential(id, None).await?;
+        if provider == SubProvider::Grok {
+            // No known usage endpoint; the credential check above keeps the token fresh.
+            return Ok(AccountUsage { account_id: id.to_string(), fetched_at: now(), windows: Vec::new(), raw: None });
+        }
         let ep = &self.cfg.endpoints;
         let mut attempt = 0;
         let body: Value = loop {
@@ -818,6 +857,7 @@ impl Subscriptions {
                 SubProvider::Codex => codex::usage_request(&self.http, ep, &cred),
                 SubProvider::Claude => claude::usage_request(&self.http, ep, &cred),
                 SubProvider::OpencodeGo => opencode_go::usage_request(&self.http, ep, &cred),
+                SubProvider::Grok => unreachable!("returned above"),
             };
             let resp = req.timeout(Duration::from_secs(15)).send().await?;
             let status = resp.status();
@@ -834,6 +874,7 @@ impl Subscriptions {
             SubProvider::Codex => codex::parse_usage(&body),
             SubProvider::Claude => (claude::parse_usage(&body), None),
             SubProvider::OpencodeGo => (opencode_go::parse_usage(&body), None),
+            SubProvider::Grok => (Vec::new(), None),
         };
         if let Some(plan) = plan.filter(|p| row.plan.as_deref() != Some(p)) {
             let mut updated = row.clone();
@@ -891,6 +932,7 @@ impl Subscriptions {
             let req = match provider {
                 SubProvider::Claude => claude::models_request(&self.http, ep, &cred),
                 SubProvider::Codex => codex::models_request(&self.http, ep, &cred, codex_client_version),
+                SubProvider::Grok => grok::models_request(&self.http, ep, &cred, &self.grok_client_version),
                 SubProvider::OpencodeGo => {
                     self.http.get(format!("{}/v1/models", ep.opencode_go.trim_end_matches('/'))).bearer_auth(cred.bearer())
                 }
@@ -943,6 +985,7 @@ impl Subscriptions {
             SubProvider::Codex => vec![ep.codex_backend.clone()],
             SubProvider::Claude => vec![ep.claude_api.clone()],
             SubProvider::OpencodeGo => vec![ep.opencode_go.clone()],
+            SubProvider::Grok => vec![ep.grok_api.clone()],
         }
         .into_iter()
         // Scheme, host and port must all match a configured provider endpoint.
@@ -1018,8 +1061,45 @@ impl Subscriptions {
                 let flow_id = self.flows.insert(provider, FlowKind::Pkce { verifier: p.verifier, state, redirect_uri });
                 Ok(FlowStart { flow_id, provider, url, user_code: None, needs_code: true, instructions: instructions.into() })
             }
+            (SubProvider::Grok, _) => {
+                let dc = grok::start_device(&self.http, ep).await?;
+                let flow_id = self.flows.insert(provider, FlowKind::Device);
+                let start = FlowStart {
+                    flow_id: flow_id.clone(),
+                    provider,
+                    url: dc.verification_url.clone(),
+                    user_code: Some(dc.user_code.clone()),
+                    needs_code: false,
+                    instructions: "Open the URL, sign in to your xAI account and confirm the code.".into(),
+                };
+                let this = self.clone();
+                tokio::spawn(async move { this.run_grok_device_flow(flow_id, dc).await });
+                Ok(start)
+            }
             (SubProvider::OpencodeGo, _) => anyhow::bail!("opencode-go uses API keys; add one with `xolotl accounts add-key`"),
         }
+    }
+
+    async fn run_grok_device_flow(self: Arc<Self>, flow_id: String, dc: grok::DeviceCode) {
+        let deadline = Instant::now() + Duration::from_secs(dc.expires_in.clamp(60, 15 * 60));
+        let mut interval = dc.interval;
+        let outcome: Result<AccountRow> = async {
+            loop {
+                anyhow::ensure!(Instant::now() < deadline, "device login timed out");
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+                match grok::poll_device(&self.http, &dc).await? {
+                    grok::DevicePoll::Pending => {}
+                    grok::DevicePoll::SlowDown => interval = (interval + 5).min(60),
+                    grok::DevicePoll::Done(tr) => {
+                        let mut cred = Credential::default();
+                        grok::apply_tokens(&mut cred, tr);
+                        return self.save_account(cred).await;
+                    }
+                }
+            }
+        }
+        .await;
+        self.flows.set_status(&flow_id, flow_outcome(outcome));
     }
 
     async fn run_device_flow(self: Arc<Self>, flow_id: String, dc: codex::DeviceCode) {
@@ -1066,6 +1146,7 @@ impl Subscriptions {
                     }
                 }
                 SubProvider::OpencodeGo => anyhow::bail!("not an OAuth provider"),
+                SubProvider::Grok => anyhow::bail!("Grok logins use the device code; poll the flow status instead"),
             }
             self.save_account(cred).await
         }
@@ -1091,6 +1172,7 @@ impl Subscriptions {
                 }
                 c
             }
+            SubProvider::Grok => anyhow::bail!("importing Grok credentials is not supported; use `xolotl auth login grok`"),
             SubProvider::OpencodeGo => {
                 let key = data.get("api_key").and_then(Value::as_str).filter(|k| !k.is_empty()).context("api_key is required")?;
                 Credential { provider, api_key: Some(key.to_string()), ..Default::default() }

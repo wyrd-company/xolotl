@@ -223,7 +223,7 @@ pub enum AccountsCmd {
 
 #[derive(Subcommand)]
 pub enum AuthCmd {
-    /// Log in a Codex (ChatGPT) or Claude subscription account.
+    /// Log in a Codex (ChatGPT), Claude or Grok Build (xAI) subscription account.
     Login {
         #[arg(value_enum)]
         provider: SubProvider,
@@ -339,7 +339,10 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
     let keys = Arc::new(KeyManager::new(secrets.clone()));
     let (policies, n) = keys.reload().await.context("loading policies and client keys from the vault")?;
     tracing::info!(policies, keys = n, "loaded policies and client keys");
-    let subs = Arc::new(Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone()));
+    let subs = Arc::new(
+        Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone())
+            .with_grok_client_version(cfg.catalog.grok_client_version.clone()),
+    );
     let n = subs.sync().await.context("loading accounts from the vault")?;
     tracing::info!(accounts = n, "loaded subscription accounts");
     let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()));

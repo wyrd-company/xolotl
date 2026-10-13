@@ -64,12 +64,15 @@ no_auth = true
 [catalog]
 refresh_secs = 600
 codex_client_version = "0.160.0"   # Codex filters its model roster by client version
+grok_client_version = "1.0.52"     # xAI rejects old Grok CLI versions with 426
 
 [catalog.static_models]
 # llamacpp = ["qwen3-coder"]
+# Fallback if the Grok roster can't be discovered from xAI's chat proxy:
+# grok = ["grok-build"]
 
 [catalog.wires]
 # Endpoint formats a provider/model is reachable on (no translation is done).
-# Defaults: claude=messages, codex=responses, opencode-go per model,
+# Defaults: claude=messages, codex=responses, grok=responses, opencode-go per model,
 # vercel=chat+responses+messages, others=chat.
 # llamacpp = ["chat", "messages"]

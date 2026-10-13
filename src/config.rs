@@ -27,6 +27,9 @@ pub struct CatalogConfig {
     pub refresh_secs: u64,
     /// Codex filters its model roster by client version.
     pub codex_client_version: String,
+    /// Grok CLI version sent to xAI's chat proxy, which rejects old clients
+    /// with 426. Requests from the Grok CLI send its own version instead.
+    pub grok_client_version: String,
     /// Extra models per provider, merged with discovered ones.
     pub static_models: BTreeMap<String, Vec<String>>,
     /// Wire-format overrides keyed by `provider` or `provider/model`.
@@ -35,7 +38,13 @@ pub struct CatalogConfig {
 
 impl Default for CatalogConfig {
     fn default() -> Self {
-        Self { refresh_secs: 600, codex_client_version: "0.160.0".into(), static_models: BTreeMap::new(), wires: BTreeMap::new() }
+        Self {
+            refresh_secs: 600,
+            codex_client_version: "0.160.0".into(),
+            grok_client_version: "1.0.52".into(),
+            static_models: BTreeMap::new(),
+            wires: BTreeMap::new(),
+        }
     }
 }
 
@@ -191,7 +200,7 @@ pub struct SubscriptionConfig {
     pub refresh_margin_secs: i64,
     /// Accounts above this usage percent in any window are only used as a last resort.
     pub soft_limit_percent: f64,
-    /// Keep a session (Codex session id, Claude Code session id) on one account
+    /// Keep a session (Codex session id, Claude Code session id, Grok session id) on one account
     /// for this long, preserving prompt caches. 0 disables affinity.
     pub session_affinity_secs: u64,
     /// Upstream URLs; only override for testing or if a provider moves.
@@ -208,6 +217,10 @@ pub struct Endpoints {
     pub claude_token: String,
     pub claude_manual_redirect: String,
     pub opencode_go: String,
+    /// xAI's CLI chat proxy (Grok Build subscriptions).
+    pub grok_api: String,
+    /// xAI's OAuth issuer; endpoints come from its OIDC discovery document.
+    pub grok_auth: String,
 }
 
 impl Default for Endpoints {
@@ -220,6 +233,8 @@ impl Default for Endpoints {
             claude_token: "https://platform.claude.com/v1/oauth/token".into(),
             claude_manual_redirect: "https://platform.claude.com/oauth/code/callback".into(),
             opencode_go: "https://opencode.ai/zen/go".into(),
+            grok_api: "https://cli-chat-proxy.grok.com/v1".into(),
+            grok_auth: "https://auth.x.ai".into(),
         }
     }
 }

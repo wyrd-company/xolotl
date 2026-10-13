@@ -6,7 +6,7 @@ Xolotl is a single Rust binary (`xolotl`). `xolotl serve` runs the HTTP server; 
 clients (Claude Code, Codex CLI, SDKs, T3Code hubs, xolotl CLI, web UI)
         │  client key (Authorization / x-api-key), or a web UI session
         ▼
-  axum router ── authorize (keys + policy) ──┬── subscription pools: codex, claude, opencode-go
+  axum router ── authorize (keys + policy) ──┬── subscription pools: codex, claude, grok, opencode-go
         │                                     └── gateway providers: vercel, mistral, openai-compatible
         ├── OpenBao (KV v2, AppRole): every secret
         ├── SQLite: runtime state, no secrets
@@ -15,7 +15,7 @@ clients (Claude Code, Codex CLI, SDKs, T3Code hubs, xolotl CLI, web UI)
 
 ## Two kinds of upstream
 
-- **Subscription pools** (`claude`, `codex`, `opencode-go`) hold several accounts per provider. Codex and Claude accounts use OAuth tokens; OpenCode Go accounts use API keys. A request goes to one account chosen by the pool, and fails over to another on quota, auth or transient errors. See [Subscription accounts](subscriptions.md).
+- **Subscription pools** (`claude`, `codex`, `grok`, `opencode-go`) hold several accounts per provider. Codex, Claude and Grok accounts use OAuth tokens; OpenCode Go accounts use API keys. A request goes to one account chosen by the pool, and fails over to another on quota, auth or transient errors. See [Subscription accounts](subscriptions.md).
 - **Gateway providers** are configured in the config file under `[gateway.providers.<name>]` with a `kind`: `vercel`, `mistral` or `openai-compatible` (used for llama.cpp). Each has one API key in OpenBao at `providers/<name>`, or `no_auth = true`. Provider names become model prefixes and path prefixes, so names like `v1`, `admin` or `claude` are rejected.
 
 ## Storage

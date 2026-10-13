@@ -118,6 +118,7 @@ The CLI talks to the server's admin API (`XOLOTL_URL`, default `http://127.0.0.1
 # Subscription accounts
 xolotl auth login codex            # device code flow (add --browser for the paste flow)
 xolotl auth login claude           # opens claude.ai, paste back CODE#STATE
+xolotl auth login grok             # Grok Build (xAI) device code flow
 xolotl accounts add-key            # OpenCode Go API key (stdin)
 xolotl accounts import codex ~/.codex/auth.json   # or claude ~/.claude/.credentials.json
 xolotl accounts list               # state, plan, usage windows
@@ -145,9 +146,9 @@ Imported tokens keep rotating on refresh. Stop using the same login in the local
 
 Every client key belongs to a policy (see [`examples/policies/devcontainer.toml`](examples/policies/devcontainer.toml)):
 
-- `providers`: which providers the key may use (`claude`, `codex`, `opencode-go`, gateway provider names, or `*`).
+- `providers`: which providers the key may use (`claude`, `codex`, `grok`, `opencode-go`, gateway provider names, or `*`).
 - `allow_models` / `deny_models`: globs matched against `model` or `provider/model`; deny wins.
-- `precedence` and `winners`: who owns a model name served by several providers. The winner serves the plain name (`claude-haiku-5-5`), the others drop it. Without a `precedence` list the order is `claude`, `codex`, `opencode-go`, then gateway providers alphabetically.
+- `precedence` and `winners`: who owns a model name served by several providers. The winner serves the plain name (`claude-haiku-5-5`), the others drop it. Without a `precedence` list the order is `claude`, `codex`, `grok`, `opencode-go`, then gateway providers alphabetically.
 - `aliases`: extra names, each a `provider/model` or a list tried in order on 429/5xx. Use them to bring back a model that lost its plain name.
 - `scopes`: `proxy` (default), `management` (T3Code hubs), `admin`.
 
@@ -186,6 +187,20 @@ env_key = "XOLOTL_API_KEY"
 wire_api = "responses"
 ```
 
+**Grok CLI** (Grok Build): the CLI runs `auth_provider_command` and sends what it prints as the bearer token, so point it at a command that prints the client key. Declare a model on xolotl with the Responses backend:
+
+```toml
+[auth]
+auth_provider_command = "secrets-helper xolotl-key"   # prints $XOLOTL_API_KEY
+
+[model."grok-build"]
+base_url = "http://xolotl:8317/v1"
+model = "grok-build"
+api_backend = "responses"
+```
+
+`GET /v1/models` answers in the Grok CLI's shape when the user agent contains `grok-shell`. Xolotl forwards the CLI's own `x-grok-client-version`; other clients reaching Grok send `catalog.grok_client_version`.
+
 **T3Code hubs**: add a CLIProxyAPI usage source with URL `http://xolotl:8317` and a key whose policy has the `management` scope.
 
 **Anything else** (OpenAI-compatible SDKs): base URL `http://xolotl:8317/v1` and any model name the key's policy exposes.
@@ -202,9 +217,9 @@ wire_api = "responses"
 | `/admin/...` | CLI and web UI |
 | `/`, `/assets/...` | web UI |
 
-Passthroughs strip the client's credentials and inject the provider's. Models are reachable on all three LLM endpoints: a provider that speaks the endpoint's format gets the request as is, any other gets it translated between Anthropic Messages, OpenAI Responses and Chat Completions (Claude speaks Messages, Codex Responses, OpenCode Go per model, Vercel all three, others Chat; override with `[catalog.wires]`). So Claude Code can use Codex models, and Codex CLI can use Anthropic models served by Vercel or OpenCode Go. Claude subscription accounts are the exception: they serve only the Claude Code API path (`/v1/messages`) and are never translated. `count_tokens` and `/v1/responses/compact` are not translated either. Such requests get a 400 naming the endpoints the model is served on.
+Passthroughs strip the client's credentials and inject the provider's. Models are reachable on all three LLM endpoints: a provider that speaks the endpoint's format gets the request as is, any other gets it translated between Anthropic Messages, OpenAI Responses and Chat Completions (Claude speaks Messages, Codex and Grok Responses, OpenCode Go per model, Vercel all three, others Chat; override with `[catalog.wires]`). So Claude Code can use Codex models, and Codex CLI can use Anthropic models served by Vercel or OpenCode Go. Claude subscription accounts are the exception: they serve only the Claude Code API path (`/v1/messages`) and are never translated. `count_tokens` and `/v1/responses/compact` are not translated either. Such requests get a 400 naming the endpoints the model is served on.
 
-Account pools refresh OAuth tokens before they expire and once more on a 401. Refresh tokens are single-use, so a rotated credential that can't be written to OpenBao keeps serving from memory, is retried every 15 s and on shutdown, and shows as `UNSAVED` in `xolotl accounts list` (metric `xolotl.vault.unsaved_credentials`). Run a single instance: refreshes are serialized per account in-process only. An account whose quota is exhausted (429 / `usage_limit_reached`, including when it arrives inside a 200 stream) cools down until its reset time and the request moves to the next account. Strategy is `round-robin`, `fill-first` or `least-used`. A session (Codex `session_id`, Claude Code session id) stays on one account to keep prompt caches warm. Usage windows are polled from each provider and also read from response headers.
+Account pools refresh OAuth tokens before they expire and once more on a 401. Refresh tokens are single-use, so a rotated credential that can't be written to OpenBao keeps serving from memory, is retried every 15 s and on shutdown, and shows as `UNSAVED` in `xolotl accounts list` (metric `xolotl.vault.unsaved_credentials`). Run a single instance: refreshes are serialized per account in-process only. An account whose quota is exhausted (429 / `usage_limit_reached`, including when it arrives inside a 200 stream) cools down until its reset time and the request moves to the next account. Strategy is `round-robin`, `fill-first` or `least-used`. A session (Codex `session_id`, Claude Code session id, Grok `x-grok-session-id` or `x-grok-conv-id`) stays on one account to keep prompt caches warm. Usage windows are polled from each provider and also read from response headers.
 
 `api-call` only reaches the account's own provider hosts, so a management key can't send account tokens to arbitrary URLs.
 
