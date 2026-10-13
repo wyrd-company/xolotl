@@ -63,7 +63,7 @@ async fn harness() -> Harness {
     let subs = Arc::new(Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone()));
     let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()));
     let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
-    let state = AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: None };
+    let state = AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: None, sessions: Default::default() };
     Harness { state, admin: "boot".into(), upstream }
 }
 
@@ -544,4 +544,125 @@ async fn admin_policies_keys_and_accounts() {
     assert_eq!(status, 200);
     assert!(catalog["codex"].as_array().unwrap().iter().any(|m| m == "gpt-6-codex"));
     assert_eq!(h.call("GET", "/admin/usage?group_by=model", Some(&h.admin), None).await.0, 200);
+}
+
+#[tokio::test]
+async fn ui_session_needs_password_cookie_and_csrf() {
+    let h = harness().await;
+    let (_, s) = h.call_with("GET", "/admin/session", &[], None).await;
+    assert_eq!(s, json!({"authenticated": false, "password_set": false}));
+    assert_eq!(h.call_with("POST", "/admin/session", &[], Some(json!({"password": "x"}))).await.0, 409, "no password set yet");
+
+    // Only an admin can set the password, and only as an argon2id hash.
+    let hash = session::hash_password("correct horse battery").unwrap();
+    let req = json!({"password_hash": hash});
+    assert_eq!(h.call_with("PUT", "/admin/ui/password", &[], Some(req.clone())).await.0, 401);
+    assert_eq!(h.call("PUT", "/admin/ui/password", Some(&h.admin), Some(json!({"password_hash": "plain"}))).await.0, 400);
+    assert_eq!(h.call("PUT", "/admin/ui/password", Some(&h.admin), Some(req)).await.0, 200);
+    let admin = h.state.secrets.get("admin").await.unwrap().unwrap();
+    assert_eq!(admin["token"], "boot", "the bootstrap token is kept");
+
+    assert_eq!(h.call_with("POST", "/admin/session", &[], Some(json!({"password": "wrong"}))).await.0, 401);
+    let resp = router(h.state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/session")
+                .header("content-type", "application/json")
+                .header("x-forwarded-proto", "https")
+                .body(Body::from(json!({"password": "correct horse battery"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let set_cookie = resp.headers()["set-cookie"].to_str().unwrap().to_string();
+    assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict") && set_cookie.contains("Secure"), "{set_cookie}");
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
+    let body: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let csrf = body["csrf_token"].as_str().unwrap().to_string();
+
+    // The cookie alone is not enough; with the CSRF token it is admin, and only admin.
+    assert_eq!(h.call_with("GET", "/admin/keys", &[("cookie", &cookie)], None).await.0, 401);
+    assert_eq!(h.call_with("GET", "/admin/keys", &[("cookie", &cookie), ("x-csrf-token", "nope")], None).await.0, 401);
+    let session = [("cookie", cookie.as_str()), ("x-csrf-token", csrf.as_str())];
+    assert_eq!(h.call_with("GET", "/admin/keys", &session, None).await.0, 200);
+    assert_eq!(h.call_with("GET", "/v1/models", &session, None).await.0, 401);
+    let (_, s) = h.call_with("GET", "/admin/session", &[("cookie", &cookie)], None).await;
+    assert_eq!(s["csrf_token"], csrf.as_str());
+
+    // Changing the password ends every session.
+    let hash = session::hash_password("another long password").unwrap();
+    assert_eq!(h.call_with("PUT", "/admin/ui/password", &session, Some(json!({"password_hash": hash}))).await.0, 200);
+    assert_eq!(h.call_with("GET", "/admin/keys", &session, None).await.0, 401);
+}
+
+#[tokio::test]
+async fn ui_logout_and_lockout() {
+    let h = harness().await;
+    let hash = session::hash_password("correct horse battery").unwrap();
+    h.call("PUT", "/admin/ui/password", Some(&h.admin), Some(json!({"password_hash": hash}))).await;
+    let resp = router(h.state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/session")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"password": "correct horse battery"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = resp.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+    let body: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let csrf = body["csrf_token"].as_str().unwrap().to_string();
+    let session = [("cookie", cookie.as_str()), ("x-csrf-token", csrf.as_str())];
+    assert_eq!(h.call_with("DELETE", "/admin/session", &session, None).await.0, 200);
+    assert_eq!(h.call_with("GET", "/admin/keys", &session, None).await.0, 401);
+
+    for _ in 0..5 {
+        assert_eq!(h.call_with("POST", "/admin/session", &[], Some(json!({"password": "guess"}))).await.0, 401);
+    }
+    let (status, _) = h.call_with("POST", "/admin/session", &[], Some(json!({"password": "correct horse battery"}))).await;
+    assert_eq!(status, 429, "locked out even with the right password");
+}
+
+#[tokio::test]
+async fn ui_admin_endpoints() {
+    let h = harness().await;
+    let (status, s) = h.call("GET", "/admin/status", Some(&h.admin), None).await;
+    assert_eq!(status, 200, "{s}");
+    assert_eq!(s["database"]["ok"], true);
+    assert_eq!(s["subscription"]["strategy"], "round-robin");
+
+    let (_, providers) = h.call("GET", "/admin/providers", Some(&h.admin), None).await;
+    assert_eq!(
+        providers,
+        json!([{
+            "name": "llama", "kind": "openai-compatible", "enabled": true, "base_url": format!("{}/llama/v1", h.upstream.uri()),
+            "no_auth": false, "secret": "providers/llama", "has_key": true,
+        }])
+    );
+
+    let (_, routes) = h.call("GET", "/admin/catalog/routes", Some(&h.admin), None).await;
+    let codex = routes.as_array().unwrap().iter().find(|r| r["model"] == "gpt-6-codex").unwrap();
+    assert_eq!(codex["endpoints"], json!(["/v1/responses"]));
+    assert_eq!(codex["translated_endpoints"], json!(["/v1/messages", "/v1/chat/completions"]));
+
+    // Preview an unsaved policy: the resolved names, and who wins shared names.
+    let draft = json!({"name": "", "providers": ["claude", "opencode-go"], "winners": {"claude-haiku-5-5": "opencode-go"}});
+    let (status, view) = h.call("POST", "/admin/policies/preview", Some(&h.admin), Some(draft)).await;
+    assert_eq!(status, 200, "{view}");
+    let haiku = view["models"].as_array().unwrap().iter().find(|m| m["name"] == "claude-haiku-5-5").unwrap();
+    assert_eq!(haiku["targets"], json!(["opencode-go/claude-haiku-5-5"]));
+    assert_eq!(view["shared"], json!([{"model": "claude-haiku-5-5", "providers": ["claude", "opencode-go"], "winner": "opencode-go"}]));
+    let (status, err) = h.call("POST", "/admin/policies/preview", Some(&h.admin), Some(json!({"name": "x", "providers": ["nope"]}))).await;
+    assert_eq!(status, 400);
+    assert!(err["error"]["message"].as_str().unwrap().contains("unknown provider"));
+
+    // The UI page is public (the API behind it is not), with a strict CSP.
+    let resp = router(h.state.clone()).oneshot(Request::builder().uri("/").body(Body::empty()).unwrap()).await.unwrap();
+    assert!(resp.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+    assert!(resp.headers()["content-security-policy"].to_str().unwrap().contains("frame-ancestors 'none'"));
+    assert_eq!(h.call("GET", "/assets/../../Cargo.toml", None, None).await.0, 404);
 }

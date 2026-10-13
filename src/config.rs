@@ -147,6 +147,8 @@ pub struct TelemetryConfig {
     /// Default `RUST_LOG`-style filter.
     pub log_filter: String,
     pub metrics_interval_secs: u64,
+    /// Where operators look at traces and logs (e.g. OpenObserve); the web UI links to it.
+    pub dashboard_url: Option<String>,
 }
 
 impl Default for TelemetryConfig {
@@ -158,6 +160,7 @@ impl Default for TelemetryConfig {
             log_format: "pretty".into(),
             log_filter: "info".into(),
             metrics_interval_secs: 30,
+            dashboard_url: None,
         }
     }
 }
@@ -355,7 +358,7 @@ impl Config {
                 "provider name {name:?} is reserved for subscription accounts"
             );
             anyhow::ensure!(
-                !["v0", "v1", "admin", "ui", "backend-api", "healthz", "readyz"].contains(&name.as_str()),
+                !["v0", "v1", "admin", "ui", "assets", "backend-api", "healthz", "readyz"].contains(&name.as_str()),
                 "provider name {name:?} collides with a built-in route"
             );
             if p.kind == ProviderKind::OpenaiCompatible {
