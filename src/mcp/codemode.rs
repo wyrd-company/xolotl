@@ -135,12 +135,13 @@ pub async fn execute(
             let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().map_err(|e| e.to_string())?;
             rt.block_on(run(source, handle, host, limits, l, c, flag, stop_rx))
         });
+        let mut aborted = Vec::new();
         let joined = tokio::select! {
             joined = &mut worker => joined,
             _ = &mut caller_gone => {
                 // Refuse and abort tool calls, interrupt busy JavaScript, end
                 // awaiting JavaScript, then wait for the worker to finish.
-                drop(close_calls(&calls));
+                aborted = close_calls(&calls);
                 stopped.store(true, std::sync::atomic::Ordering::SeqCst);
                 let _ = stop.send(true);
                 worker.await
@@ -151,8 +152,9 @@ pub async fn execute(
             Err(e) => Err(format!("execution failed: {e}")),
         };
         // However the execution ended, stop tool calls still running and wait
-        // until they have.
-        for task in close_calls(&calls) {
+        // until they have, including the ones aborted on cancellation.
+        aborted.extend(close_calls(&calls));
+        for task in aborted {
             let _ = task.await;
         }
         let logs = std::mem::take(&mut logs.lock().lines);
@@ -640,10 +642,21 @@ mod tests {
     }
 
     /// Counts started calls; `effect` sleeps, then records that it ran.
+    /// A call's future takes 300 ms to drop, and records when it has.
     #[derive(Default)]
     struct Counting {
         started: std::sync::atomic::AtomicUsize,
         effects: std::sync::atomic::AtomicUsize,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct SlowDrop(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(300));
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     #[async_trait::async_trait]
@@ -651,6 +664,7 @@ mod tests {
         async fn call(&self, _server: String, tool: String, _arguments: Value) -> Result<Value, String> {
             use std::sync::atomic::Ordering;
             self.started.fetch_add(1, Ordering::SeqCst);
+            let _teardown = SlowDrop(self.dropped.clone());
             tokio::time::sleep(Duration::from_millis(if tool == "effect" { 350 } else { 50 })).await;
             self.effects.fetch_add(1, Ordering::SeqCst);
             Ok(Value::Null)
@@ -703,6 +717,7 @@ mod tests {
         let _ = outer.await;
         let back = tokio::time::timeout(Duration::from_secs(3), permits.acquire()).await;
         assert!(back.is_ok(), "the permit was never released");
+        assert_eq!(host.dropped.load(Ordering::SeqCst), 1, "the tool call's teardown finished before the permit came back");
         drop(back);
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!((host.started.load(Ordering::SeqCst), host.effects.load(Ordering::SeqCst)), (1, 0));

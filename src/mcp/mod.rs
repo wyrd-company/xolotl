@@ -584,8 +584,9 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::secrets::SecretStore for Yielding {
         async fn get(&self, key: &str) -> Result<Option<Map<String, Value>>> {
+            let snapshot = self.0.get(key).await;
             tokio::task::yield_now().await;
-            self.0.get(key).await
+            snapshot
         }
         async fn put(&self, key: &str, data: Map<String, Value>) -> Result<()> {
             self.0.put(key, data).await
@@ -597,8 +598,9 @@ mod tests {
             self.0.list(dir).await
         }
         async fn get_versioned(&self, key: &str) -> Result<(Option<Map<String, Value>>, u64)> {
+            let snapshot = self.0.get_versioned(key).await;
             tokio::task::yield_now().await;
-            self.0.get_versioned(key).await
+            snapshot
         }
         async fn put_cas(&self, key: &str, data: Map<String, Value>, cas: u64) -> Result<u64> {
             self.0.put_cas(key, data, cas).await
@@ -620,15 +622,22 @@ mod tests {
             let hub = hub.clone();
             async move { hub.set_secret("calc", json!({format!("f{i}"): "v"}).as_object().unwrap().clone()).await }
         });
+        // A well-behaved writer elsewhere: check-and-set, retried until it lands.
         let outside = async move {
             tokio::task::yield_now().await;
-            let (cur, v) = other.get_versioned("mcp/calc").await.unwrap();
-            let mut cur = cur.unwrap_or_default();
-            cur.insert("outside".into(), json!("x"));
-            let _ = other.put_cas("mcp/calc", cur, v).await;
+            for _ in 0..50 {
+                let (cur, v) = other.get_versioned("mcp/calc").await.unwrap();
+                let mut cur = cur.unwrap_or_default();
+                cur.insert("outside".into(), json!("x"));
+                if other.put_cas("mcp/calc", cur, v).await.is_ok() {
+                    return true;
+                }
+            }
+            false
         };
-        let (results, ()) = tokio::join!(futures::future::join_all(updates), outside);
+        let (results, landed) = tokio::join!(futures::future::join_all(updates), outside);
         assert!(results.iter().all(Result::is_ok));
+        assert!(landed, "the outside writer's check-and-set never succeeded");
         let stored = secrets.get("mcp/calc").await.unwrap().unwrap();
         for i in 0..8 {
             assert!(stored.contains_key(&format!("f{i}")), "f{i} lost: {stored:?}");
