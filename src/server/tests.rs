@@ -826,8 +826,8 @@ async fn ui_sign_in_with_oidc_refusals() {
     let mut h = harness().await;
     let idp = Idp::mount(&mut h).await;
 
-    // Outside the admin group.
-    let (state, pending) = idp.start(&h, &["users"], str::to_string).await;
+    // Outside the admin group, including groups whose names merely start with it.
+    let (state, pending) = idp.start(&h, &["users", "admins-readonly"], str::to_string).await;
     assert_eq!(h.callback(&state, &pending).await, ("/?signin=forbidden".into(), None));
 
     // An ID token for another sign-in.
@@ -918,4 +918,62 @@ async fn ui_admin_endpoints() {
     assert!(resp.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
     assert!(resp.headers()["content-security-policy"].to_str().unwrap().contains("frame-ancestors 'none'"));
     assert_eq!(h.call("GET", "/assets/../../Cargo.toml", None, None).await.0, 404);
+}
+
+#[tokio::test]
+async fn ui_sign_in_does_not_follow_provider_redirects_or_read_huge_responses() {
+    let mut h = harness().await;
+    let idp = Idp::mount(&mut h).await;
+    let start = |h: &Harness| {
+        let h = h.state.clone();
+        async move {
+            let resp = router(h).oneshot(Request::builder().uri("/admin/session/login").body(Body::empty()).unwrap()).await.unwrap();
+            resp.headers()["location"].to_str().unwrap().to_string()
+        }
+    };
+    // A working provider first, so the failures below are the redirect and the size.
+    assert!(start(&h).await.starts_with(&format!("{}/authorize", idp.issuer)));
+
+    let elsewhere = MockServer::start().await;
+    h.upstream.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/oidc/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", format!("{}/discovery", elsewhere.uri())))
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/discovery"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": idp.issuer, "authorization_endpoint": format!("{}/authorize", idp.issuer),
+            "jwks_uri": format!("{}/jwks", idp.issuer), "response_types_supported": ["code"],
+            "subject_types_supported": ["public"], "id_token_signing_alg_values_supported": ["RS256"],
+        })))
+        .mount(&elsewhere)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/oidc/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"keys": []})))
+        .mount(&h.upstream)
+        .await;
+    assert_eq!(start(&h).await, "/?signin=unavailable", "a redirect is not followed");
+
+    h.upstream.reset().await;
+    let mut huge = serde_json::to_string(&json!({
+        "issuer": idp.issuer, "authorization_endpoint": format!("{}/authorize", idp.issuer),
+        "jwks_uri": format!("{}/jwks", idp.issuer), "response_types_supported": ["code"],
+        "subject_types_supported": ["public"], "id_token_signing_alg_values_supported": ["RS256"],
+    }))
+    .unwrap();
+    huge.push_str(&" ".repeat(2 * 1024 * 1024));
+    Mock::given(method("GET"))
+        .and(path("/oidc/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(huge, "application/json"))
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/oidc/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"keys": []})))
+        .mount(&h.upstream)
+        .await;
+    assert_eq!(start(&h).await, "/?signin=unavailable", "an oversized response is refused");
 }

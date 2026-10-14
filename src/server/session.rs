@@ -433,5 +433,14 @@ mod tests {
         assert!(s.take("state-1").is_some());
         assert!(s.take(&format!("state-{MAX_PENDING}")).is_some());
         assert!(s.take("state-1").is_none(), "each completes once");
+
+        let expired = Pending {
+            nonce: Nonce::new_random(),
+            verifier: PkceCodeVerifier::new("v".into()),
+            metadata,
+            expires: Instant::now() - Duration::from_secs(1),
+        };
+        s.begin("late".into(), expired);
+        assert!(s.take("late").is_none(), "an expired sign-in can't complete");
     }
 }
