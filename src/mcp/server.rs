@@ -156,7 +156,7 @@ impl CodeModeServer {
     }
 
     async fn execute(&self, principal: Principal, code: &str) -> CallToolResult {
-        let _permit = self.hub.execution_permit().await;
+        let permit = self.hub.execution_permit().await;
         let tools = self.hub.allowed_tools(&principal.policy).await;
         let namespaces: Vec<(String, String)> =
             self.hub.allowed_servers(&principal.policy).iter().map(|(n, _)| (namespace(n), n.clone())).collect();
@@ -168,7 +168,7 @@ impl CodeModeServer {
             max_log_bytes: cfg.max_output_bytes / 2,
         };
         let host = Arc::new(Host { hub: self.hub.clone(), principal, tools });
-        let outcome = codemode::execute(code, namespaces, host, limits).await;
+        let outcome = codemode::execute(code, namespaces, host, limits, Some(permit)).await;
         let outcome_label = if outcome.result.is_ok() { "ok" } else { "error" };
         metrics().mcp_executions.add(1, &[KeyValue::new("status", outcome_label)]);
         let (body, is_error) = match outcome.result {

@@ -131,7 +131,7 @@ pub struct McpHub {
     servers: RwLock<BTreeMap<String, Entry>>,
     /// Serializes reloads and server changes.
     changes: tokio::sync::Mutex<()>,
-    executions: tokio::sync::Semaphore,
+    executions: Arc<tokio::sync::Semaphore>,
 }
 
 /// Whether a changed definition still uses the same OAuth login.
@@ -164,7 +164,7 @@ impl McpHub {
             db,
             servers: RwLock::new(servers),
             changes: Default::default(),
-            executions: tokio::sync::Semaphore::new(cfg.max_concurrent_executions.max(1)),
+            executions: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_executions.max(1))),
         }
     }
 
@@ -528,8 +528,8 @@ impl McpHub {
     }
 
     /// Wait for an execution slot.
-    pub async fn execution_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
-        self.executions.acquire().await.expect("semaphore is never closed")
+    pub async fn execution_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.executions.clone().acquire_owned().await.expect("semaphore is never closed")
     }
 }
 

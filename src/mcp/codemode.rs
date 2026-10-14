@@ -104,40 +104,76 @@ struct Calls {
 }
 
 /// Run `code` with one global per `(identifier, server)` pair.
-pub async fn execute(code: &str, namespaces: Vec<(String, String)>, host: Arc<dyn ToolHost>, limits: Limits) -> Outcome {
+///
+/// The execution runs in a task of its own, which owns `permit`. If the
+/// caller stops waiting (the client went away), the task is told to stop:
+/// it interrupts the JavaScript, aborts and joins the tool calls still
+/// running, and only then releases the permit. Either way no gateway work
+/// continues, or starts, after the execution.
+pub async fn execute(
+    code: &str,
+    namespaces: Vec<(String, String)>,
+    host: Arc<dyn ToolHost>,
+    limits: Limits,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Outcome {
     let source = program(code, &namespaces);
-    let handle = tokio::runtime::Handle::current();
-    let logs = Arc::new(Mutex::new(Logs { lines: Vec::new(), bytes: 0, max: limits.max_log_bytes }));
-    let calls = Arc::new(Mutex::new(Calls::default()));
-    let (l, c) = (logs.clone(), calls.clone());
-    // QuickJS runtimes aren't Send: run on a blocking thread with its own
-    // single-threaded runtime. Tool calls are spawned back onto the main one,
-    // where the upstream connections live.
-    let joined = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().map_err(|e| e.to_string())?;
-        rt.block_on(run(source, handle, host, limits, l, c))
-    })
-    .await;
-    let result = match joined {
-        Ok(r) => r,
-        Err(e) => Err(format!("execution failed: {e}")),
-    };
-    // However the execution ended, stop tool calls still running and wait
-    // until they have: no gateway work continues, or starts, afterwards.
-    let tasks = {
-        let mut c = calls.lock();
-        c.closed = true;
-        std::mem::take(&mut c.tasks)
-    };
+    // Dropped with this future: the task sees the caller is gone.
+    let (_caller, mut caller_gone) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _permit = permit;
+        let handle = tokio::runtime::Handle::current();
+        let logs = Arc::new(Mutex::new(Logs { lines: Vec::new(), bytes: 0, max: limits.max_log_bytes }));
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let (l, c, flag) = (logs.clone(), calls.clone(), stopped.clone());
+        // QuickJS runtimes aren't Send: run on a blocking thread with its own
+        // single-threaded runtime. Tool calls are spawned back onto the main one,
+        // where the upstream connections live.
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().map_err(|e| e.to_string())?;
+            rt.block_on(run(source, handle, host, limits, l, c, flag, stop_rx))
+        });
+        let joined = tokio::select! {
+            joined = &mut worker => joined,
+            _ = &mut caller_gone => {
+                // Refuse and abort tool calls, interrupt busy JavaScript, end
+                // awaiting JavaScript, then wait for the worker to finish.
+                drop(close_calls(&calls));
+                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = stop.send(true);
+                worker.await
+            }
+        };
+        let result = match joined {
+            Ok(r) => r,
+            Err(e) => Err(format!("execution failed: {e}")),
+        };
+        // However the execution ended, stop tool calls still running and wait
+        // until they have.
+        for task in close_calls(&calls) {
+            let _ = task.await;
+        }
+        let logs = std::mem::take(&mut logs.lock().lines);
+        let calls = std::mem::take(&mut calls.lock().summaries);
+        Outcome { result, logs, calls }
+    });
+    match task.await {
+        Ok(outcome) => outcome,
+        Err(e) => Outcome { result: Err(format!("execution failed: {e}")), logs: Vec::new(), calls: Vec::new() },
+    }
+}
+
+/// Refuse further tool calls and abort the running ones; returns their tasks to join.
+fn close_calls(calls: &Mutex<Calls>) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut c = calls.lock();
+    c.closed = true;
+    let tasks = std::mem::take(&mut c.tasks);
     for task in &tasks {
         task.abort();
     }
-    for task in tasks {
-        let _ = task.await;
-    }
-    let logs = std::mem::take(&mut logs.lock().lines);
-    let calls = std::mem::take(&mut calls.lock().summaries);
-    Outcome { result, logs, calls }
+    tasks
 }
 
 struct Logs {
@@ -160,6 +196,7 @@ impl Logs {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     source: String,
     handle: tokio::runtime::Handle,
@@ -167,14 +204,19 @@ async fn run(
     limits: Limits,
     logs: Arc<Mutex<Logs>>,
     calls: Arc<Mutex<Calls>>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Value, String> {
     let deadline = Instant::now() + limits.timeout;
     let timeout_msg = format!("execution timed out after {}s", limits.timeout.as_secs());
     let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
     runtime.set_memory_limit(limits.memory_bytes).await;
     runtime.set_max_stack_size(512 * 1024).await;
-    // Stops JavaScript that keeps running past the deadline (busy loops).
-    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline))).await;
+    // Stops JavaScript that keeps running past the deadline (busy loops), or
+    // after the execution was cancelled.
+    runtime
+        .set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline || stopped.load(std::sync::atomic::Ordering::SeqCst))))
+        .await;
     let context = AsyncContext::full(&runtime).await.map_err(|e| e.to_string())?;
 
     let max_calls = limits.max_calls;
@@ -206,9 +248,9 @@ async fn run(
     // interrupt handler stops busy code); this catches code that awaits
     // something that never settles.
     let grace = deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(1);
-    let result = match tokio::time::timeout(grace, evaluated).await {
-        Ok(r) => r,
-        Err(_) => Err(timeout_msg.clone()),
+    let result = tokio::select! {
+        r = tokio::time::timeout(grace, evaluated) => r.unwrap_or_else(|_| Err(timeout_msg.clone())),
+        _ = stop.wait_for(|stop| *stop) => Err("execution cancelled".to_string()),
     };
     if Instant::now() >= deadline && result.as_ref().is_err_and(|e| e.contains("interrupted")) {
         return Err(timeout_msg);
@@ -557,7 +599,7 @@ mod tests {
     }
 
     async fn run(code: &str) -> Outcome {
-        execute(code, vec![("gh_work".into(), "gh-work".into())], Arc::new(Echo), limits()).await
+        execute(code, vec![("gh_work".into(), "gh-work".into())], Arc::new(Echo), limits(), None).await
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -621,7 +663,7 @@ mod tests {
         let host = Arc::new(Counting::default());
         let code = "const r = await Promise.allSettled(Array.from({length: 20}, () => gh_work.work({}))); \
                     return r.filter((x) => x.status === 'fulfilled').length";
-        let o = execute(code, vec![("gh_work".into(), "gh-work".into())], host.clone(), limits()).await;
+        let o = execute(code, vec![("gh_work".into(), "gh-work".into())], host.clone(), limits(), None).await;
         assert_eq!(o.result.unwrap(), json!(3));
         assert_eq!(host.started.load(Ordering::SeqCst), 3, "only admitted calls reach the host");
         assert_eq!(o.calls.len(), 3);
@@ -635,11 +677,45 @@ mod tests {
         // Timed out while a call is in flight; and returned without awaiting one.
         for code in ["await gh_work.effect({})", "gh_work.effect({}); return 1"] {
             let host = Arc::new(Counting::default());
-            let o = execute(code, ns(), host.clone(), quick.clone()).await;
+            let o = execute(code, ns(), host.clone(), quick.clone(), None).await;
             assert_eq!(host.started.load(Ordering::SeqCst), 1, "{code}");
             tokio::time::sleep(Duration::from_millis(500)).await;
             assert_eq!(host.effects.load(Ordering::SeqCst), 0, "{code}: {:?}", o.result);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_the_execution_stops_its_work_before_the_permit_is_released() {
+        use std::sync::atomic::Ordering;
+        let ns = || vec![("gh_work".to_string(), "gh-work".to_string())];
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+
+        // Cancelled once the host call has started: the call is aborted and its
+        // side effect never happens; the permit comes back after teardown.
+        let host = Arc::new(Counting::default());
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let h = host.clone();
+        let outer = tokio::spawn(async move { execute("await gh_work.effect({})", ns(), h, limits(), Some(permit)).await });
+        while host.started.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        outer.abort();
+        let _ = outer.await;
+        let back = tokio::time::timeout(Duration::from_secs(3), permits.acquire()).await;
+        assert!(back.is_ok(), "the permit was never released");
+        drop(back);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!((host.started.load(Ordering::SeqCst), host.effects.load(Ordering::SeqCst)), (1, 0));
+
+        // Cancelled while JavaScript is busy: it is interrupted long before the deadline.
+        let slow = Limits { timeout: Duration::from_secs(60), ..limits() };
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let outer = tokio::spawn(async move { execute("while (true) {}", ns(), Arc::new(Echo), slow, Some(permit)).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        outer.abort();
+        let _ = outer.await;
+        let back = tokio::time::timeout(Duration::from_secs(3), permits.acquire()).await;
+        assert!(back.is_ok(), "busy JavaScript kept running after cancellation");
     }
 
     #[test]
@@ -657,11 +733,11 @@ mod tests {
         let ns = || vec![("gh_work".to_string(), "gh-work".to_string())];
         for code in ["while (true) {}", "await gh_work.slow({})", "await new Promise(() => {})"] {
             let started = Instant::now();
-            let o = execute(code, ns(), host.clone(), quick.clone()).await;
+            let o = execute(code, ns(), host.clone(), quick.clone(), None).await;
             assert!(o.result.unwrap_err().contains("timed out"), "{code}");
             assert!(started.elapsed() < Duration::from_secs(3), "{code}");
         }
-        let o = execute("const a = []; while (true) a.push('x'.repeat(1000));", ns(), host, limits()).await;
+        let o = execute("const a = []; while (true) a.push('x'.repeat(1000));", ns(), host, limits(), None).await;
         let e = o.result.unwrap_err();
         assert!(e.to_lowercase().contains("memory"), "{e}");
     }
