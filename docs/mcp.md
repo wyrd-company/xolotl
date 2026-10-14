@@ -181,6 +181,8 @@ declare const github_work: {
 };
 ```
 
+`codemode.call(server, tool, args)` calls any tool by name. The server can be given by its name or its identifier. Tools named `then` or `toJSON` need it: a server object never exposes those names, so it isn't mistaken for a promise or turned into JSON. Their declarations say so, and the policy and limits apply as for any call.
+
 Input schemas become TypeScript types, and so do output schemas. Property descriptions become doc comments. Unsupported schema constructs become `unknown`. Tool names that aren't identifiers are quoted (`"get-item"(args)`) and are called as `ns["get-item"](...)`; the identifier form `ns.get_item(...)` works too.
 
 ### `execute`

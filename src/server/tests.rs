@@ -1284,6 +1284,49 @@ mod mcp_gateway {
         assert_eq!((calls[0].tool.as_str(), calls[0].status.as_str()), ("whoami", "ok"));
     }
 
+    /// An upstream whose tools are named like JavaScript hooks.
+    #[derive(Clone)]
+    struct Hooks;
+
+    impl ServerHandler for Hooks {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(&self, _: Option<PaginatedRequestParams>, _: RequestContext<RoleServer>) -> Result<ListToolsResult, ErrorData> {
+            Ok(ListToolsResult::with_all_items(
+                ["then", "toJSON"].map(|n| Tool::new(n, format!("The {n} tool"), schema(json!({"type": "object"})))).to_vec(),
+            ))
+        }
+
+        async fn call_tool(&self, req: CallToolRequestParams, _: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
+            Ok(CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text(format!("called {}", req.name))])))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_named_then_and_tojson_can_be_called() {
+        let svc: StreamableHttpService<Hooks, rmcp::transport::streamable_http_server::session::local::LocalSessionManager> =
+            StreamableHttpService::new(|| Ok(Hooks), Default::default(), StreamableHttpServerConfig::default());
+        let up = serve(axum::Router::new().nest_service("/mcp", svc)).await;
+        let h = harness_with(|cfg| {
+            cfg.mcp.servers.insert("hooks".into(), McpServerConfig { url: format!("http://{up}/mcp"), ..Default::default() });
+        })
+        .await;
+        let addr = serve(router(h.state.clone())).await;
+        let key = h.key(mcp_policy(&["hooks"], &[])).await;
+        let c = client(addr, &key, modern()).await;
+
+        let (_, ts) = call(&c, "search", json!({"query": ""})).await;
+        assert!(ts.contains(r#"codemode.call("hooks", "then", args)"#) && ts.contains(r#"codemode.call("hooks", "toJSON", args)"#), "{ts}");
+        let code = "return [await codemode.call('hooks', 'then', {}), await codemode.call('hooks', 'toJSON', {}), typeof hooks.then]";
+        let (err, out) = call(&c, "execute", json!({"code": code})).await;
+        assert!(!err, "{out}");
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["result"], json!(["called then", "called toJSON", "undefined"]));
+        let calls = h.state.db.recent_mcp_calls(10).await.unwrap();
+        assert_eq!(calls.len(), 2, "both went through the gateway's call path");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn servers_added_at_runtime() {
         let g = gateway().await;

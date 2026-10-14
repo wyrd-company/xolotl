@@ -93,7 +93,8 @@ impl CodeModeServer {
             "execute",
             format!(
                 "Run JavaScript (QuickJS, no network, files or timers) as the body of an async function. Call tools as \
-                 `await server.tool({{...}})` with the names from `search`, and `return` a JSON-serializable result. \
+                 `await server.tool({{...}})` with the names from `search` (or `await codemode.call(\"server\", \"tool\", {{...}})` \
+                 for any name), and `return` a JSON-serializable result. \
                  A tool resolves to its structured content when it has any, otherwise to its text (several text blocks are \
                  joined with newlines); a tool error is thrown. console.log output is returned too. Limits: {}s, {} tool calls.\n\n\
                  Servers:\n{list}",

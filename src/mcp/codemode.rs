@@ -63,19 +63,33 @@ const PRELUDE: &str = r#"(() => {
   };
   const out = (level) => (...args) => log(level, args.map(fmt).join(" "));
   globalThis.console = Object.freeze({ log: out("log"), info: out("info"), warn: out("warn"), error: out("error"), debug: out("debug") });
+  const invoke = async (server, tool, args) => {
+    const reply = JSON.parse(await call(server, tool, JSON.stringify(args === undefined ? {} : args)));
+    if ("error" in reply) throw new Error(reply.error);
+    return reply.value;
+  };
+  // `then` and `toJSON` stay undefined so a namespace isn't taken for a
+  // promise or serialized as a call; tools with those names go through codemode.call.
   const namespace = (server) => new Proxy(Object.freeze({}), {
     get(_, tool) {
       if (typeof tool !== "string" || tool === "then" || tool === "toJSON") return undefined;
-      return async (args) => {
-        const reply = JSON.parse(await call(server, tool, JSON.stringify(args === undefined ? {} : args)));
-        if ("error" in reply) throw new Error(reply.error);
-        return reply.value;
-      };
+      return (args) => invoke(server, tool, args);
     },
   });
+  const servers = new Map();
   for (const [ident, server] of __NAMESPACES__) {
     Object.defineProperty(globalThis, ident, { value: namespace(server), enumerable: true });
+    servers.set(ident, server);
+    servers.set(server, server);
   }
+  // Call any tool by name, including ones that can't be properties.
+  globalThis.codemode = Object.freeze({
+    call: async (server, tool, args) => {
+      const name = servers.get(String(server));
+      if (name === undefined) throw new Error(`unknown server ${String(server)}`);
+      return invoke(name, String(tool), args);
+    },
+  });
 })();
 "#;
 
@@ -402,7 +416,7 @@ fn sandbox_globals() -> &'static std::collections::HashSet<String> {
     static GLOBALS: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
     GLOBALS.get_or_init(|| {
         let mut names: std::collections::HashSet<String> =
-            ["console", "__xolotl_call", "__xolotl_log"].iter().map(|s| s.to_string()).collect();
+            ["console", "codemode", "__xolotl_call", "__xolotl_log"].iter().map(|s| s.to_string()).collect();
         let listed = rquickjs::Runtime::new()
             .and_then(|rt| rquickjs::Context::full(&rt))
             .and_then(|ctx| ctx.with(|ctx| ctx.eval::<Vec<String>, _>("Object.getOwnPropertyNames(globalThis)")));
@@ -418,6 +432,9 @@ pub fn reserved_identifier(ident: &str) -> bool {
 }
 
 // ------------------------------------------------------------ declarations
+
+/// Tool names a namespace object can't expose as methods (promise and JSON hooks).
+const HIDDEN_NAMES: &[&str] = &["then", "toJSON"];
 
 /// One server's allowed tools, for [`declarations`].
 pub struct Group<'a> {
@@ -451,6 +468,11 @@ pub fn declarations(groups: &[Group<'_>]) -> String {
                 if !hints.is_empty() {
                     doc = format!("{doc}\n@remarks {}", hints.join(", "));
                 }
+            }
+            if HIDDEN_NAMES.contains(&t.name.as_ref()) {
+                let note =
+                    format!("Call with `codemode.call({:?}, {:?}, args)`: this name can't be called as a method.", g.namespace, t.name);
+                doc = if doc.is_empty() { note } else { format!("{doc}\n{note}") };
             }
             if !doc.is_empty() {
                 out.push_str(&doc_comment(&doc, 2));
@@ -731,6 +753,17 @@ mod tests {
         let _ = outer.await;
         let back = tokio::time::timeout(Duration::from_secs(3), permits.acquire()).await;
         assert!(back.is_ok(), "busy JavaScript kept running after cancellation");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_named_like_hooks_are_called_by_name() {
+        let o = run("return [await codemode.call('gh_work', 'then', {a: 1}), await codemode.call('gh-work', 'toJSON')]").await;
+        let v = o.result.unwrap();
+        assert_eq!(v[0], json!({"server": "gh-work", "tool": "then", "args": {"a": 1}}));
+        assert_eq!(v[1]["tool"], "toJSON");
+        assert_eq!(run("return typeof gh_work.then").await.result.unwrap(), json!("undefined"), "not a thenable");
+        let e = run("await codemode.call('other', 'x', {})").await.result.unwrap_err();
+        assert!(e.contains("unknown server other"), "{e}");
     }
 
     #[test]
