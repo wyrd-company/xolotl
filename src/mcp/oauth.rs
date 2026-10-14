@@ -105,6 +105,16 @@ struct Record {
     needs_login: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signed_in_at: Option<i64>,
+    /// Moves on with every new login and sign-out. Credentials obtained under
+    /// an earlier generation are never saved over a later one.
+    #[serde(default)]
+    generation: u64,
+}
+
+impl Record {
+    fn received_at(&self) -> Option<u64> {
+        self.credentials.as_ref().and_then(|c| c.token_received_at)
+    }
 }
 
 #[derive(Default)]
@@ -114,7 +124,13 @@ struct State {
     version: u64,
     /// The vault write of the current record failed; retried later.
     unsaved: bool,
+    /// The server was removed or its login replaced: nothing is saved any more.
+    retired: bool,
 }
+
+/// Marks errors from saving credentials of a superseded login; the
+/// connection that holds them reconnects.
+pub const LOGIN_CHANGED: &str = "the OAuth login changed";
 
 /// What the admin API shows about an OAuth server's login.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -145,47 +161,117 @@ impl OAuthStore {
         Arc::new(Self { secrets, key: format!("mcp/{server}/oauth"), state: Default::default(), refresh: Default::default() })
     }
 
+    async fn read(&self) -> Result<(Option<Record>, u64), AuthError> {
+        let (data, version) = self.secrets.get_versioned(&self.key).await.map_err(|e| AuthError::CredentialStoreError(format!("{e:#}")))?;
+        let record = match data {
+            Some(m) => Some(serde_json::from_value(Value::Object(m)).map_err(|e| AuthError::CredentialStoreError(e.to_string()))?),
+            None => None,
+        };
+        Ok((record, version))
+    }
+
     async fn locked(&self) -> Result<tokio::sync::MutexGuard<'_, State>, AuthError> {
         let mut st = self.state.lock().await;
         if !st.loaded {
-            let (data, version) =
-                self.secrets.get_versioned(&self.key).await.map_err(|e| AuthError::CredentialStoreError(format!("{e:#}")))?;
-            st.record = match data {
-                Some(m) => serde_json::from_value(Value::Object(m)).map_err(|e| AuthError::CredentialStoreError(e.to_string()))?,
-                None => Record::default(),
-            };
+            let (record, version) = self.read().await?;
+            st.record = record.unwrap_or_default();
             st.version = version;
             st.loaded = true;
         }
         Ok(st)
     }
 
-    /// Write the record. A failed write keeps the record in memory, marked
-    /// unsaved: a refreshed token may already have spent the stored refresh token.
-    async fn persist(&self, st: &mut State) {
-        let data = match serde_json::to_value(&st.record) {
-            Ok(Value::Object(m)) => m,
-            _ => unreachable!("record serializes to an object"),
-        };
-        let mut result = self.secrets.put_cas(&self.key, data.clone(), st.version).await;
-        if let Err(e) = &result
-            && e.downcast_ref::<Conflict>().is_some()
-        {
-            // Changed outside xolotl; the in-memory record is the one in use.
-            if let Ok((_, v)) = self.secrets.get_versioned(&self.key).await {
-                result = self.secrets.put_cas(&self.key, data, v).await;
-            }
+    /// Bring the in-memory record up to date with the vault, which another
+    /// instance (or an operator) may have changed:
+    /// - a deleted record or another generation (a sign-out or new login
+    ///   elsewhere) replaces the in-memory one;
+    /// - within a generation, the newer token wins, so a refresh made
+    ///   elsewhere is used instead of spending a stale refresh token.
+    async fn reconcile(&self, st: &mut State) -> Result<(), AuthError> {
+        let (stored, version) = self.read().await?;
+        if version == st.version && st.loaded {
+            return Ok(());
         }
-        match result {
-            Ok(v) => {
-                st.version = v;
+        match stored {
+            None if st.version > 0 => {
+                // Removed from the vault (e.g. the server was deleted elsewhere).
+                st.record = Record { generation: st.record.generation + 1, needs_login: Some("removed".into()), ..Default::default() };
+                st.version = 0;
                 st.unsaved = false;
             }
-            Err(e) => {
-                tracing::error!(secret = %self.key, error = %format!("{e:#}"), "saving MCP OAuth credentials failed; keeping them in memory");
-                st.unsaved = true;
+            None => {}
+            Some(stored) => {
+                let keep_ours = st.unsaved && stored.generation == st.record.generation && st.record.received_at() > stored.received_at();
+                if !keep_ours {
+                    st.record = stored;
+                    st.unsaved = false;
+                }
+                st.version = version;
             }
         }
+        st.loaded = true;
+        Ok(())
+    }
+
+    /// Write the record with check-and-set; on a conflict, reconcile and
+    /// write again only what still belongs to the current generation. A failed
+    /// write keeps the record in memory, marked unsaved: a refreshed token may
+    /// already have spent the stored refresh token.
+    async fn persist(&self, st: &mut State) {
+        if st.retired {
+            return;
+        }
+        st.unsaved = true;
+        for _ in 0..3 {
+            let data = match serde_json::to_value(&st.record) {
+                Ok(Value::Object(m)) => m,
+                _ => unreachable!("record serializes to an object"),
+            };
+            match self.secrets.put_cas(&self.key, data, st.version).await {
+                Ok(v) => {
+                    st.version = v;
+                    st.unsaved = false;
+                    return;
+                }
+                Err(e) if e.downcast_ref::<Conflict>().is_some() => {
+                    if let Err(e) = self.reconcile(st).await {
+                        tracing::error!(secret = %self.key, error = %e, "re-reading MCP OAuth credentials failed");
+                        return;
+                    }
+                    if !st.unsaved {
+                        return; // the stored record won
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(secret = %self.key, error = %format!("{e:#}"), "saving MCP OAuth credentials failed; keeping them in memory");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Re-read the vault record (the periodic sync).
+    pub async fn sync(&self) {
+        let mut st = self.state.lock().await;
+        if st.loaded
+            && !st.retired
+            && let Err(e) = self.reconcile(&mut st).await
+        {
+            tracing::warn!(secret = %self.key, error = %e, "re-reading MCP OAuth credentials failed");
+        }
+    }
+
+    pub async fn generation(&self) -> Result<u64, AuthError> {
+        Ok(self.locked().await?.record.generation)
+    }
+
+    /// Stop using this store: the server was removed or its login replaced.
+    /// Saves through any handle, including logins in progress, are refused.
+    pub async fn retire(&self) {
+        let _guard = self.refresh.lock().await;
+        let mut st = self.state.lock().await;
+        st.retired = true;
+        st.record.generation += 1;
     }
 
     pub async fn status(&self) -> OAuthStatus {
@@ -244,6 +330,7 @@ impl OAuthStore {
         st.record.credentials = None;
         st.record.needs_login = Some("signed out".into());
         st.record.signed_in_at = None;
+        st.record.generation += 1;
         self.persist(&mut st).await;
         anyhow::ensure!(!st.unsaved, "signed out in memory, but the vault write failed");
         Ok(())
@@ -261,46 +348,77 @@ impl OAuthStore {
     }
 }
 
-/// The [`CredentialStore`] handed to rmcp.
+/// The [`CredentialStore`] handed to rmcp, bound to the login generation it
+/// was created under: a login in progress, or a connection's refreshes.
 #[derive(Clone)]
-pub struct StoreHandle(pub Arc<OAuthStore>);
+pub struct StoreHandle {
+    store: Arc<OAuthStore>,
+    generation: u64,
+    /// A login in progress: its save starts the next generation.
+    login: bool,
+}
+
+impl StoreHandle {
+    pub fn login(store: Arc<OAuthStore>, generation: u64) -> Self {
+        Self { store, generation, login: true }
+    }
+
+    pub fn session(store: Arc<OAuthStore>, generation: u64) -> Self {
+        Self { store, generation, login: false }
+    }
+}
 
 #[async_trait::async_trait]
 impl CredentialStore for StoreHandle {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
-        Ok(self.0.locked().await?.record.credentials.clone())
+        Ok(self.store.locked().await?.record.credentials.clone())
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        let mut st = self.0.locked().await?;
-        let fresh_login = st.record.credentials.as_ref().map(|c| c.token_received_at) != Some(credentials.token_received_at)
-            && st.record.needs_login.is_some();
-        st.record.credentials = Some(credentials);
-        st.record.needs_login = None;
-        if fresh_login || st.record.signed_in_at.is_none() {
+        let mut st = self.store.locked().await?;
+        if st.retired || st.record.generation != self.generation {
+            return Err(AuthError::CredentialStoreError(format!(
+                "{LOGIN_CHANGED} (signed out, signed in again or removed) while these credentials were obtained; they were not saved"
+            )));
+        }
+        if self.login {
+            st.record.generation += 1;
             st.record.signed_in_at = Some(now());
         }
-        self.0.persist(&mut st).await;
+        st.record.credentials = Some(credentials);
+        st.record.needs_login = None;
+        self.store.persist(&mut st).await;
         Ok(())
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
-        let mut st = self.0.locked().await?;
-        st.record.credentials = None;
-        st.record.needs_login = Some("the authorization server changed".into());
-        self.0.persist(&mut st).await;
+        let mut st = self.store.locked().await?;
+        if st.record.generation == self.generation {
+            st.record.credentials = None;
+            st.record.needs_login = Some("the authorization server changed".into());
+            self.store.persist(&mut st).await;
+        }
         Ok(())
     }
 
     async fn on_refresh_token_rejected(&self, _credentials: &StoredCredentials) -> Result<(), AuthError> {
-        let mut st = self.0.locked().await?;
-        st.record.needs_login = Some("the refresh token was rejected".into());
-        self.0.persist(&mut st).await;
+        let mut st = self.store.locked().await?;
+        if st.record.generation == self.generation {
+            st.record.needs_login = Some("the refresh token was rejected".into());
+            self.store.persist(&mut st).await;
+        }
         Ok(())
     }
 
+    /// Serializes refreshes in this instance, and re-reads the vault first so
+    /// a refresh another instance made is used rather than repeated.
     async fn acquire_refresh_guard(&self) -> Result<Option<CredentialRefreshGuard>, AuthError> {
-        Ok(Some(CredentialRefreshGuard::new(self.0.refresh.clone().lock_owned().await)))
+        let guard = self.store.refresh.clone().lock_owned().await;
+        let mut st = self.store.locked().await?;
+        if !st.retired {
+            self.store.reconcile(&mut st).await?;
+        }
+        Ok(Some(CredentialRefreshGuard::new(guard)))
     }
 }
 
@@ -329,8 +447,9 @@ pub async fn authorized_client(
     if let Some(reason) = store.needs_login().await {
         anyhow::bail!("sign-in needed ({reason}): run `xolotl mcp login {name}` or use the web UI");
     }
+    let generation = store.generation().await?;
     let mut manager = AuthorizationManager::new(server.url.as_str()).await?;
-    manager.set_credential_store(StoreHandle(store.clone()));
+    manager.set_credential_store(StoreHandle::session(store.clone(), generation));
     if !manager.initialize_from_store().await.context("restoring the OAuth login")? {
         store.mark_needs_login("the authorization server changed").await;
         anyhow::bail!("sign-in needed (the authorization server changed): run `xolotl mcp login {name}`");
@@ -365,6 +484,8 @@ pub enum FlowStatus {
 
 struct Flow {
     server: String,
+    /// The login store the flow was started for; a replaced store refuses it.
+    store: Arc<OAuthStore>,
     state: String,
     started: Instant,
     /// Taken while the code is exchanged, so a login completes only once.
@@ -402,18 +523,29 @@ impl Flows {
         self.flows.lock().get(id).filter(|f| f.started.elapsed() < FLOW_TTL).map(|f| (f.server.clone(), f.status.clone()))
     }
 
+    /// Cancel a server's logins in progress (sign-out, removal, replacement).
+    pub fn cancel_server(&self, server: &str) {
+        self.flows.lock().retain(|_, f| f.server != server);
+    }
+
     pub fn by_state(&self, state: &str) -> Option<String> {
         self.flows.lock().iter().find(|(_, f)| f.state == state && f.started.elapsed() < FLOW_TTL).map(|(id, _)| id.clone())
     }
 
-    /// Exchange the code in a redirect URL. Returns the server name.
-    pub async fn complete(&self, id: &str, redirect_url: &str) -> Result<String> {
+    /// Exchange the code in a redirect URL. `current` gives a server's live
+    /// login store; a flow started for another one is refused. Returns the
+    /// server name.
+    pub async fn complete(&self, id: &str, redirect_url: &str, current: impl Fn(&str) -> Option<Arc<OAuthStore>>) -> Result<String> {
         let callback = AuthorizationCallback::from_redirect_url(redirect_url.trim())
             .map_err(|e| anyhow::anyhow!("{e}; paste the whole URL the browser ended on"))?;
         let (server, session) = {
             let mut flows = self.flows.lock();
             let flow = flows.get_mut(id).filter(|f| f.started.elapsed() < FLOW_TTL).context("no such login, or it expired; start again")?;
             anyhow::ensure!(flow.state == callback.csrf_token, "this URL belongs to a different login");
+            anyhow::ensure!(
+                current(&flow.server).is_some_and(|s| Arc::ptr_eq(&s, &flow.store)),
+                "the server was removed or changed since this login started; start again"
+            );
             let session = flow.session.take().context("this login was already completed")?;
             (flow.server.clone(), session)
         };
@@ -460,8 +592,9 @@ pub async fn start(
     flows: &Flows,
 ) -> Result<FlowStart> {
     let redirect = redirect_uri(cfg);
+    let generation = store.generation().await?;
     let mut manager = AuthorizationManager::new(server.url.as_str()).await?;
-    manager.set_credential_store(StoreHandle(store.clone()));
+    manager.set_credential_store(StoreHandle::login(store.clone(), generation));
     let challenge = challenge(http, &server.url).await;
     let resolution = manager.resolve_metadata_from_challenge(challenge.as_deref()).await.context("discovering the authorization server")?;
     let issuer = resolution.metadata.issuer.clone();
@@ -547,7 +680,14 @@ pub async fn start(
     let callback = public_url(cfg).is_some_and(|base| redirect == format!("{base}{CALLBACK_PATH}"));
     flows.insert(
         id.clone(),
-        Flow { server: name.to_string(), state, started: Instant::now(), session: Some(session), status: FlowStatus::Pending },
+        Flow {
+            server: name.to_string(),
+            store: store.clone(),
+            state,
+            started: Instant::now(),
+            session: Some(session),
+            status: FlowStatus::Pending,
+        },
     );
     Ok(FlowStart { flow_id: id, server: name.to_string(), url, redirect_uri: redirect, callback, registration: kind })
 }
@@ -570,6 +710,133 @@ mod tests {
         assert_eq!(doc["redirect_uris"], json!(["https://xolotl.example/admin/mcp/oauth/callback"]));
         cfg.mcp.oauth.redirect_uri = Some("http://localhost:9/cb".into());
         assert_eq!(redirect_uri(&cfg), "http://localhost:9/cb");
+    }
+
+    use crate::secrets::{MemoryStore, SecretStore};
+    use serde_json::Map;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A store whose writes can be made to fail, like an OpenBao outage.
+    #[derive(Default)]
+    struct Flaky {
+        inner: MemoryStore,
+        down: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl SecretStore for Flaky {
+        async fn get(&self, key: &str) -> Result<Option<Map<String, Value>>> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, data: Map<String, Value>) -> Result<()> {
+            self.inner.put(key, data).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, dir: &str) -> Result<Vec<String>> {
+            self.inner.list(dir).await
+        }
+        async fn get_versioned(&self, key: &str) -> Result<(Option<Map<String, Value>>, u64)> {
+            self.inner.get_versioned(key).await
+        }
+        async fn put_cas(&self, key: &str, data: Map<String, Value>, cas: u64) -> Result<u64> {
+            anyhow::ensure!(!self.down.load(Ordering::SeqCst), "vault unreachable");
+            self.inner.put_cas(key, data, cas).await
+        }
+        async fn destroy_versions(&self, key: &str, versions: &[u64]) -> Result<()> {
+            self.inner.destroy_versions(key, versions).await
+        }
+    }
+
+    fn creds(token: &str, at: u64) -> StoredCredentials {
+        serde_json::from_value(json!({
+            "client_id": "c",
+            "token_response": {"access_token": token, "token_type": "bearer", "expires_in": 3600, "refresh_token": format!("r-{token}")},
+            "granted_scopes": [],
+            "token_received_at": at,
+        }))
+        .unwrap()
+    }
+
+    async fn token(store: &Arc<OAuthStore>) -> Option<String> {
+        let c = StoreHandle::session(store.clone(), store.generation().await.unwrap()).load().await.unwrap()?;
+        serde_json::to_value(c).unwrap()["token_response"]["access_token"].as_str().map(str::to_string)
+    }
+
+    async fn signed_in(secrets: &Secrets) -> (Arc<OAuthStore>, Arc<OAuthStore>) {
+        let a = OAuthStore::new(secrets.clone(), "cloud");
+        StoreHandle::login(a.clone(), a.generation().await.unwrap()).save(creds("t1", 1)).await.unwrap();
+        let b = OAuthStore::new(secrets.clone(), "cloud");
+        assert_eq!(token(&b).await.as_deref(), Some("t1"));
+        (a, b)
+    }
+
+    #[tokio::test]
+    async fn superseded_logins_are_never_saved() {
+        let secrets: Secrets = Arc::new(MemoryStore::default());
+        let store = OAuthStore::new(secrets.clone(), "cloud");
+        // A login started, then a sign-out before its code was exchanged.
+        let pending = StoreHandle::login(store.clone(), store.generation().await.unwrap());
+        store.sign_out().await.unwrap();
+        assert!(pending.save(creds("late", 5)).await.unwrap_err().to_string().contains(LOGIN_CHANGED));
+        assert_eq!(token(&store).await, None);
+        // A connection's refresh after a sign-out.
+        let pending = StoreHandle::login(store.clone(), store.generation().await.unwrap());
+        pending.save(creds("t1", 6)).await.unwrap();
+        let session = StoreHandle::session(store.clone(), store.generation().await.unwrap());
+        store.sign_out().await.unwrap();
+        assert!(session.save(creds("t2", 7)).await.is_err());
+        // A removed server.
+        let pending = StoreHandle::login(store.clone(), store.generation().await.unwrap());
+        store.retire().await;
+        assert!(pending.save(creds("t3", 8)).await.is_err());
+        let stored = secrets.get("mcp/cloud/oauth").await.unwrap().unwrap();
+        assert!(stored.get("credentials").is_none(), "{stored:?}");
+    }
+
+    #[tokio::test]
+    async fn another_instances_changes_are_kept() {
+        let flaky = Arc::new(Flaky::default());
+        let secrets: Secrets = flaky.clone();
+
+        // A sign-out elsewhere beats an unsaved refresh flushed later.
+        let (a, b) = signed_in(&secrets).await;
+        flaky.down.store(true, Ordering::SeqCst);
+        StoreHandle::session(a.clone(), a.generation().await.unwrap()).save(creds("t2", 2)).await.unwrap();
+        assert!(a.is_unsaved().await);
+        flaky.down.store(false, Ordering::SeqCst);
+        b.sign_out().await.unwrap();
+        a.flush().await;
+        assert!(!a.is_unsaved().await);
+        assert_eq!(a.needs_login().await.as_deref(), Some("signed out"));
+        let fresh = OAuthStore::new(secrets.clone(), "cloud");
+        assert_eq!(token(&fresh).await, None, "the vault keeps the sign-out");
+
+        // So does a deletion.
+        let (a, _b) = signed_in(&secrets).await;
+        flaky.down.store(true, Ordering::SeqCst);
+        StoreHandle::session(a.clone(), a.generation().await.unwrap()).save(creds("t3", 3)).await.unwrap();
+        flaky.down.store(false, Ordering::SeqCst);
+        secrets.delete("mcp/cloud/oauth").await.unwrap();
+        a.flush().await;
+        assert!(secrets.get("mcp/cloud/oauth").await.unwrap().is_none(), "not written back");
+        assert_eq!(token(&a).await, None);
+
+        // A sign-out elsewhere reaches a loaded store on sync.
+        let (a, b) = signed_in(&secrets).await;
+        b.sign_out().await.unwrap();
+        assert_eq!(token(&a).await.as_deref(), Some("t1"), "cached until the next sync");
+        a.sync().await;
+        assert_eq!(token(&a).await, None);
+
+        // A refresh made elsewhere is picked up before refreshing again, and
+        // an older unsaved token doesn't replace it.
+        let (a, b) = signed_in(&secrets).await;
+        StoreHandle::session(b.clone(), b.generation().await.unwrap()).save(creds("t9", 9)).await.unwrap();
+        let handle = StoreHandle::session(a.clone(), a.generation().await.unwrap());
+        drop(handle.acquire_refresh_guard().await.unwrap());
+        assert_eq!(token(&a).await.as_deref(), Some("t9"));
     }
 
     #[test]

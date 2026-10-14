@@ -1533,6 +1533,71 @@ mod mcp_gateway {
             assert!(whoami(hub).await.unwrap_err().contains("sign-in needed (signed out)"));
         }
 
+        async fn login(hub: &McpHub, a: &Auth) {
+            let start = hub.login_start("cloud").await.unwrap();
+            hub.login_complete(&start.flow_id, &a.authorize(&start.url, Some(&a.base))).await.unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn stale_logins_and_other_instances() {
+            let a = auth_server().await;
+            let h = oauth_harness(&a, |_| {}).await;
+            let hub = &h.state.mcp;
+
+            // A login started before a sign-out can't sign the server back in.
+            let start = hub.login_start("cloud").await.unwrap();
+            let redirect = a.authorize(&start.url, Some(&a.base));
+            hub.logout("cloud").await.unwrap();
+            assert!(hub.login_complete(&start.flow_id, &redirect).await.is_err());
+            assert!(whoami(hub).await.unwrap_err().contains("sign-in needed (signed out)"));
+
+            // Two instances sharing the vault: a sign-out on one reaches the other.
+            login(hub, &a).await;
+            let other = McpHub::new(&h.state.cfg, h.state.secrets.clone(), h.state.db.clone());
+            other.reload().await.unwrap();
+            assert!(whoami(&other).await.is_ok());
+            hub.logout("cloud").await.unwrap();
+            other.reload().await.unwrap();
+            assert!(whoami(&other).await.unwrap_err().contains("sign-in needed"), "the sign-out wins");
+            assert!(h.state.secrets.get("mcp/cloud/oauth").await.unwrap().unwrap().get("credentials").is_none());
+
+            // The losing side of a refresh uses the winner's tokens.
+            login(hub, &a).await;
+            other.reload().await.unwrap();
+            assert!(whoami(&other).await.is_ok());
+            a.access.lock().clear();
+            assert!(whoami(hub).await.is_ok(), "refreshed (single-use refresh token spent)");
+            let t = whoami(&other).await;
+            assert!(t.as_ref().is_ok_and(|t| t.starts_with("Bearer at-")), "{t:?}");
+            let status = other.servers().await.unwrap();
+            assert_eq!(status[0].status.oauth.as_ref().unwrap().needs_login, None);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_removed_servers_login_stays_removed() {
+            let a = auth_server().await;
+            let h = oauth_harness(&a, |_| {}).await;
+            let hub = &h.state.mcp;
+            let def = || serde_json::from_value::<McpServerConfig>(json!({"url": format!("{}/mcp", a.base), "auth": "oauth"})).unwrap();
+            hub.put_server("live", def(), true).await.unwrap();
+            let start = hub.login_start("live").await.unwrap();
+            let redirect = a.authorize(&start.url, Some(&a.base));
+            hub.delete_server("live", &[]).await.unwrap();
+            hub.put_server("live", def(), true).await.unwrap();
+            let e = hub.login_complete(&start.flow_id, &redirect).await.unwrap_err();
+            assert!(format!("{e:#}").contains("no such login"), "{e:#}");
+            assert!(h.state.secrets.get("mcp/live/oauth").await.unwrap().is_none_or(|r| r.get("credentials").is_none()));
+
+            // Editing the description keeps the login; changing the URL doesn't.
+            let start = hub.login_start("live").await.unwrap();
+            hub.login_complete(&start.flow_id, &a.authorize(&start.url, Some(&a.base))).await.unwrap();
+            let mut renamed = def();
+            renamed.description = "new".into();
+            hub.put_server("live", renamed, false).await.unwrap();
+            let p = Principal { client_id: None, policy: Arc::new(mcp_policy(&["live"], &[])) };
+            assert!(hub.call(&p, "live", "whoami", Default::default()).await.is_ok());
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn tokens_near_expiry_are_refreshed_once_at_a_time() {
             let a = auth_server().await;

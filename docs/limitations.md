@@ -5,7 +5,7 @@
 | No budgets or rate limits; policies only control models and names. | [#3](https://github.com/wyrd-company/xolotl/issues/3) |
 | A refreshed OAuth token can still be lost: a lost token response after the provider rotated it, a crash during an OpenBao outage, or a login shared with a local CLI. Claude imports without `expiresAt` refresh only after a 401. | [#4](https://github.com/wyrd-company/xolotl/issues/4) |
 | The provider side (logins, refresh, usage, Claude Code and Codex CLI end to end, T3Code hubs) was only tested against mocks. OpenBao was tested against a real server. | [#5](https://github.com/wyrd-company/xolotl/issues/5) |
-| Single instance only: refreshes are serialized in-process, and cooldowns and session affinity are per instance. | [#6](https://github.com/wyrd-company/xolotl/issues/6) |
+| Single instance only: refreshes are serialized in-process, and cooldowns and session affinity are per instance. MCP OAuth logins re-read the vault before refreshing and reconcile conflicting writes, but two instances refreshing the same login at the same moment can still spend one refresh token twice. | [#6](https://github.com/wyrd-company/xolotl/issues/6) |
 
 Smaller points, not tracked separately:
 

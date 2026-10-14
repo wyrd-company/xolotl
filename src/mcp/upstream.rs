@@ -78,13 +78,19 @@ pub enum CallError {
 
 impl Upstream {
     pub fn new(name: String, cfg: McpServerConfig, secrets: Secrets) -> Self {
+        Self::with_store(name, cfg, secrets, None)
+    }
+
+    /// `store`: the login of the server this one replaces, kept when only
+    /// fields that don't affect it changed.
+    pub fn with_store(name: String, cfg: McpServerConfig, secrets: Secrets, store: Option<Arc<OAuthStore>>) -> Self {
         // No redirects: the headers carry credentials meant for this origin only.
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("reqwest client builds");
-        let oauth = (cfg.auth == McpAuth::Oauth).then(|| OAuthStore::new(secrets.clone(), &name));
+        let oauth = (cfg.auth == McpAuth::Oauth).then(|| store.unwrap_or_else(|| OAuthStore::new(secrets.clone(), &name)));
         Self { name, cfg, secrets, http, oauth, client: Default::default(), cached: Default::default() }
     }
 
@@ -292,6 +298,11 @@ impl Upstream {
     /// A rejected token marks an OAuth server as needing a login.
     async fn upstream_error(&self, e: ServiceError) -> CallError {
         let msg = error_chain(&e);
+        if msg.contains(oauth::LOGIN_CHANGED) {
+            // A refresh under a superseded login; reconnect with the current one.
+            self.disconnect().await;
+            return CallError::Upstream(msg);
+        }
         if let (Some(store), Some(reason)) = (&self.oauth, oauth::auth_failure(&msg)) {
             store.mark_needs_login(&reason).await;
             let reason = store.needs_login().await.unwrap_or(reason);

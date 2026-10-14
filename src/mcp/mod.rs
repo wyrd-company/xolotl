@@ -134,6 +134,11 @@ pub struct McpHub {
     executions: tokio::sync::Semaphore,
 }
 
+/// Whether a changed definition still uses the same OAuth login.
+fn same_login(a: &McpServerConfig, b: &McpServerConfig) -> bool {
+    a.auth == McpAuth::Oauth && b.auth == McpAuth::Oauth && a.url == b.url && a.oauth == b.oauth
+}
+
 /// The JavaScript identifier of a server name.
 pub fn namespace(server: &str) -> String {
     server.replace('-', "_")
@@ -214,19 +219,35 @@ impl McpHub {
                 tracing::warn!(server = %name, "MCP server in the vault ignored: {a:?} and {b:?} have the same name in code");
                 continue;
             }
-            let kept = current.iter().find(|(n, e)| *n == name && e.source == ServerSource::Vault && e.up.cfg == cfg);
-            let up = match kept {
-                Some((_, e)) => e.up.clone(),
-                None => Arc::new(Upstream::new(name.clone(), cfg, self.secrets.clone())),
+            let previous = current.iter().find(|(n, e)| *n == name && e.source == ServerSource::Vault).map(|(_, e)| &e.up);
+            let up = match previous {
+                Some(up) if up.cfg == cfg => up.clone(),
+                // Same login when nothing it depends on changed (e.g. the description).
+                Some(up) if same_login(&up.cfg, &cfg) => {
+                    Arc::new(Upstream::with_store(name.clone(), cfg, self.secrets.clone(), up.oauth.clone()))
+                }
+                _ => Arc::new(Upstream::new(name.clone(), cfg, self.secrets.clone())),
             };
             next.insert(name, Entry { up, source: ServerSource::Vault });
         }
         let gone: Vec<Arc<Upstream>> =
             current.iter().filter(|(n, e)| next.get(n).is_none_or(|x| !Arc::ptr_eq(&x.up, &e.up))).map(|(_, e)| e.up.clone()).collect();
+        let live: Vec<Arc<oauth::OAuthStore>> = next.values().filter_map(|e| e.up.oauth.clone()).collect();
         let n = next.values().filter(|e| e.source == ServerSource::Vault).count();
         *self.servers.write() = next;
         for up in gone {
             up.disconnect().await;
+            // A login no server uses any more: stop it, and its logins in progress.
+            if let Some(store) = &up.oauth
+                && !live.iter().any(|s| Arc::ptr_eq(s, store))
+            {
+                store.retire().await;
+                self.flows.cancel_server(&up.name);
+            }
+        }
+        // Pick up sign-outs, logins and refreshes made by other instances.
+        for store in live {
+            store.sync().await;
         }
         Ok(n)
     }
@@ -280,6 +301,11 @@ impl McpHub {
                 users.join(", ")
             )));
         }
+        // Stop the login first, so nothing in flight writes it back.
+        if let Some(store) = self.get(name).and_then(|u| u.oauth.clone()) {
+            store.retire().await;
+        }
+        self.flows.cancel_server(name);
         self.secrets.delete(&key).await.map_err(ServerChangeError::Store)?;
         for secret in [format!("mcp/{name}/oauth"), format!("mcp/{name}")] {
             if let Err(e) = self.secrets.delete(&secret).await {
@@ -310,7 +336,7 @@ impl McpHub {
     /// Finish a login with the URL the browser was redirected to, then
     /// reconnect and re-read the server's tools.
     pub async fn login_complete(&self, flow_id: &str, redirect_url: &str) -> Result<String> {
-        let server = self.flows.complete(flow_id, redirect_url).await?;
+        let server = self.flows.complete(flow_id, redirect_url, |name| self.get(name).and_then(|u| u.oauth.clone())).await?;
         let up = self.server(&server)?;
         up.disconnect().await;
         if let Err(e) = up.refresh().await {
@@ -322,6 +348,7 @@ impl McpHub {
 
     pub async fn logout(&self, name: &str) -> Result<()> {
         let (up, store) = self.oauth_server(name)?;
+        self.flows.cancel_server(name);
         store.sign_out().await?;
         up.disconnect().await;
         Ok(())

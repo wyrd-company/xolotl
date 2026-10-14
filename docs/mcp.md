@@ -118,7 +118,13 @@ Tokens live in the vault at `mcp/<name>/oauth` together with the client registra
 - **Use:** every request to the server carries the access token.
 - **Refresh:** the token is refreshed shortly before it expires, and once more when the server answers 401.
 - **Serialized:** refreshes are serialized per server, because refresh tokens may be single-use.
-- **Vault failures:** a token whose vault write fails keeps working from memory. It shows as unsaved and is retried every 15 s.
+- **Re-read before refreshing:** before each refresh, xolotl reads the vault again, so a refresh another instance made is used rather than repeated with a spent refresh token.
+- **Generations:** the record carries a login generation, which moves on with each login, sign-out and removal.
+  - Credentials obtained under an earlier generation are never saved. That covers a login started before a sign-out, a refresh racing a sign-out, and a login started for a server that was since removed and re-created.
+  - Logins in progress are cancelled when the server is signed out, removed or replaced.
+- **Other instances:** writes use check-and-set. On a conflict, the stored record wins when its generation differs, for example after a sign-out or new login elsewhere. Within the same generation, the newer token wins. The 60 s sync re-reads the record, so a sign-out elsewhere also reaches a connection that is already open.
+- **Vault failures:** a token whose vault write fails keeps working from memory. It shows as unsaved and is retried every 15 s, through the same check-and-set, so a sign-out or removal that happened meanwhile is kept.
+- **Editing a server:** changing only fields the login doesn't depend on (description, headers, timeout) keeps the login. Changing the URL, the auth mode or the OAuth settings starts a new one.
 
 These mark the server **sign-in needed**:
 
