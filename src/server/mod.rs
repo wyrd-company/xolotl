@@ -201,6 +201,9 @@ pub fn spawn_background(state: AppState) {
             if s.subs.unsaved_count() > 0 {
                 s.subs.flush_unsaved().await;
             }
+            if s.mcp.unsaved_count().await > 0 {
+                s.mcp.flush_unsaved().await;
+            }
         }
     });
     let poll = state.cfg.subscription.usage_poll_secs;

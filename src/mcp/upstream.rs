@@ -18,7 +18,8 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::{ClientLifecycleMode, ClientServiceExt};
 use serde::Serialize;
 
-use crate::config::McpServerConfig;
+use super::oauth::{self, OAuthStatus, OAuthStore};
+use crate::config::{McpAuth, McpServerConfig};
 use crate::db::now;
 use crate::secrets::Secrets;
 
@@ -35,6 +36,11 @@ pub struct UpstreamStatus {
     pub tools: usize,
     pub tools_refreshed_at: Option<i64>,
     pub last_error: Option<String>,
+    /// `headers` or `oauth`.
+    pub auth: McpAuth,
+    /// The OAuth login, for `auth = "oauth"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthStatus>,
 }
 
 #[derive(Default)]
@@ -53,6 +59,8 @@ pub struct Upstream {
     pub cfg: McpServerConfig,
     secrets: Secrets,
     http: reqwest::Client,
+    /// The login, for `auth = "oauth"`.
+    pub oauth: Option<Arc<OAuthStore>>,
     client: tokio::sync::Mutex<Option<RunningService<RoleClient, ClientConfig>>>,
     cached: RwLock<Cached>,
 }
@@ -76,10 +84,19 @@ impl Upstream {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("reqwest client builds");
-        Self { name, cfg, secrets, http, client: Default::default(), cached: Default::default() }
+        let oauth = (cfg.auth == McpAuth::Oauth).then(|| OAuthStore::new(secrets.clone(), &name));
+        Self { name, cfg, secrets, http, oauth, client: Default::default(), cached: Default::default() }
     }
 
-    pub fn status(&self) -> UpstreamStatus {
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    pub async fn status(&self) -> UpstreamStatus {
+        let oauth = match &self.oauth {
+            Some(store) => Some(store.status().await),
+            None => None,
+        };
         let c = self.cached.read();
         let connected = self.client.try_lock().map(|g| g.as_ref().is_some_and(|s| !s.is_closed())).unwrap_or(false);
         UpstreamStatus {
@@ -89,6 +106,8 @@ impl Upstream {
             tools: c.tools.len(),
             tools_refreshed_at: c.refreshed_at,
             last_error: c.last_error.clone(),
+            auth: self.cfg.auth,
+            oauth,
         }
     }
 
@@ -139,16 +158,46 @@ impl Upstream {
         let config = StreamableHttpClientTransportConfig::with_uri(self.cfg.url.clone())
             .custom_headers(self.headers().await?)
             .reinit_on_expired_session(true);
-        let transport = StreamableHttpClientTransport::with_client(self.http.clone(), config);
         let info = ClientConfig::new(ClientCapabilities::default(), Implementation::new("xolotl", env!("CARGO_PKG_VERSION")));
         let lifecycle = ClientLifecycleMode::Auto {
             preferred_versions: vec![ProtocolVersion::V_2026_07_28],
             legacy_version: Some(ProtocolVersion::V_2025_11_25),
         };
-        let svc = tokio::time::timeout(CONNECT_TIMEOUT, info.serve_with_lifecycle(transport, lifecycle))
-            .await
-            .map_err(|_| anyhow::anyhow!("connecting timed out after {CONNECT_TIMEOUT:?}"))?
-            .map_err(|e| anyhow::anyhow!("connecting failed: {e}"))?;
+        let served = match &self.oauth {
+            Some(store) => {
+                // Restoring the login reads the authorization server's metadata.
+                let client = tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    oauth::authorized_client(&self.name, &self.cfg, store, &self.secrets, self.http.clone()),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("reaching the authorization server timed out after {CONNECT_TIMEOUT:?}"))??;
+                let transport = StreamableHttpClientTransport::with_client(client, config);
+                tokio::time::timeout(CONNECT_TIMEOUT, info.serve_with_lifecycle(transport, lifecycle)).await
+            }
+            None => {
+                let transport = StreamableHttpClientTransport::with_client(self.http.clone(), config);
+                tokio::time::timeout(CONNECT_TIMEOUT, info.serve_with_lifecycle(transport, lifecycle)).await
+            }
+        };
+        let svc = match served {
+            Err(_) => anyhow::bail!("connecting timed out after {CONNECT_TIMEOUT:?}"),
+            Ok(Err(e)) => {
+                let msg = error_chain(&e);
+                if let Some(reason) = oauth::auth_failure(&msg) {
+                    match &self.oauth {
+                        Some(store) => {
+                            store.mark_needs_login(&reason).await;
+                            let reason = store.needs_login().await.unwrap_or(reason);
+                            anyhow::bail!("sign-in needed ({reason}): run `xolotl mcp login {}`", self.name)
+                        }
+                        None => anyhow::bail!("connecting failed: {msg} (if the server uses OAuth, set auth = \"oauth\" for it)"),
+                    }
+                }
+                anyhow::bail!("connecting failed: {msg}")
+            }
+            Ok(Ok(svc)) => svc,
+        };
         let mut c = self.cached.write();
         if let Some(info) = svc.peer_info() {
             c.server_info = serde_json::to_value(&*info).ok().and_then(|v| {
@@ -234,11 +283,36 @@ impl Upstream {
     }
 
     /// A transport failure drops the connection so the next call reconnects.
+    /// A rejected token marks an OAuth server as needing a login.
     async fn upstream_error(&self, e: ServiceError) -> CallError {
+        let msg = error_chain(&e);
+        if let (Some(store), Some(reason)) = (&self.oauth, oauth::auth_failure(&msg)) {
+            store.mark_needs_login(&reason).await;
+            let reason = store.needs_login().await.unwrap_or(reason);
+            self.disconnect().await;
+            let msg = format!("sign-in needed ({reason}): run `xolotl mcp login {}`", self.name);
+            self.set_error(&msg);
+            return CallError::Upstream(msg);
+        }
         if matches!(e, ServiceError::TransportClosed | ServiceError::TransportSend(_)) {
             self.disconnect().await;
-            self.set_error(&e.to_string());
+            self.set_error(&msg);
         }
-        CallError::Upstream(e.to_string())
+        CallError::Upstream(msg)
     }
+}
+
+/// An error with its sources, which carry the transport's reason.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        let text = s.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = s.source();
+    }
+    out
 }

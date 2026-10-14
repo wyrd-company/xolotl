@@ -44,7 +44,7 @@
         - llama.cpp (OpenAI-compatible)
         - OpenCode Go
 - MCP gateway
-    - Upstream: Streamable HTTP MCP servers, several instances of one server with different credentials (secrets in OpenBao)
+    - Upstream: Streamable HTTP MCP servers, several instances of one server with different credentials: header secrets or OAuth logins, kept in OpenBao
     - Downstream: one code-mode MCP server at `/mcp` (`search` + `execute`, QuickJS sandbox), MCP 2026-07-28 and older clients
     - Policies select MCP servers and tools
 - T3Code Hubs compatibility (CLIProxyAPI)
@@ -88,7 +88,8 @@ bao kv put secret/xolotl/telemetry Authorization="Basic ..."
 | `telemetry` | OTLP header values |
 | `providers/<name>` | `api_key` for gateway providers |
 | `accounts/<provider>/<id>` | OAuth tokens / API key for subscription accounts (rewritten on refresh) |
-| `mcp/<server>` | values for the `{field}` placeholders in an MCP server's headers |
+| `mcp/<server>` | values for the `{field}` placeholders in an MCP server's headers; `client_secret` of a pre-registered OAuth client |
+| `mcp/<server>/oauth` | an MCP server's OAuth client registration and tokens (rewritten on refresh) |
 | `policies/<policy>` | client key policy |
 | `keys/<policy>/<client>` | client key record, including `api_key`, for that client to read |
 
@@ -148,6 +149,8 @@ xolotl usage --group-by client --since 7d
 # MCP gateway
 xolotl mcp servers                 # connection, tools, secret fields
 xolotl mcp set-secret github-work token   # value on stdin, fills {token} in the headers
+xolotl mcp login linear            # OAuth: open the URL, approve, paste the URL the browser ends on
+xolotl mcp logout linear
 xolotl mcp tools github-work
 xolotl mcp refresh
 xolotl mcp usage --group-by tool

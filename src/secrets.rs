@@ -7,6 +7,7 @@
 //! - `providers/<name>`             `{ api_key }` upstream gateway provider keys
 //! - `accounts/<provider>/<id>`     OAuth credentials for subscription accounts
 //! - `mcp/<server>`                 values for an MCP server's `{field}` header placeholders
+//! - `mcp/<server>/oauth`           an MCP server's OAuth client registration and tokens
 //! - `policies/<name>`               client key policies
 //! - `keys/<policy>/<client>`       client key records (readable by that client)
 

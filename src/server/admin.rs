@@ -48,6 +48,14 @@ pub fn router() -> Router<AppState> {
         .route("/mcp/servers/{name}/tools", get(mcp_tools))
         .route("/mcp/servers/{name}/refresh", post(mcp_refresh))
         .route("/mcp/servers/{name}/secret", axum::routing::put(mcp_set_secret))
+        .route("/mcp/servers/{name}/oauth", delete(mcp_logout))
+        .route("/mcp/servers/{name}/oauth/start", post(mcp_login_start))
+        .route("/mcp/oauth/flows/{id}", get(mcp_login_status))
+        .route("/mcp/oauth/flows/{id}/complete", post(mcp_login_complete))
+        // Public: the authorization server redirects the browser here, and
+        // authorization servers fetch the client metadata document.
+        .route("/mcp/oauth/callback", get(mcp_login_callback))
+        .route("/mcp/oauth/client-metadata.json", get(mcp_client_metadata))
         .route("/mcp/refresh", post(mcp_refresh_all))
         .route("/mcp/usage", get(mcp_usage))
         .route("/mcp/calls", get(mcp_calls))
@@ -473,6 +481,96 @@ async fn mcp_set_secret(State(s): State<AppState>, h: HeaderMap, Path(name): Pat
     s.mcp.set_secret(&name, req.fields).await.map_err(bad)?;
     tracing::info!(server = %name, ?fields, "updated MCP server secret");
     ok(json!({"server": name, "updated": fields}))
+}
+
+async fn mcp_login_start(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    if !s.mcp.has_server(&name) {
+        return Err(json_error(StatusCode::NOT_FOUND, "no such MCP server"));
+    }
+    ok(s.mcp.login_start(&name).await.map_err(|e| json_error(StatusCode::BAD_GATEWAY, format!("{e:#}")))?)
+}
+
+async fn mcp_login_status(State(s): State<AppState>, h: HeaderMap, Path(id): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    let (server, status) = s.mcp.flows.status(&id).ok_or_else(|| json_error(StatusCode::NOT_FOUND, "no such login, or it expired"))?;
+    let mut v = serde_json::to_value(status).map_err(|e| internal(e.into()))?;
+    v["server"] = json!(server);
+    ok(v)
+}
+
+#[derive(Deserialize)]
+struct McpLoginComplete {
+    /// The URL the browser ended on after consent.
+    redirect_url: String,
+}
+
+async fn mcp_login_complete(State(s): State<AppState>, h: HeaderMap, Path(id): Path<String>, Json(req): Json<McpLoginComplete>) -> Res {
+    admin(&s, &h).await?;
+    let server = s.mcp.login_complete(&id, &req.redirect_url).await.map_err(bad)?;
+    ok(json!({"server": server, "status": "complete"}))
+}
+
+#[derive(Deserialize)]
+struct CallbackQuery {
+    state: Option<String>,
+    code: Option<String>,
+}
+
+/// The browser lands here after consent when `server.public_url` is set. The
+/// unguessable `state` of a login an admin started is what authorizes it.
+async fn mcp_login_callback(State(s): State<AppState>, uri: axum::http::Uri, Query(q): Query<CallbackQuery>) -> Response {
+    let page = |status: StatusCode, title: &str, text: &str| {
+        let html = format!(
+            "<!doctype html><meta charset=utf-8><title>{title}</title>\
+             <body style=\"font-family:sans-serif;max-width:36rem;margin:4rem auto\"><h1>{title}</h1><p>{text}</p>"
+        );
+        (
+            status,
+            [(axum::http::header::CONTENT_SECURITY_POLICY, "default-src 'none'; style-src 'unsafe-inline'")],
+            axum::response::Html(html),
+        )
+            .into_response()
+    };
+    let Some(id) = q.state.as_deref().and_then(|st| s.mcp.flows.by_state(st)) else {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Unknown login",
+            "This sign-in link doesn't belong to a login in progress. Start again from xolotl.",
+        );
+    };
+    if q.code.is_none() {
+        return page(StatusCode::BAD_REQUEST, "Sign-in refused", "The authorization server did not grant access. Start again from xolotl.");
+    }
+    // The redirect URL as the authorization server built it, so `iss` and `state` are checked as sent.
+    let url = format!("http://callback{}", uri.path_and_query().map(|p| p.as_str()).unwrap_or(""));
+    match s.mcp.login_complete(&id, &url).await {
+        Ok(server) => page(StatusCode::OK, "Signed in", &format!("xolotl is signed in to {server}. You can close this tab.")),
+        Err(e) => page(StatusCode::BAD_REQUEST, "Sign-in failed", &html_escape(&format!("{e:#}"))),
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+async fn mcp_client_metadata(State(s): State<AppState>) -> Response {
+    match s.mcp.client_metadata() {
+        Some(doc) => Json(doc).into_response(),
+        None => {
+            json_error(StatusCode::NOT_FOUND, "no client metadata document: set server.public_url (https) or mcp.oauth.client_metadata_url")
+        }
+    }
+}
+
+async fn mcp_logout(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    if !s.mcp.has_server(&name) {
+        return Err(json_error(StatusCode::NOT_FOUND, "no such MCP server"));
+    }
+    s.mcp.logout(&name).await.map_err(bad)?;
+    tracing::info!(server = %name, "signed out of MCP server");
+    ok(json!({"server": name, "signed_out": true}))
 }
 
 #[derive(Deserialize)]

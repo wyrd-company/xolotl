@@ -4,6 +4,7 @@
 listen = "0.0.0.0:8317"
 max_body_bytes = 67108864      # 64 MiB (OCR / batch uploads)
 upstream_timeout_secs = 600    # max idle time while reading an upstream response
+# public_url = "https://xolotl.example.lan"   # where browsers reach xolotl; lets OAuth logins finish by themselves
 
 [database]
 # Runtime state only (cooldowns, usage snapshots, request log). No secrets.
@@ -89,6 +90,13 @@ max_concurrent_executions = 8
 tools_refresh_secs = 300
 allowed_origins = []            # browser origins allowed to call /mcp; empty refuses any Origin
 
+[mcp.oauth]
+# OAuth logins (auth = "oauth"). The browser returns to a loopback URL whose
+# address you paste back, or to xolotl itself when server.public_url is set.
+# redirect_uri = "http://127.0.0.1:33418/callback"
+# client_metadata_url = "https://example.com/xolotl-client.json"   # Client ID Metadata Document
+client_name = "xolotl"
+
 # One entry per instance; `{field}` in headers comes from the vault secret
 # mcp/<name> (xolotl mcp set-secret <name> <field>). In code, `-` becomes `_`.
 # [mcp.servers.github-work]
@@ -96,3 +104,9 @@ allowed_origins = []            # browser origins allowed to call /mcp; empty re
 # description = "GitHub, work account"
 # headers = { Authorization = "Bearer {token}" }
 # timeout_secs = 60
+
+# An OAuth server: `xolotl mcp login linear`. Optional: oauth.client_id for a
+# pre-registered client (its secret: xolotl mcp set-secret linear client_secret).
+# [mcp.servers.linear]
+# url = "https://mcp.linear.app/mcp"
+# auth = "oauth"

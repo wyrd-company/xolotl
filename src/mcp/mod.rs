@@ -4,6 +4,7 @@
 //! tools its policy allows) and `execute` (JavaScript that calls them).
 
 pub mod codemode;
+pub mod oauth;
 pub mod server;
 mod upstream;
 
@@ -17,7 +18,7 @@ use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::config::McpConfig;
+use crate::config::{Config, McpAuth, McpConfig};
 use crate::db::{Db, McpCallRecord};
 use crate::keys::Principal;
 use crate::policy::Policy;
@@ -84,7 +85,10 @@ pub struct ServerInfo {
 
 pub struct McpHub {
     pub cfg: McpConfig,
+    /// The whole config, for the OAuth redirect URI (`server.public_url`).
+    app: Config,
     secrets: Secrets,
+    pub flows: oauth::Flows,
     db: Db,
     servers: BTreeMap<String, Arc<Upstream>>,
     executions: tokio::sync::Semaphore,
@@ -96,10 +100,77 @@ pub fn namespace(server: &str) -> String {
 }
 
 impl McpHub {
-    pub fn new(cfg: &McpConfig, secrets: Secrets, db: Db) -> Self {
+    pub fn new(app: &Config, secrets: Secrets, db: Db) -> Self {
+        let cfg = &app.mcp;
         let servers =
             cfg.servers.iter().map(|(name, s)| (name.clone(), Arc::new(Upstream::new(name.clone(), s.clone(), secrets.clone())))).collect();
-        Self { cfg: cfg.clone(), secrets, db, servers, executions: tokio::sync::Semaphore::new(cfg.max_concurrent_executions.max(1)) }
+        Self {
+            cfg: cfg.clone(),
+            app: app.clone(),
+            secrets,
+            flows: Default::default(),
+            db,
+            servers,
+            executions: tokio::sync::Semaphore::new(cfg.max_concurrent_executions.max(1)),
+        }
+    }
+
+    fn server(&self, name: &str) -> Result<&Arc<Upstream>> {
+        self.servers.get(name).ok_or_else(|| anyhow::anyhow!("no such MCP server"))
+    }
+
+    fn oauth_server(&self, name: &str) -> Result<(&Arc<Upstream>, &Arc<oauth::OAuthStore>)> {
+        let up = self.server(name)?;
+        let store = up.oauth.as_ref().ok_or_else(|| anyhow::anyhow!("MCP server {name} does not use OAuth (auth = \"oauth\")"))?;
+        Ok((up, store))
+    }
+
+    /// Start an OAuth login to a server.
+    pub async fn login_start(&self, name: &str) -> Result<oauth::FlowStart> {
+        let (up, store) = self.oauth_server(name)?;
+        let start = oauth::start(&self.app, name, &up.cfg, store, &self.secrets, up.http(), &self.flows);
+        tokio::time::timeout(std::time::Duration::from_secs(60), start)
+            .await
+            .map_err(|_| anyhow::anyhow!("discovery and client registration timed out after 60s"))?
+    }
+
+    /// Finish a login with the URL the browser was redirected to, then
+    /// reconnect and re-read the server's tools.
+    pub async fn login_complete(&self, flow_id: &str, redirect_url: &str) -> Result<String> {
+        let server = self.flows.complete(flow_id, redirect_url).await?;
+        let up = self.server(&server)?;
+        up.disconnect().await;
+        if let Err(e) = up.refresh().await {
+            tracing::warn!(server = %server, error = %e, "signed in, but listing tools failed");
+        }
+        tracing::info!(server = %server, "MCP OAuth login complete");
+        Ok(server)
+    }
+
+    pub async fn logout(&self, name: &str) -> Result<()> {
+        let (up, store) = self.oauth_server(name)?;
+        store.sign_out().await?;
+        up.disconnect().await;
+        Ok(())
+    }
+
+    pub fn client_metadata(&self) -> Option<Value> {
+        oauth::client_metadata(&self.app)
+    }
+
+    pub async fn unsaved_count(&self) -> usize {
+        let mut n = 0;
+        for store in self.servers.values().filter_map(|u| u.oauth.as_ref()) {
+            n += usize::from(store.is_unsaved().await);
+        }
+        n
+    }
+
+    /// Retry vault writes of OAuth credentials that failed.
+    pub async fn flush_unsaved(&self) {
+        for store in self.servers.values().filter_map(|u| u.oauth.as_ref()) {
+            store.flush().await;
+        }
     }
 
     pub fn server_names(&self) -> BTreeSet<String> {
@@ -118,6 +189,9 @@ impl McpHub {
             for v in up.cfg.headers.values() {
                 fields.extend(template_fields(v)?);
             }
+            if up.cfg.auth == McpAuth::Oauth && up.cfg.oauth.client_id.is_some() {
+                fields.insert("client_secret".to_string());
+            }
             let stored = if fields.is_empty() { Default::default() } else { self.secrets.get(&secret).await?.unwrap_or_default() };
             let secret_fields = fields
                 .into_iter()
@@ -133,7 +207,7 @@ impl McpHub {
                 namespace: namespace(name),
                 secret,
                 secret_fields,
-                status: up.status(),
+                status: up.status().await,
             });
         }
         Ok(out)

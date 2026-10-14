@@ -71,7 +71,7 @@ async fn harness_with(tweak: impl FnOnce(&mut Config)) -> Harness {
     let subs = Arc::new(Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone()));
     let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()));
     let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
-    let mcp = Arc::new(McpHub::new(&cfg.mcp, secrets.clone(), db.clone()));
+    let mcp = Arc::new(McpHub::new(&cfg, secrets.clone(), db.clone()));
     let state = AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: None, sessions: Default::default(), mcp };
     Harness { state, admin: "boot".into(), upstream }
 }
@@ -1077,5 +1077,314 @@ mod mcp_gateway {
         assert_eq!(view["tools"], json!(["calc/add", "calc/whoami"]));
         let bad = json!({"name": "x", "scopes": ["mcp"], "mcp_servers": ["nope"]});
         assert_eq!(g.h.call("POST", "/admin/policy-preview", Some(&g.h.admin), Some(bad)).await.0, 400);
+    }
+
+    mod oauth {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use axum::extract::{Form, State as AxState};
+        use base64::Engine;
+        use parking_lot::Mutex;
+        use sha2::Digest;
+
+        use super::*;
+        use crate::config::{McpAuth, McpServerOAuthConfig};
+        use crate::keys::Principal;
+        use crate::mcp::oauth::{DEFAULT_REDIRECT_URI, RegistrationKind};
+
+        /// A mock authorization server and an OAuth-protected MCP server on one origin.
+        #[derive(Default)]
+        struct Auth {
+            base: String,
+            cimd: AtomicBool,
+            /// Tokens from the next code exchange expire within rmcp's refresh margin.
+            short_ttl: AtomicBool,
+            registrations: AtomicUsize,
+            token_calls: AtomicUsize,
+            refreshes: AtomicUsize,
+            n: AtomicUsize,
+            codes: Mutex<HashMap<String, String>>,
+            access: Mutex<HashSet<String>>,
+            refresh: Mutex<Option<String>>,
+            last_token_request: Mutex<HashMap<String, String>>,
+            last_token_auth: Mutex<Option<String>>,
+        }
+
+        impl Auth {
+            fn issue(&self, short: bool) -> Value {
+                let n = self.n.fetch_add(1, Ordering::SeqCst) + 1;
+                let (at, rt) = (format!("at-{n}"), format!("rt-{n}"));
+                self.access.lock().insert(at.clone());
+                *self.refresh.lock() = Some(rt.clone());
+                json!({"access_token": at, "refresh_token": rt, "token_type": "Bearer", "expires_in": if short { 5 } else { 3600 }, "scope": "tools"})
+            }
+
+            /// What the browser does: approve, and follow the redirect with a code.
+            fn authorize(&self, auth_url: &str, iss: Option<&str>) -> String {
+                let u = url::Url::parse(auth_url).unwrap();
+                let q: HashMap<String, String> = u.query_pairs().map(|(k, v)| (k.into(), v.into())).collect();
+                assert_eq!(q["code_challenge_method"], "S256");
+                assert_eq!(q["resource"], format!("{}/mcp", self.base), "RFC 8707 resource");
+                let code = format!("code-{}", self.codes.lock().len() + 1);
+                self.codes.lock().insert(code.clone(), q["code_challenge"].clone());
+                let mut redirect = url::Url::parse(&q["redirect_uri"]).unwrap();
+                redirect.query_pairs_mut().append_pair("code", &code).append_pair("state", &q["state"]);
+                if let Some(iss) = iss {
+                    redirect.query_pairs_mut().append_pair("iss", iss);
+                }
+                redirect.to_string()
+            }
+        }
+
+        async fn token(
+            AxState(a): AxState<Arc<Auth>>,
+            headers: axum::http::HeaderMap,
+            Form(f): Form<HashMap<String, String>>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            a.token_calls.fetch_add(1, Ordering::SeqCst);
+            *a.last_token_request.lock() = f.clone();
+            *a.last_token_auth.lock() = headers.get("authorization").map(|v| v.to_str().unwrap().to_string());
+            let invalid = || (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_grant"}))).into_response();
+            assert_eq!(f.get("resource").map(String::as_str), Some(format!("{}/mcp", a.base).as_str()), "resource on token requests");
+            match f["grant_type"].as_str() {
+                "authorization_code" => {
+                    let Some(challenge) = a.codes.lock().remove(&f["code"]) else { return invalid() };
+                    let digest = sha2::Sha256::digest(f["code_verifier"].as_bytes());
+                    assert_eq!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest), challenge, "PKCE");
+                    Json(a.issue(a.short_ttl.load(Ordering::SeqCst))).into_response()
+                }
+                "refresh_token" => {
+                    if a.refresh.lock().as_deref() != Some(f["refresh_token"].as_str()) {
+                        return invalid();
+                    }
+                    a.refreshes.fetch_add(1, Ordering::SeqCst);
+                    Json(a.issue(false)).into_response()
+                }
+                _ => invalid(),
+            }
+        }
+
+        async fn auth_server() -> Arc<Auth> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let a = Arc::new(Auth { base: base.clone(), ..Default::default() });
+            let prm = json!({"resource": format!("{base}/mcp"), "authorization_servers": [base], "scopes_supported": ["tools"]});
+            let a2 = a.clone();
+            let metadata = move || {
+                json!({
+                    "issuer": a2.base,
+                    "authorization_endpoint": format!("{}/authorize", a2.base),
+                    "token_endpoint": format!("{}/token", a2.base),
+                    "registration_endpoint": format!("{}/register", a2.base),
+                    "response_types_supported": ["code"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "code_challenge_methods_supported": ["S256"],
+                    "authorization_response_iss_parameter_supported": true,
+                    "client_id_metadata_document_supported": a2.cimd.load(Ordering::SeqCst),
+                })
+            };
+            let svc: StreamableHttpService<Upstream, rmcp::transport::streamable_http_server::session::local::LocalSessionManager> =
+                StreamableHttpService::new(|| Ok(Upstream), Default::default(), StreamableHttpServerConfig::default());
+            let guard = {
+                let a = a.clone();
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let a = a.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        let token =
+                            req.headers().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+                        if token.is_some_and(|t| a.access.lock().contains(t)) {
+                            return next.run(req).await;
+                        }
+                        let challenge =
+                            format!("Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\", scope=\"tools\"", a.base);
+                        (axum::http::StatusCode::UNAUTHORIZED, [("www-authenticate", challenge)]).into_response()
+                    }
+                }
+            };
+            let mcp = axum::Router::new().nest_service("/mcp", svc).layer(axum::middleware::from_fn(guard));
+            let a3 = a.clone();
+            let router = axum::Router::new()
+                .route("/.well-known/oauth-protected-resource/mcp", axum::routing::get(move || std::future::ready(Json(prm.clone()))))
+                .route("/.well-known/oauth-authorization-server", axum::routing::get(move || std::future::ready(Json(metadata()))))
+                .route(
+                    "/register",
+                    axum::routing::post(move |Json(req): Json<Value>| {
+                        a3.registrations.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Json(json!({"client_id": "dyn-client", "redirect_uris": req["redirect_uris"]})))
+                    }),
+                )
+                .route("/token", axum::routing::post(token))
+                .with_state(a.clone())
+                .merge(mcp);
+            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            a
+        }
+
+        async fn oauth_harness(a: &Auth, tweak: impl FnOnce(&mut Config)) -> Harness {
+            let url = format!("{}/mcp", a.base);
+            harness_with(move |cfg| {
+                cfg.mcp.servers.insert("cloud".into(), McpServerConfig { url, auth: McpAuth::Oauth, ..Default::default() });
+                tweak(cfg);
+            })
+            .await
+        }
+
+        fn principal() -> Principal {
+            Principal { client_id: Some("agents/client".into()), policy: Arc::new(mcp_policy(&["cloud"], &[])) }
+        }
+
+        async fn whoami(hub: &McpHub) -> Result<String, String> {
+            hub.call(&principal(), "cloud", "whoami", Default::default()).await.map(|r| crate::mcp::text_of(&r))
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn login_refresh_and_relogin() {
+            let a = auth_server().await;
+            let h = oauth_harness(&a, |_| {}).await;
+            let hub = &h.state.mcp;
+            let e = whoami(hub).await.unwrap_err();
+            assert!(e.contains("sign-in needed (not signed in)"), "{e}");
+
+            // Dynamic registration; an `iss` mismatch is rejected before the code is spent.
+            let start = hub.login_start("cloud").await.unwrap();
+            assert_eq!(
+                (start.registration, start.callback, start.redirect_uri.as_str()),
+                (RegistrationKind::Dynamic, false, DEFAULT_REDIRECT_URI)
+            );
+            let e = hub.login_complete(&start.flow_id, &a.authorize(&start.url, Some("http://evil.example"))).await.unwrap_err();
+            assert!(format!("{e:#}").to_lowercase().contains("issuer"), "{e:#}");
+            assert_eq!(a.token_calls.load(Ordering::SeqCst), 0);
+            assert!(hub.login_complete(&start.flow_id, "http://127.0.0.1:33418/callback?code=x&state=y").await.is_err());
+
+            // The registration is reused; the token is sent upstream.
+            let start = hub.login_start("cloud").await.unwrap();
+            assert_eq!(a.registrations.load(Ordering::SeqCst), 1);
+            assert_eq!(hub.login_complete(&start.flow_id, &a.authorize(&start.url, Some(&a.base))).await.unwrap(), "cloud");
+            assert_eq!(whoami(hub).await.unwrap(), "Bearer at-1");
+            let (_, servers) = h.call("GET", "/admin/mcp/servers", Some(&h.admin), None).await;
+            let o = &servers[0]["oauth"];
+            assert_eq!(
+                (o["signed_in"].clone(), o["refreshable"].clone(), o["registration"].clone()),
+                (json!(true), json!(true), json!("dynamic"))
+            );
+            assert_eq!(servers[0]["tools"], 4, "tools were listed after the login");
+            let rec = h.state.secrets.get("mcp/cloud/oauth").await.unwrap().unwrap();
+            assert_eq!(rec["registration"]["client_id"], "dyn-client");
+
+            // A token the server stops accepting is refreshed and the request retried.
+            a.access.lock().clear();
+            assert_eq!(whoami(hub).await.unwrap(), "Bearer at-2");
+
+            // The login survives a restart (it lives in the vault).
+            let hub2 = McpHub::new(&h.state.cfg, h.state.secrets.clone(), h.state.db.clone());
+            assert_eq!(whoami(&hub2).await.unwrap(), "Bearer at-2");
+
+            // A rejected refresh token means a new login.
+            a.access.lock().clear();
+            *a.refresh.lock() = None;
+            let e = whoami(hub).await.unwrap_err();
+            assert!(e.contains("sign-in needed (the refresh token was rejected)"), "{e}");
+            let e = whoami(hub).await.unwrap_err();
+            assert!(e.contains("sign-in needed"), "fails fast until a new login: {e}");
+
+            // Sign in again through xolotl's callback, then sign out.
+            let start = hub.login_start("cloud").await.unwrap();
+            let redirect = url::Url::parse(&a.authorize(&start.url, Some(&a.base))).unwrap();
+            let (status, page) = h.call("GET", &format!("/admin/mcp/oauth/callback?{}", redirect.query().unwrap()), None, None).await;
+            assert_eq!(status, 200, "{page}");
+            assert!(page.as_str().unwrap().contains("signed in to cloud"));
+            assert!(whoami(hub).await.unwrap().starts_with("Bearer at-"));
+            let (status, _) = h.call("GET", &format!("/admin/mcp/oauth/callback?{}", redirect.query().unwrap()), None, None).await;
+            assert_eq!(status, 400, "a login completes once");
+            assert_eq!(h.call("DELETE", "/admin/mcp/servers/cloud/oauth", Some(&h.admin), None).await.0, 200);
+            assert!(whoami(hub).await.unwrap_err().contains("sign-in needed (signed out)"));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn tokens_near_expiry_are_refreshed_once_at_a_time() {
+            let a = auth_server().await;
+            a.short_ttl.store(true, Ordering::SeqCst);
+            let h = oauth_harness(&a, |_| {}).await;
+            let hub = &h.state.mcp;
+            let start = hub.login_start("cloud").await.unwrap();
+            hub.login_complete(&start.flow_id, &a.authorize(&start.url, Some(&a.base))).await.unwrap();
+            // at-1 expires within the refresh margin: concurrent calls refresh
+            // without spending one (single-use) refresh token twice.
+            let calls = (0..6).map(|_| whoami(hub));
+            for r in futures::future::join_all(calls).await {
+                assert!(r.as_ref().is_ok_and(|t| t != "Bearer at-1"), "{r:?}");
+            }
+            assert!(a.refreshes.load(Ordering::SeqCst) >= 1);
+            let status = h.call("GET", "/admin/mcp/servers", Some(&h.admin), None).await.1;
+            assert_eq!(status[0]["oauth"]["needs_login"], Value::Null);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn client_metadata_documents_and_pre_registered_clients() {
+            let a = auth_server().await;
+            a.cimd.store(true, Ordering::SeqCst);
+            let h = oauth_harness(&a, |cfg| {
+                cfg.server.public_url = Some("https://xolotl.example".into());
+                cfg.mcp.servers.insert(
+                    "pre".into(),
+                    McpServerConfig {
+                        url: format!("{}/mcp", a.base),
+                        auth: McpAuth::Oauth,
+                        oauth: McpServerOAuthConfig { client_id: Some("pre-1".into()), scopes: vec!["tools".into()] },
+                        ..Default::default()
+                    },
+                );
+            })
+            .await;
+            let hub = &h.state.mcp;
+
+            let start = hub.login_start("cloud").await.unwrap();
+            assert_eq!(start.registration, RegistrationKind::ClientMetadataDocument);
+            assert!(start.callback);
+            let q: HashMap<String, String> =
+                url::Url::parse(&start.url).unwrap().query_pairs().map(|(k, v)| (k.into(), v.into())).collect();
+            assert_eq!(q["client_id"], "https://xolotl.example/admin/mcp/oauth/client-metadata.json");
+            assert_eq!(q["redirect_uri"], "https://xolotl.example/admin/mcp/oauth/callback");
+            assert_eq!(a.registrations.load(Ordering::SeqCst), 0);
+            let (status, doc) = h.call("GET", "/admin/mcp/oauth/client-metadata.json", None, None).await;
+            assert_eq!(status, 200);
+            assert_eq!(doc["client_id"], q["client_id"]);
+            assert_eq!(doc["redirect_uris"], json!([q["redirect_uri"]]));
+
+            hub.set_secret("pre", json!({"client_secret": "s3cret"}).as_object().unwrap().clone()).await.unwrap();
+            let (_, servers) = h.call("GET", "/admin/mcp/servers", Some(&h.admin), None).await;
+            assert_eq!(servers[1]["secret_fields"], json!({"client_secret": true}));
+            let (status, start) = h.call("POST", "/admin/mcp/servers/pre/oauth/start", Some(&h.admin), None).await;
+            assert_eq!(status, 200, "{start}");
+            assert_eq!(start["registration"], "pre-registered");
+            let q: HashMap<String, String> =
+                url::Url::parse(start["url"].as_str().unwrap()).unwrap().query_pairs().map(|(k, v)| (k.into(), v.into())).collect();
+            assert_eq!(q["client_id"], "pre-1");
+            let redirect = a.authorize(start["url"].as_str().unwrap(), Some(&a.base));
+            let flow = start["flow_id"].as_str().unwrap();
+            let body = json!({"redirect_url": redirect});
+            let (status, done) = h.call("POST", &format!("/admin/mcp/oauth/flows/{flow}/complete"), Some(&h.admin), Some(body)).await;
+            assert_eq!(status, 200, "{done}");
+            let (_, flow_status) = h.call("GET", &format!("/admin/mcp/oauth/flows/{flow}"), Some(&h.admin), None).await;
+            assert_eq!(flow_status["status"], "complete");
+            // The pre-registered secret authenticates the token request.
+            let basic = a.last_token_auth.lock().clone();
+            let sent_secret = a.last_token_request.lock().get("client_secret").cloned();
+            assert!(basic.is_some_and(|b| b.starts_with("Basic ")) || sent_secret.as_deref() == Some("s3cret"));
+            assert_eq!(
+                hub.call(&principal_for("pre"), "pre", "add", json!({"a": 1, "b": 2}).as_object().unwrap().clone())
+                    .await
+                    .unwrap()
+                    .structured_content,
+                Some(json!({"sum": 3.0}))
+            );
+        }
+
+        fn principal_for(server: &str) -> Principal {
+            Principal { client_id: None, policy: Arc::new(mcp_policy(&[server], &[])) }
+        }
     }
 }

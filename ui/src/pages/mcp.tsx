@@ -1,7 +1,9 @@
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { ChevronDown, ChevronRight, RefreshCw } from "lucide-react";
+import { useEffect, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { ChevronDown, ChevronRight, ExternalLink, LogIn, RefreshCw } from "lucide-react";
+import { toast } from "sonner";
 
+import { Confirm } from "@/components/confirm";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -10,8 +12,21 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { get, post, put, type McpCall, type McpGroupBy, type McpServer, type McpTool, type McpUsageRow } from "@/lib/api";
-import { clock, num, relative } from "@/lib/format";
+import {
+  del,
+  get,
+  post,
+  put,
+  type McpCall,
+  type McpGroupBy,
+  type McpLoginStart,
+  type McpLoginStatus,
+  type McpOAuthStatus,
+  type McpServer,
+  type McpTool,
+  type McpUsageRow,
+} from "@/lib/api";
+import { clock, dateTime, num, relative } from "@/lib/format";
 import { useAction } from "@/lib/hooks";
 
 const GROUPS: [McpGroupBy, string][] = [
@@ -65,6 +80,7 @@ export function McpPage() {
 }
 
 function ServerState({ s }: { s: McpServer }) {
+  if (s.oauth?.needs_login) return <Badge variant="warning">sign-in needed</Badge>;
   if (s.last_error) return <Badge variant="destructive">error</Badge>;
   if (s.connected) return <Badge variant="success">connected</Badge>;
   return <Badge variant="secondary">idle</Badge>;
@@ -117,7 +133,10 @@ function ServerCard({ s }: { s: McpServer }) {
             {s.tools} · listed {relative(s.tools_refreshed_at)}
           </dd>
         </dl>
-        {s.last_error && <p className="bg-danger-muted text-destructive rounded-md px-3 py-2 break-words">{s.last_error}</p>}
+        {s.last_error && !s.oauth?.needs_login && (
+          <p className="bg-danger-muted text-destructive rounded-md px-3 py-2 break-words">{s.last_error}</p>
+        )}
+        {s.oauth && <OAuthLogin server={s.name} oauth={s.oauth} />}
         {fields.length > 0 && (
           <div className="flex flex-col gap-3">
             <h3 className="font-medium">
@@ -137,6 +156,163 @@ function ServerCard({ s }: { s: McpServer }) {
         {open && <Tools server={s.name} />}
       </CardContent>
     </Card>
+  );
+}
+
+const REGISTRATIONS: Record<NonNullable<McpOAuthStatus["registration"]>, string> = {
+  "pre-registered": "pre-registered client",
+  "client-metadata-document": "client metadata document",
+  dynamic: "dynamic registration",
+};
+
+function OAuthLogin({ server, oauth }: { server: string; oauth: McpOAuthStatus }) {
+  const [flow, setFlow] = useState<McpLoginStart | null>(null);
+  const start = useAction(() => post<McpLoginStart>(`/admin/mcp/servers/${server}/oauth/start`), {
+    onSuccess: (f) => {
+      setFlow(f);
+      window.open(f.url, "_blank", "noopener,noreferrer");
+    },
+  });
+  const signOut = useAction(() => del(`/admin/mcp/servers/${server}/oauth`), {
+    invalidate: [["mcp-servers"]],
+    success: `Signed out of ${server}`,
+  });
+
+  return (
+    <div className="flex flex-col gap-3">
+      <h3 className="font-medium">OAuth</h3>
+      {oauth.needs_login ? (
+        <p className="bg-warning-muted text-warning rounded-md px-3 py-2">Sign-in needed: {oauth.needs_login}.</p>
+      ) : (
+        <dl className="grid gap-x-6 gap-y-2 sm:grid-cols-[auto_1fr]">
+          <dt className="text-muted-foreground">Signed in</dt>
+          <dd>{oauth.signed_in_at ? dateTime(oauth.signed_in_at) : "yes"}</dd>
+          <dt className="text-muted-foreground">Access token</dt>
+          <dd>
+            {oauth.expires_at ? `expires ${relative(oauth.expires_at)}` : "no expiry given"}
+            {oauth.refreshable ? ", refreshed automatically" : ", no refresh token: sign in again when it expires"}
+          </dd>
+          {oauth.scopes.length > 0 && (
+            <>
+              <dt className="text-muted-foreground">Scopes</dt>
+              <dd>
+                <Mono>{oauth.scopes.join(" ")}</Mono>
+              </dd>
+            </>
+          )}
+        </dl>
+      )}
+      {(oauth.registration || oauth.issuer) && (
+        <p className="text-muted-foreground text-xs">
+          {oauth.registration && <>Client: {REGISTRATIONS[oauth.registration]}. </>}
+          {oauth.issuer && (
+            <>
+              Authorization server <Mono>{oauth.issuer}</Mono>.
+            </>
+          )}
+        </p>
+      )}
+      {oauth.unsaved && (
+        <p className="bg-danger-muted text-destructive rounded-md px-3 py-2">
+          The latest tokens could not be written to OpenBao; xolotl keeps retrying.
+        </p>
+      )}
+      {flow ? (
+        <LoginFlow flow={flow} onDone={() => setFlow(null)} />
+      ) : (
+        <div className="flex flex-wrap gap-2">
+          <Button variant={oauth.needs_login ? "default" : "outline"} size="sm" disabled={start.isPending} onClick={() => start.mutate(undefined)}>
+            <LogIn />
+            {oauth.needs_login ? "Sign in" : "Sign in again"}
+          </Button>
+          {!oauth.needs_login && (
+            <Confirm
+              title={`Sign out of ${server}?`}
+              description="xolotl forgets the tokens; tool calls fail until someone signs in again."
+              action="Sign out"
+              onConfirm={() => signOut.mutate(undefined)}
+            >
+              <Button variant="ghost" size="sm" disabled={signOut.isPending}>
+                Sign out
+              </Button>
+            </Confirm>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LoginFlow({ flow, onDone }: { flow: McpLoginStart; onDone: () => void }) {
+  const [pasted, setPasted] = useState("");
+  const status = useQuery({
+    queryKey: ["mcp-login", flow.flow_id],
+    queryFn: () => get<McpLoginStatus>(`/admin/mcp/oauth/flows/${flow.flow_id}`),
+    enabled: flow.callback,
+    refetchInterval: (q) => (q.state.data?.status === "pending" || !q.state.data ? 2000 : false),
+  });
+  const complete = useAction(() => post(`/admin/mcp/oauth/flows/${flow.flow_id}/complete`, { redirect_url: pasted.trim() }), {
+    invalidate: [["mcp-servers"], ["mcp-tools", flow.server], ["policy-view"]],
+    success: `Signed in to ${flow.server}`,
+    onSuccess: onDone,
+  });
+  const qc = useQueryClient();
+  const state = status.data?.status;
+  // Completed through xolotl's callback.
+  useEffect(() => {
+    if (state !== "complete") return;
+    for (const key of [["mcp-servers"], ["mcp-tools", flow.server], ["policy-view"]]) qc.invalidateQueries({ queryKey: key });
+    toast.success(`Signed in to ${flow.server}`);
+    onDone();
+  }, [state, qc, flow.server, onDone]);
+  const id = `login-${flow.flow_id}`;
+
+  return (
+    <div className="bg-muted/40 flex flex-col gap-3 rounded-md border p-3">
+      <p>
+        Approve access in the tab that opened.{" "}
+        <a href={flow.url} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1">
+          Open the sign-in page again <ExternalLink className="size-3" />
+        </a>
+      </p>
+      {flow.callback ? (
+        status.data?.status === "failed" ? (
+          <p className="text-destructive">{status.data.error}</p>
+        ) : (
+          <p className="text-muted-foreground">Waiting for the browser to come back to xolotl…</p>
+        )
+      ) : (
+        <form
+          className="flex flex-col gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            complete.mutate(undefined);
+          }}
+        >
+          <Label htmlFor={id}>
+            <span>
+              The browser then opens <Mono>{flow.redirect_uri}</Mono>, which doesn't load. Paste that page's full URL here.
+            </span>
+          </Label>
+          <div className="flex max-w-2xl gap-2">
+            <Input
+              id={id}
+              autoComplete="off"
+              className="font-mono"
+              placeholder={`${flow.redirect_uri}?code=…`}
+              value={pasted}
+              onChange={(e) => setPasted(e.target.value)}
+            />
+            <Button type="submit" disabled={!pasted.trim() || complete.isPending}>
+              Finish
+            </Button>
+          </div>
+        </form>
+      )}
+      <Button variant="ghost" size="sm" className="self-start" onClick={onDone}>
+        Cancel
+      </Button>
+    </div>
   );
 }
 

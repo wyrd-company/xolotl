@@ -259,6 +259,12 @@ pub enum McpCmd {
     SetSecret { server: String, field: String },
     /// Remove a field of a server's vault secret.
     UnsetSecret { server: String, field: String },
+    /// Sign in to a server that uses OAuth (`auth = "oauth"`): open the URL
+    /// printed, approve, then paste the URL the browser ends on (unless
+    /// `server.public_url` lets xolotl finish the login itself).
+    Login { server: String },
+    /// Forget a server's OAuth tokens.
+    Logout { server: String },
     /// Show MCP tool calls from the call log.
     Usage {
         /// client, server or tool.
@@ -380,7 +386,7 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
     let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()));
     let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
 
-    let mcp = Arc::new(crate::mcp::McpHub::new(&cfg.mcp, secrets.clone(), db.clone()));
+    let mcp = Arc::new(crate::mcp::McpHub::new(&cfg, secrets.clone(), db.clone()));
     let state =
         AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: Some(vault), sessions: Default::default(), mcp };
     server::spawn_background(state.clone());
@@ -524,9 +530,10 @@ async fn mcp(c: Client, cmd: McpCmd) -> Result<()> {
                     .flatten()
                     .map(|(k, set)| if set.as_bool() == Some(true) { k.clone() } else { format!("{k} (unset)") })
                     .collect();
-                let state = match (s["connected"].as_bool(), s["last_error"].is_string()) {
-                    (_, true) => "ERROR",
-                    (Some(true), _) => "connected",
+                let state = match (s["connected"].as_bool(), s["last_error"].is_string(), s["oauth"]["needs_login"].as_str()) {
+                    (_, _, Some(_)) => "SIGN-IN",
+                    (_, true, _) => "ERROR",
+                    (Some(true), _, _) => "connected",
                     _ => "idle",
                 };
                 println!(
@@ -538,7 +545,9 @@ async fn mcp(c: Client, cmd: McpCmd) -> Result<()> {
                     if fields.is_empty() { "-".to_string() } else { fields.join(",") },
                     s["url"].as_str().unwrap_or("")
                 );
-                if let Some(e) = s["last_error"].as_str() {
+                if let Some(reason) = s["oauth"]["needs_login"].as_str() {
+                    println!("    OAuth: {reason}; run `xolotl mcp login {}`", s["name"].as_str().unwrap_or(""));
+                } else if let Some(e) = s["last_error"].as_str() {
                     println!("    {e}");
                 }
             }
@@ -564,6 +573,35 @@ async fn mcp(c: Client, cmd: McpCmd) -> Result<()> {
         McpCmd::UnsetSecret { server, field } => {
             c.print(c.put(&format!("/admin/mcp/servers/{server}/secret"), json!({"fields": {field: null}})).await?)
         }
+        McpCmd::Login { server } => {
+            let start = c.post(&format!("/admin/mcp/servers/{server}/oauth/start"), json!({})).await?;
+            let flow_id = start["flow_id"].as_str().context("server returned no flow id")?.to_string();
+            eprintln!("\nOpen this URL in a browser and approve access for xolotl:\n\n  {}\n", start["url"].as_str().unwrap_or(""));
+            let done = if start["callback"].as_bool().unwrap_or(false) {
+                eprintln!("Waiting for the browser to return to xolotl...");
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let s = c.get(&format!("/admin/mcp/oauth/flows/{flow_id}")).await?;
+                    match s["status"].as_str() {
+                        Some("pending") => continue,
+                        Some("complete") => break s,
+                        _ => anyhow::bail!("login failed: {}", s["error"].as_str().unwrap_or("unknown error")),
+                    }
+                }
+            } else {
+                eprintln!("The browser then goes to {} and shows an error page;", start["redirect_uri"].as_str().unwrap_or("a local URL"));
+                eprint!("paste that page's full URL here: ");
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                c.post(&format!("/admin/mcp/oauth/flows/{flow_id}/complete"), json!({"redirect_url": line.trim()})).await?
+            };
+            if c.json {
+                return c.print(done);
+            }
+            println!("Signed in to {server}");
+            Ok(())
+        }
+        McpCmd::Logout { server } => c.print(c.delete(&format!("/admin/mcp/servers/{server}/oauth")).await?),
         McpCmd::Usage { group_by, since } => {
             let secs = parse_duration(&since)?;
             let v = c.get(&format!("/admin/mcp/usage?group_by={group_by}&since_secs={secs}")).await?;

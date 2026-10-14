@@ -222,7 +222,32 @@ export interface McpServer {
   tools: number;
   tools_refreshed_at: number | null;
   last_error: string | null;
+  auth: "headers" | "oauth";
+  oauth?: McpOAuthStatus;
 }
+
+export interface McpOAuthStatus {
+  signed_in: boolean;
+  signed_in_at: number | null;
+  expires_at: number | null;
+  refreshable: boolean;
+  scopes: string[];
+  registration: "pre-registered" | "client-metadata-document" | "dynamic" | null;
+  issuer: string | null;
+  needs_login: string | null;
+  unsaved: boolean;
+}
+
+export interface McpLoginStart {
+  flow_id: string;
+  server: string;
+  url: string;
+  redirect_uri: string;
+  callback: boolean;
+  registration: NonNullable<McpOAuthStatus["registration"]>;
+}
+
+export type McpLoginStatus = { server: string } & ({ status: "pending" } | { status: "complete" } | { status: "failed"; error: string });
 
 export interface McpTool {
   name: string;

@@ -48,7 +48,7 @@ Started by `server::spawn_background`:
 | 60 s | Reload client keys and policies from OpenBao; sync accounts (picks up added and removed accounts; keeps the in-memory credentials of accounts it already holds) |
 | `catalog.refresh_secs` (600 s) | Re-discover models from every provider |
 | `mcp.tools_refresh_secs` (300 s) | Re-read upstream MCP tool lists (only when MCP servers are configured) |
-| 15 s | Retry OpenBao writes of refreshed OAuth credentials that failed ([details](subscriptions.md#when-the-vault-write-fails)) |
+| 15 s | Retry OpenBao writes of refreshed OAuth credentials that failed: subscription accounts ([details](subscriptions.md#when-the-vault-write-fails)) and MCP server logins |
 | `subscription.usage_poll_secs` (300 s) | Poll each enabled account's usage; this also keeps OAuth tokens fresh |
 | 24 h | Prune the request log and the MCP call log |
 
@@ -74,7 +74,7 @@ On graceful shutdown the server makes one last attempt to save unsaved credentia
 | `src/keys.rs` | Client keys and policy storage |
 | `src/subscription/` | Account pools: `mod.rs` (selection, failover, refresh), `codex.rs`, `claude.rs`, `opencode_go.rs`, `oauth.rs` (PKCE, token errors) |
 | `src/gateway.rs` | Gateway providers |
-| `src/mcp/` | MCP gateway: `mod.rs` (servers, policy checks, call log), `upstream.rs` (client connections), `codemode.rs` (QuickJS sandbox, TypeScript declarations), `server.rs` (the `/mcp` server) |
+| `src/mcp/` | MCP gateway: `mod.rs` (servers, policy checks, call log), `upstream.rs` (client connections), `oauth.rs` (OAuth logins and token storage), `codemode.rs` (QuickJS sandbox, TypeScript declarations), `server.rs` (the `/mcp` server) |
 | `src/proxy.rs` | Header filtering, streaming relay, token usage, error shapes |
 | `src/translate/` | Translation between Messages, Responses and Chat: requests, responses and streams |
 | `src/db.rs`, `migrations/` | SQLite |
