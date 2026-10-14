@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0
+
+### Features
+
+- Sign in to the web UI with OpenID Connect (tested with Pocket ID) instead of a password. Configure `[ui.oidc]` (issuer, client ID, redirect URL, admin group) and store the client secret in the vault secret `oidc`; only members of the admin group get a session. `xolotl ui set-password`, `PUT /admin/ui/password` and `POST /admin/session` are removed, and the `ui_password_hash` field of the `admin` secret is no longer read.
+- Add an MCP gateway: upstream Streamable HTTP MCP servers from `[mcp.servers]` (several instances of one server with different credentials, header secrets in OpenBao) exposed to clients at `/mcp` as a code-mode MCP server with `search` and `execute` tools. Policies gain the `mcp` scope, `mcp_servers`, `allow_tools` and `deny_tools`. Includes an MCP call log, metrics, `xolotl mcp` commands and an MCP servers page in the web UI.
+  
+  Upstream servers can use OAuth logins (`auth = "oauth"`, `xolotl mcp login`): discovery, pre-registered clients, client metadata documents or dynamic registration, PKCE, token refresh, with a paste-back or `server.public_url` callback finish.
+  
+  MCP servers can also be added, changed and removed at runtime from the web UI or `xolotl mcp put` / `remove`; they are stored in OpenBao, and removal is refused while a policy lists the server.
+- Add Grok Build (xAI) subscription accounts: `xolotl auth login grok` (device code), token refresh, a `grok` pool on the Responses wire with keepalive rewriting, and the Grok CLI's `/v1/models` shape.
+
+### Fixes
+
+- Fix concurrent AMD64 and ARM64 container builds by separating Cargo caches for each architecture.
+
 ## 0.1.0
 
 ### Features
