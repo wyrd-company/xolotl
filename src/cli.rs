@@ -250,6 +250,12 @@ pub enum ProvidersCmd {
 pub enum McpCmd {
     /// List upstream MCP servers: connection, tool count, secret fields.
     Servers,
+    /// Add or change a server stored in the vault, from a TOML or JSON file
+    /// with `name` and the fields of a `[mcp.servers.<name>]` entry.
+    Put { file: PathBuf },
+    /// Remove a server stored in the vault, with its secrets and login.
+    /// Refused while a policy lists it.
+    Remove { server: String },
     /// List one server's tools (unfiltered by any policy).
     Tools { server: String },
     /// Re-read tool lists from every server, or from one.
@@ -387,6 +393,8 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
     let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
 
     let mcp = Arc::new(crate::mcp::McpHub::new(&cfg, secrets.clone(), db.clone()));
+    let n = mcp.reload().await.context("loading MCP servers from the vault")?;
+    tracing::info!(config = cfg.mcp.servers.len(), vault = n, "loaded MCP servers");
     let state =
         AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: Some(vault), sessions: Default::default(), mcp };
     server::spawn_background(state.clone());
@@ -522,7 +530,7 @@ async fn mcp(c: Client, cmd: McpCmd) -> Result<()> {
             if c.json {
                 return c.print(v);
             }
-            println!("{:<20} {:<20} {:<10} {:>6} {:<24} URL", "NAME", "NAMESPACE", "STATE", "TOOLS", "SECRET FIELDS");
+            println!("{:<20} {:<20} {:<7} {:<10} {:>6} {:<24} URL", "NAME", "NAMESPACE", "SOURCE", "STATE", "TOOLS", "SECRET FIELDS");
             for s in v.as_array().into_iter().flatten() {
                 let fields: Vec<String> = s["secret_fields"]
                     .as_object()
@@ -537,9 +545,10 @@ async fn mcp(c: Client, cmd: McpCmd) -> Result<()> {
                     _ => "idle",
                 };
                 println!(
-                    "{:<20} {:<20} {:<10} {:>6} {:<24} {}",
+                    "{:<20} {:<20} {:<7} {:<10} {:>6} {:<24} {}",
                     s["name"].as_str().unwrap_or(""),
                     s["namespace"].as_str().unwrap_or(""),
+                    s["source"].as_str().unwrap_or(""),
                     state,
                     s["tools"].as_u64().unwrap_or(0),
                     if fields.is_empty() { "-".to_string() } else { fields.join(",") },
@@ -553,6 +562,23 @@ async fn mcp(c: Client, cmd: McpCmd) -> Result<()> {
             }
             Ok(())
         }
+        McpCmd::Put { file } => {
+            let raw = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+            let def: Value = if file.extension().is_some_and(|e| e == "toml") {
+                serde_json::to_value(toml::from_str::<toml::Value>(&raw)?)?
+            } else {
+                serde_json::from_str(&raw)?
+            };
+            let name = def["name"].as_str().context("the server needs a name")?.to_string();
+            let servers = c.get("/admin/mcp/servers").await?;
+            let existing = servers.as_array().into_iter().flatten().find(|s| s["name"] == name.as_str());
+            match existing.map(|s| s["source"].as_str().unwrap_or("")) {
+                Some("config") => anyhow::bail!("{name} is defined in the config file; change it there"),
+                Some(_) => c.print(c.put(&format!("/admin/mcp/servers/{name}"), def).await?),
+                None => c.print(c.post("/admin/mcp/servers", def).await?),
+            }
+        }
+        McpCmd::Remove { server } => c.print(c.delete(&format!("/admin/mcp/servers/{server}")).await?),
         McpCmd::Tools { server } => {
             let v = c.get(&format!("/admin/mcp/servers/{server}/tools")).await?;
             if c.json {

@@ -27,7 +27,7 @@ clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web
 
 | Store | Holds | Why |
 |---|---|---|
-| OpenBao, KV v2 under `secret/xolotl/` | admin token, telemetry headers, provider keys, account credentials, MCP server header secrets, policies, client key records | Secrets stay off disk and out of env vars. Writes that can race use check-and-set. |
+| OpenBao, KV v2 under `secret/xolotl/` | admin token, telemetry headers, provider keys, account credentials, MCP servers added at runtime and their secrets, policies, client key records | Secrets stay off disk and out of env vars. Writes that can race use check-and-set. |
 | SQLite (`database.path`) | accounts index, cooldowns, usage snapshots, request log and MCP call log (pruned after `retention_days`, default 90) | Cheap, frequently changing state. Holds no secrets and is rebuilt from OpenBao if lost. |
 
 `src/vault.rs` is the OpenBao client: AppRole login, re-login on 403, KV v2 get/put/list/delete, versioned reads, check-and-set writes and version destroy. It implements the `SecretStore` trait (`src/secrets.rs`); tests use the in-memory `MemoryStore`.
@@ -45,7 +45,7 @@ Started by `server::spawn_background`:
 
 | Every | Task |
 |---|---|
-| 60 s | Reload client keys and policies from OpenBao; sync accounts (picks up added and removed accounts; keeps the in-memory credentials of accounts it already holds) |
+| 60 s | Reload client keys, policies and MCP servers from OpenBao; sync accounts (picks up added and removed accounts; keeps the in-memory credentials of accounts it already holds) |
 | `catalog.refresh_secs` (600 s) | Re-discover models from every provider |
 | `mcp.tools_refresh_secs` (300 s) | Re-read upstream MCP tool lists (only when MCP servers are configured) |
 | 15 s | Retry OpenBao writes of refreshed OAuth credentials that failed: subscription accounts ([details](subscriptions.md#when-the-vault-write-fails)) and MCP server logins |

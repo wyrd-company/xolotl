@@ -160,16 +160,14 @@ async fn mcp_auth(State(state): State<AppState>, mut req: Request, next: axum::m
 /// Background maintenance: reload keys and accounts, refresh the model
 /// catalog and MCP tool lists, poll usage, prune logs.
 pub fn spawn_background(state: AppState) {
-    if !state.mcp.server_names().is_empty() {
-        let s = state.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(s.cfg.mcp.tools_refresh_secs.max(30)));
-            loop {
-                tick.tick().await;
-                s.mcp.refresh_all().await;
-            }
-        });
-    }
+    let s = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(s.cfg.mcp.tools_refresh_secs.max(30)));
+        loop {
+            tick.tick().await;
+            s.mcp.refresh_all().await;
+        }
+    });
     let s = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
@@ -181,6 +179,9 @@ pub fn spawn_background(state: AppState) {
             }
             if let Err(e) = s.subs.sync().await {
                 tracing::warn!(error = %e, "account sync failed");
+            }
+            if let Err(e) = s.mcp.reload().await {
+                tracing::warn!(error = %e, "MCP server reload failed");
             }
         }
     });

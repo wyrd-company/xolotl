@@ -1079,6 +1079,78 @@ mod mcp_gateway {
         assert_eq!(g.h.call("POST", "/admin/policy-preview", Some(&g.h.admin), Some(bad)).await.0, 400);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn servers_added_at_runtime() {
+        let g = gateway().await;
+        let h = &g.h;
+        let url = h.state.cfg.mcp.servers["calc"].url.clone();
+        let live = json!({"name": "live", "url": url, "description": "Added from the UI", "headers": {"Authorization": "Bearer {token}"}});
+
+        // A policy can't name a server before it exists.
+        let p = json!({"name": "agents", "scopes": ["mcp"], "mcp_servers": ["live"]});
+        assert_eq!(h.call("PUT", "/admin/policies/agents", Some(&h.admin), Some(p.clone())).await.0, 400);
+
+        assert_eq!(h.call("POST", "/admin/mcp/servers", Some(&h.admin), Some(live.clone())).await.0, 200);
+        let (_, servers) = h.call("GET", "/admin/mcp/servers", Some(&h.admin), None).await;
+        let find = |servers: &Value, n: &str| servers.as_array().unwrap().iter().find(|s| s["name"] == n).cloned();
+        let s = find(&servers, "live").unwrap();
+        assert_eq!((s["source"].clone(), s["definition"]["description"].clone()), (json!("vault"), json!("Added from the UI")));
+        assert_eq!(s["secret_fields"], json!({"token": false}));
+        let calc = find(&servers, "calc").unwrap();
+        assert_eq!(calc["source"], "config");
+        assert!(calc.get("definition").is_none());
+
+        // Refused: duplicates, config-file names, names that collide in code, bad definitions.
+        for (body, status) in [
+            (live.clone(), 409),
+            (json!({"name": "calc", "url": url}), 409),
+            (json!({"name": "calc_two", "url": url}), 409),
+            (json!({"name": "bad", "url": "ftp://x"}), 400),
+            (json!({"name": "Bad", "url": url}), 400),
+            (json!({"name": "bad", "url": url, "colour": "red"}), 400),
+            (json!({"name": "bad", "url": url, "oauth": {"client_id": "x"}}), 400),
+        ] {
+            let (got, err) = h.call("POST", "/admin/mcp/servers", Some(&h.admin), Some(body.clone())).await;
+            assert_eq!(got, status, "{body}: {err}");
+        }
+
+        // It works like any other server.
+        h.state.mcp.set_secret("live", json!({"token": "tok"}).as_object().unwrap().clone()).await.unwrap();
+        let key = h.key(serde_json::from_value(p).unwrap()).await;
+        let c = client(g.addr, &key, modern()).await;
+        let (err, out) = call(&c, "execute", json!({"code": "return await live.whoami()"})).await;
+        assert!(!err && out.contains("Bearer tok"), "{out}");
+
+        // Changes apply at once; the config file's servers are read-only.
+        let changed = json!({"url": url, "description": "Renamed", "headers": {"Authorization": "Bearer {token}"}});
+        assert_eq!(h.call("PUT", "/admin/mcp/servers/live", Some(&h.admin), Some(changed)).await.0, 200);
+        let (_, servers) = h.call("GET", "/admin/mcp/servers", Some(&h.admin), None).await;
+        assert_eq!(find(&servers, "live").unwrap()["description"], "Renamed");
+        assert_eq!(h.call("PUT", "/admin/mcp/servers/calc", Some(&h.admin), Some(json!({"url": url}))).await.0, 409);
+        assert_eq!(h.call("PUT", "/admin/mcp/servers/nope", Some(&h.admin), Some(json!({"url": url}))).await.0, 404);
+        let renamed = json!({"name": "other", "url": url});
+        assert_eq!(h.call("PUT", "/admin/mcp/servers/live", Some(&h.admin), Some(renamed)).await.0, 400);
+
+        // Deleting is refused while a policy lists the server.
+        let (status, err) = h.call("DELETE", "/admin/mcp/servers/live", Some(&h.admin), None).await;
+        assert_eq!(status, 409);
+        assert!(err["error"]["message"].as_str().unwrap().contains("used by policy agents"), "{err}");
+        assert_eq!(h.call("DELETE", "/admin/mcp/servers/calc", Some(&h.admin), None).await.0, 409);
+        let p = json!({"name": "agents", "scopes": ["mcp"], "mcp_servers": ["calc"]});
+        assert_eq!(h.call("PUT", "/admin/policies/agents", Some(&h.admin), Some(p)).await.0, 200);
+        assert_eq!(h.call("DELETE", "/admin/mcp/servers/live", Some(&h.admin), None).await.0, 200);
+        assert!(!h.state.mcp.has_server("live"));
+        assert!(h.state.secrets.get("mcp/live").await.unwrap().is_none(), "its secrets go too");
+        assert_eq!(h.call("DELETE", "/admin/mcp/servers/live", Some(&h.admin), None).await.0, 404);
+
+        // Servers written by another instance appear on reload; invalid ones are skipped.
+        let ext = json!({"url": url}).as_object().unwrap().clone();
+        h.state.secrets.put("mcp-servers/ext", ext).await.unwrap();
+        h.state.secrets.put("mcp-servers/broken", json!({"url": "nope"}).as_object().unwrap().clone()).await.unwrap();
+        assert_eq!(h.state.mcp.reload().await.unwrap(), 1);
+        assert!(h.state.mcp.has_server("ext") && !h.state.mcp.has_server("broken"));
+    }
+
     mod oauth {
         use std::collections::{HashMap, HashSet};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

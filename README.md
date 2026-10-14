@@ -88,6 +88,7 @@ bao kv put secret/xolotl/telemetry Authorization="Basic ..."
 | `telemetry` | OTLP header values |
 | `providers/<name>` | `api_key` for gateway providers |
 | `accounts/<provider>/<id>` | OAuth tokens / API key for subscription accounts (rewritten on refresh) |
+| `mcp-servers/<server>` | MCP servers added from the web UI or `xolotl mcp put` |
 | `mcp/<server>` | values for the `{field}` placeholders in an MCP server's headers; `client_secret` of a pre-registered OAuth client |
 | `mcp/<server>/oauth` | an MCP server's OAuth client registration and tokens (rewritten on refresh) |
 | `policies/<policy>` | client key policy |
@@ -147,7 +148,9 @@ xolotl keys revoke devcontainer/laptop
 xolotl usage --group-by client --since 7d
 
 # MCP gateway
-xolotl mcp servers                 # connection, tools, secret fields
+xolotl mcp servers                 # source, connection, tools, secret fields
+xolotl mcp put linear.toml         # add or change a server stored in OpenBao (name + [mcp.servers] fields)
+xolotl mcp remove linear           # refused while a policy lists it
 xolotl mcp set-secret github-work token   # value on stdin, fills {token} in the headers
 xolotl mcp login linear            # OAuth: open the URL, approve, paste the URL the browser ends on
 xolotl mcp logout linear

@@ -24,7 +24,12 @@ Only Streamable HTTP upstreams are supported. Stdio servers (`npx`, `uvx`) are n
 
 ## Upstream servers
 
-Servers come from the config file, keyed by name:
+Servers come from two places, keyed by name:
+
+- **Config file:** `[mcp.servers.<name>]` entries. They are read-only at runtime.
+- **OpenBao:** servers added with the web UI's **Add server** form or `xolotl mcp put`, stored at `mcp-servers/<name>`.
+
+A config-file entry looks like this:
 
 ```toml
 [mcp.servers.github-work]
@@ -38,6 +43,22 @@ description = "GitHub, personal account"
 headers = { Authorization = "Bearer {token}" }
 ```
 
+- **Servers in OpenBao:** a definition has the same fields as a config entry, plus `name`. For example, a TOML file for `xolotl mcp put`:
+
+  ```toml
+  name = "linear"
+  url = "https://mcp.linear.app/mcp"
+  auth = "oauth"
+  ```
+
+  - **Applying changes:** changes take effect at once. Other instances pick them up within 60 s, the same sync that reloads keys and policies.
+  - **Reconnecting:** a changed server reconnects and lists its tools again. An unchanged one keeps its connection and login.
+  - **Renaming:** not possible; remove the server and add it again.
+- **Rules for servers in OpenBao:**
+  - A name the config file already uses is refused, and so is one that collides in code with an existing server.
+  - A server written to OpenBao by hand with a config-file name, or with an invalid definition, is skipped with a warning.
+  - Removing a server (`xolotl mcp remove`, or the UI) also deletes its `mcp/<name>` secret and its OAuth login.
+  - Removal is refused while a policy lists the server by name; a policy with `mcp_servers = ["*"]` doesn't block it.
 - **Instances:** each entry is one instance. Listing the same URL twice under two names gives two sets of credentials, and a policy can allow one, the other, or both.
 - **Authentication:** `auth = "headers"` (the default) sends the configured headers; `auth = "oauth"` signs in with OAuth (see [OAuth logins](#oauth-logins)) and sends the headers too.
 - **Secrets:** `{field}` in a header value is filled from the vault secret `mcp/<name>`.
@@ -215,12 +236,13 @@ Calls refused by the policy never reach an upstream and aren't logged. The log i
 
 | Endpoint | Does |
 |---|---|
-| `GET /admin/mcp/servers` | servers with connection state, server info, protocol version, tool count, last error, and which secret fields are set |
+| `GET /admin/mcp/servers` | servers with their source (`config` or `vault`, with the stored definition), connection state, server info, protocol version, tool count, last error, and which secret fields are set |
 | `GET /admin/mcp/servers/<name>/tools` | the server's full tool list |
 | `POST /admin/mcp/servers/<name>/refresh`, `POST /admin/mcp/refresh` | re-read tool lists |
 | `POST /admin/mcp/servers/<name>/oauth/start` | start a login: the authorization URL, the redirect URI, whether xolotl's callback finishes it, the registration used |
 | `GET /admin/mcp/oauth/flows/<id>`, `POST /admin/mcp/oauth/flows/<id>/complete` | a login's state; `{"redirect_url": "…"}` finishes a pasted-back login |
 | `DELETE /admin/mcp/servers/<name>/oauth` | sign out |
 | `GET /admin/mcp/oauth/callback`, `GET /admin/mcp/oauth/client-metadata.json` | unauthenticated: the redirect target and the client metadata document |
+| `POST /admin/mcp/servers`, `PUT /admin/mcp/servers/<name>`, `DELETE /admin/mcp/servers/<name>` | add, change or remove a server stored in OpenBao (`{"name": …, "url": …, …}`); 409 for config-file servers, taken names, and removals while a policy lists the server |
 | `PUT /admin/mcp/servers/<name>/secret` | `{"fields": {"token": "…", "old": null}}` merges into `mcp/<name>`; `null` removes a field |
 | `GET /admin/mcp/usage`, `GET /admin/mcp/calls` | call log |

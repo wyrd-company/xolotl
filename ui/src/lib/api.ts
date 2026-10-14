@@ -224,6 +224,19 @@ export interface McpServer {
   last_error: string | null;
   auth: "headers" | "oauth";
   oauth?: McpOAuthStatus;
+  /** `config`: from the config file, read-only here. `vault`: added at runtime. */
+  source: "config" | "vault";
+  definition?: McpServerDefinition;
+}
+
+/** The fields of a `[mcp.servers.<name>]` entry. */
+export interface McpServerDefinition {
+  url: string;
+  description?: string;
+  headers?: Record<string, string>;
+  timeout_secs?: number | null;
+  auth?: "headers" | "oauth";
+  oauth?: { client_id?: string | null; scopes?: string[] };
 }
 
 export interface McpOAuthStatus {

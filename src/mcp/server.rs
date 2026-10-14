@@ -135,13 +135,15 @@ impl CodeModeServer {
             by_server.entry(t.server.as_str()).or_default().push(&t.tool);
         }
         let namespaces: Vec<String> = by_server.keys().map(|s| namespace(s)).collect();
+        let descriptions: BTreeMap<String, String> =
+            self.hub.allowed_servers(&principal.policy).into_iter().map(|(n, c)| (n, c.description)).collect();
         let groups: Vec<Group<'_>> = by_server
             .iter()
             .zip(&namespaces)
             .map(|((server, tools), ns)| Group {
                 namespace: ns,
                 server,
-                description: self.hub.cfg.servers.get(*server).map(|s| s.description.as_str()).unwrap_or(""),
+                description: descriptions.get(*server).map(String::as_str).unwrap_or(""),
                 tools: tools.clone(),
             })
             .collect();
@@ -157,7 +159,7 @@ impl CodeModeServer {
         let _permit = self.hub.execution_permit().await;
         let tools = self.hub.allowed_tools(&principal.policy).await;
         let namespaces: Vec<(String, String)> =
-            self.hub.allowed_servers(&principal.policy).iter().map(|(n, _)| (namespace(n), n.to_string())).collect();
+            self.hub.allowed_servers(&principal.policy).iter().map(|(n, _)| (namespace(n), n.clone())).collect();
         let cfg = &self.hub.cfg;
         let limits = Limits {
             timeout: Duration::from_secs(cfg.execute_timeout_secs.max(1)),

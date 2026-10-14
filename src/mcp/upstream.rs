@@ -126,6 +126,12 @@ impl Upstream {
         c.refreshed_at.is_none() && c.attempted_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(30))
     }
 
+    /// Let the next client that needs this server's tools ask for them now,
+    /// e.g. after its credentials changed.
+    pub fn retry_listing_now(&self) {
+        self.cached.write().attempted_at = None;
+    }
+
     fn set_error(&self, e: &str) {
         self.cached.write().last_error = Some(e.to_string());
     }

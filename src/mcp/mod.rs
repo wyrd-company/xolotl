@@ -14,11 +14,12 @@ use std::time::Instant;
 
 use anyhow::Result;
 use opentelemetry::KeyValue;
+use parking_lot::RwLock;
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::config::{Config, McpAuth, McpConfig};
+use crate::config::{Config, McpAuth, McpConfig, McpServerConfig, colliding_mcp_names};
 use crate::db::{Db, McpCallRecord};
 use crate::keys::Principal;
 use crate::policy::Policy;
@@ -67,12 +68,29 @@ pub struct AllowedTool {
     pub tool: Tool,
 }
 
+/// Where a server's definition comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerSource {
+    /// `[mcp.servers]` in the config file; read-only at runtime.
+    Config,
+    /// Added through the admin API; stored in the vault under [`SERVERS_PREFIX`].
+    Vault,
+}
+
+/// Vault directory of servers added at runtime: `mcp-servers/<name>`.
+pub const SERVERS_PREFIX: &str = "mcp-servers";
+
 /// An upstream server as the admin API shows it.
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerInfo {
     pub name: String,
     pub url: String,
     pub description: String,
+    pub source: ServerSource,
+    /// The stored definition, for editing; only for servers from the vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<McpServerConfig>,
     /// Name used in code mode (`-` becomes `_`).
     pub namespace: String,
     /// Vault secret holding the header placeholder values.
@@ -83,6 +101,26 @@ pub struct ServerInfo {
     pub status: UpstreamStatus,
 }
 
+/// Why adding, changing or removing a server was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum ServerChangeError {
+    #[error("no MCP server named {0}")]
+    NotFound(String),
+    /// The name is taken, comes from the config file, is still in use, or changed concurrently.
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0:#}")]
+    Invalid(anyhow::Error),
+    #[error("{0:#}")]
+    Store(anyhow::Error),
+}
+
+#[derive(Clone)]
+struct Entry {
+    up: Arc<Upstream>,
+    source: ServerSource,
+}
+
 pub struct McpHub {
     pub cfg: McpConfig,
     /// The whole config, for the OAuth redirect URI (`server.public_url`).
@@ -90,7 +128,9 @@ pub struct McpHub {
     secrets: Secrets,
     pub flows: oauth::Flows,
     db: Db,
-    servers: BTreeMap<String, Arc<Upstream>>,
+    servers: RwLock<BTreeMap<String, Entry>>,
+    /// Serializes reloads and server changes.
+    changes: tokio::sync::Mutex<()>,
     executions: tokio::sync::Semaphore,
 }
 
@@ -100,35 +140,168 @@ pub fn namespace(server: &str) -> String {
 }
 
 impl McpHub {
+    /// A hub with the config file's servers. [`McpHub::reload`] adds the vault's.
     pub fn new(app: &Config, secrets: Secrets, db: Db) -> Self {
         let cfg = &app.mcp;
-        let servers =
-            cfg.servers.iter().map(|(name, s)| (name.clone(), Arc::new(Upstream::new(name.clone(), s.clone(), secrets.clone())))).collect();
+        let servers = cfg
+            .servers
+            .iter()
+            .map(|(name, s)| {
+                let up = Arc::new(Upstream::new(name.clone(), s.clone(), secrets.clone()));
+                (name.clone(), Entry { up, source: ServerSource::Config })
+            })
+            .collect();
         Self {
             cfg: cfg.clone(),
             app: app.clone(),
             secrets,
             flows: Default::default(),
             db,
-            servers,
+            servers: RwLock::new(servers),
+            changes: Default::default(),
             executions: tokio::sync::Semaphore::new(cfg.max_concurrent_executions.max(1)),
         }
     }
 
-    fn server(&self, name: &str) -> Result<&Arc<Upstream>> {
-        self.servers.get(name).ok_or_else(|| anyhow::anyhow!("no such MCP server"))
+    fn entries(&self) -> Vec<(String, Entry)> {
+        self.servers.read().iter().map(|(n, e)| (n.clone(), e.clone())).collect()
     }
 
-    fn oauth_server(&self, name: &str) -> Result<(&Arc<Upstream>, &Arc<oauth::OAuthStore>)> {
+    fn upstreams(&self) -> Vec<Arc<Upstream>> {
+        self.servers.read().values().map(|e| e.up.clone()).collect()
+    }
+
+    fn get(&self, name: &str) -> Option<Arc<Upstream>> {
+        self.servers.read().get(name).map(|e| e.up.clone())
+    }
+
+    fn server(&self, name: &str) -> Result<Arc<Upstream>> {
+        self.get(name).ok_or_else(|| anyhow::anyhow!("no such MCP server"))
+    }
+
+    // ---- servers stored in the vault
+
+    /// Read the servers stored in the vault and apply them. Unchanged servers
+    /// keep their connection, tools and login; changed ones start over.
+    /// Invalid entries, and names the config file already uses, are skipped.
+    pub async fn reload(&self) -> Result<usize> {
+        let _changes = self.changes.lock().await;
+        self.reload_locked().await
+    }
+
+    async fn reload_locked(&self) -> Result<usize> {
+        let mut stored = BTreeMap::new();
+        for key in self.secrets.list(SERVERS_PREFIX).await? {
+            if key.ends_with('/') {
+                continue;
+            }
+            let Some(data) = self.secrets.get(&format!("{SERVERS_PREFIX}/{key}")).await? else { continue };
+            let parsed = serde_json::from_value::<McpServerConfig>(Value::Object(data)).map_err(anyhow::Error::from);
+            match parsed.and_then(|cfg| cfg.validate(&key).map(|()| cfg)) {
+                Ok(_) if self.cfg.servers.contains_key(&key) => {
+                    tracing::warn!(server = %key, "MCP server in the vault ignored: the config file defines one with that name");
+                }
+                Ok(cfg) => {
+                    stored.insert(key, cfg);
+                }
+                Err(e) => tracing::warn!(server = %key, error = %format!("{e:#}"), "invalid MCP server in the vault ignored"),
+            }
+        }
+        let current = self.entries();
+        let mut next: BTreeMap<String, Entry> = current.iter().filter(|(_, e)| e.source == ServerSource::Config).cloned().collect();
+        for (name, cfg) in stored {
+            if let Some((a, b)) = colliding_mcp_names(next.keys().map(String::as_str).chain([name.as_str()])) {
+                tracing::warn!(server = %name, "MCP server in the vault ignored: {a:?} and {b:?} have the same name in code");
+                continue;
+            }
+            let kept = current.iter().find(|(n, e)| *n == name && e.source == ServerSource::Vault && e.up.cfg == cfg);
+            let up = match kept {
+                Some((_, e)) => e.up.clone(),
+                None => Arc::new(Upstream::new(name.clone(), cfg, self.secrets.clone())),
+            };
+            next.insert(name, Entry { up, source: ServerSource::Vault });
+        }
+        let gone: Vec<Arc<Upstream>> =
+            current.iter().filter(|(n, e)| next.get(n).is_none_or(|x| !Arc::ptr_eq(&x.up, &e.up))).map(|(_, e)| e.up.clone()).collect();
+        let n = next.values().filter(|e| e.source == ServerSource::Vault).count();
+        *self.servers.write() = next;
+        for up in gone {
+            up.disconnect().await;
+        }
+        Ok(n)
+    }
+
+    /// Add (`create`) or change a server stored in the vault.
+    pub async fn put_server(&self, name: &str, cfg: McpServerConfig, create: bool) -> Result<(), ServerChangeError> {
+        cfg.validate(name).map_err(ServerChangeError::Invalid)?;
+        let _changes = self.changes.lock().await;
+        if self.cfg.servers.contains_key(name) {
+            return Err(ServerChangeError::Conflict(format!("MCP server {name} is defined in the config file; change it there")));
+        }
+        let names = self.server_names();
+        if let Some((a, b)) = colliding_mcp_names(names.iter().map(String::as_str).filter(|n| *n != name).chain([name])) {
+            return Err(ServerChangeError::Conflict(format!("{a:?} and {b:?} would have the same name in code ('-' becomes '_')")));
+        }
+        let key = format!("{SERVERS_PREFIX}/{name}");
+        let (existing, version) = self.secrets.get_versioned(&key).await.map_err(ServerChangeError::Store)?;
+        match (create, existing.is_some()) {
+            (true, true) => return Err(ServerChangeError::Conflict(format!("an MCP server named {name} already exists"))),
+            (false, false) => return Err(ServerChangeError::NotFound(name.to_string())),
+            _ => {}
+        }
+        let data = match serde_json::to_value(&cfg).map_err(|e| ServerChangeError::Store(e.into()))? {
+            Value::Object(m) => m,
+            _ => unreachable!("server definitions serialize to objects"),
+        };
+        self.secrets.put_cas(&key, data, version).await.map_err(|e| match e.downcast_ref::<crate::secrets::Conflict>() {
+            Some(_) => ServerChangeError::Conflict(format!("MCP server {name} was changed concurrently; reload and retry")),
+            None => ServerChangeError::Store(e),
+        })?;
+        self.reload_locked().await.map_err(ServerChangeError::Store)?;
+        Ok(())
+    }
+
+    /// Remove a server stored in the vault, with its secrets and login.
+    /// Refused while a policy lists it by name.
+    pub async fn delete_server(&self, name: &str, policies: &[Arc<Policy>]) -> Result<(), ServerChangeError> {
+        let _changes = self.changes.lock().await;
+        if self.cfg.servers.contains_key(name) {
+            return Err(ServerChangeError::Conflict(format!("MCP server {name} is defined in the config file; remove it there")));
+        }
+        let key = format!("{SERVERS_PREFIX}/{name}");
+        if self.secrets.get(&key).await.map_err(ServerChangeError::Store)?.is_none() {
+            return Err(ServerChangeError::NotFound(name.to_string()));
+        }
+        let users: Vec<&str> = policies.iter().filter(|p| p.mcp_servers.iter().any(|s| s == name)).map(|p| p.name.as_str()).collect();
+        if !users.is_empty() {
+            return Err(ServerChangeError::Conflict(format!(
+                "MCP server {name} is used by polic{} {}; remove it from them first",
+                if users.len() == 1 { "y" } else { "ies" },
+                users.join(", ")
+            )));
+        }
+        self.secrets.delete(&key).await.map_err(ServerChangeError::Store)?;
+        for secret in [format!("mcp/{name}/oauth"), format!("mcp/{name}")] {
+            if let Err(e) = self.secrets.delete(&secret).await {
+                tracing::warn!(secret = %secret, error = %format!("{e:#}"), "removing a deleted MCP server's secret failed");
+            }
+        }
+        self.reload_locked().await.map_err(ServerChangeError::Store)?;
+        Ok(())
+    }
+
+    // ---- OAuth logins
+
+    fn oauth_server(&self, name: &str) -> Result<(Arc<Upstream>, Arc<oauth::OAuthStore>)> {
         let up = self.server(name)?;
-        let store = up.oauth.as_ref().ok_or_else(|| anyhow::anyhow!("MCP server {name} does not use OAuth (auth = \"oauth\")"))?;
+        let store = up.oauth.clone().ok_or_else(|| anyhow::anyhow!("MCP server {name} does not use OAuth (auth = \"oauth\")"))?;
         Ok((up, store))
     }
 
     /// Start an OAuth login to a server.
     pub async fn login_start(&self, name: &str) -> Result<oauth::FlowStart> {
         let (up, store) = self.oauth_server(name)?;
-        let start = oauth::start(&self.app, name, &up.cfg, store, &self.secrets, up.http(), &self.flows);
+        let start = oauth::start(&self.app, name, &up.cfg, &store, &self.secrets, up.http(), &self.flows);
         tokio::time::timeout(std::time::Duration::from_secs(60), start)
             .await
             .map_err(|_| anyhow::anyhow!("discovery and client registration timed out after 60s"))?
@@ -160,30 +333,36 @@ impl McpHub {
 
     pub async fn unsaved_count(&self) -> usize {
         let mut n = 0;
-        for store in self.servers.values().filter_map(|u| u.oauth.as_ref()) {
-            n += usize::from(store.is_unsaved().await);
+        for up in self.upstreams() {
+            if let Some(store) = &up.oauth {
+                n += usize::from(store.is_unsaved().await);
+            }
         }
         n
     }
 
     /// Retry vault writes of OAuth credentials that failed.
     pub async fn flush_unsaved(&self) {
-        for store in self.servers.values().filter_map(|u| u.oauth.as_ref()) {
-            store.flush().await;
+        for up in self.upstreams() {
+            if let Some(store) = &up.oauth {
+                store.flush().await;
+            }
         }
     }
 
+    // ---- reading
+
     pub fn server_names(&self) -> BTreeSet<String> {
-        self.servers.keys().cloned().collect()
+        self.servers.read().keys().cloned().collect()
     }
 
     pub fn has_server(&self, name: &str) -> bool {
-        self.servers.contains_key(name)
+        self.servers.read().contains_key(name)
     }
 
     pub async fn servers(&self) -> Result<Vec<ServerInfo>> {
         let mut out = Vec::new();
-        for (name, up) in &self.servers {
+        for (name, Entry { up, source }) in self.entries() {
             let secret = format!("mcp/{name}");
             let mut fields = BTreeSet::new();
             for v in up.cfg.headers.values() {
@@ -201,13 +380,15 @@ impl McpHub {
                 })
                 .collect();
             out.push(ServerInfo {
-                name: name.clone(),
                 url: up.cfg.url.clone(),
                 description: up.cfg.description.clone(),
-                namespace: namespace(name),
+                source,
+                definition: (source == ServerSource::Vault).then(|| up.cfg.clone()),
+                namespace: namespace(&name),
                 secret,
                 secret_fields,
                 status: up.status().await,
+                name,
             });
         }
         Ok(out)
@@ -215,12 +396,12 @@ impl McpHub {
 
     /// Every tool of one server, unfiltered (admin view).
     pub fn server_tools(&self, name: &str) -> Option<Arc<Vec<Tool>>> {
-        self.servers.get(name).map(|u| u.tools())
+        self.get(name).map(|u| u.tools())
     }
 
     /// Merge fields into a server's vault secret and reconnect with them.
     pub async fn set_secret(&self, name: &str, fields: Map<String, Value>) -> Result<()> {
-        let up = self.servers.get(name).ok_or_else(|| anyhow::anyhow!("no such MCP server"))?;
+        let up = self.server(name)?;
         let key = format!("mcp/{name}");
         let mut data = self.secrets.get(&key).await?.unwrap_or_default();
         for (k, v) in fields {
@@ -240,12 +421,14 @@ impl McpHub {
             self.secrets.put(&key, data).await?;
         }
         up.disconnect().await;
+        up.retry_listing_now();
         Ok(())
     }
 
     /// Re-read every server's tool list. Failures are logged and kept per server.
     pub async fn refresh_all(&self) {
-        let jobs = self.servers.values().map(|up| async move {
+        let ups = self.upstreams();
+        let jobs = ups.iter().map(|up| async move {
             match up.refresh().await {
                 Ok(n) => tracing::debug!(server = %up.name, tools = n, "refreshed MCP tool list"),
                 Err(e) => tracing::warn!(server = %up.name, error = %e, "MCP tool list refresh failed"),
@@ -255,27 +438,25 @@ impl McpHub {
     }
 
     pub async fn refresh(&self, name: &str) -> Result<usize> {
-        self.servers.get(name).ok_or_else(|| anyhow::anyhow!("no such MCP server"))?.refresh().await
+        self.server(name)?.refresh().await
     }
 
     /// The servers a policy may use, in name order.
-    pub fn allowed_servers(&self, policy: &Policy) -> Vec<(&str, &crate::config::McpServerConfig)> {
-        self.servers.iter().filter(|(n, _)| policy.allows_mcp_server(n)).map(|(n, u)| (n.as_str(), &u.cfg)).collect()
+    pub fn allowed_servers(&self, policy: &Policy) -> Vec<(String, McpServerConfig)> {
+        self.servers.read().iter().filter(|(n, _)| policy.allows_mcp_server(n)).map(|(n, e)| (n.clone(), e.up.cfg.clone())).collect()
     }
 
     /// The tools a policy may call. Servers whose tools were never listed
     /// are asked first (see [`Upstream::needs_listing`]).
     pub async fn allowed_tools(&self, policy: &Policy) -> Vec<AllowedTool> {
-        let pending = self.servers.values().filter(|u| policy.allows_mcp_server(&u.name) && u.needs_listing()).map(|u| u.refresh());
-        futures::future::join_all(pending).await;
-        self.servers
-            .iter()
-            .filter(|(n, _)| policy.allows_mcp_server(n))
-            .flat_map(|(n, u)| {
+        let ups: Vec<Arc<Upstream>> = self.upstreams().into_iter().filter(|u| policy.allows_mcp_server(&u.name)).collect();
+        futures::future::join_all(ups.iter().filter(|u| u.needs_listing()).map(|u| u.refresh())).await;
+        ups.iter()
+            .flat_map(|u| {
                 u.tools()
                     .iter()
-                    .filter(|t| policy.allows_tool(n, &t.name))
-                    .map(|t| AllowedTool { server: n.clone(), tool: t.clone() })
+                    .filter(|t| policy.allows_tool(&u.name, &t.name))
+                    .map(|t| AllowedTool { server: u.name.clone(), tool: t.clone() })
                     .collect::<Vec<_>>()
             })
             .collect()
@@ -283,7 +464,7 @@ impl McpHub {
 
     /// Call an upstream tool for a principal: policy check, call log, metrics.
     pub async fn call(&self, principal: &Principal, server: &str, tool: &str, arguments: JsonObject) -> Result<CallToolResult, String> {
-        let up = self.servers.get(server).filter(|_| principal.policy.allows_mcp_server(server));
+        let up = self.get(server).filter(|_| principal.policy.allows_mcp_server(server));
         let Some(up) = up else {
             return Err(format!("unknown MCP server {server:?}"));
         };

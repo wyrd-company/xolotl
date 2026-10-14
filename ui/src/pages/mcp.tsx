@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronDown, ChevronRight, ExternalLink, LogIn, RefreshCw } from "lucide-react";
+import { ChevronDown, ChevronRight, ExternalLink, LogIn, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Confirm } from "@/components/confirm";
@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
@@ -23,6 +24,7 @@ import {
   type McpLoginStatus,
   type McpOAuthStatus,
   type McpServer,
+  type McpServerDefinition,
   type McpTool,
   type McpUsageRow,
 } from "@/lib/api";
@@ -42,6 +44,7 @@ export function McpPage() {
     success: "Tool lists refreshed",
   });
   const list = servers.data ?? [];
+  const [adding, setAdding] = useState(false);
 
   return (
     <>
@@ -49,11 +52,14 @@ export function McpPage() {
         title="MCP servers"
         description={
           <>
-            Upstream servers come from the config file; header secrets live in OpenBao. Clients connect to <Mono>{window.location.origin}/mcp</Mono>{" "}
-            with a key whose policy has the <Mono>mcp</Mono> scope, and see them in code mode.
+            Servers added here are stored in OpenBao, next to the config file's; so are their secrets and logins. Clients connect to{" "}
+            <Mono>{window.location.origin}/mcp</Mono> with a key whose policy has the <Mono>mcp</Mono> scope, and see them in code mode.
           </>
         }
       >
+        <Button disabled={adding} onClick={() => setAdding(true)}>
+          <Plus /> Add server
+        </Button>
         <Button variant="outline" disabled={refresh.isPending || list.length === 0} onClick={() => refresh.mutate(undefined)}>
           <RefreshCw className={refresh.isPending ? "animate-spin" : undefined} />
           Refresh tools
@@ -62,13 +68,14 @@ export function McpPage() {
       <QueryError error={servers.error} />
 
       <section aria-label="MCP servers" className="flex flex-col gap-4">
+        {adding && <ServerForm initial={null} onDone={() => setAdding(false)} />}
         {list.map((s) => (
           <ServerCard key={s.name} s={s} />
         ))}
-        {servers.isSuccess && list.length === 0 && (
+        {servers.isSuccess && list.length === 0 && !adding && (
           <Card>
             <Empty>
-              No MCP servers are configured. Add them under <Mono>[mcp.servers.&lt;name&gt;]</Mono> in the config file.
+              No MCP servers yet. Add one here, or under <Mono>[mcp.servers.&lt;name&gt;]</Mono> in the config file.
             </Empty>
           </Card>
         )}
@@ -87,7 +94,17 @@ function ServerState({ s }: { s: McpServer }) {
 }
 
 function ServerCard({ s }: { s: McpServer }) {
+  const [editing, setEditing] = useState(false);
+  if (editing && s.definition) return <ServerForm initial={{ name: s.name, def: s.definition }} onDone={() => setEditing(false)} />;
+  return <ServerView s={s} onEdit={() => setEditing(true)} />;
+}
+
+function ServerView({ s, onEdit }: { s: McpServer; onEdit: () => void }) {
   const [open, setOpen] = useState(false);
+  const remove = useAction(() => del(`/admin/mcp/servers/${s.name}`), {
+    invalidate: [["mcp-servers"], ["policy-view"]],
+    success: `Removed ${s.name}`,
+  });
   const refresh = useAction(() => post(`/admin/mcp/servers/${s.name}/refresh`), {
     invalidate: [["mcp-servers"], ["mcp-tools", s.name], ["policy-view"]],
     success: (r) => `${s.name}: ${(r as { tools: number }).tools} tools`,
@@ -100,13 +117,31 @@ function ServerCard({ s }: { s: McpServer }) {
         <CardTitle className="flex flex-wrap items-center gap-2">
           <span className="font-mono">{s.name}</span>
           <ServerState s={s} />
+          {s.source === "config" && <Badge variant="outline">config file</Badge>}
         </CardTitle>
         <CardDescription>{s.description || <Mono className="break-all">{s.url}</Mono>}</CardDescription>
-        <CardAction>
+        <CardAction className="flex gap-2">
           <Button variant="outline" size="sm" disabled={refresh.isPending} onClick={() => refresh.mutate(undefined)}>
             <RefreshCw className={refresh.isPending ? "animate-spin" : undefined} />
             Refresh
           </Button>
+          {s.source === "vault" && (
+            <>
+              <Button variant="outline" size="sm" onClick={onEdit}>
+                <Pencil /> Edit
+              </Button>
+              <Confirm
+                title={`Remove ${s.name}?`}
+                description="Its definition, secrets and login are deleted from OpenBao. Policies that list it must drop it first."
+                action="Remove"
+                onConfirm={() => remove.mutate(undefined)}
+              >
+                <Button variant="outline" size="sm" className="text-destructive" disabled={remove.isPending} aria-label={`Remove ${s.name}`}>
+                  <Trash2 />
+                </Button>
+              </Confirm>
+            </>
+          )}
         </CardAction>
       </CardHeader>
       <CardContent className="flex flex-col gap-4 text-sm">
@@ -154,6 +189,195 @@ function ServerCard({ s }: { s: McpServer }) {
           </Button>
         </div>
         {open && <Tools server={s.name} />}
+      </CardContent>
+    </Card>
+  );
+}
+
+interface FormState {
+  name: string;
+  url: string;
+  description: string;
+  auth: "headers" | "oauth";
+  headers: { name: string; value: string }[];
+  timeout: string;
+  clientId: string;
+  scopes: string;
+}
+
+function toForm(initial: { name: string; def: McpServerDefinition } | null): FormState {
+  const d = initial?.def;
+  return {
+    name: initial?.name ?? "",
+    url: d?.url ?? "",
+    description: d?.description ?? "",
+    auth: d?.auth ?? "headers",
+    headers: Object.entries(d?.headers ?? {}).map(([name, value]) => ({ name, value })),
+    timeout: d?.timeout_secs ? String(d.timeout_secs) : "",
+    clientId: d?.oauth?.client_id ?? "",
+    scopes: (d?.oauth?.scopes ?? []).join(" "),
+  };
+}
+
+function toDefinition(f: FormState): McpServerDefinition {
+  const oauth = f.auth === "oauth";
+  return {
+    url: f.url.trim(),
+    description: f.description.trim(),
+    headers: Object.fromEntries(f.headers.filter((h) => h.name.trim()).map((h) => [h.name.trim(), h.value])),
+    timeout_secs: f.timeout.trim() ? Number(f.timeout) : null,
+    auth: f.auth,
+    oauth: {
+      client_id: oauth && f.clientId.trim() ? f.clientId.trim() : null,
+      scopes: oauth ? f.scopes.split(/\s+/).filter(Boolean) : [],
+    },
+  };
+}
+
+function ServerForm({ initial, onDone }: { initial: { name: string; def: McpServerDefinition } | null; onDone: () => void }) {
+  const isNew = initial === null;
+  const [f, setF] = useState<FormState>(() => toForm(initial));
+  const set = <K extends keyof FormState>(k: K, v: FormState[K]) => setF((x) => ({ ...x, [k]: v }));
+  const name = f.name.trim();
+  const save = useAction(
+    () => (isNew ? post("/admin/mcp/servers", { name, ...toDefinition(f) }) : put(`/admin/mcp/servers/${name}`, toDefinition(f))),
+    {
+      invalidate: [["mcp-servers"], ["mcp-tools", name], ["policy-view"]],
+      success: isNew ? `Added ${name}` : `Saved ${name}`,
+      onSuccess: onDone,
+    },
+  );
+  const id = (k: string) => `server-${initial?.name ?? "new"}-${k}`;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{isNew ? "Add MCP server" : <span className="font-mono">{initial.name}</span>}</CardTitle>
+        <CardDescription>
+          A Streamable HTTP MCP server. Saved to <Mono>mcp-servers/{name || "…"}</Mono> in OpenBao and used right away.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form
+          className="flex flex-col gap-5 text-sm"
+          onSubmit={(e) => {
+            e.preventDefault();
+            save.mutate(undefined);
+          }}
+        >
+          <div className="grid gap-4 md:grid-cols-[minmax(0,16rem)_1fr]">
+            <div className="flex flex-col gap-2">
+              <Label htmlFor={id("name")}>Name</Label>
+              <Input
+                id={id("name")}
+                className="font-mono"
+                placeholder="github-work"
+                value={f.name}
+                disabled={!isNew}
+                onChange={(e) => set("name", e.target.value)}
+              />
+              <span className="text-muted-foreground text-xs">
+                Lowercase. In code: <Mono>{name.replace(/-/g, "_") || "…"}</Mono>
+              </span>
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor={id("url")}>URL</Label>
+              <Input
+                id={id("url")}
+                className="font-mono"
+                placeholder="https://mcp.example.com/mcp"
+                value={f.url}
+                onChange={(e) => set("url", e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor={id("desc")}>Description</Label>
+            <Input id={id("desc")} placeholder="Shown to clients by search" value={f.description} onChange={(e) => set("description", e.target.value)} />
+          </div>
+          <div className="grid gap-4 md:grid-cols-[minmax(0,16rem)_minmax(0,10rem)]">
+            <div className="flex flex-col gap-2">
+              <Label htmlFor={id("auth")}>Authentication</Label>
+              <Select value={f.auth} onValueChange={(v) => set("auth", v as FormState["auth"])}>
+                <SelectTrigger id={id("auth")}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="headers">Headers</SelectItem>
+                  <SelectItem value="oauth">OAuth login</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor={id("timeout")}>Call timeout (s)</Label>
+              <Input
+                id={id("timeout")}
+                type="number"
+                min={1}
+                placeholder="60"
+                value={f.timeout}
+                onChange={(e) => set("timeout", e.target.value)}
+              />
+            </div>
+          </div>
+          {f.auth === "oauth" && (
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="flex flex-col gap-2">
+                <Label htmlFor={id("client")}>Pre-registered client id (optional)</Label>
+                <Input id={id("client")} className="font-mono" value={f.clientId} onChange={(e) => set("clientId", e.target.value)} />
+              </div>
+              <div className="flex flex-col gap-2">
+                <Label htmlFor={id("scopes")}>Scopes (optional, space-separated)</Label>
+                <Input id={id("scopes")} className="font-mono" value={f.scopes} onChange={(e) => set("scopes", e.target.value)} />
+              </div>
+            </div>
+          )}
+          <fieldset className="flex flex-col gap-2">
+            <legend className="pb-2 font-medium">Headers</legend>
+            <p className="text-muted-foreground text-xs">
+              <Mono>{"{field}"}</Mono> is filled from the server's secret; set the values after saving. E.g. <Mono>Authorization</Mono> ={" "}
+              <Mono>{"Bearer {token}"}</Mono>.
+            </p>
+            {f.headers.map((h, i) => (
+              <div key={i} className="flex flex-wrap gap-2">
+                <Input
+                  aria-label="Header name"
+                  className="w-48 font-mono"
+                  placeholder="Authorization"
+                  value={h.name}
+                  onChange={(e) => set("headers", f.headers.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)))}
+                />
+                <Input
+                  aria-label="Header value"
+                  className="min-w-64 flex-1 font-mono"
+                  placeholder="Bearer {token}"
+                  value={h.value}
+                  onChange={(e) => set("headers", f.headers.map((x, j) => (j === i ? { ...x, value: e.target.value } : x)))}
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Remove header ${h.name}`}
+                  onClick={() => set("headers", f.headers.filter((_, j) => j !== i))}
+                >
+                  <Trash2 />
+                </Button>
+              </div>
+            ))}
+            <Button type="button" variant="outline" size="sm" className="self-start" onClick={() => set("headers", [...f.headers, { name: "", value: "" }])}>
+              <Plus /> Add header
+            </Button>
+          </fieldset>
+          <div className="flex gap-2">
+            <Button type="submit" disabled={!name || !f.url.trim() || save.isPending}>
+              {isNew ? "Add server" : "Save"}
+            </Button>
+            <Button type="button" variant="ghost" onClick={onDone}>
+              Cancel
+            </Button>
+          </div>
+        </form>
       </CardContent>
     </Card>
   );

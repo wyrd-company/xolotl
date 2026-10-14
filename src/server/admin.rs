@@ -44,7 +44,8 @@ pub fn router() -> Router<AppState> {
         .route("/providers", get(list_providers))
         .route("/providers/{name}/key", post(set_provider_key))
         .route("/usage", get(usage))
-        .route("/mcp/servers", get(mcp_servers))
+        .route("/mcp/servers", get(mcp_servers).post(mcp_create_server))
+        .route("/mcp/servers/{name}", axum::routing::put(mcp_update_server).delete(mcp_delete_server))
         .route("/mcp/servers/{name}/tools", get(mcp_tools))
         .route("/mcp/servers/{name}/refresh", post(mcp_refresh))
         .route("/mcp/servers/{name}/secret", axum::routing::put(mcp_set_secret))
@@ -153,7 +154,7 @@ fn view_json(s: &AppState, policy: &Policy) -> Value {
         "policy": policy.name,
         "models": models,
         "shared": policy.shared_names(&catalog),
-        "mcp_servers": s.mcp.allowed_servers(policy).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        "mcp_servers": s.mcp.allowed_servers(policy).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
         "tools": mcp_view_tools(s, policy),
     })
 }
@@ -444,6 +445,68 @@ async fn usage(State(s): State<AppState>, h: HeaderMap, Query(q): Query<UsageQue
 async fn mcp_servers(State(s): State<AppState>, h: HeaderMap) -> Res {
     admin(&s, &h).await?;
     ok(s.mcp.servers().await.map_err(internal)?)
+}
+
+/// A server definition from the admin API: the config file's fields plus its
+/// name. Unknown fields are refused, as in the config file.
+fn server_req(mut body: Value) -> Result<(Option<String>, crate::config::McpServerConfig), Response> {
+    let name = match body.as_object_mut().and_then(|m| m.remove("name")) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(n)) => Some(n.trim().to_string()),
+        Some(_) => return Err(json_error(StatusCode::BAD_REQUEST, "name must be a string")),
+    };
+    let server = serde_json::from_value(body).map_err(|e| json_error(StatusCode::BAD_REQUEST, format!("invalid server: {e}")))?;
+    Ok((name, server))
+}
+
+fn server_change_error(e: crate::mcp::ServerChangeError) -> Response {
+    use crate::mcp::ServerChangeError as E;
+    match e {
+        E::NotFound(_) => json_error(StatusCode::NOT_FOUND, e.to_string()),
+        E::Conflict(_) => json_error(StatusCode::CONFLICT, e.to_string()),
+        E::Invalid(_) => json_error(StatusCode::BAD_REQUEST, e.to_string()),
+        E::Store(e) => internal(e),
+    }
+}
+
+async fn mcp_create_server(State(s): State<AppState>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    admin(&s, &h).await?;
+    let (name, server) = server_req(body)?;
+    let name = name.unwrap_or_default();
+    s.mcp.put_server(&name, server, true).await.map_err(server_change_error)?;
+    tracing::info!(server = %name, "added MCP server");
+    refresh_server_later(&s, &name);
+    ok(json!({"server": name, "created": true}))
+}
+
+async fn mcp_update_server(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>, Json(body): Json<Value>) -> Res {
+    admin(&s, &h).await?;
+    let (body_name, server) = server_req(body)?;
+    if body_name.is_some_and(|n| n != name) {
+        return Err(json_error(StatusCode::BAD_REQUEST, "server name must match the URL; servers can't be renamed"));
+    }
+    s.mcp.put_server(&name, server, false).await.map_err(server_change_error)?;
+    tracing::info!(server = %name, "changed MCP server");
+    refresh_server_later(&s, &name);
+    ok(json!({"server": name, "updated": true}))
+}
+
+async fn mcp_delete_server(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    s.mcp.delete_server(&name, &s.keys.policies()).await.map_err(server_change_error)?;
+    tracing::info!(server = %name, "removed MCP server");
+    ok(json!({"server": name, "deleted": true}))
+}
+
+/// Read a new or changed server's tools in the background, so saving doesn't
+/// wait on the server (or on a login it still needs).
+fn refresh_server_later(s: &AppState, name: &str) {
+    let (hub, name) = (s.mcp.clone(), name.to_string());
+    tokio::spawn(async move {
+        if let Err(e) = hub.refresh(&name).await {
+            tracing::info!(server = %name, error = %format!("{e:#}"), "listing a saved MCP server's tools failed");
+        }
+    });
 }
 
 async fn mcp_tools(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {

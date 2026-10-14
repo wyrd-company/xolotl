@@ -80,7 +80,7 @@ pub enum McpAuth {
     Oauth,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpServerOAuthConfig {
     /// A client registered with the authorization server beforehand. Its
@@ -108,7 +108,7 @@ impl Default for McpConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpServerConfig {
     /// Streamable HTTP endpoint of the upstream server.
@@ -128,6 +128,39 @@ impl McpServerConfig {
     pub fn timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.timeout_secs.unwrap_or(60).max(1))
     }
+
+    /// Checks shared by servers from the config file and from the admin API.
+    pub fn validate(&self, name: &str) -> Result<()> {
+        anyhow::ensure!(
+            valid_mcp_server_name(name),
+            "mcp server name {name:?} must start with a lowercase letter and use lowercase letters, digits, '-' or '_' (max 63)"
+        );
+        let url = url::Url::parse(&self.url).with_context(|| format!("mcp server {name:?}: invalid url"))?;
+        anyhow::ensure!(matches!(url.scheme(), "http" | "https"), "mcp server {name:?}: url must be http or https");
+        for (header, value) in &self.headers {
+            anyhow::ensure!(
+                axum::http::HeaderName::from_bytes(header.as_bytes()).is_ok(),
+                "mcp server {name:?}: invalid header name {header:?}"
+            );
+            crate::mcp::template_fields(value).with_context(|| format!("mcp server {name:?}: header {header:?}"))?;
+        }
+        anyhow::ensure!(
+            self.oauth.client_id.is_none() && self.oauth.scopes.is_empty() || self.auth == McpAuth::Oauth,
+            "mcp server {name:?}: oauth settings need auth = \"oauth\""
+        );
+        Ok(())
+    }
+}
+
+/// Server names that become the same JavaScript identifier (`-` turns into `_`).
+pub fn colliding_mcp_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<(&'a str, &'a str)> {
+    let mut idents = BTreeMap::new();
+    for name in names {
+        if let Some(other) = idents.insert(name.replace('-', "_"), name) {
+            return Some((other, name));
+        }
+    }
+    None
 }
 
 /// MCP server names become JavaScript identifiers in code mode (`-` turns
@@ -515,24 +548,11 @@ impl Config {
                 "catalog.wires.{key:?}: Claude subscription accounts serve only /v1/messages; their wire formats can't be overridden"
             );
         }
-        let mut idents = BTreeMap::new();
         for (name, server) in &self.mcp.servers {
-            anyhow::ensure!(
-                valid_mcp_server_name(name),
-                "mcp server name {name:?} must start with a lowercase letter and use lowercase letters, digits, '-' or '_' (max 63)"
-            );
-            if let Some(other) = idents.insert(name.replace('-', "_"), name) {
-                anyhow::bail!("mcp servers {other:?} and {name:?} have the same name in code ('-' becomes '_')");
-            }
-            let url = url::Url::parse(&server.url).with_context(|| format!("mcp server {name:?}: invalid url"))?;
-            anyhow::ensure!(matches!(url.scheme(), "http" | "https"), "mcp server {name:?}: url must be http or https");
-            for (header, value) in &server.headers {
-                anyhow::ensure!(
-                    axum::http::HeaderName::from_bytes(header.as_bytes()).is_ok(),
-                    "mcp server {name:?}: invalid header name {header:?}"
-                );
-                crate::mcp::template_fields(value).with_context(|| format!("mcp server {name:?}: header {header:?}"))?;
-            }
+            server.validate(name)?;
+        }
+        if let Some((a, b)) = colliding_mcp_names(self.mcp.servers.keys().map(String::as_str)) {
+            anyhow::bail!("mcp servers {a:?} and {b:?} have the same name in code ('-' becomes '_')");
         }
         anyhow::ensure!(self.mcp.max_concurrent_executions >= 1, "mcp.max_concurrent_executions must be >= 1");
         if let Some(u) = &self.server.public_url {
