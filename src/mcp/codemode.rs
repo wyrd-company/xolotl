@@ -91,12 +91,24 @@ fn program(code: &str, namespaces: &[(String, String)]) -> String {
     format!("{prelude}\n{call}.then((v) => JSON.stringify(v === undefined ? null : v))")
 }
 
+/// The tool calls of one execution: slots are reserved before a call starts,
+/// so concurrent calls can't exceed the limit, and every call's task is kept
+/// so that none outlives the execution.
+#[derive(Default)]
+struct Calls {
+    admitted: usize,
+    summaries: Vec<CallSummary>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Set when the execution ends; later calls are refused.
+    closed: bool,
+}
+
 /// Run `code` with one global per `(identifier, server)` pair.
 pub async fn execute(code: &str, namespaces: Vec<(String, String)>, host: Arc<dyn ToolHost>, limits: Limits) -> Outcome {
     let source = program(code, &namespaces);
     let handle = tokio::runtime::Handle::current();
     let logs = Arc::new(Mutex::new(Logs { lines: Vec::new(), bytes: 0, max: limits.max_log_bytes }));
-    let calls = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(Mutex::new(Calls::default()));
     let (l, c) = (logs.clone(), calls.clone());
     // QuickJS runtimes aren't Send: run on a blocking thread with its own
     // single-threaded runtime. Tool calls are spawned back onto the main one,
@@ -110,8 +122,21 @@ pub async fn execute(code: &str, namespaces: Vec<(String, String)>, host: Arc<dy
         Ok(r) => r,
         Err(e) => Err(format!("execution failed: {e}")),
     };
+    // However the execution ended, stop tool calls still running and wait
+    // until they have: no gateway work continues, or starts, afterwards.
+    let tasks = {
+        let mut c = calls.lock();
+        c.closed = true;
+        std::mem::take(&mut c.tasks)
+    };
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
     let logs = std::mem::take(&mut logs.lock().lines);
-    let calls = std::mem::take(&mut *calls.lock());
+    let calls = std::mem::take(&mut calls.lock().summaries);
     Outcome { result, logs, calls }
 }
 
@@ -141,7 +166,7 @@ async fn run(
     host: Arc<dyn ToolHost>,
     limits: Limits,
     logs: Arc<Mutex<Logs>>,
-    calls: Arc<Mutex<Vec<CallSummary>>>,
+    calls: Arc<Mutex<Calls>>,
 ) -> Result<Value, String> {
     let deadline = Instant::now() + limits.timeout;
     let timeout_msg = format!("execution timed out after {}s", limits.timeout.as_secs());
@@ -198,7 +223,7 @@ async fn run(
 
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
-    calls: &Mutex<Vec<CallSummary>>,
+    calls: &Mutex<Calls>,
     max_calls: usize,
     deadline: Instant,
     timeout_msg: &str,
@@ -208,24 +233,42 @@ async fn dispatch(
     host: Arc<dyn ToolHost>,
     handle: tokio::runtime::Handle,
 ) -> Value {
-    if calls.lock().len() >= max_calls {
-        return json!({"error": format!("tool call limit reached ({max_calls} per execution)")});
-    }
     let arguments = match serde_json::from_str::<Value>(&args) {
         Ok(v @ Value::Object(_)) => v,
         _ => return json!({"error": "tool arguments must be an object"}),
     };
     let label = format!("{server}/{tool}");
     let started = Instant::now();
+    // Reserve the slot and register the task under one lock, before awaiting.
+    let (reply, abort) = {
+        let mut c = calls.lock();
+        if c.closed {
+            return json!({"error": "the execution has ended"});
+        }
+        if c.admitted >= max_calls {
+            return json!({"error": format!("tool call limit reached ({max_calls} per execution)")});
+        }
+        c.admitted += 1;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = handle.spawn(async move {
+            let _ = tx.send(host.call(server, tool, arguments).await);
+        });
+        let abort = task.abort_handle();
+        c.tasks.push(task);
+        (rx, abort)
+    };
     let remaining = deadline.saturating_duration_since(started);
-    let result = match tokio::time::timeout(remaining, handle.spawn(async move { host.call(server, tool, arguments).await })).await {
+    let result = match tokio::time::timeout(remaining, reply).await {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => Err(format!("tool call failed: {e}")),
-        Err(_) => Err(timeout_msg.to_string()),
+        Ok(Err(_)) => Err("tool call was cancelled".to_string()),
+        Err(_) => {
+            abort.abort();
+            Err(timeout_msg.to_string())
+        }
     };
     let ms = started.elapsed().as_millis() as u64;
     let summary = CallSummary { tool: label, ok: result.is_ok(), ms, error: result.as_ref().err().cloned() };
-    calls.lock().push(summary);
+    calls.lock().summaries.push(summary);
     match result {
         Ok(value) => json!({"value": value}),
         Err(error) => json!({"error": error}),
@@ -249,6 +292,85 @@ fn js_error(ctx: &Ctx<'_>, error: rquickjs::Error) -> String {
         }
         CaughtError::Error(e) => e.to_string(),
     }
+}
+
+// ------------------------------------------------------------ names
+
+/// Reserved words, including the ones only reserved in strict mode or in
+/// some contexts. Server names are lowercase, so only lowercase words matter.
+const KEYWORDS: &[&str] = &[
+    "arguments",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "eval",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "get",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "instanceof",
+    "interface",
+    "let",
+    "new",
+    "null",
+    "of",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "set",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+];
+
+/// The globals of a fresh sandbox, plus the ones the prelude defines.
+fn sandbox_globals() -> &'static std::collections::HashSet<String> {
+    static GLOBALS: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    GLOBALS.get_or_init(|| {
+        let mut names: std::collections::HashSet<String> =
+            ["console", "__xolotl_call", "__xolotl_log"].iter().map(|s| s.to_string()).collect();
+        let listed = rquickjs::Runtime::new()
+            .and_then(|rt| rquickjs::Context::full(&rt))
+            .and_then(|ctx| ctx.with(|ctx| ctx.eval::<Vec<String>, _>("Object.getOwnPropertyNames(globalThis)")));
+        names.extend(listed.expect("QuickJS lists its globals"));
+        names
+    })
+}
+
+/// Whether an identifier can't be a server's global in code mode: a keyword,
+/// or a name the sandbox already defines (`undefined`, `console`, …).
+pub fn reserved_identifier(ident: &str) -> bool {
+    KEYWORDS.contains(&ident) || sandbox_globals().contains(ident)
 }
 
 // ------------------------------------------------------------ declarations
@@ -473,6 +595,59 @@ mod tests {
         for code in ["typeof fetch", "typeof require", "typeof setTimeout", "typeof __xolotl_call"] {
             assert_eq!(run(&format!("return {code}")).await.result.unwrap(), json!("undefined"), "{code}");
         }
+    }
+
+    /// Counts started calls; `effect` sleeps, then records that it ran.
+    #[derive(Default)]
+    struct Counting {
+        started: std::sync::atomic::AtomicUsize,
+        effects: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolHost for Counting {
+        async fn call(&self, _server: String, tool: String, _arguments: Value) -> Result<Value, String> {
+            use std::sync::atomic::Ordering;
+            self.started.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(if tool == "effect" { 350 } else { 50 })).await;
+            self.effects.fetch_add(1, Ordering::SeqCst);
+            Ok(Value::Null)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_calls_count_against_the_limit() {
+        use std::sync::atomic::Ordering;
+        let host = Arc::new(Counting::default());
+        let code = "const r = await Promise.allSettled(Array.from({length: 20}, () => gh_work.work({}))); \
+                    return r.filter((x) => x.status === 'fulfilled').length";
+        let o = execute(code, vec![("gh_work".into(), "gh-work".into())], host.clone(), limits()).await;
+        assert_eq!(o.result.unwrap(), json!(3));
+        assert_eq!(host.started.load(Ordering::SeqCst), 3, "only admitted calls reach the host");
+        assert_eq!(o.calls.len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_tool_work_outlives_the_execution() {
+        use std::sync::atomic::Ordering;
+        let quick = Limits { timeout: Duration::from_millis(100), ..limits() };
+        let ns = || vec![("gh_work".to_string(), "gh-work".to_string())];
+        // Timed out while a call is in flight; and returned without awaiting one.
+        for code in ["await gh_work.effect({})", "gh_work.effect({}); return 1"] {
+            let host = Arc::new(Counting::default());
+            let o = execute(code, ns(), host.clone(), quick.clone()).await;
+            assert_eq!(host.started.load(Ordering::SeqCst), 1, "{code}");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(host.effects.load(Ordering::SeqCst), 0, "{code}: {:?}", o.result);
+        }
+    }
+
+    #[test]
+    fn reserved_names() {
+        for name in ["undefined", "console", "class", "eval", "nan", "globalThis"] {
+            assert_eq!(reserved_identifier(name), name != "nan", "{name}");
+        }
+        assert!(!reserved_identifier("github_work"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

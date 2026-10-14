@@ -135,6 +135,10 @@ impl McpServerConfig {
             valid_mcp_server_name(name),
             "mcp server name {name:?} must start with a lowercase letter and use lowercase letters, digits, '-' or '_' (max 63)"
         );
+        anyhow::ensure!(
+            !crate::mcp::codemode::reserved_identifier(&name.replace('-', "_")),
+            "mcp server name {name:?} is a JavaScript keyword or a global in code mode; choose another name"
+        );
         let url = url::Url::parse(&self.url).with_context(|| format!("mcp server {name:?}: invalid url"))?;
         anyhow::ensure!(matches!(url.scheme(), "http" | "https"), "mcp server {name:?}: url must be http or https");
         for (header, value) in &self.headers {
