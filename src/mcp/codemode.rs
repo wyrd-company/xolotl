@@ -203,7 +203,8 @@ impl Logs {
         if self.bytes > self.max {
             return;
         }
-        self.bytes += line.len();
+        // Each line costs at least one byte, so empty lines count too.
+        self.bytes += line.len() + 1;
         if self.bytes > self.max {
             self.lines.push("[further logs dropped: output limit reached]".into());
         } else {
@@ -657,6 +658,13 @@ mod tests {
 
         let o = run("for (let i = 0; i < 100; i++) console.log('line ' + i)").await;
         assert!(o.logs.len() < 40 && o.logs.last().unwrap().contains("dropped"), "{:?}", o.logs);
+
+        let o = run("for (let i = 0; i < 100000; i++) console.log()").await;
+        assert!(o.logs.len() <= 201 && o.logs.last().unwrap().contains("dropped"), "{} lines", o.logs.len());
+        let silent = Limits { max_log_bytes: 0, ..limits() };
+        let o = execute("for (let i = 0; i < 1000; i++) console.log(''); return 1", vec![], Arc::new(Echo), silent, None).await;
+        assert_eq!(o.result.unwrap(), json!(1));
+        assert_eq!(o.logs, vec!["[further logs dropped: output limit reached]"]);
 
         for code in ["typeof fetch", "typeof require", "typeof setTimeout", "typeof __xolotl_call"] {
             assert_eq!(run(&format!("return {code}")).await.result.unwrap(), json!("undefined"), "{code}");

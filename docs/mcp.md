@@ -214,7 +214,7 @@ Each execution gets a fresh [QuickJS](https://bellard.org/quickjs/) runtime (thr
 - **Deadline:** `mcp.execute_timeout_secs` (120), wall clock, tool calls included. Busy JavaScript is interrupted, pending tool calls fail, and code that awaits something that never settles is stopped.
 - **Memory:** `mcp.memory_limit_mb` (64) of heap.
 - **Tool calls:** `mcp.max_tool_calls` (100) per execution.
-- **Output:** `mcp.max_output_bytes` (100 000) for the reply; logs get half of that. Larger output is truncated.
+- **Output:** `mcp.max_output_bytes` (100 000) for the reply; logs get half of that, with each line counting at least one byte. Larger output is truncated.
 - **Concurrency:** `mcp.max_concurrent_executions` (8). Further executions wait.
 
 Code mode has no approvals and no durable replay: a tool call happens when the code makes it. Use `deny_tools` to keep destructive tools away from a key.
