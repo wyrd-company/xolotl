@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { NavLink, Outlet } from "react-router";
 import { toast } from "sonner";
 
-import { del, get, setCsrfToken, type Status } from "@/lib/api";
+import { del, get, setCsrfToken, type Session, type Status } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const NAV = [
@@ -19,6 +19,7 @@ export function Layout() {
   const qc = useQueryClient();
   const status = useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/admin/status"), refetchInterval: 30_000 });
   const vault = status.data?.vault;
+  const user = qc.getQueryData<Session>(["session"])?.user;
 
   async function signOut() {
     try {
@@ -62,6 +63,7 @@ export function Layout() {
             "…"
           )}
           {status.data && <span className="block pt-1">v{status.data.version}</span>}
+          {user && <span className="block pt-1">Signed in as {user}</span>}
         </div>
         <button type="button" onClick={signOut} className="rounded-md px-3 py-2.5 text-left text-sm hover:bg-sidebar-accent hover:text-white">
           Sign out

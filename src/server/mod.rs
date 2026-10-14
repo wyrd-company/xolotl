@@ -84,9 +84,7 @@ pub fn router(state: AppState) -> Router {
 pub async fn serve(state: AppState) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(state.cfg.server.listen).await?;
     tracing::info!(addr = %state.cfg.server.listen, "xolotl listening");
-    // Connection info lets the UI sign-in count failed attempts per address.
-    let app = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    axum::serve(listener, router(state)).with_graceful_shutdown(shutdown_signal()).await?;
     Ok(())
 }
 

@@ -70,16 +70,18 @@ bao write auth/approle/role/xolotl token_policies=xolotl token_ttl=1h token_max_
 bao read -field=role_id auth/approle/role/xolotl/role-id
 bao write -f -field=secret_id auth/approle/role/xolotl/secret-id
 
-# Bootstrap admin token (used by the CLI). Later changes: `bao kv patch`, so the
-# web UI's password hash in the same secret is kept.
+# Bootstrap admin token (used by the CLI)
 bao kv put secret/xolotl/admin token="$(openssl rand -base64 32)"
+# Web UI sign-in: the OIDC client secret from the identity provider
+bao kv put secret/xolotl/oidc client_secret="..."
 # Optional: OTLP headers for OpenObserve
 bao kv put secret/xolotl/telemetry Authorization="Basic ..."
 ```
 
 | Path (under the prefix) | Contents |
 |---|---|
-| `admin` | `token`: bootstrap admin token; `ui_password_hash`: web UI password (argon2id) |
+| `admin` | `token`: bootstrap admin token |
+| `oidc` | `client_secret`: the web UI's OpenID Connect client secret |
 | `telemetry` | OTLP header values |
 | `providers/<name>` | `api_key` for gateway providers |
 | `accounts/<provider>/<id>` | OAuth tokens / API key for subscription accounts (rewritten on refresh) |
@@ -102,10 +104,14 @@ docker run -d --name xolotl -p 8317:8317 \
 
 ### 3. Administer in the browser
 
-Set a password, then open `http://xolotl:8317/`:
+The web UI signs in with OpenID Connect. In the identity provider (for example Pocket ID), add a confidential client with the callback URL `https://<xolotl>/admin/session/callback`, and an admin group. Then configure it and open `https://<xolotl>/`:
 
-```sh
-xolotl ui set-password   # hashed locally; only the argon2id hash is stored in OpenBao
+```toml
+[ui.oidc]
+issuer = "https://id.example.lan"
+client_id = "..."
+redirect_url = "https://xolotl.example.lan/admin/session/callback"
+admin_group = "xolotl-admins"
 ```
 
 The web UI covers what the CLI does: accounts and logins, policies (with a live preview of the names a key sees), client keys, provider keys and the model catalog, and usage. See [Web UI](docs/web-ui.md).

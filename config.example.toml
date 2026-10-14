@@ -37,6 +37,16 @@ metrics_interval_secs = 30
 [telemetry.otlp_headers]
 # Authorization = "Basic ..."   # prefer the vault secret instead
 
+[ui.oidc]
+# Web UI sign-in with OpenID Connect (e.g. Pocket ID). Register a confidential
+# client with this redirect URL; its secret is the vault secret `xolotl/oidc`
+# (field client_secret). Only members of admin_group (the `groups` claim) get in.
+# Without this section the web UI can't be signed in to.
+issuer = "https://id.example.lan"
+client_id = "00000000-0000-0000-0000-000000000000"
+redirect_url = "https://xolotl.example.lan/admin/session/callback"
+admin_group = "xolotl-admins"
+
 [subscription]
 strategy = "round-robin"   # round-robin | fill-first | least-used
 usage_poll_secs = 300

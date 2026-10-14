@@ -107,13 +107,6 @@ pub enum Command {
         #[arg(long, default_value = "24h")]
         since: String,
     },
-    /// Manage the admin web UI.
-    Ui {
-        #[command(flatten)]
-        remote: Remote,
-        #[command(subcommand)]
-        cmd: UiCmd,
-    },
     /// Reload keys and accounts from the vault.
     Reload {
         #[command(flatten)]
@@ -239,14 +232,6 @@ pub enum ProvidersCmd {
     SetKey { name: String },
 }
 
-#[derive(Subcommand)]
-pub enum UiCmd {
-    /// Set the web UI password. It is hashed (argon2id) here and only the hash
-    /// is stored, in the vault `admin` secret. Signs out every UI session.
-    /// Reads the password from stdin when it is not a terminal.
-    SetPassword,
-}
-
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Serve { config } => serve(config).await,
@@ -303,12 +288,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                 );
             }
             Ok(())
-        }
-        Command::Ui { remote, cmd: UiCmd::SetPassword } => {
-            let c = Client::new(&remote)?;
-            let password = read_new_password()?;
-            let hash = server::session::hash_password(&password)?;
-            c.print(c.put("/admin/ui/password", json!({"password_hash": hash})).await?)
         }
         Command::Reload { remote } => {
             let c = Client::new(&remote)?;
@@ -578,22 +557,6 @@ fn read_secret(prompt: &str) -> Result<String> {
     let value = value.trim().to_string();
     anyhow::ensure!(!value.is_empty(), "no value provided");
     Ok(value)
-}
-
-/// A new password, typed twice on a terminal. Unlike other secrets it is
-/// not trimmed: only stdin's trailing newline is dropped.
-fn read_new_password() -> Result<String> {
-    let password = if std::io::stdin().is_terminal() {
-        let first = rpassword::prompt_password("New UI password: ")?;
-        anyhow::ensure!(rpassword::prompt_password("Repeat it: ")? == first, "the passwords don't match");
-        first
-    } else {
-        let mut s = String::new();
-        std::io::stdin().read_to_string(&mut s)?;
-        s.strip_suffix('\n').map(|s| s.strip_suffix('\r').unwrap_or(s)).unwrap_or(&s).to_string()
-    };
-    anyhow::ensure!(password.chars().count() >= 12, "use at least 12 characters");
-    Ok(password)
 }
 
 /// `90`, `30s`, `15m`, `24h`, `7d`.

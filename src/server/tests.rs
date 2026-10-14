@@ -660,131 +660,217 @@ async fn admin_policies_keys_and_accounts() {
     assert_eq!(h.call("GET", "/admin/usage?group_by=model", Some(&h.admin), None).await.0, 200);
 }
 
-#[tokio::test]
-async fn ui_session_needs_password_cookie_and_csrf() {
-    let h = harness().await;
-    let (_, s) = h.call_with("GET", "/admin/session", &[], None).await;
-    assert_eq!(s, json!({"authenticated": false, "password_set": false}));
-    assert_eq!(h.call_with("POST", "/admin/session", &[], Some(json!({"password": "x"}))).await.0, 409, "no password set yet");
+/// A mock OpenID provider at `<upstream>/oidc` for the web UI sign-in.
+struct Idp {
+    issuer: String,
+    key: openidconnect::core::CoreRsaPrivateSigningKey,
+}
 
-    // Only an admin can set the password, and only as an argon2id hash.
-    let hash = session::hash_password("correct horse battery").unwrap();
-    let req = json!({"password_hash": hash});
-    assert_eq!(h.call_with("PUT", "/admin/ui/password", &[], Some(req.clone())).await.0, 401);
-    assert_eq!(h.call("PUT", "/admin/ui/password", Some(&h.admin), Some(json!({"password_hash": "plain"}))).await.0, 400);
-    assert_eq!(h.call("PUT", "/admin/ui/password", Some(&h.admin), Some(req)).await.0, 200);
-    let admin = h.state.secrets.get("admin").await.unwrap().unwrap();
-    assert_eq!(admin["token"], "boot", "the bootstrap token is kept");
-
-    assert_eq!(h.call_with("POST", "/admin/session", &[], Some(json!({"password": "wrong"}))).await.0, 401);
-    let resp = router(h.state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/admin/session")
-                .header("content-type", "application/json")
-                .header("x-forwarded-proto", "https")
-                .body(Body::from(json!({"password": "correct horse battery"}).to_string()))
-                .unwrap(),
+impl Idp {
+    async fn mount(h: &mut Harness) -> Idp {
+        use openidconnect::PrivateSigningKey;
+        let issuer = format!("{}/oidc", h.upstream.uri());
+        let key = openidconnect::core::CoreRsaPrivateSigningKey::from_pem(
+            include_str!("testdata/oidc-test-key.pem"),
+            Some(openidconnect::JsonWebKeyId::new("k1".into())),
         )
-        .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
-    let set_cookie = resp.headers()["set-cookie"].to_str().unwrap().to_string();
-    assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict") && set_cookie.contains("Secure"), "{set_cookie}");
-    let cookie = set_cookie.split(';').next().unwrap().to_string();
-    let body: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
-    let csrf = body["csrf_token"].as_str().unwrap().to_string();
+        Mock::given(method("GET"))
+            .and(path("/oidc/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["RS256"],
+            })))
+            .mount(&h.upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/oidc/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"keys": [key.as_verification_key()]})))
+            .mount(&h.upstream)
+            .await;
+        h.state.secrets.put("oidc", json!({"client_secret": "shh"}).as_object().unwrap().clone()).await.unwrap();
+        let mut cfg = (*h.state.cfg).clone();
+        cfg.ui.oidc = Some(crate::config::OidcConfig {
+            issuer: issuer.clone(),
+            client_id: "xolotl".into(),
+            redirect_url: format!("https://gw.example.test{}", session::CALLBACK_PATH),
+            admin_group: "admins".into(),
+        });
+        h.state.cfg = Arc::new(cfg);
+        Idp { issuer, key }
+    }
+
+    fn id_token(&self, nonce: &str, groups: &[&str]) -> String {
+        use openidconnect::core::{CoreGenderClaim, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm};
+        use openidconnect::{Audience, EndUserUsername, IdToken, IdTokenClaims, IssuerUrl, Nonce, StandardClaims, SubjectIdentifier};
+        let now = chrono::Utc::now();
+        let claims = IdTokenClaims::new(
+            IssuerUrl::new(self.issuer.clone()).unwrap(),
+            vec![Audience::new("xolotl".into())],
+            now + chrono::Duration::minutes(5),
+            now,
+            StandardClaims::new(SubjectIdentifier::new("u-1".into())).set_preferred_username(Some(EndUserUsername::new("operator".into()))),
+            session::Groups { groups: groups.iter().map(|g| g.to_string()).collect() },
+        )
+        .set_nonce(Some(Nonce::new(nonce.into())));
+        IdToken::<_, CoreGenderClaim, CoreJweContentEncryptionAlgorithm, _>::new(
+            claims,
+            &self.key,
+            CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+            None,
+            None,
+        )
+        .unwrap()
+        .to_string()
+    }
+
+    /// Start a sign-in; the provider then answers one code exchange with an
+    /// ID token for `groups` (and the nonce from `nonce`, given the real one).
+    /// Returns the callback query's `state` and the pending-sign-in cookie.
+    async fn start(&self, h: &Harness, groups: &[&str], nonce: impl Fn(&str) -> String) -> (String, String) {
+        self.start_with(h, |real| self.id_token(&nonce(real), groups)).await
+    }
+
+    /// Start a sign-in whose code exchange returns `id_token(nonce)`.
+    async fn start_with(&self, h: &Harness, id_token: impl FnOnce(&str) -> String) -> (String, String) {
+        let resp = h.send("GET", "/admin/session/login", &[]).await;
+        assert_eq!(resp.status(), 303);
+        let location = url::Url::parse(resp.headers()["location"].to_str().unwrap()).unwrap();
+        assert!(location.as_str().starts_with(&format!("{}/authorize", self.issuer)), "{location}");
+        let q: BTreeMap<String, String> = location.query_pairs().into_owned().collect();
+        assert_eq!(q["client_id"], "xolotl");
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert!(q["scope"].split(' ').any(|s| s == "groups"), "{}", q["scope"]);
+        let pending = resp.headers()["set-cookie"].to_str().unwrap();
+        for attr in ["SameSite=Lax", "Secure", "HttpOnly", "Path=/admin/session/callback"] {
+            assert!(pending.contains(attr), "{attr} missing: {pending}");
+        }
+        Mock::given(method("POST"))
+            .and(path("/oidc/token"))
+            .and(header("authorization", "Basic eG9sb3RsOnNoaA=="))
+            .and(wiremock::matchers::body_string_contains("code_verifier="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "at", "token_type": "Bearer", "expires_in": 300,
+                "id_token": id_token(&q["nonce"]),
+            })))
+            .up_to_n_times(1)
+            .mount(&h.upstream)
+            .await;
+        (q["state"].clone(), pending.split(';').next().unwrap().to_string())
+    }
+}
+
+impl Harness {
+    async fn send(&self, method: &str, uri: &str, headers: &[(&str, &str)]) -> axum::response::Response {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        router(self.state.clone()).oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// The callback: where it sends the browser, and the session cookie it sets.
+    async fn callback(&self, state: &str, cookie: &str) -> (String, Option<String>) {
+        let resp = self.send("GET", &format!("/admin/session/callback?code=c0de&state={state}"), &[("cookie", cookie)]).await;
+        assert_eq!(resp.status(), 303);
+        let cookies: Vec<String> = resp.headers().get_all("set-cookie").iter().map(|v| v.to_str().unwrap().to_string()).collect();
+        assert!(cookies.iter().any(|c| c.starts_with("xolotl_oidc=;") && c.contains("Max-Age=0")), "pending cookie cleared: {cookies:?}");
+        let session = cookies.into_iter().find(|c| c.starts_with("xolotl_session="));
+        (resp.headers()["location"].to_str().unwrap().to_string(), session)
+    }
+}
+
+#[tokio::test]
+async fn ui_sign_in_with_oidc_gives_an_admin_session() {
+    let mut h = harness().await;
+    let (_, s) = h.call_with("GET", "/admin/session", &[], None).await;
+    assert_eq!(s, json!({"authenticated": false, "configured": false}));
+    assert_eq!(h.send("GET", "/admin/session/login", &[]).await.status(), 404);
+
+    let idp = Idp::mount(&mut h).await;
+    let (_, s) = h.call_with("GET", "/admin/session", &[], None).await;
+    assert_eq!(s, json!({"authenticated": false, "configured": true}));
+
+    let (state, pending) = idp.start(&h, &["admins"], str::to_string).await;
+    let (to, session) = h.callback(&state, &pending).await;
+    assert_eq!(to, "/");
+    let session = session.expect("a session cookie");
+    assert!(session.contains("HttpOnly") && session.contains("SameSite=Strict") && session.contains("Secure"), "{session}");
+    let cookie = session.split(';').next().unwrap().to_string();
+
+    let (_, s) = h.call_with("GET", "/admin/session", &[("cookie", &cookie)], None).await;
+    assert_eq!(s["user"], "operator");
+    let csrf = s["csrf_token"].as_str().unwrap().to_string();
 
     // The cookie alone is not enough; with the CSRF token it is admin, and only admin.
     assert_eq!(h.call_with("GET", "/admin/keys", &[("cookie", &cookie)], None).await.0, 401);
     assert_eq!(h.call_with("GET", "/admin/keys", &[("cookie", &cookie), ("x-csrf-token", "nope")], None).await.0, 401);
-    let session = [("cookie", cookie.as_str()), ("x-csrf-token", csrf.as_str())];
-    assert_eq!(h.call_with("GET", "/admin/keys", &session, None).await.0, 200);
-    assert_eq!(h.call_with("GET", "/v1/models", &session, None).await.0, 401);
-    let (_, s) = h.call_with("GET", "/admin/session", &[("cookie", &cookie)], None).await;
-    assert_eq!(s["csrf_token"], csrf.as_str());
+    let signed_in = [("cookie", cookie.as_str()), ("x-csrf-token", csrf.as_str())];
+    assert_eq!(h.call_with("GET", "/admin/keys", &signed_in, None).await.0, 200);
+    assert_eq!(h.call_with("GET", "/v1/models", &signed_in, None).await.0, 401);
 
-    // Changing the password ends every session.
-    let hash = session::hash_password("another long password").unwrap();
-    assert_eq!(h.call_with("PUT", "/admin/ui/password", &session, Some(json!({"password_hash": hash}))).await.0, 200);
-    assert_eq!(h.call_with("GET", "/admin/keys", &session, None).await.0, 401);
+    // A callback completes once.
+    assert_eq!(h.callback(&state, &pending).await, ("/?signin=expired".into(), None));
+
+    assert_eq!(h.call_with("DELETE", "/admin/session", &signed_in, None).await.0, 200);
+    assert_eq!(h.call_with("GET", "/admin/keys", &signed_in, None).await.0, 401);
 }
 
 #[tokio::test]
-async fn ui_sign_in_checked_against_a_replaced_password_gets_no_session() {
-    use crate::secrets::SecretStore;
-    let h = harness().await;
-    let gated = Arc::new(crate::secrets::testing::GatedStore::default());
-    let old = session::hash_password("correct horse battery").unwrap();
-    gated.inner.put("admin", json!({"token": "boot", "ui_password_hash": old}).as_object().unwrap().clone()).await.unwrap();
-    let mut state = h.state.clone();
-    state.secrets = gated.clone();
+async fn ui_sign_in_with_oidc_refusals() {
+    let mut h = harness().await;
+    let idp = Idp::mount(&mut h).await;
 
-    // The sign-in reads the old hash, then pauses before checking it.
-    gated.arm("got", "admin");
-    let login = tokio::spawn(
-        router(state.clone()).oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/admin/session")
-                .header("content-type", "application/json")
-                .body(Body::from(json!({"password": "correct horse battery"}).to_string()))
-                .unwrap(),
-        ),
-    );
-    gated.reached.notified().await;
+    // Outside the admin group.
+    let (state, pending) = idp.start(&h, &["users"], str::to_string).await;
+    assert_eq!(h.callback(&state, &pending).await, ("/?signin=forbidden".into(), None));
 
-    // Meanwhile the password changes.
-    let new = session::hash_password("another long password").unwrap();
-    let change = router(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/admin/ui/password")
-                .header("authorization", "Bearer boot")
-                .header("content-type", "application/json")
-                .body(Body::from(json!({"password_hash": new}).to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(change.status(), 200);
+    // An ID token for another sign-in.
+    let (state, pending) = idp.start(&h, &["admins"], |_| "someone-elses".into()).await;
+    assert_eq!(h.callback(&state, &pending).await, ("/?signin=failed".into(), None));
 
-    gated.release.notify_one();
-    let resp = login.await.unwrap().unwrap();
-    assert_eq!(resp.status(), 409);
-    assert!(resp.headers().get("set-cookie").is_none(), "no session for the old password");
-}
+    // Signed with the client secret instead of the provider's key.
+    let (state, pending) = idp
+        .start_with(&h, |nonce| {
+            use openidconnect::core::{CoreGenderClaim, CoreHmacKey, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm};
+            use openidconnect::{Audience, IdToken, IdTokenClaims, IssuerUrl, Nonce, StandardClaims, SubjectIdentifier};
+            let now = chrono::Utc::now();
+            let claims = IdTokenClaims::new(
+                IssuerUrl::new(idp.issuer.clone()).unwrap(),
+                vec![Audience::new("xolotl".into())],
+                now + chrono::Duration::minutes(5),
+                now,
+                StandardClaims::new(SubjectIdentifier::new("u-1".into())),
+                session::Groups { groups: vec!["admins".into()] },
+            )
+            .set_nonce(Some(Nonce::new(nonce.into())));
+            IdToken::<_, CoreGenderClaim, CoreJweContentEncryptionAlgorithm, _>::new(
+                claims,
+                &CoreHmacKey::new("shh"),
+                CoreJwsSigningAlgorithm::HmacSha256,
+                None,
+                None,
+            )
+            .unwrap()
+            .to_string()
+        })
+        .await;
+    assert_eq!(h.callback(&state, &pending).await, ("/?signin=failed".into(), None));
 
-#[tokio::test]
-async fn ui_logout_and_lockout() {
-    let h = harness().await;
-    let hash = session::hash_password("correct horse battery").unwrap();
-    h.call("PUT", "/admin/ui/password", Some(&h.admin), Some(json!({"password_hash": hash}))).await;
-    let resp = router(h.state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/admin/session")
-                .header("content-type", "application/json")
-                .body(Body::from(json!({"password": "correct horse battery"}).to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
-    let body: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
-    let csrf = body["csrf_token"].as_str().unwrap().to_string();
-    let session = [("cookie", cookie.as_str()), ("x-csrf-token", csrf.as_str())];
-    assert_eq!(h.call_with("DELETE", "/admin/session", &session, None).await.0, 200);
-    assert_eq!(h.call_with("GET", "/admin/keys", &session, None).await.0, 401);
+    // Finished in a browser that didn't start it.
+    let (state, _) = idp.start(&h, &["admins"], str::to_string).await;
+    assert_eq!(h.callback(&state, "xolotl_oidc=other").await, ("/?signin=expired".into(), None));
+    assert_eq!(h.callback(&state, "").await, ("/?signin=expired".into(), None));
 
-    for _ in 0..5 {
-        assert_eq!(h.call_with("POST", "/admin/session", &[], Some(json!({"password": "guess"}))).await.0, 401);
-    }
-    let (status, _) = h.call_with("POST", "/admin/session", &[], Some(json!({"password": "correct horse battery"}))).await;
-    assert_eq!(status, 429, "locked out even with the right password");
+    // The provider refused.
+    let (state, pending) = idp.start(&h, &["admins"], str::to_string).await;
+    let resp = h.send("GET", &format!("/admin/session/callback?error=access_denied&state={state}"), &[("cookie", &pending)]).await;
+    assert_eq!(resp.headers()["location"], "/?signin=denied");
 }
 
 #[tokio::test]
