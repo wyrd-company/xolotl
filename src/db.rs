@@ -152,6 +152,12 @@ impl Db {
         Self::from_pool(pool).await
     }
 
+    /// Hold the in-memory database's only connection, so writes wait (tests).
+    #[cfg(test)]
+    pub async fn hold(&self) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
+        self.pool.acquire().await.expect("connection")
+    }
+
     async fn from_pool(pool: SqlitePool) -> Result<Self> {
         sqlx::migrate!("./migrations").run(&pool).await.context("running migrations")?;
         Ok(Self { pool })

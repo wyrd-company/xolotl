@@ -1262,6 +1262,29 @@ mod mcp_gateway {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_cancelled_while_its_row_waits_is_still_logged() {
+        let up = upstream().await;
+        let h = harness_with(|cfg| {
+            cfg.mcp.servers.insert("calc".into(), McpServerConfig { url: format!("http://{up}/mcp"), ..Default::default() });
+        })
+        .await;
+        h.state.mcp.refresh("calc").await.unwrap();
+        // The database is busy: the row write waits after the upstream answered.
+        let held = h.state.db.hold().await;
+        let hub = h.state.mcp.clone();
+        let p = crate::keys::Principal { client_id: None, policy: Arc::new(mcp_policy(&["calc"], &[])) };
+        let call = tokio::spawn(async move { hub.call(&p, "calc", "whoami", Default::default()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        call.abort();
+        let _ = call.await;
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let calls = h.state.db.recent_mcp_calls(10).await.unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!((calls[0].tool.as_str(), calls[0].status.as_str()), ("whoami", "ok"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn servers_added_at_runtime() {
         let g = gateway().await;
         let h = &g.h;

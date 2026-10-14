@@ -381,6 +381,16 @@ impl McpHub {
         n
     }
 
+    /// The last attempt to save OAuth credentials on shutdown; returns how
+    /// many logins are still unsaved.
+    pub async fn flush_on_shutdown(&self) -> usize {
+        if self.unsaved_count().await == 0 {
+            return 0;
+        }
+        self.flush_unsaved().await;
+        self.unsaved_count().await
+    }
+
     /// Retry vault writes of OAuth credentials that failed.
     pub async fn flush_unsaved(&self) {
         for up in self.upstreams() {
@@ -538,10 +548,10 @@ impl McpHub {
             Ok(_) => ("ok", None),
             Err(e) => ("error", Some(e.to_string())),
         };
-        if let Some(record) = log.finish(status, error)
-            && let Err(e) = self.db.log_mcp_call(&record).await
-        {
-            tracing::warn!(error = %e, "writing MCP call log failed");
+        // The row is written by a task of its own: cancelling this call
+        // while the write waits for the database doesn't lose it.
+        if let Some(record) = log.finish(status, error) {
+            let _ = write_call_log(self.db.clone(), record).await;
         }
         result.map_err(|e| format!("{server}/{tool}: {e}"))
     }
@@ -583,18 +593,21 @@ impl Drop for CallLog {
     fn drop(&mut self) {
         let error = "cancelled before a result arrived (the execution ended); the upstream outcome is unknown".to_string();
         let Some(record) = self.finish("cancelled", Some(error)) else { return };
-        let db = self.db.clone();
-        match tokio::runtime::Handle::try_current() {
-            Ok(rt) => {
-                rt.spawn(async move {
-                    if let Err(e) = db.log_mcp_call(&record).await {
-                        tracing::warn!(error = %e, "writing MCP call log failed");
-                    }
-                });
-            }
-            Err(_) => tracing::warn!(server = %record.server, tool = %record.tool, "MCP call cancelled outside a runtime; not logged"),
+        if tokio::runtime::Handle::try_current().is_ok() {
+            drop(write_call_log(self.db.clone(), record));
+        } else {
+            tracing::warn!(server = %record.server, tool = %record.tool, "MCP call cancelled outside a runtime; not logged");
         }
     }
+}
+
+/// Write a call log row in a task that owns it.
+fn write_call_log(db: Db, record: McpCallRecord) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = db.log_mcp_call(&record).await {
+            tracing::warn!(error = %e, "writing MCP call log failed");
+        }
+    })
 }
 
 /// The text blocks of a tool result, joined.
@@ -654,6 +667,28 @@ mod tests {
         async fn destroy_versions(&self, key: &str, versions: &[u64]) -> Result<()> {
             self.0.destroy_versions(key, versions).await
         }
+    }
+
+    #[tokio::test]
+    async fn unsaved_logins_are_flushed_on_shutdown() {
+        use rmcp::transport::auth::CredentialStore;
+        use std::sync::atomic::Ordering;
+        let mut cfg = Config::default();
+        cfg.mcp
+            .servers
+            .insert("cloud".into(), McpServerConfig { url: "http://127.0.0.1:9/mcp".into(), auth: McpAuth::Oauth, ..Default::default() });
+        let flaky = Arc::new(oauth::tests::Flaky::default());
+        let secrets: Secrets = flaky.clone();
+        let hub = McpHub::new(&cfg, secrets.clone(), Db::in_memory().await.unwrap());
+        let store = hub.get("cloud").unwrap().oauth.clone().unwrap();
+        flaky.down.store(true, Ordering::SeqCst);
+        let login = oauth::StoreHandle::login(store.clone(), store.generation().await.unwrap());
+        login.save(oauth::tests::creds("t1", 1)).await.unwrap();
+        assert_eq!(hub.flush_on_shutdown().await, 1, "still down: reported as unsaved");
+        flaky.down.store(false, Ordering::SeqCst);
+        assert_eq!(hub.flush_on_shutdown().await, 0);
+        let stored = secrets.get("mcp/cloud/oauth").await.unwrap().unwrap();
+        assert!(stored.get("credentials").is_some(), "{stored:?}");
     }
 
     #[tokio::test]

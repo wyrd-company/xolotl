@@ -718,7 +718,7 @@ pub async fn start(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -743,9 +743,9 @@ mod tests {
 
     /// A store whose writes can be made to fail, like an OpenBao outage.
     #[derive(Default)]
-    struct Flaky {
+    pub(crate) struct Flaky {
         inner: MemoryStore,
-        down: AtomicBool,
+        pub(crate) down: AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -774,7 +774,7 @@ mod tests {
         }
     }
 
-    fn creds(token: &str, at: u64) -> StoredCredentials {
+    pub(crate) fn creds(token: &str, at: u64) -> StoredCredentials {
         serde_json::from_value(json!({
             "client_id": "c",
             "token_response": {"access_token": token, "token_type": "bearer", "expires_in": 3600, "refresh_token": format!("r-{token}")},

@@ -52,7 +52,7 @@ Started by `server::spawn_background`:
 | `subscription.usage_poll_secs` (300 s) | Poll each enabled account's usage; this also keeps OAuth tokens fresh |
 | 24 h | Prune the request log and the MCP call log |
 
-On graceful shutdown the server makes one last attempt to save unsaved credentials.
+On graceful shutdown the server makes one last attempt to save unsaved credentials, of subscription accounts and of MCP server logins, and logs an error for any that remain.
 
 ## Telemetry
 

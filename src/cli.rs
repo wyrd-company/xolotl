@@ -378,6 +378,7 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
         AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: Some(vault), sessions: Default::default(), mcp };
     server::spawn_background(state.clone());
     let subs = state.subs.clone();
+    let mcp = state.mcp.clone();
     let result = server::serve(state).await;
     // Last chance to save refreshed credentials whose vault write failed.
     if subs.unsaved_count() > 0 {
@@ -388,6 +389,13 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
                 "shutting down with refreshed credentials not saved to the vault; those accounts will need to log in again"
             );
         }
+    }
+    let left = mcp.flush_on_shutdown().await;
+    if left > 0 {
+        tracing::error!(
+            servers = left,
+            "shutting down with refreshed MCP OAuth credentials not saved to the vault; those servers will need to sign in again"
+        );
     }
     guard.shutdown();
     result
