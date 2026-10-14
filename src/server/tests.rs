@@ -754,6 +754,8 @@ impl Idp {
             .and(path("/oidc/token"))
             .and(header("authorization", "Basic eG9sb3RsOnNoaA=="))
             .and(wiremock::matchers::body_string_contains("code_verifier="))
+            // Each sign-in's code is its state (see `callback`), so the exchange gets its own token.
+            .and(wiremock::matchers::body_string_contains(format!("code={}", q["state"])))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "access_token": "at", "token_type": "Bearer", "expires_in": 300,
                 "id_token": id_token(&q["nonce"]),
@@ -774,12 +776,15 @@ impl Harness {
         router(self.state.clone()).oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
     }
 
-    /// The callback: where it sends the browser, and the session cookie it sets.
+    /// The callback: where it sends the browser, and the session cookie it
+    /// sets. It ends the pending sign-in (clears its cookie) when the cookie
+    /// names this `state`, and only then.
     async fn callback(&self, state: &str, cookie: &str) -> (String, Option<String>) {
-        let resp = self.send("GET", &format!("/admin/session/callback?code=c0de&state={state}"), &[("cookie", cookie)]).await;
+        let resp = self.send("GET", &format!("/admin/session/callback?code={state}&state={state}"), &[("cookie", cookie)]).await;
         assert_eq!(resp.status(), 303);
         let cookies: Vec<String> = resp.headers().get_all("set-cookie").iter().map(|v| v.to_str().unwrap().to_string()).collect();
-        assert!(cookies.iter().any(|c| c.starts_with("xolotl_oidc=;") && c.contains("Max-Age=0")), "pending cookie cleared: {cookies:?}");
+        let cleared = cookies.iter().any(|c| c.starts_with("xolotl_oidc=;") && c.contains("Max-Age=0"));
+        assert_eq!(cleared, cookie == format!("xolotl_oidc={state}"), "pending cookie cleared only for its own sign-in: {cookies:?}");
         let session = cookies.into_iter().find(|c| c.starts_with("xolotl_session="));
         (resp.headers()["location"].to_str().unwrap().to_string(), session)
     }
@@ -866,6 +871,15 @@ async fn ui_sign_in_with_oidc_refusals() {
     let (state, _) = idp.start(&h, &["admins"], str::to_string).await;
     assert_eq!(h.callback(&state, "xolotl_oidc=other").await, ("/?signin=expired".into(), None));
     assert_eq!(h.callback(&state, "").await, ("/?signin=expired".into(), None));
+
+    // Two sign-ins in one browser: the second's cookie replaces the first's.
+    // The first's callback fails without disturbing the second, which completes.
+    let (first, _) = idp.start(&h, &["admins"], str::to_string).await;
+    let (second, pending) = idp.start(&h, &["admins"], str::to_string).await;
+    assert_eq!(h.callback(&first, &pending).await, ("/?signin=expired".into(), None));
+    let (to, session) = h.callback(&second, &pending).await;
+    assert_eq!(to, "/");
+    assert!(session.is_some());
 
     // The provider refused.
     let (state, pending) = idp.start(&h, &["admins"], str::to_string).await;

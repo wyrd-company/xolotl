@@ -325,20 +325,24 @@ async fn callback(State(s): State<AppState>, h: HeaderMap, Query(q): Query<Callb
     let Some(cfg) = &s.cfg.ui.oidc else {
         return json_error(StatusCode::NOT_FOUND, "web UI sign-in is not configured ([ui.oidc])");
     };
-    let mut resp = finish(&s, cfg, &h, q).await;
+    // Only the browser that started the sign-in may finish it. A callback for
+    // another sign-in leaves the cookie alone: it names a newer sign-in that
+    // may still complete.
+    let Some(state) = q
+        .state
+        .clone()
+        .filter(|state| cookie(&h, PENDING_COOKIE).is_some_and(|ours| crate::keys::ct_eq(state.as_bytes(), ours.as_bytes())))
+    else {
+        return to_ui(Some("expired"));
+    };
+    let mut resp = finish(&s, cfg, &state, q).await;
     resp.headers_mut().append(header::SET_COOKIE, set_pending_cookie(cfg, "", 0));
     resp
 }
 
-async fn finish(s: &AppState, cfg: &OidcConfig, h: &HeaderMap, q: CallbackParams) -> Response {
-    // Only the browser that started the sign-in may finish it.
-    let (Some(state), Some(ours)) = (q.state, cookie(h, PENDING_COOKIE)) else {
-        return to_ui(Some("expired"));
-    };
-    if !crate::keys::ct_eq(state.as_bytes(), ours.as_bytes()) {
-        return to_ui(Some("expired"));
-    }
-    let Some(pending) = s.sessions.take(&state) else {
+/// Complete the sign-in named by `state`, which the browser's cookie matches.
+async fn finish(s: &AppState, cfg: &OidcConfig, state: &str, q: CallbackParams) -> Response {
+    let Some(pending) = s.sessions.take(state) else {
         return to_ui(Some("expired"));
     };
     if let Some(e) = q.error {
