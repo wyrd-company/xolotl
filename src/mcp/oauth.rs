@@ -109,6 +109,15 @@ struct Record {
     /// an earlier generation are never saved over a later one.
     #[serde(default)]
     generation: u64,
+    /// The server settings the login was made for ([`login_fingerprint`]).
+    /// A login made for another URL, client id or scopes is not used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<String>,
+}
+
+/// What a login depends on: the resource (URL), the client and the scopes.
+pub fn login_fingerprint(cfg: &McpServerConfig) -> String {
+    crate::keys::sha256_hex(&json!({"url": cfg.url, "client_id": cfg.oauth.client_id, "scopes": cfg.oauth.scopes}).to_string())
 }
 
 impl Record {
@@ -152,21 +161,36 @@ pub struct OAuthStatus {
 pub struct OAuthStore {
     secrets: Secrets,
     key: String,
+    fingerprint: String,
     state: tokio::sync::Mutex<State>,
     refresh: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl OAuthStore {
-    pub fn new(secrets: Secrets, server: &str) -> Arc<Self> {
-        Arc::new(Self { secrets, key: format!("mcp/{server}/oauth"), state: Default::default(), refresh: Default::default() })
+    pub fn new(secrets: Secrets, server: &str, fingerprint: String) -> Arc<Self> {
+        Arc::new(Self { secrets, key: format!("mcp/{server}/oauth"), fingerprint, state: Default::default(), refresh: Default::default() })
     }
 
     async fn read(&self) -> Result<(Option<Record>, u64), AuthError> {
         let (data, version) = self.secrets.get_versioned(&self.key).await.map_err(|e| AuthError::CredentialStoreError(format!("{e:#}")))?;
-        let record = match data {
+        let record: Option<Record> = match data {
             Some(m) => Some(serde_json::from_value(Value::Object(m)).map_err(|e| AuthError::CredentialStoreError(e.to_string()))?),
             None => None,
         };
+        // A login made for other server settings (URL, client id, scopes) is
+        // not this server's: nothing of it is used, and the next write replaces it.
+        let record = record.map(|r| {
+            if r.fingerprint.as_deref() == Some(self.fingerprint.as_str()) {
+                r
+            } else {
+                Record {
+                    generation: r.generation + 1,
+                    needs_login: Some("the server's OAuth settings changed".into()),
+                    fingerprint: Some(self.fingerprint.clone()),
+                    ..Default::default()
+                }
+            }
+        });
         Ok((record, version))
     }
 
@@ -222,6 +246,7 @@ impl OAuthStore {
             return;
         }
         st.unsaved = true;
+        st.record.fingerprint = Some(self.fingerprint.clone());
         for _ in 0..3 {
             let data = match serde_json::to_value(&st.record) {
                 Ok(Value::Object(m)) => m,
@@ -765,9 +790,9 @@ mod tests {
     }
 
     async fn signed_in(secrets: &Secrets) -> (Arc<OAuthStore>, Arc<OAuthStore>) {
-        let a = OAuthStore::new(secrets.clone(), "cloud");
+        let a = OAuthStore::new(secrets.clone(), "cloud", "fp".into());
         StoreHandle::login(a.clone(), a.generation().await.unwrap()).save(creds("t1", 1)).await.unwrap();
-        let b = OAuthStore::new(secrets.clone(), "cloud");
+        let b = OAuthStore::new(secrets.clone(), "cloud", "fp".into());
         assert_eq!(token(&b).await.as_deref(), Some("t1"));
         (a, b)
     }
@@ -775,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn superseded_logins_are_never_saved() {
         let secrets: Secrets = Arc::new(MemoryStore::default());
-        let store = OAuthStore::new(secrets.clone(), "cloud");
+        let store = OAuthStore::new(secrets.clone(), "cloud", "fp".into());
         // A login started, then a sign-out before its code was exchanged.
         let pending = StoreHandle::login(store.clone(), store.generation().await.unwrap());
         store.sign_out().await.unwrap();
@@ -810,7 +835,7 @@ mod tests {
         a.flush().await;
         assert!(!a.is_unsaved().await);
         assert_eq!(a.needs_login().await.as_deref(), Some("signed out"));
-        let fresh = OAuthStore::new(secrets.clone(), "cloud");
+        let fresh = OAuthStore::new(secrets.clone(), "cloud", "fp".into());
         assert_eq!(token(&fresh).await, None, "the vault keeps the sign-out");
 
         // So does a deletion.
@@ -837,6 +862,24 @@ mod tests {
         let handle = StoreHandle::session(a.clone(), a.generation().await.unwrap());
         drop(handle.acquire_refresh_guard().await.unwrap());
         assert_eq!(token(&a).await.as_deref(), Some("t9"));
+    }
+
+    #[test]
+    fn login_fingerprints() {
+        let base: McpServerConfig = serde_json::from_value(json!({"url": "https://a/mcp", "auth": "oauth"})).unwrap();
+        let fp = login_fingerprint(&base);
+        let same: McpServerConfig = serde_json::from_value(
+            json!({"url": "https://a/mcp", "auth": "oauth", "description": "d", "headers": {"X": "y"}, "timeout_secs": 5}),
+        )
+        .unwrap();
+        assert_eq!(login_fingerprint(&same), fp, "cosmetic fields don't matter");
+        for changed in [
+            json!({"url": "https://b/mcp", "auth": "oauth"}),
+            json!({"url": "https://a/mcp", "auth": "oauth", "oauth": {"client_id": "c"}}),
+            json!({"url": "https://a/mcp", "auth": "oauth", "oauth": {"scopes": ["s"]}}),
+        ] {
+            assert_ne!(login_fingerprint(&serde_json::from_value(changed.clone()).unwrap()), fp, "{changed}");
+        }
     }
 
     #[test]

@@ -90,7 +90,8 @@ impl Upstream {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("reqwest client builds");
-        let oauth = (cfg.auth == McpAuth::Oauth).then(|| store.unwrap_or_else(|| OAuthStore::new(secrets.clone(), &name)));
+        let oauth = (cfg.auth == McpAuth::Oauth)
+            .then(|| store.unwrap_or_else(|| OAuthStore::new(secrets.clone(), &name, oauth::login_fingerprint(&cfg))));
         Self { name, cfg, secrets, http, oauth, client: Default::default(), cached: Default::default() }
     }
 

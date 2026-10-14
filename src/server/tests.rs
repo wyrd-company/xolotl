@@ -1534,7 +1534,11 @@ mod mcp_gateway {
         }
 
         async fn login(hub: &McpHub, a: &Auth) {
-            let start = hub.login_start("cloud").await.unwrap();
+            login_to(hub, a, "cloud").await;
+        }
+
+        async fn login_to(hub: &McpHub, a: &Auth, server: &str) {
+            let start = hub.login_start(server).await.unwrap();
             hub.login_complete(&start.flow_id, &a.authorize(&start.url, Some(&a.base))).await.unwrap();
         }
 
@@ -1596,6 +1600,49 @@ mod mcp_gateway {
             hub.put_server("live", renamed, false).await.unwrap();
             let p = Principal { client_id: None, policy: Arc::new(mcp_policy(&["live"], &[])) };
             assert!(hub.call(&p, "live", "whoami", Default::default()).await.is_ok());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_change_of_login_settings_ends_the_login() {
+            let a = auth_server().await;
+            let h = oauth_harness(&a, |_| {}).await;
+            let hub = &h.state.mcp;
+            let p = Principal { client_id: None, policy: Arc::new(mcp_policy(&["live", "cloud"], &[])) };
+            let call = |server: &'static str| hub.call(&p, server, "whoami", Default::default());
+            let def = |extra: Value| {
+                let mut v = json!({"url": format!("{}/mcp", a.base), "auth": "oauth"});
+                v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                serde_json::from_value::<McpServerConfig>(v).unwrap()
+            };
+            hub.put_server("live", def(json!({})), true).await.unwrap();
+
+            // A different client id, then different scopes, end the login.
+            for changed in [json!({"oauth": {"client_id": "other"}}), json!({"oauth": {"client_id": "other", "scopes": ["tools"]}})] {
+                login_to(hub, &a, "live").await;
+                assert!(call("live").await.is_ok());
+                hub.put_server("live", def(changed.clone()), false).await.unwrap();
+                let e = call("live").await.unwrap_err();
+                assert!(e.contains("sign-in needed"), "{changed}: {e}");
+                assert!(h.state.secrets.get("mcp/live/oauth").await.unwrap().is_none(), "{changed}: old login removed");
+            }
+
+            // So does switching to headers and back.
+            login_to(hub, &a, "live").await;
+            let headers = serde_json::from_value::<McpServerConfig>(json!({"url": format!("{}/mcp", a.base)})).unwrap();
+            hub.put_server("live", headers, false).await.unwrap();
+            hub.put_server("live", def(json!({"oauth": {"client_id": "other", "scopes": ["tools"]}})), false).await.unwrap();
+            assert!(call("live").await.unwrap_err().contains("sign-in needed"));
+
+            // A config-file server whose settings changed across a restart.
+            login_to(hub, &a, "cloud").await;
+            assert!(call("cloud").await.is_ok());
+            let mut cfg = (*h.state.cfg).clone();
+            cfg.mcp.servers.get_mut("cloud").unwrap().oauth.scopes = vec!["tools".into()];
+            let restarted = McpHub::new(&cfg, h.state.secrets.clone(), h.state.db.clone());
+            let e = restarted.call(&p, "cloud", "whoami", Default::default()).await.unwrap_err();
+            assert!(e.contains("the server's OAuth settings changed"), "{e}");
+            let unchanged = McpHub::new(&h.state.cfg, h.state.secrets.clone(), h.state.db.clone());
+            assert!(unchanged.call(&p, "cloud", "whoami", Default::default()).await.is_ok());
         }
 
         #[tokio::test(flavor = "multi_thread")]

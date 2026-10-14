@@ -131,6 +131,8 @@ pub struct McpHub {
     servers: RwLock<BTreeMap<String, Entry>>,
     /// Serializes reloads and server changes.
     changes: tokio::sync::Mutex<()>,
+    /// Serializes header-secret merges.
+    secret_writes: tokio::sync::Mutex<()>,
     executions: Arc<tokio::sync::Semaphore>,
 }
 
@@ -164,6 +166,7 @@ impl McpHub {
             db,
             servers: RwLock::new(servers),
             changes: Default::default(),
+            secret_writes: Default::default(),
             executions: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_executions.max(1))),
         }
     }
@@ -265,6 +268,9 @@ impl McpHub {
         }
         let key = format!("{SERVERS_PREFIX}/{name}");
         let (existing, version) = self.secrets.get_versioned(&key).await.map_err(ServerChangeError::Store)?;
+        // A change the login depends on (URL, client, scopes, auth mode) ends it.
+        let previous = existing.clone().and_then(|m| serde_json::from_value::<McpServerConfig>(Value::Object(m)).ok());
+        let ends_login = previous.is_some_and(|p| p.auth == McpAuth::Oauth && !same_login(&p, &cfg));
         match (create, existing.is_some()) {
             (true, true) => return Err(ServerChangeError::Conflict(format!("an MCP server named {name} already exists"))),
             (false, false) => return Err(ServerChangeError::NotFound(name.to_string())),
@@ -274,6 +280,13 @@ impl McpHub {
             Value::Object(m) => m,
             _ => unreachable!("server definitions serialize to objects"),
         };
+        if ends_login {
+            if let Some(store) = self.get(name).and_then(|u| u.oauth.clone()) {
+                store.retire().await;
+            }
+            self.flows.cancel_server(name);
+            self.secrets.delete(&format!("mcp/{name}/oauth")).await.map_err(ServerChangeError::Store)?;
+        }
         self.secrets.put_cas(&key, data, version).await.map_err(|e| match e.downcast_ref::<crate::secrets::Conflict>() {
             Some(_) => ServerChangeError::Conflict(format!("MCP server {name} was changed concurrently; reload and retry")),
             None => ServerChangeError::Store(e),
@@ -427,25 +440,30 @@ impl McpHub {
     }
 
     /// Merge fields into a server's vault secret and reconnect with them.
+    /// Fields are merged with check-and-set (retried on a conflict) under a
+    /// lock, so concurrent updates of different fields all survive.
     pub async fn set_secret(&self, name: &str, fields: Map<String, Value>) -> Result<()> {
         let up = self.server(name)?;
-        let key = format!("mcp/{name}");
-        let mut data = self.secrets.get(&key).await?.unwrap_or_default();
-        for (k, v) in fields {
-            match v {
-                Value::Null => {
-                    data.remove(&k);
-                }
-                Value::String(s) => {
-                    data.insert(k, Value::String(s));
-                }
-                _ => anyhow::bail!("secret field {k:?} must be a string (or null to remove it)"),
-            }
+        for v in fields.values() {
+            anyhow::ensure!(v.is_null() || v.is_string(), "secret fields must be strings (or null to remove them)");
         }
-        if data.is_empty() {
-            self.secrets.delete(&key).await?;
-        } else {
-            self.secrets.put(&key, data).await?;
+        let key = format!("mcp/{name}");
+        let _writes = self.secret_writes.lock().await;
+        let mut attempts = 0;
+        loop {
+            let (stored, version) = self.secrets.get_versioned(&key).await?;
+            let mut data = stored.unwrap_or_default();
+            for (k, v) in &fields {
+                match v {
+                    Value::String(s) => data.insert(k.clone(), Value::String(s.clone())),
+                    _ => data.remove(k),
+                };
+            }
+            match self.secrets.put_cas(&key, data, version).await {
+                Ok(_) => break,
+                Err(e) if e.downcast_ref::<crate::secrets::Conflict>().is_some() && attempts < 5 => attempts += 1,
+                Err(e) => return Err(e),
+            }
         }
         up.disconnect().await;
         up.retry_listing_now();
@@ -558,6 +576,67 @@ pub fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A store whose reads yield, so concurrent read-modify-writes interleave.
+    #[derive(Default)]
+    struct Yielding(crate::secrets::MemoryStore);
+
+    #[async_trait::async_trait]
+    impl crate::secrets::SecretStore for Yielding {
+        async fn get(&self, key: &str) -> Result<Option<Map<String, Value>>> {
+            tokio::task::yield_now().await;
+            self.0.get(key).await
+        }
+        async fn put(&self, key: &str, data: Map<String, Value>) -> Result<()> {
+            self.0.put(key, data).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.0.delete(key).await
+        }
+        async fn list(&self, dir: &str) -> Result<Vec<String>> {
+            self.0.list(dir).await
+        }
+        async fn get_versioned(&self, key: &str) -> Result<(Option<Map<String, Value>>, u64)> {
+            tokio::task::yield_now().await;
+            self.0.get_versioned(key).await
+        }
+        async fn put_cas(&self, key: &str, data: Map<String, Value>, cas: u64) -> Result<u64> {
+            self.0.put_cas(key, data, cas).await
+        }
+        async fn destroy_versions(&self, key: &str, versions: &[u64]) -> Result<()> {
+            self.0.destroy_versions(key, versions).await
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_secret_updates_all_survive() {
+        let mut cfg = Config::default();
+        cfg.mcp.servers.insert("calc".into(), McpServerConfig { url: "http://127.0.0.1:9/mcp".into(), ..Default::default() });
+        let secrets: Secrets = Arc::new(Yielding::default());
+        // Another instance's write, between this instance's read and its write.
+        let other = secrets.clone();
+        let hub = Arc::new(McpHub::new(&cfg, secrets.clone(), Db::in_memory().await.unwrap()));
+        let updates = (0..8).map(|i| {
+            let hub = hub.clone();
+            async move { hub.set_secret("calc", json!({format!("f{i}"): "v"}).as_object().unwrap().clone()).await }
+        });
+        let outside = async move {
+            tokio::task::yield_now().await;
+            let (cur, v) = other.get_versioned("mcp/calc").await.unwrap();
+            let mut cur = cur.unwrap_or_default();
+            cur.insert("outside".into(), json!("x"));
+            let _ = other.put_cas("mcp/calc", cur, v).await;
+        };
+        let (results, ()) = tokio::join!(futures::future::join_all(updates), outside);
+        assert!(results.iter().all(Result::is_ok));
+        let stored = secrets.get("mcp/calc").await.unwrap().unwrap();
+        for i in 0..8 {
+            assert!(stored.contains_key(&format!("f{i}")), "f{i} lost: {stored:?}");
+        }
+        assert!(stored.contains_key("outside"), "{stored:?}");
+        hub.set_secret("calc", json!({"f0": null}).as_object().unwrap().clone()).await.unwrap();
+        assert!(!secrets.get("mcp/calc").await.unwrap().unwrap().contains_key("f0"));
+    }
 
     #[test]
     fn templates() {

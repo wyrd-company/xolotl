@@ -65,6 +65,7 @@ headers = { Authorization = "Bearer {token}" }
   - Set fields with `xolotl mcp set-secret <server> <field>` (the value is read from stdin) or on the web UI's MCP page.
   - Remove them with `xolotl mcp unset-secret`.
   - Changing a secret drops the connection, so the next call reconnects with the new value.
+  - Fields are merged with check-and-set and retried on a conflict, so concurrent updates of different fields all survive.
 - **Names:** lowercase, starting with a letter. In code a name becomes a JavaScript identifier with `-` replaced by `_`, so `github-work` is `github_work`. Names that collide after that replacement are rejected. `mcp` is also reserved as a gateway provider name.
 - **Connections:** opened on first use. A transport failure drops the connection and the next call reconnects. Redirects are never followed, so the headers only reach the configured origin. Each tool call is limited by `timeout_secs` (default 60).
 - **Tool lists:** read at startup, every `mcp.tools_refresh_secs` (300), on `xolotl mcp refresh`, and the first time a policy needs a server that hasn't been listed yet. If a refresh fails, the previous list is kept. `list_changed` notifications are not subscribed to.
@@ -125,6 +126,8 @@ Tokens live in the vault at `mcp/<name>/oauth` together with the client registra
 - **Other instances:** writes use check-and-set. On a conflict, the stored record wins when its generation differs, for example after a sign-out or new login elsewhere. Within the same generation, the newer token wins. The 60 s sync re-reads the record, so a sign-out elsewhere also reaches a connection that is already open.
 - **Vault failures:** a token whose vault write fails keeps working from memory. It shows as unsaved and is retried every 15 s, through the same check-and-set, so a sign-out or removal that happened meanwhile is kept.
 - **Editing a server:** changing only fields the login doesn't depend on (description, headers, timeout) keeps the login. Changing the URL, the auth mode or the OAuth settings starts a new one.
+  - Through the API, the old login is deleted.
+  - The login record also carries a fingerprint of the URL, client id and scopes it was made for. A login whose fingerprint doesn't match the server's current settings is never used, which covers config-file edits across a restart.
 
 These mark the server **sign-in needed**:
 
