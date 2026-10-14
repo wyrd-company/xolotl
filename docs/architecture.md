@@ -3,11 +3,12 @@
 Xolotl is a single Rust binary (`xolotl`). `xolotl serve` runs the HTTP server; every other subcommand is a CLI client of the server's `/admin` API. The server also serves a web UI at `/` that uses the same API ([Web UI](web-ui.md)).
 
 ```
-clients (Claude Code, Codex CLI, SDKs, T3Code hubs, xolotl CLI, web UI)
+clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web UI)
         │  client key (Authorization / x-api-key), or a web UI session
         ▼
   axum router ── authorize (keys + policy) ──┬── subscription pools: codex, claude, grok, opencode-go
-        │                                     └── gateway providers: vercel, mistral, openai-compatible
+        │                                     ├── gateway providers: vercel, mistral, openai-compatible
+        │                                     └── /mcp code mode ── upstream MCP servers
         ├── OpenBao (KV v2, AppRole): every secret
         ├── SQLite: runtime state, no secrets
         └── OpenTelemetry (OTLP/HTTP): traces, logs, metrics
@@ -18,12 +19,16 @@ clients (Claude Code, Codex CLI, SDKs, T3Code hubs, xolotl CLI, web UI)
 - **Subscription pools** (`claude`, `codex`, `grok`, `opencode-go`) hold several accounts per provider. Codex, Claude and Grok accounts use OAuth tokens; OpenCode Go accounts use API keys. A request goes to one account chosen by the pool, and fails over to another on quota, auth or transient errors. See [Subscription accounts](subscriptions.md).
 - **Gateway providers** are configured in the config file under `[gateway.providers.<name>]` with a `kind`: `vercel`, `mistral` or `openai-compatible` (used for llama.cpp). Each has one API key in OpenBao at `providers/<name>`, or `no_auth = true`. Provider names become model prefixes and path prefixes, so names like `v1`, `admin` or `claude` are rejected.
 
+## MCP gateway
+
+`/mcp` is an MCP server whose two tools, `search` and `execute`, give a client code-mode access to the upstream MCP servers in `[mcp.servers]`, limited by its policy. See [MCP gateway](mcp.md).
+
 ## Storage
 
 | Store | Holds | Why |
 |---|---|---|
-| OpenBao, KV v2 under `secret/xolotl/` | admin token, telemetry headers, provider keys, account credentials, policies, client key records | Secrets stay off disk and out of env vars. Writes that can race use check-and-set. |
-| SQLite (`database.path`) | accounts index, cooldowns, usage snapshots, request log (pruned after `retention_days`, default 90) | Cheap, frequently changing state. Holds no secrets and is rebuilt from OpenBao if lost. |
+| OpenBao, KV v2 under `secret/xolotl/` | admin token, telemetry headers, provider keys, account credentials, MCP servers added at runtime and their secrets, policies, client key records | Secrets stay off disk and out of env vars. Writes that can race use check-and-set. |
+| SQLite (`database.path`) | accounts index, cooldowns, usage snapshots, request log and MCP call log (pruned after `retention_days`, default 90) | Cheap, frequently changing state. Holds no secrets and is rebuilt from OpenBao if lost. |
 
 `src/vault.rs` is the OpenBao client: AppRole login, re-login on 403, KV v2 get/put/list/delete, versioned reads, check-and-set writes and version destroy. It implements the `SecretStore` trait (`src/secrets.rs`); tests use the in-memory `MemoryStore`.
 
@@ -40,13 +45,14 @@ Started by `server::spawn_background`:
 
 | Every | Task |
 |---|---|
-| 60 s | Reload client keys and policies from OpenBao; sync accounts (picks up added and removed accounts; keeps the in-memory credentials of accounts it already holds) |
+| 60 s | Reload client keys, policies and MCP servers from OpenBao; sync accounts (picks up added and removed accounts; keeps the in-memory credentials of accounts it already holds) |
 | `catalog.refresh_secs` (600 s) | Re-discover models from every provider |
-| 15 s | Retry OpenBao writes of refreshed OAuth credentials that failed ([details](subscriptions.md#when-the-vault-write-fails)) |
+| `mcp.tools_refresh_secs` (300 s) | Re-read upstream MCP tool lists (only when MCP servers are configured) |
+| 15 s | Retry OpenBao writes of refreshed OAuth credentials that failed: subscription accounts ([details](subscriptions.md#when-the-vault-write-fails)) and MCP server logins |
 | `subscription.usage_poll_secs` (300 s) | Poll each enabled account's usage; this also keeps OAuth tokens fresh |
-| 24 h | Prune the request log |
+| 24 h | Prune the request log and the MCP call log |
 
-On graceful shutdown the server makes one last attempt to save unsaved credentials.
+On graceful shutdown the server makes one last attempt to save unsaved credentials, of subscription accounts and of MCP server logins, and logs an error for any that remain.
 
 ## Telemetry
 
@@ -68,6 +74,7 @@ On graceful shutdown the server makes one last attempt to save unsaved credentia
 | `src/keys.rs` | Client keys and policy storage |
 | `src/subscription/` | Account pools: `mod.rs` (selection, failover, refresh), `codex.rs`, `claude.rs`, `opencode_go.rs`, `oauth.rs` (PKCE, token errors) |
 | `src/gateway.rs` | Gateway providers |
+| `src/mcp/` | MCP gateway: `mod.rs` (servers, policy checks, call log), `upstream.rs` (client connections), `oauth.rs` (OAuth logins and token storage), `codemode.rs` (QuickJS sandbox, TypeScript declarations), `server.rs` (the `/mcp` server) |
 | `src/proxy.rs` | Header filtering, streaming relay, token usage, error shapes |
 | `src/translate/` | Translation between Messages, Responses and Chat: requests, responses and streams |
 | `src/db.rs`, `migrations/` | SQLite |

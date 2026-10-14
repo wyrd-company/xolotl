@@ -120,6 +120,9 @@ pub struct Metrics {
     pub account_available: Gauge<u64>,
     pub token_refreshes: Counter<u64>,
     pub unsaved_credentials: Gauge<u64>,
+    pub mcp_tool_calls: Counter<u64>,
+    pub mcp_tool_call_duration: Histogram<f64>,
+    pub mcp_executions: Counter<u64>,
 }
 
 pub fn metrics() -> &'static Metrics {
@@ -146,6 +149,13 @@ pub fn metrics() -> &'static Metrics {
                 .u64_gauge("xolotl.vault.unsaved_credentials")
                 .with_description("Refreshed OAuth credentials not yet written to the vault")
                 .build(),
+            mcp_tool_calls: meter.u64_counter("xolotl.mcp.tool_calls").with_description("Upstream MCP tool calls by status").build(),
+            mcp_tool_call_duration: meter
+                .f64_histogram("xolotl.mcp.tool_call.duration")
+                .with_unit("s")
+                .with_description("Upstream MCP tool call duration")
+                .build(),
+            mcp_executions: meter.u64_counter("xolotl.mcp.executions").with_description("Code-mode executions by outcome").build(),
         }
     })
 }

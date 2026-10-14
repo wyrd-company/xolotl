@@ -23,6 +23,10 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with(|_| {}).await
+}
+
+async fn harness_with(tweak: impl FnOnce(&mut Config)) -> Harness {
     let upstream = MockServer::start().await;
     let uri = upstream.uri();
     let secrets: Secrets = Arc::new(MemoryStore::default());
@@ -59,6 +63,7 @@ async fn harness() -> Harness {
         grok_api: format!("{uri}/grok/v1"),
         grok_auth: uri.clone(),
     };
+    tweak(&mut cfg);
     let db = Db::in_memory().await.unwrap();
     let http = crate::proxy::upstream_client(std::time::Duration::from_secs(30)).unwrap();
     let keys = Arc::new(KeyManager::new(secrets.clone()));
@@ -66,7 +71,8 @@ async fn harness() -> Harness {
     let subs = Arc::new(Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone()));
     let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()));
     let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
-    let state = AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: None, sessions: Default::default() };
+    let mcp = Arc::new(McpHub::new(&cfg, secrets.clone(), db.clone()));
+    let state = AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: None, sessions: Default::default(), mcp };
     Harness { state, admin: "boot".into(), upstream }
 }
 
@@ -103,7 +109,7 @@ impl Harness {
     /// Create the policy and issue a key under it; returns the key read from the vault.
     async fn key(&self, p: Policy) -> String {
         let name = p.name.clone();
-        self.state.keys.put_policy(p, &self.state.catalog.known_providers()).await.unwrap();
+        self.state.keys.put_policy(p, &self.state.catalog.known_providers(), &self.state.mcp.server_names()).await.unwrap();
         let info = self.state.keys.issue(IssueRequest { policy: name, name: "client".into(), ..Default::default() }).await.unwrap();
         let rec = self.state.secrets.get(&info.vault_path).await.unwrap().unwrap();
         rec["api_key"].as_str().unwrap().to_string()
@@ -990,4 +996,827 @@ async fn ui_sign_in_does_not_follow_provider_redirects_or_read_huge_responses() 
         .mount(&h.upstream)
         .await;
     assert_eq!(start(&h).await, "/?signin=unavailable", "an oversized response is refused");
+}
+
+// ------------------------------------------------------------------ MCP
+
+mod mcp_gateway {
+    use std::net::SocketAddr;
+
+    use rmcp::model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientConfig, ContentBlock, Implementation,
+        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
+    };
+    use rmcp::service::{RequestContext, RoleServer};
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+    use rmcp::transport::{StreamableHttpClientTransport, StreamableHttpServerConfig, StreamableHttpService};
+    use rmcp::{ClientLifecycleMode, ClientServiceExt, ErrorData, ServerHandler};
+
+    use super::*;
+    use crate::config::McpServerConfig;
+
+    /// An upstream MCP server with a few tools; `whoami` echoes the
+    /// Authorization header it received.
+    #[derive(Clone)]
+    struct Upstream;
+
+    fn schema(v: Value) -> Arc<serde_json::Map<String, Value>> {
+        Arc::new(v.as_object().unwrap().clone())
+    }
+
+    impl ServerHandler for Upstream {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(&self, _: Option<PaginatedRequestParams>, _: RequestContext<RoleServer>) -> Result<ListToolsResult, ErrorData> {
+            let num = json!({"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}, "required": ["a", "b"]});
+            Ok(ListToolsResult::with_all_items(vec![
+                Tool::new("add", "Add two numbers", schema(num.clone()))
+                    .with_raw_output_schema(schema(json!({"type": "object", "properties": {"sum": {"type": "number"}}}))),
+                Tool::new("whoami", "Who the server thinks you are", schema(json!({"type": "object"}))),
+                Tool::new("delete_everything", "Do not call", schema(json!({"type": "object"}))),
+                Tool::new("fail", "Always fails", schema(json!({"type": "object"}))),
+            ]))
+        }
+
+        async fn call_tool(&self, req: CallToolRequestParams, ctx: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
+            let args = req.arguments.unwrap_or_default();
+            if let Some(ms) = args.get("delay_ms").and_then(Value::as_u64) {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+            let result = match req.name.as_ref() {
+                "add" => {
+                    let n = |k: &str| args.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+                    CallToolResult::structured(json!({"sum": n("a") + n("b")}))
+                }
+                "whoami" => {
+                    let parts = ctx.extensions.get::<axum::http::request::Parts>().unwrap();
+                    let auth = parts.headers.get("authorization").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+                    CallToolResult::success(vec![ContentBlock::text(auth)])
+                }
+                "fail" => CallToolResult::error(vec![ContentBlock::text("upstream said no")]),
+                _ => CallToolResult::success(vec![ContentBlock::text("deleted")]),
+            };
+            Ok(CallToolResponse::Complete(result))
+        }
+    }
+
+    async fn serve(router: axum::Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        addr
+    }
+
+    async fn upstream() -> SocketAddr {
+        let svc: StreamableHttpService<Upstream, rmcp::transport::streamable_http_server::session::local::LocalSessionManager> =
+            StreamableHttpService::new(|| Ok(Upstream), Default::default(), StreamableHttpServerConfig::default());
+        serve(axum::Router::new().nest_service("/mcp", svc)).await
+    }
+
+    struct Gateway {
+        h: Harness,
+        addr: SocketAddr,
+    }
+
+    async fn gateway() -> Gateway {
+        let up = upstream().await;
+        let h = harness_with(|cfg| {
+            for name in ["calc", "calc-two"] {
+                cfg.mcp.servers.insert(
+                    name.into(),
+                    McpServerConfig {
+                        url: format!("http://{up}/mcp"),
+                        description: format!("Calculator {name}"),
+                        headers: BTreeMap::from([("Authorization".into(), "Bearer {token}".into())]),
+                        ..Default::default()
+                    },
+                );
+            }
+        })
+        .await;
+        h.state.mcp.set_secret("calc", json!({"token": "one"}).as_object().unwrap().clone()).await.unwrap();
+        h.state.mcp.set_secret("calc-two", json!({"token": "two"}).as_object().unwrap().clone()).await.unwrap();
+        let addr = serve(router(h.state.clone())).await;
+        Gateway { h, addr }
+    }
+
+    type Client = rmcp::service::RunningService<rmcp::service::RoleClient, ClientConfig>;
+
+    async fn client(addr: SocketAddr, key: &str, lifecycle: ClientLifecycleMode) -> Client {
+        let cfg = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")).auth_header(key);
+        let transport = StreamableHttpClientTransport::from_config(cfg);
+        ClientConfig::new(ClientCapabilities::default(), Implementation::new("test", "1"))
+            .serve_with_lifecycle(transport, lifecycle)
+            .await
+            .unwrap()
+    }
+
+    fn modern() -> ClientLifecycleMode {
+        ClientLifecycleMode::Discover { preferred_versions: vec![ProtocolVersion::V_2026_07_28] }
+    }
+
+    async fn call(c: &Client, tool: &str, args: Value) -> (bool, String) {
+        let mut p = CallToolRequestParams::new(tool.to_string());
+        p.arguments = args.as_object().cloned();
+        let r = c.call_tool(p).await.unwrap();
+        let text = r.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n");
+        (r.is_error == Some(true), text)
+    }
+
+    fn mcp_policy(servers: &[&str], deny_tools: &[&str]) -> Policy {
+        Policy {
+            name: "agents".into(),
+            scopes: vec![Scope::Mcp],
+            mcp_servers: servers.iter().map(|s| s.to_string()).collect(),
+            deny_tools: deny_tools.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_and_execute_through_the_policy() {
+        let g = gateway().await;
+        let key = g.h.key(mcp_policy(&["calc", "calc-two"], &["delete_*"])).await;
+        let c = client(g.addr, &key, modern()).await;
+
+        let tools = c.list_all_tools().await.unwrap();
+        assert_eq!(tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(), vec!["search", "execute"]);
+        assert!(tools[1].description.as_deref().unwrap().contains("`calc_two`: Calculator calc-two"));
+
+        let (err, ts) = call(&c, "search", json!({"query": "add"})).await;
+        assert!(!err);
+        assert!(ts.contains("declare const calc: {") && ts.contains("declare const calc_two: {"), "{ts}");
+        assert!(ts.contains("add(args: {") && ts.contains("Promise<{\n    sum?: number;\n  }>"), "{ts}");
+        let (_, all) = call(&c, "search", json!({"query": ""})).await;
+        assert!(all.contains("whoami") && !all.contains("delete_everything"), "denied tools are hidden: {all}");
+
+        // Two instances of one server, each with its own credentials.
+        let code = "const s = await calc.add({a: 2, b: 3}); \
+                    return {sum: s.sum, one: await calc.whoami(), two: await calc_two.whoami()};";
+        let (err, out) = call(&c, "execute", json!({"code": code})).await;
+        assert!(!err, "{out}");
+        let out: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["result"], json!({"sum": 5, "one": "Bearer one", "two": "Bearer two"}));
+        assert_eq!(out["calls"].as_array().unwrap().len(), 3);
+
+        // Denied tools and tool errors throw inside the code.
+        let (_, out) = call(&c, "execute", json!({"code": "try { await calc.delete_everything() } catch (e) { return e.message }"})).await;
+        assert!(out.contains("not a tool available to this key"), "{out}");
+        let (err, out) = call(&c, "execute", json!({"code": "await calc.fail()"})).await;
+        assert!(err && out.contains("upstream said no"), "{out}");
+
+        // Upstream calls are logged; denied ones never left the gateway.
+        let (_, calls) = g.h.call("GET", "/admin/mcp/calls", Some(&g.h.admin), None).await;
+        let calls = calls.as_array().unwrap();
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert_eq!(calls[0]["tool"], "fail");
+        assert_eq!(calls[0]["status"], "tool_error");
+        let (_, usage) = g.h.call("GET", "/admin/mcp/usage?group_by=server", Some(&g.h.admin), None).await;
+        assert_eq!(usage[0]["key"], "calc");
+        assert_eq!(usage[0]["calls"], 3);
+        assert_eq!(usage[0]["errors"], 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_clients_auth_and_admin() {
+        let g = gateway().await;
+        let key = g.h.key(mcp_policy(&["calc"], &[])).await;
+
+        // A pre-2026-07-28 client (initialize handshake) works too.
+        let c = client(g.addr, &key, ClientLifecycleMode::Initialize).await;
+        let (err, out) = call(&c, "execute", json!({"code": "return (await calc.add({a: 1, b: 1})).sum"})).await;
+        assert!(!err, "{out}");
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["result"], json!(2));
+        let (_, out) = call(&c, "execute", json!({"code": "return typeof calc_two"})).await;
+        assert!(out.contains("\"undefined\""), "servers outside the policy don't exist: {out}");
+
+        // No key, a key without the mcp scope, and browser origins are refused.
+        let http = reqwest::Client::new();
+        let url = format!("http://{}/mcp", g.addr);
+        let r = http.post(&url).json(&json!({})).send().await.unwrap();
+        assert_eq!(r.status(), 401);
+        assert_eq!(r.headers()["www-authenticate"], "Bearer");
+        let proxy_key = g.h.key(Policy { name: "llm".into(), providers: vec!["*".into()], ..Default::default() }).await;
+        assert_eq!(http.post(&url).bearer_auth(&proxy_key).json(&json!({})).send().await.unwrap().status(), 403);
+        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "x", "version": "1"}}});
+        let r = http
+            .post(&url)
+            .bearer_auth(&key)
+            .header("origin", "https://evil.example")
+            .header("accept", "application/json, text/event-stream")
+            .json(&init)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+
+        // Admin: servers with secret state, tool lists, secrets, policy view.
+        let (_, servers) = g.h.call("GET", "/admin/mcp/servers", Some(&g.h.admin), None).await;
+        assert_eq!(servers[0]["name"], "calc");
+        assert_eq!(servers[0]["namespace"], "calc");
+        assert_eq!(servers[1]["namespace"], "calc_two");
+        assert_eq!(servers[0]["secret_fields"], json!({"token": true}));
+        assert_eq!(servers[0]["tools"], 4);
+        let (status, tools) = g.h.call("POST", "/admin/mcp/servers/calc-two/refresh", Some(&g.h.admin), None).await;
+        assert_eq!((status, tools["tools"].clone()), (200, json!(4)));
+        let (_, tools) = g.h.call("GET", "/admin/mcp/servers/calc/tools", Some(&g.h.admin), None).await;
+        assert_eq!(tools[0]["name"], "add");
+        let body = json!({"fields": {"token": null}});
+        assert_eq!(g.h.call("PUT", "/admin/mcp/servers/calc/secret", Some(&g.h.admin), Some(body)).await.0, 200);
+        let (_, servers) = g.h.call("GET", "/admin/mcp/servers", Some(&g.h.admin), None).await;
+        assert_eq!(servers[0]["secret_fields"], json!({"token": false}));
+        let (_, out) = call(&c, "execute", json!({"code": "await calc.whoami()"})).await;
+        assert!(out.contains("secret field \\\"token\\\" is not set"), "{out}");
+
+        let draft = json!({"name": "x", "scopes": ["mcp"], "mcp_servers": ["calc"], "deny_tools": ["fail", "delete_*"]});
+        let (status, view) = g.h.call("POST", "/admin/policy-preview", Some(&g.h.admin), Some(draft)).await;
+        assert_eq!(status, 200, "{view}");
+        assert_eq!(view["mcp_servers"], json!(["calc"]));
+        assert_eq!(view["tools"], json!(["calc/add", "calc/whoami"]));
+        let bad = json!({"name": "x", "scopes": ["mcp"], "mcp_servers": ["nope"]});
+        assert_eq!(g.h.call("POST", "/admin/policy-preview", Some(&g.h.admin), Some(bad)).await.0, 400);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_cut_off_by_the_deadline_is_still_logged() {
+        let up = upstream().await;
+        let h = harness_with(|cfg| {
+            cfg.mcp.execute_timeout_secs = 1;
+            cfg.mcp.servers.insert("calc".into(), McpServerConfig { url: format!("http://{up}/mcp"), ..Default::default() });
+        })
+        .await;
+        let addr = serve(router(h.state.clone())).await;
+        let key = h.key(mcp_policy(&["calc"], &[])).await;
+        let c = client(addr, &key, modern()).await;
+        // The upstream accepts the call and takes 3 s; the execution ends after 1 s.
+        let (err, out) = call(&c, "execute", json!({"code": "return await calc.whoami({delay_ms: 3000})"})).await;
+        assert!(err && out.contains("timed out"), "{out}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let calls = h.state.db.recent_mcp_calls(10).await.unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!((calls[0].tool.as_str(), calls[0].status.as_str()), ("whoami", "cancelled"));
+        assert!(calls[0].error.as_deref().unwrap().contains("outcome is unknown"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_cancelled_while_its_row_waits_is_still_logged() {
+        let up = upstream().await;
+        let h = harness_with(|cfg| {
+            cfg.mcp.servers.insert("calc".into(), McpServerConfig { url: format!("http://{up}/mcp"), ..Default::default() });
+        })
+        .await;
+        h.state.mcp.refresh("calc").await.unwrap();
+        // The database is busy: the row write waits after the upstream answered.
+        let held = h.state.db.hold().await;
+        let hub = h.state.mcp.clone();
+        let p = crate::keys::Principal { client_id: None, policy: Arc::new(mcp_policy(&["calc"], &[])) };
+        let call = tokio::spawn(async move { hub.call(&p, "calc", "whoami", Default::default()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        call.abort();
+        let _ = call.await;
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let calls = h.state.db.recent_mcp_calls(10).await.unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!((calls[0].tool.as_str(), calls[0].status.as_str()), ("whoami", "ok"));
+    }
+
+    /// An upstream whose tools are named like JavaScript hooks.
+    #[derive(Clone)]
+    struct Hooks;
+
+    impl ServerHandler for Hooks {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(&self, _: Option<PaginatedRequestParams>, _: RequestContext<RoleServer>) -> Result<ListToolsResult, ErrorData> {
+            Ok(ListToolsResult::with_all_items(
+                ["then", "toJSON"].map(|n| Tool::new(n, format!("The {n} tool"), schema(json!({"type": "object"})))).to_vec(),
+            ))
+        }
+
+        async fn call_tool(&self, req: CallToolRequestParams, _: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
+            Ok(CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text(format!("called {}", req.name))])))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_named_then_and_tojson_can_be_called() {
+        let svc: StreamableHttpService<Hooks, rmcp::transport::streamable_http_server::session::local::LocalSessionManager> =
+            StreamableHttpService::new(|| Ok(Hooks), Default::default(), StreamableHttpServerConfig::default());
+        let up = serve(axum::Router::new().nest_service("/mcp", svc)).await;
+        let h = harness_with(|cfg| {
+            cfg.mcp.servers.insert("hooks".into(), McpServerConfig { url: format!("http://{up}/mcp"), ..Default::default() });
+        })
+        .await;
+        let addr = serve(router(h.state.clone())).await;
+        let key = h.key(mcp_policy(&["hooks"], &[])).await;
+        let c = client(addr, &key, modern()).await;
+
+        let (_, ts) = call(&c, "search", json!({"query": ""})).await;
+        assert!(ts.contains(r#"codemode.call("hooks", "then", args)"#) && ts.contains(r#"codemode.call("hooks", "toJSON", args)"#), "{ts}");
+        let code = "return [await codemode.call('hooks', 'then', {}), await codemode.call('hooks', 'toJSON', {}), typeof hooks.then]";
+        let (err, out) = call(&c, "execute", json!({"code": code})).await;
+        assert!(!err, "{out}");
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["result"], json!(["called then", "called toJSON", "undefined"]));
+        let calls = h.state.db.recent_mcp_calls(10).await.unwrap();
+        assert_eq!(calls.len(), 2, "both went through the gateway's call path");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn servers_added_at_runtime() {
+        let g = gateway().await;
+        let h = &g.h;
+        let url = h.state.cfg.mcp.servers["calc"].url.clone();
+        let live = json!({"name": "live", "url": url, "description": "Added from the UI", "headers": {"Authorization": "Bearer {token}"}});
+
+        // A policy can't name a server before it exists.
+        let p = json!({"name": "agents", "scopes": ["mcp"], "mcp_servers": ["live"]});
+        assert_eq!(h.call("PUT", "/admin/policies/agents", Some(&h.admin), Some(p.clone())).await.0, 400);
+
+        assert_eq!(h.call("POST", "/admin/mcp/servers", Some(&h.admin), Some(live.clone())).await.0, 200);
+        let (_, servers) = h.call("GET", "/admin/mcp/servers", Some(&h.admin), None).await;
+        let find = |servers: &Value, n: &str| servers.as_array().unwrap().iter().find(|s| s["name"] == n).cloned();
+        let s = find(&servers, "live").unwrap();
+        assert_eq!((s["source"].clone(), s["definition"]["description"].clone()), (json!("vault"), json!("Added from the UI")));
+        assert_eq!(s["secret_fields"], json!({"token": false}));
+        let calc = find(&servers, "calc").unwrap();
+        assert_eq!(calc["source"], "config");
+        assert!(calc.get("definition").is_none());
+
+        // Refused: duplicates, config-file names, names that collide in code, bad definitions.
+        for (body, status) in [
+            (live.clone(), 409),
+            (json!({"name": "calc", "url": url}), 409),
+            (json!({"name": "calc_two", "url": url}), 409),
+            (json!({"name": "bad", "url": "ftp://x"}), 400),
+            (json!({"name": "Bad", "url": url}), 400),
+            (json!({"name": "bad", "url": url, "colour": "red"}), 400),
+            (json!({"name": "bad", "url": url, "oauth": {"client_id": "x"}}), 400),
+        ] {
+            let (got, err) = h.call("POST", "/admin/mcp/servers", Some(&h.admin), Some(body.clone())).await;
+            assert_eq!(got, status, "{body}: {err}");
+        }
+
+        // It works like any other server.
+        h.state.mcp.set_secret("live", json!({"token": "tok"}).as_object().unwrap().clone()).await.unwrap();
+        let key = h.key(serde_json::from_value(p).unwrap()).await;
+        let c = client(g.addr, &key, modern()).await;
+        let (err, out) = call(&c, "execute", json!({"code": "return await live.whoami()"})).await;
+        assert!(!err && out.contains("Bearer tok"), "{out}");
+
+        // Changes apply at once; the config file's servers are read-only.
+        let changed = json!({"url": url, "description": "Renamed", "headers": {"Authorization": "Bearer {token}"}});
+        assert_eq!(h.call("PUT", "/admin/mcp/servers/live", Some(&h.admin), Some(changed)).await.0, 200);
+        let (_, servers) = h.call("GET", "/admin/mcp/servers", Some(&h.admin), None).await;
+        assert_eq!(find(&servers, "live").unwrap()["description"], "Renamed");
+        assert_eq!(h.call("PUT", "/admin/mcp/servers/calc", Some(&h.admin), Some(json!({"url": url}))).await.0, 409);
+        assert_eq!(h.call("PUT", "/admin/mcp/servers/nope", Some(&h.admin), Some(json!({"url": url}))).await.0, 404);
+        let renamed = json!({"name": "other", "url": url});
+        assert_eq!(h.call("PUT", "/admin/mcp/servers/live", Some(&h.admin), Some(renamed)).await.0, 400);
+
+        // Deleting is refused while a policy lists the server.
+        let (status, err) = h.call("DELETE", "/admin/mcp/servers/live", Some(&h.admin), None).await;
+        assert_eq!(status, 409);
+        assert!(err["error"]["message"].as_str().unwrap().contains("used by policy agents"), "{err}");
+        assert_eq!(h.call("DELETE", "/admin/mcp/servers/calc", Some(&h.admin), None).await.0, 409);
+        let p = json!({"name": "agents", "scopes": ["mcp"], "mcp_servers": ["calc"]});
+        assert_eq!(h.call("PUT", "/admin/policies/agents", Some(&h.admin), Some(p)).await.0, 200);
+        assert_eq!(h.call("DELETE", "/admin/mcp/servers/live", Some(&h.admin), None).await.0, 200);
+        assert!(!h.state.mcp.has_server("live"));
+        assert!(h.state.secrets.get("mcp/live").await.unwrap().is_none(), "its secrets go too");
+        assert_eq!(h.call("DELETE", "/admin/mcp/servers/live", Some(&h.admin), None).await.0, 404);
+
+        // Servers written by another instance appear on reload; invalid ones are skipped.
+        let ext = json!({"url": url}).as_object().unwrap().clone();
+        h.state.secrets.put("mcp-servers/ext", ext).await.unwrap();
+        h.state.secrets.put("mcp-servers/broken", json!({"url": "nope"}).as_object().unwrap().clone()).await.unwrap();
+        assert_eq!(h.state.mcp.reload().await.unwrap(), 1);
+        assert!(h.state.mcp.has_server("ext") && !h.state.mcp.has_server("broken"));
+    }
+
+    mod oauth {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use axum::extract::{Form, State as AxState};
+        use base64::Engine;
+        use parking_lot::Mutex;
+        use sha2::Digest;
+
+        use super::*;
+        use crate::config::{McpAuth, McpServerOAuthConfig};
+        use crate::keys::Principal;
+        use crate::mcp::oauth::{DEFAULT_REDIRECT_URI, RegistrationKind};
+
+        /// A mock authorization server and an OAuth-protected MCP server on one origin.
+        #[derive(Default)]
+        struct Auth {
+            base: String,
+            cimd: AtomicBool,
+            /// Tokens from the next code exchange expire within rmcp's refresh margin.
+            short_ttl: AtomicBool,
+            registrations: AtomicUsize,
+            token_calls: AtomicUsize,
+            refreshes: AtomicUsize,
+            n: AtomicUsize,
+            codes: Mutex<HashMap<String, String>>,
+            access: Mutex<HashSet<String>>,
+            refresh: Mutex<Option<String>>,
+            last_token_request: Mutex<HashMap<String, String>>,
+            last_token_auth: Mutex<Option<String>>,
+        }
+
+        impl Auth {
+            fn issue(&self, short: bool) -> Value {
+                let n = self.n.fetch_add(1, Ordering::SeqCst) + 1;
+                let (at, rt) = (format!("at-{n}"), format!("rt-{n}"));
+                self.access.lock().insert(at.clone());
+                *self.refresh.lock() = Some(rt.clone());
+                json!({"access_token": at, "refresh_token": rt, "token_type": "Bearer", "expires_in": if short { 5 } else { 3600 }, "scope": "tools"})
+            }
+
+            /// What the browser does: approve, and follow the redirect with a code.
+            fn authorize(&self, auth_url: &str, iss: Option<&str>) -> String {
+                let u = url::Url::parse(auth_url).unwrap();
+                let q: HashMap<String, String> = u.query_pairs().map(|(k, v)| (k.into(), v.into())).collect();
+                assert_eq!(q["code_challenge_method"], "S256");
+                assert_eq!(q["resource"], format!("{}/mcp", self.base), "RFC 8707 resource");
+                let code = format!("code-{}", self.codes.lock().len() + 1);
+                self.codes.lock().insert(code.clone(), q["code_challenge"].clone());
+                let mut redirect = url::Url::parse(&q["redirect_uri"]).unwrap();
+                redirect.query_pairs_mut().append_pair("code", &code).append_pair("state", &q["state"]);
+                if let Some(iss) = iss {
+                    redirect.query_pairs_mut().append_pair("iss", iss);
+                }
+                redirect.to_string()
+            }
+        }
+
+        async fn token(
+            AxState(a): AxState<Arc<Auth>>,
+            headers: axum::http::HeaderMap,
+            Form(f): Form<HashMap<String, String>>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            a.token_calls.fetch_add(1, Ordering::SeqCst);
+            *a.last_token_request.lock() = f.clone();
+            *a.last_token_auth.lock() = headers.get("authorization").map(|v| v.to_str().unwrap().to_string());
+            let invalid = || (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_grant"}))).into_response();
+            assert_eq!(f.get("resource").map(String::as_str), Some(format!("{}/mcp", a.base).as_str()), "resource on token requests");
+            match f["grant_type"].as_str() {
+                "authorization_code" => {
+                    let Some(challenge) = a.codes.lock().remove(&f["code"]) else { return invalid() };
+                    let digest = sha2::Sha256::digest(f["code_verifier"].as_bytes());
+                    assert_eq!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest), challenge, "PKCE");
+                    Json(a.issue(a.short_ttl.load(Ordering::SeqCst))).into_response()
+                }
+                "refresh_token" => {
+                    if a.refresh.lock().as_deref() != Some(f["refresh_token"].as_str()) {
+                        return invalid();
+                    }
+                    a.refreshes.fetch_add(1, Ordering::SeqCst);
+                    Json(a.issue(false)).into_response()
+                }
+                _ => invalid(),
+            }
+        }
+
+        async fn auth_server() -> Arc<Auth> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let a = Arc::new(Auth { base: base.clone(), ..Default::default() });
+            let prm = json!({"resource": format!("{base}/mcp"), "authorization_servers": [base], "scopes_supported": ["tools"]});
+            let a2 = a.clone();
+            let metadata = move || {
+                json!({
+                    "issuer": a2.base,
+                    "authorization_endpoint": format!("{}/authorize", a2.base),
+                    "token_endpoint": format!("{}/token", a2.base),
+                    "registration_endpoint": format!("{}/register", a2.base),
+                    "response_types_supported": ["code"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "code_challenge_methods_supported": ["S256"],
+                    "authorization_response_iss_parameter_supported": true,
+                    "client_id_metadata_document_supported": a2.cimd.load(Ordering::SeqCst),
+                })
+            };
+            let svc: StreamableHttpService<Upstream, rmcp::transport::streamable_http_server::session::local::LocalSessionManager> =
+                StreamableHttpService::new(|| Ok(Upstream), Default::default(), StreamableHttpServerConfig::default());
+            let guard = {
+                let a = a.clone();
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let a = a.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        let token =
+                            req.headers().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+                        if token.is_some_and(|t| a.access.lock().contains(t)) {
+                            return next.run(req).await;
+                        }
+                        let challenge =
+                            format!("Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\", scope=\"tools\"", a.base);
+                        (axum::http::StatusCode::UNAUTHORIZED, [("www-authenticate", challenge)]).into_response()
+                    }
+                }
+            };
+            let mcp = axum::Router::new().nest_service("/mcp", svc).layer(axum::middleware::from_fn(guard));
+            let a3 = a.clone();
+            let router = axum::Router::new()
+                .route("/.well-known/oauth-protected-resource/mcp", axum::routing::get(move || std::future::ready(Json(prm.clone()))))
+                .route("/.well-known/oauth-authorization-server", axum::routing::get(move || std::future::ready(Json(metadata()))))
+                .route(
+                    "/register",
+                    axum::routing::post(move |Json(req): Json<Value>| {
+                        a3.registrations.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Json(json!({"client_id": "dyn-client", "redirect_uris": req["redirect_uris"]})))
+                    }),
+                )
+                .route("/token", axum::routing::post(token))
+                .with_state(a.clone())
+                .merge(mcp);
+            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            a
+        }
+
+        async fn oauth_harness(a: &Auth, tweak: impl FnOnce(&mut Config)) -> Harness {
+            let url = format!("{}/mcp", a.base);
+            harness_with(move |cfg| {
+                cfg.mcp.servers.insert("cloud".into(), McpServerConfig { url, auth: McpAuth::Oauth, ..Default::default() });
+                tweak(cfg);
+            })
+            .await
+        }
+
+        fn principal() -> Principal {
+            Principal { client_id: Some("agents/client".into()), policy: Arc::new(mcp_policy(&["cloud"], &[])) }
+        }
+
+        async fn whoami(hub: &McpHub) -> Result<String, String> {
+            hub.call(&principal(), "cloud", "whoami", Default::default()).await.map(|r| crate::mcp::text_of(&r))
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn login_refresh_and_relogin() {
+            let a = auth_server().await;
+            let h = oauth_harness(&a, |_| {}).await;
+            let hub = &h.state.mcp;
+            let e = whoami(hub).await.unwrap_err();
+            assert!(e.contains("sign-in needed (not signed in)"), "{e}");
+
+            // Dynamic registration; an `iss` mismatch is rejected before the code is spent.
+            let start = hub.login_start("cloud").await.unwrap();
+            assert_eq!(
+                (start.registration, start.callback, start.redirect_uri.as_str()),
+                (RegistrationKind::Dynamic, false, DEFAULT_REDIRECT_URI)
+            );
+            let e = hub.login_complete(&start.flow_id, &a.authorize(&start.url, Some("http://evil.example"))).await.unwrap_err();
+            assert!(format!("{e:#}").to_lowercase().contains("issuer"), "{e:#}");
+            assert_eq!(a.token_calls.load(Ordering::SeqCst), 0);
+            assert!(hub.login_complete(&start.flow_id, "http://127.0.0.1:33418/callback?code=x&state=y").await.is_err());
+
+            // The registration is reused; the token is sent upstream.
+            let start = hub.login_start("cloud").await.unwrap();
+            assert_eq!(a.registrations.load(Ordering::SeqCst), 1);
+            assert_eq!(hub.login_complete(&start.flow_id, &a.authorize(&start.url, Some(&a.base))).await.unwrap(), "cloud");
+            assert_eq!(whoami(hub).await.unwrap(), "Bearer at-1");
+            let (_, servers) = h.call("GET", "/admin/mcp/servers", Some(&h.admin), None).await;
+            let o = &servers[0]["oauth"];
+            assert_eq!(
+                (o["signed_in"].clone(), o["refreshable"].clone(), o["registration"].clone()),
+                (json!(true), json!(true), json!("dynamic"))
+            );
+            assert_eq!(servers[0]["tools"], 4, "tools were listed after the login");
+            let rec = h.state.secrets.get("mcp/cloud/oauth").await.unwrap().unwrap();
+            assert_eq!(rec["registration"]["client_id"], "dyn-client");
+
+            // A token the server stops accepting is refreshed and the request retried.
+            a.access.lock().clear();
+            assert_eq!(whoami(hub).await.unwrap(), "Bearer at-2");
+
+            // The login survives a restart (it lives in the vault).
+            let hub2 = McpHub::new(&h.state.cfg, h.state.secrets.clone(), h.state.db.clone());
+            assert_eq!(whoami(&hub2).await.unwrap(), "Bearer at-2");
+
+            // A rejected refresh token means a new login.
+            a.access.lock().clear();
+            *a.refresh.lock() = None;
+            let e = whoami(hub).await.unwrap_err();
+            assert!(e.contains("sign-in needed (the refresh token was rejected)"), "{e}");
+            let e = whoami(hub).await.unwrap_err();
+            assert!(e.contains("sign-in needed"), "fails fast until a new login: {e}");
+
+            // Sign in again through xolotl's callback, then sign out.
+            let start = hub.login_start("cloud").await.unwrap();
+            let redirect = url::Url::parse(&a.authorize(&start.url, Some(&a.base))).unwrap();
+            let (status, page) = h.call("GET", &format!("/admin/mcp/oauth/callback?{}", redirect.query().unwrap()), None, None).await;
+            assert_eq!(status, 200, "{page}");
+            assert!(page.as_str().unwrap().contains("signed in to cloud"));
+            assert!(whoami(hub).await.unwrap().starts_with("Bearer at-"));
+            let (status, _) = h.call("GET", &format!("/admin/mcp/oauth/callback?{}", redirect.query().unwrap()), None, None).await;
+            assert_eq!(status, 400, "a login completes once");
+            assert_eq!(h.call("DELETE", "/admin/mcp/servers/cloud/oauth", Some(&h.admin), None).await.0, 200);
+            assert!(whoami(hub).await.unwrap_err().contains("sign-in needed (signed out)"));
+        }
+
+        async fn login(hub: &McpHub, a: &Auth) {
+            login_to(hub, a, "cloud").await;
+        }
+
+        async fn login_to(hub: &McpHub, a: &Auth, server: &str) {
+            let start = hub.login_start(server).await.unwrap();
+            hub.login_complete(&start.flow_id, &a.authorize(&start.url, Some(&a.base))).await.unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn stale_logins_and_other_instances() {
+            let a = auth_server().await;
+            let h = oauth_harness(&a, |_| {}).await;
+            let hub = &h.state.mcp;
+
+            // A login started before a sign-out can't sign the server back in.
+            let start = hub.login_start("cloud").await.unwrap();
+            let redirect = a.authorize(&start.url, Some(&a.base));
+            hub.logout("cloud").await.unwrap();
+            assert!(hub.login_complete(&start.flow_id, &redirect).await.is_err());
+            assert!(whoami(hub).await.unwrap_err().contains("sign-in needed (signed out)"));
+
+            // Two instances sharing the vault: a sign-out on one reaches the other.
+            login(hub, &a).await;
+            let other = McpHub::new(&h.state.cfg, h.state.secrets.clone(), h.state.db.clone());
+            other.reload().await.unwrap();
+            assert!(whoami(&other).await.is_ok());
+            hub.logout("cloud").await.unwrap();
+            other.reload().await.unwrap();
+            assert!(whoami(&other).await.unwrap_err().contains("sign-in needed"), "the sign-out wins");
+            assert!(h.state.secrets.get("mcp/cloud/oauth").await.unwrap().unwrap().get("credentials").is_none());
+
+            // The losing side of a refresh uses the winner's tokens.
+            login(hub, &a).await;
+            other.reload().await.unwrap();
+            assert!(whoami(&other).await.is_ok());
+            a.access.lock().clear();
+            assert!(whoami(hub).await.is_ok(), "refreshed (single-use refresh token spent)");
+            let t = whoami(&other).await;
+            assert!(t.as_ref().is_ok_and(|t| t.starts_with("Bearer at-")), "{t:?}");
+            let status = other.servers().await.unwrap();
+            assert_eq!(status[0].status.oauth.as_ref().unwrap().needs_login, None);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_removed_servers_login_stays_removed() {
+            let a = auth_server().await;
+            let h = oauth_harness(&a, |_| {}).await;
+            let hub = &h.state.mcp;
+            let def = || serde_json::from_value::<McpServerConfig>(json!({"url": format!("{}/mcp", a.base), "auth": "oauth"})).unwrap();
+            hub.put_server("live", def(), true).await.unwrap();
+            let start = hub.login_start("live").await.unwrap();
+            let redirect = a.authorize(&start.url, Some(&a.base));
+            hub.delete_server("live", &[]).await.unwrap();
+            hub.put_server("live", def(), true).await.unwrap();
+            let e = hub.login_complete(&start.flow_id, &redirect).await.unwrap_err();
+            assert!(format!("{e:#}").contains("no such login"), "{e:#}");
+            assert!(h.state.secrets.get("mcp/live/oauth").await.unwrap().is_none_or(|r| r.get("credentials").is_none()));
+
+            // Editing the description keeps the login; changing the URL doesn't.
+            let start = hub.login_start("live").await.unwrap();
+            hub.login_complete(&start.flow_id, &a.authorize(&start.url, Some(&a.base))).await.unwrap();
+            let mut renamed = def();
+            renamed.description = "new".into();
+            hub.put_server("live", renamed, false).await.unwrap();
+            let p = Principal { client_id: None, policy: Arc::new(mcp_policy(&["live"], &[])) };
+            assert!(hub.call(&p, "live", "whoami", Default::default()).await.is_ok());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_change_of_login_settings_ends_the_login() {
+            let a = auth_server().await;
+            let h = oauth_harness(&a, |_| {}).await;
+            let hub = &h.state.mcp;
+            let p = Principal { client_id: None, policy: Arc::new(mcp_policy(&["live", "cloud"], &[])) };
+            let call = |server: &'static str| hub.call(&p, server, "whoami", Default::default());
+            let def = |extra: Value| {
+                let mut v = json!({"url": format!("{}/mcp", a.base), "auth": "oauth"});
+                v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                serde_json::from_value::<McpServerConfig>(v).unwrap()
+            };
+            hub.put_server("live", def(json!({})), true).await.unwrap();
+
+            // A different client id, then different scopes, end the login.
+            for changed in [json!({"oauth": {"client_id": "other"}}), json!({"oauth": {"client_id": "other", "scopes": ["tools"]}})] {
+                login_to(hub, &a, "live").await;
+                assert!(call("live").await.is_ok());
+                hub.put_server("live", def(changed.clone()), false).await.unwrap();
+                let e = call("live").await.unwrap_err();
+                assert!(e.contains("sign-in needed"), "{changed}: {e}");
+                assert!(h.state.secrets.get("mcp/live/oauth").await.unwrap().is_none(), "{changed}: old login removed");
+            }
+
+            // So does switching to headers and back.
+            login_to(hub, &a, "live").await;
+            let headers = serde_json::from_value::<McpServerConfig>(json!({"url": format!("{}/mcp", a.base)})).unwrap();
+            hub.put_server("live", headers, false).await.unwrap();
+            hub.put_server("live", def(json!({"oauth": {"client_id": "other", "scopes": ["tools"]}})), false).await.unwrap();
+            assert!(call("live").await.unwrap_err().contains("sign-in needed"));
+
+            // A config-file server whose settings changed across a restart.
+            login_to(hub, &a, "cloud").await;
+            assert!(call("cloud").await.is_ok());
+            let mut cfg = (*h.state.cfg).clone();
+            cfg.mcp.servers.get_mut("cloud").unwrap().oauth.scopes = vec!["tools".into()];
+            let restarted = McpHub::new(&cfg, h.state.secrets.clone(), h.state.db.clone());
+            let e = restarted.call(&p, "cloud", "whoami", Default::default()).await.unwrap_err();
+            assert!(e.contains("the server's OAuth settings changed"), "{e}");
+            let unchanged = McpHub::new(&h.state.cfg, h.state.secrets.clone(), h.state.db.clone());
+            assert!(unchanged.call(&p, "cloud", "whoami", Default::default()).await.is_ok());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn tokens_near_expiry_are_refreshed_once_at_a_time() {
+            let a = auth_server().await;
+            a.short_ttl.store(true, Ordering::SeqCst);
+            let h = oauth_harness(&a, |_| {}).await;
+            let hub = &h.state.mcp;
+            let start = hub.login_start("cloud").await.unwrap();
+            hub.login_complete(&start.flow_id, &a.authorize(&start.url, Some(&a.base))).await.unwrap();
+            // at-1 expires within the refresh margin: concurrent calls refresh
+            // without spending one (single-use) refresh token twice.
+            let calls = (0..6).map(|_| whoami(hub));
+            for r in futures::future::join_all(calls).await {
+                assert!(r.as_ref().is_ok_and(|t| t != "Bearer at-1"), "{r:?}");
+            }
+            assert!(a.refreshes.load(Ordering::SeqCst) >= 1);
+            let status = h.call("GET", "/admin/mcp/servers", Some(&h.admin), None).await.1;
+            assert_eq!(status[0]["oauth"]["needs_login"], Value::Null);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn client_metadata_documents_and_pre_registered_clients() {
+            let a = auth_server().await;
+            a.cimd.store(true, Ordering::SeqCst);
+            let h = oauth_harness(&a, |cfg| {
+                cfg.server.public_url = Some("https://xolotl.example".into());
+                cfg.mcp.servers.insert(
+                    "pre".into(),
+                    McpServerConfig {
+                        url: format!("{}/mcp", a.base),
+                        auth: McpAuth::Oauth,
+                        oauth: McpServerOAuthConfig { client_id: Some("pre-1".into()), scopes: vec!["tools".into()] },
+                        ..Default::default()
+                    },
+                );
+            })
+            .await;
+            let hub = &h.state.mcp;
+
+            let start = hub.login_start("cloud").await.unwrap();
+            assert_eq!(start.registration, RegistrationKind::ClientMetadataDocument);
+            assert!(start.callback);
+            let q: HashMap<String, String> =
+                url::Url::parse(&start.url).unwrap().query_pairs().map(|(k, v)| (k.into(), v.into())).collect();
+            assert_eq!(q["client_id"], "https://xolotl.example/admin/mcp/oauth/client-metadata.json");
+            assert_eq!(q["redirect_uri"], "https://xolotl.example/admin/mcp/oauth/callback");
+            assert_eq!(a.registrations.load(Ordering::SeqCst), 0);
+            let (status, doc) = h.call("GET", "/admin/mcp/oauth/client-metadata.json", None, None).await;
+            assert_eq!(status, 200);
+            assert_eq!(doc["client_id"], q["client_id"]);
+            assert_eq!(doc["redirect_uris"], json!([q["redirect_uri"]]));
+
+            hub.set_secret("pre", json!({"client_secret": "s3cret"}).as_object().unwrap().clone()).await.unwrap();
+            let (_, servers) = h.call("GET", "/admin/mcp/servers", Some(&h.admin), None).await;
+            assert_eq!(servers[1]["secret_fields"], json!({"client_secret": true}));
+            let (status, start) = h.call("POST", "/admin/mcp/servers/pre/oauth/start", Some(&h.admin), None).await;
+            assert_eq!(status, 200, "{start}");
+            assert_eq!(start["registration"], "pre-registered");
+            let q: HashMap<String, String> =
+                url::Url::parse(start["url"].as_str().unwrap()).unwrap().query_pairs().map(|(k, v)| (k.into(), v.into())).collect();
+            assert_eq!(q["client_id"], "pre-1");
+            let redirect = a.authorize(start["url"].as_str().unwrap(), Some(&a.base));
+            let flow = start["flow_id"].as_str().unwrap();
+            let body = json!({"redirect_url": redirect});
+            let (status, done) = h.call("POST", &format!("/admin/mcp/oauth/flows/{flow}/complete"), Some(&h.admin), Some(body)).await;
+            assert_eq!(status, 200, "{done}");
+            let (_, flow_status) = h.call("GET", &format!("/admin/mcp/oauth/flows/{flow}"), Some(&h.admin), None).await;
+            assert_eq!(flow_status["status"], "complete");
+            // The pre-registered secret authenticates the token request.
+            let basic = a.last_token_auth.lock().clone();
+            let sent_secret = a.last_token_request.lock().get("client_secret").cloned();
+            assert!(basic.is_some_and(|b| b.starts_with("Basic ")) || sent_secret.as_deref() == Some("s3cret"));
+            assert_eq!(
+                hub.call(&principal_for("pre"), "pre", "add", json!({"a": 1, "b": 2}).as_object().unwrap().clone())
+                    .await
+                    .unwrap()
+                    .structured_content,
+                Some(json!({"sum": 3.0}))
+            );
+        }
+
+        fn principal_for(server: &str) -> Principal {
+            Principal { client_id: None, policy: Arc::new(mcp_policy(&[server], &[])) }
+        }
+    }
 }

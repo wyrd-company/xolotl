@@ -15,7 +15,19 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
-import { del, get, post, put, SUB_PROVIDERS, type GatewayProvider, type KeyInfo, type Policy, type PolicyView, type Scope } from "@/lib/api";
+import {
+  del,
+  get,
+  post,
+  put,
+  SUB_PROVIDERS,
+  type GatewayProvider,
+  type KeyInfo,
+  type McpServer,
+  type Policy,
+  type PolicyView,
+  type Scope,
+} from "@/lib/api";
 import { useAction } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 
@@ -24,6 +36,7 @@ const NEW = "+new";
 const SCOPES: [Scope, string][] = [
   ["proxy", "proxy"],
   ["management", "management (T3Code hubs)"],
+  ["mcp", "mcp (MCP gateway)"],
   ["admin", "admin"],
 ];
 
@@ -39,7 +52,10 @@ export function PoliciesPage() {
 
   return (
     <>
-      <PageHeader title="Policies" description="Every client key belongs to a policy: which providers and models it may use, and under what names.">
+      <PageHeader
+        title="Policies"
+        description="Every client key belongs to a policy: which providers and models it may use, under what names, and which MCP tools."
+      >
         <Button asChild>
           <Link to={`/policies/${NEW}`}>
             <Plus /> New policy
@@ -62,6 +78,7 @@ export function PoliciesPage() {
               <span className="text-foreground font-mono font-medium">{p.name}</span>
               <span className="text-muted-foreground text-xs">
                 {p.providers.includes("*") ? "all providers" : `${p.providers.length} provider${p.providers.length === 1 ? "" : "s"}`} ·{" "}
+                {p.mcp_servers?.length ? `${p.mcp_servers.includes("*") ? "all" : p.mcp_servers.length} MCP · ` : ""}
                 {keyCount(p.name)} key{keyCount(p.name) === 1 ? "" : "s"}
               </span>
             </Link>
@@ -88,6 +105,9 @@ interface Draft {
   precedence: string[];
   winners: Record<string, string>;
   aliases: { name: string; targets: string }[];
+  mcpServers: string[];
+  allowTools: string;
+  denyTools: string;
 }
 
 function toDraft(p: Policy | null): Draft {
@@ -101,6 +121,9 @@ function toDraft(p: Policy | null): Draft {
     precedence: p?.precedence ?? [],
     winners: p?.winners ?? {},
     aliases: Object.entries(p?.aliases ?? {}).map(([name, t]) => ({ name, targets: (Array.isArray(t) ? t : [t]).join(", ") })),
+    mcpServers: p?.mcp_servers ?? [],
+    allowTools: (p?.allow_tools ?? []).join("\n"),
+    denyTools: (p?.deny_tools ?? []).join("\n"),
   };
 }
 
@@ -128,6 +151,9 @@ function toPolicy(d: Draft): Policy {
     precedence: d.precedence,
     winners: d.winners,
     aliases,
+    mcp_servers: d.mcpServers,
+    allow_tools: lines(d.allowTools),
+    deny_tools: lines(d.denyTools),
   };
 }
 
@@ -164,7 +190,7 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
   const preview = useQuery({
     queryKey: ["policy-view", debounced],
     queryFn: () => post<PolicyView>("/admin/policy-preview", debounced),
-    enabled: debounced.providers.length > 0,
+    enabled: debounced.providers.length > 0 || (debounced.mcp_servers ?? []).length > 0,
     placeholderData: (prev) => prev,
     retry: false,
   });
@@ -307,6 +333,8 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
         </CardContent>
       </Card>
 
+      <McpAccess draft={draft} set={set} tools={preview.data?.tools ?? []} />
+
       <Card>
         <CardHeader>
           <CardTitle className="text-base">Aliases</CardTitle>
@@ -385,7 +413,7 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
             ))}
           </TableBody>
         </Table>
-        {draft.providers.length === 0 && <Empty>Pick at least one provider.</Empty>}
+        {draft.providers.length === 0 && <Empty>No providers: keys under this policy see no models.</Empty>}
         {preview.data?.models.length === 0 && draft.providers.length > 0 && <Empty>No models match this policy.</Empty>}
       </Card>
 
@@ -416,6 +444,92 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
         </span>
       </div>
     </form>
+  );
+}
+
+function McpAccess({
+  draft,
+  set,
+  tools,
+}: {
+  draft: Draft;
+  set: <K extends keyof Draft>(k: K, v: Draft[K]) => void;
+  tools: string[];
+}) {
+  const servers = useQuery({ queryKey: ["mcp-servers"], queryFn: () => get<McpServer[]>("/admin/mcp/servers") });
+  const names = (servers.data ?? []).map((s) => s.name);
+  const all = draft.mcpServers.includes("*");
+  if (names.length === 0 && draft.mcpServers.length === 0) return null;
+  const toggle = (name: string, on: boolean) => set("mcpServers", on ? [...draft.mcpServers, name] : draft.mcpServers.filter((x) => x !== name));
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">MCP servers</CardTitle>
+        <CardDescription>
+          The upstream servers and tools keys may use through <Mono>/mcp</Mono>. Needs the <Mono>mcp</Mono> scope.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-5">
+        <div className="flex flex-wrap gap-x-6 gap-y-3">
+          {names.map((n) => (
+            <label key={n} className="flex items-center gap-2 text-sm">
+              <Checkbox checked={all || draft.mcpServers.includes(n)} disabled={all} onCheckedChange={(c) => toggle(n, c === true)} />
+              <span className="font-mono">{n}</span>
+            </label>
+          ))}
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox checked={all} onCheckedChange={(c) => set("mcpServers", c === true ? ["*"] : [])} />
+            all (<span className="font-mono">*</span>)
+          </label>
+        </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="p-allow-tools">
+              <span>
+                Allow tools (globs on <Mono>tool</Mono> or <Mono>server/tool</Mono>; empty allows all)
+              </span>
+            </Label>
+            <Textarea
+              id="p-allow-tools"
+              className="font-mono"
+              rows={3}
+              value={draft.allowTools}
+              onChange={(e) => set("allowTools", e.target.value)}
+            />
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="p-deny-tools">Deny tools (deny wins)</Label>
+            <Textarea
+              id="p-deny-tools"
+              className="font-mono"
+              rows={3}
+              placeholder="delete_*"
+              value={draft.denyTools}
+              onChange={(e) => set("denyTools", e.target.value)}
+            />
+          </div>
+        </div>
+        {draft.mcpServers.length > 0 && (
+          <div className="flex flex-col gap-2">
+            <h3 className="text-sm font-semibold">Tools keys under this policy can call ({tools.length})</h3>
+            {tools.length > 0 ? (
+              <ul className="flex flex-wrap gap-1.5">
+                {tools.map((t) => (
+                  <li key={t}>
+                    <Badge variant="outline" className="font-mono">
+                      {t}
+                    </Badge>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-muted-foreground text-sm">None, or the servers' tool lists haven't been read yet.</p>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

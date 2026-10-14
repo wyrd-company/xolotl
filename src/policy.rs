@@ -26,6 +26,7 @@ pub struct Policy {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
     /// Provider names (`claude`, `codex`, `grok`, `opencode-go`, gateway provider names); `*` allows all.
+    #[serde(default)]
     pub providers: Vec<String>,
     /// Globs matched against `model` or `provider/model`. Empty allows all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -45,6 +46,16 @@ pub struct Policy {
     /// What keys under this policy may do. Defaults to `proxy`.
     #[serde(default = "default_scopes")]
     pub scopes: Vec<Scope>,
+    /// MCP servers (names from `[mcp.servers]`) keys may use through `/mcp`; `*` allows all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
+    /// Globs matched against `tool` or `server/tool`. Empty allows every tool
+    /// of the allowed servers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_tools: Vec<String>,
+    /// Globs that remove tools; deny wins over allow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_tools: Vec<String>,
 }
 
 fn default_scopes() -> Vec<Scope> {
@@ -113,7 +124,13 @@ fn valid_name(name: &str) -> bool {
 impl Policy {
     /// The implicit policy of the bootstrap admin token: everything allowed.
     pub fn unrestricted() -> Self {
-        Policy { name: "_admin".into(), providers: vec!["*".into()], scopes: vec![Scope::Admin], ..Default::default() }
+        Policy {
+            name: "_admin".into(),
+            providers: vec!["*".into()],
+            scopes: vec![Scope::Admin],
+            mcp_servers: vec!["*".into()],
+            ..Default::default()
+        }
     }
 
     pub fn normalize(&mut self) {
@@ -128,7 +145,8 @@ impl Policy {
         };
         lower(&mut self.providers);
         lower(&mut self.precedence);
-        for v in [&mut self.allow_models, &mut self.deny_models] {
+        lower(&mut self.mcp_servers);
+        for v in [&mut self.allow_models, &mut self.deny_models, &mut self.allow_tools, &mut self.deny_tools] {
             v.retain_mut(|s| {
                 *s = s.trim().to_string();
                 !s.is_empty()
@@ -139,10 +157,18 @@ impl Policy {
         }
     }
 
-    /// `known` lists every provider name the server knows.
-    pub fn validate(&self, known: &BTreeSet<String>) -> Result<()> {
+    /// `known` lists every provider name the server knows, `mcp` every
+    /// configured MCP server.
+    pub fn validate(&self, known: &BTreeSet<String>, mcp: &BTreeSet<String>) -> Result<()> {
         anyhow::ensure!(valid_name(&self.name), "policy name must be lowercase letters, digits, '-' or '_' (max 63)");
-        anyhow::ensure!(!self.providers.is_empty(), "policy must allow at least one provider (use * for all)");
+        anyhow::ensure!(
+            !self.providers.is_empty() || !self.mcp_servers.is_empty(),
+            "policy must allow at least one provider or MCP server (use * for all)"
+        );
+        for s in &self.mcp_servers {
+            anyhow::ensure!(s == "*" || mcp.contains(s), "unknown MCP server {s:?}");
+        }
+        anyhow::ensure!(self.mcp_servers.is_empty() || self.has_scope(Scope::Mcp), "mcp_servers needs the mcp scope");
         for p in self.providers.iter().chain(&self.precedence).chain(self.winners.values()) {
             anyhow::ensure!(p == "*" || known.contains(p), "unknown provider {p:?}");
         }
@@ -183,6 +209,22 @@ impl Policy {
             return false;
         }
         self.allow_models.is_empty() || hit(&self.allow_models)
+    }
+
+    pub fn allows_mcp_server(&self, server: &str) -> bool {
+        self.mcp_servers.iter().any(|s| s == "*" || s == server)
+    }
+
+    pub fn allows_tool(&self, server: &str, tool: &str) -> bool {
+        if !self.allows_mcp_server(server) {
+            return false;
+        }
+        let qualified = format!("{server}/{tool}");
+        let hit = |patterns: &[String]| patterns.iter().any(|p| glob_match(p, tool) || glob_match(p, &qualified));
+        if hit(&self.deny_tools) {
+            return false;
+        }
+        self.allow_tools.is_empty() || hit(&self.allow_tools)
     }
 
     fn rank(&self, provider: &str) -> (usize, usize, String) {
@@ -339,18 +381,40 @@ mod tests {
         let k = known();
         let mut p = policy();
         p.normalize();
-        p.validate(&k).unwrap();
+        p.validate(&k, &BTreeSet::new()).unwrap();
         p.name = "Bad Name".into();
-        assert!(p.validate(&k).is_err());
+        assert!(p.validate(&k, &BTreeSet::new()).is_err());
         let mut p = policy();
         p.providers = vec!["claude".into()];
         p.aliases.insert("x".into(), AliasTargets::One("codex/gpt".into()));
-        assert!(p.validate(&k).is_err(), "alias to disallowed provider");
+        assert!(p.validate(&k, &BTreeSet::new()).is_err(), "alias to disallowed provider");
         let mut p = policy();
         p.precedence = vec!["nope".into()];
-        assert!(p.validate(&k).is_err());
+        assert!(p.validate(&k, &BTreeSet::new()).is_err());
         let parsed: Policy = serde_json::from_str(r#"{"name":"a","providers":["*"]}"#).unwrap();
         assert_eq!(parsed.scopes, vec![Scope::Proxy]);
+    }
+
+    #[test]
+    fn mcp_servers_and_tools() {
+        let mcp: BTreeSet<String> = ["github-work", "linear"].iter().map(|s| s.to_string()).collect();
+        let mut p: Policy = serde_json::from_str(r#"{"name":"agents","scopes":["mcp"],"mcp_servers":["github-work"]}"#).unwrap();
+        p.normalize();
+        p.validate(&known(), &mcp).unwrap();
+        p.deny_tools = vec!["delete_*".into()];
+        p.allow_tools = vec!["github-work/*".into()];
+        assert!(p.allows_tool("github-work", "create_issue"));
+        assert!(!p.allows_tool("github-work", "delete_repo"), "deny wins");
+        assert!(!p.allows_tool("linear", "list_issues"), "server not allowed");
+        assert!(!p.allows_model("claude", "claude-opus-5"), "no providers");
+
+        p.mcp_servers = vec!["nope".into()];
+        assert!(p.validate(&known(), &mcp).is_err(), "unknown server");
+        p.mcp_servers = vec!["linear".into()];
+        p.scopes = vec![Scope::Proxy];
+        assert!(p.validate(&known(), &mcp).unwrap_err().to_string().contains("mcp scope"));
+        p.mcp_servers.clear();
+        assert!(p.validate(&known(), &mcp).is_err(), "nothing allowed");
     }
 }
 
@@ -364,7 +428,7 @@ mod example_tests {
         let mut p: Policy = toml::from_str(raw).unwrap();
         p.normalize();
         let known: BTreeSet<String> = ["claude", "codex", "grok", "opencode-go", "vercel"].iter().map(|s| s.to_string()).collect();
-        p.validate(&known).unwrap();
+        p.validate(&known, &BTreeSet::new()).unwrap();
         assert_eq!(p.aliases["fast"].list().len(), 2);
     }
 }

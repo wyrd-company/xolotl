@@ -141,7 +141,7 @@ export type FlowStatus =
   | { status: "complete"; account_id: string; email: string | null }
   | { status: "failed"; error: string };
 
-export type Scope = "proxy" | "management" | "admin";
+export type Scope = "proxy" | "management" | "mcp" | "admin";
 
 export interface Policy {
   name: string;
@@ -153,12 +153,18 @@ export interface Policy {
   winners?: Record<string, string>;
   aliases?: Record<string, string | string[]>;
   scopes: Scope[];
+  mcp_servers?: string[];
+  allow_tools?: string[];
+  deny_tools?: string[];
 }
 
 export interface PolicyView {
   policy: string;
   models: { name: string; targets: string[]; endpoints: string[]; translated_endpoints: string[]; alias: boolean }[];
   shared: { model: string; providers: string[]; winner: string }[];
+  mcp_servers: string[];
+  /** `server/tool` names the policy allows. */
+  tools: string[];
 }
 
 export interface KeyInfo {
@@ -200,4 +206,87 @@ export interface UsageRow {
   input_tokens: number;
   output_tokens: number;
   cached_tokens: number;
+}
+
+export interface McpServer {
+  name: string;
+  url: string;
+  description: string;
+  /** The global name in code mode. */
+  namespace: string;
+  secret: string;
+  /** Header placeholder fields and whether each is set. */
+  secret_fields: Record<string, boolean>;
+  connected: boolean;
+  server_info: string | null;
+  protocol_version: string | null;
+  tools: number;
+  tools_refreshed_at: number | null;
+  last_error: string | null;
+  auth: "headers" | "oauth";
+  oauth?: McpOAuthStatus;
+  /** `config`: from the config file, read-only here. `vault`: added at runtime. */
+  source: "config" | "vault";
+  definition?: McpServerDefinition;
+}
+
+/** The fields of a `[mcp.servers.<name>]` entry. */
+export interface McpServerDefinition {
+  url: string;
+  description?: string;
+  headers?: Record<string, string>;
+  timeout_secs?: number | null;
+  auth?: "headers" | "oauth";
+  oauth?: { client_id?: string | null; scopes?: string[] };
+}
+
+export interface McpOAuthStatus {
+  signed_in: boolean;
+  signed_in_at: number | null;
+  expires_at: number | null;
+  refreshable: boolean;
+  scopes: string[];
+  registration: "pre-registered" | "client-metadata-document" | "dynamic" | null;
+  issuer: string | null;
+  needs_login: string | null;
+  unsaved: boolean;
+}
+
+export interface McpLoginStart {
+  flow_id: string;
+  server: string;
+  url: string;
+  redirect_uri: string;
+  callback: boolean;
+  registration: NonNullable<McpOAuthStatus["registration"]>;
+}
+
+export type McpLoginStatus = { server: string } & ({ status: "pending" } | { status: "complete" } | { status: "failed"; error: string });
+
+export interface McpTool {
+  name: string;
+  title?: string;
+  description?: string;
+  inputSchema: Record<string, unknown>;
+  annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean; title?: string };
+}
+
+export type McpGroupBy = "server" | "tool" | "client";
+
+export interface McpUsageRow {
+  key: string | null;
+  calls: number;
+  errors: number;
+  avg_latency_ms: number;
+}
+
+export interface McpCall {
+  ts: number;
+  client_id: string | null;
+  server: string;
+  tool: string;
+  status: "ok" | "tool_error" | "error" | "cancelled";
+  error: string | null;
+  latency_ms: number;
+  trace_id: string | null;
 }

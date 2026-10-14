@@ -96,6 +96,13 @@ pub enum Command {
         #[command(subcommand)]
         cmd: ProvidersCmd,
     },
+    /// Inspect the MCP gateway's upstream servers and set their credentials.
+    Mcp {
+        #[command(flatten)]
+        remote: Remote,
+        #[command(subcommand)]
+        cmd: McpCmd,
+    },
     /// Show request/token usage from the request log.
     Usage {
         #[command(flatten)]
@@ -232,6 +239,42 @@ pub enum ProvidersCmd {
     SetKey { name: String },
 }
 
+#[derive(Subcommand)]
+pub enum McpCmd {
+    /// List upstream MCP servers: connection, tool count, secret fields.
+    Servers,
+    /// Add or change a server stored in the vault, from a TOML or JSON file
+    /// with `name` and the fields of a `[mcp.servers.<name>]` entry.
+    Put { file: PathBuf },
+    /// Remove a server stored in the vault, with its secrets and login.
+    /// Refused while a policy lists it.
+    Remove { server: String },
+    /// List one server's tools (unfiltered by any policy).
+    Tools { server: String },
+    /// Re-read tool lists from every server, or from one.
+    Refresh { server: Option<String> },
+    /// Store a field of a server's vault secret (`mcp/<server>`), used by its
+    /// `{field}` header placeholders. Reads the value from stdin.
+    SetSecret { server: String, field: String },
+    /// Remove a field of a server's vault secret.
+    UnsetSecret { server: String, field: String },
+    /// Sign in to a server that uses OAuth (`auth = "oauth"`): open the URL
+    /// printed, approve, then paste the URL the browser ends on (unless
+    /// `server.public_url` lets xolotl finish the login itself).
+    Login { server: String },
+    /// Forget a server's OAuth tokens.
+    Logout { server: String },
+    /// Show MCP tool calls from the call log.
+    Usage {
+        /// client, server or tool.
+        #[arg(long, default_value = "server")]
+        group_by: String,
+        /// Look-back window, e.g. 1h, 24h, 7d.
+        #[arg(long, default_value = "24h")]
+        since: String,
+    },
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Serve { config } => serve(config).await,
@@ -268,6 +311,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Mcp { remote, cmd } => mcp(Client::new(&remote)?, cmd).await,
         Command::Usage { remote, group_by, since } => {
             let c = Client::new(&remote)?;
             let secs = parse_duration(&since)?;
@@ -327,10 +371,14 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
     let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()));
     let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
 
+    let mcp = Arc::new(crate::mcp::McpHub::new(&cfg, secrets.clone(), db.clone()));
+    let n = mcp.reload().await.context("loading MCP servers from the vault")?;
+    tracing::info!(config = cfg.mcp.servers.len(), vault = n, "loaded MCP servers");
     let state =
-        AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: Some(vault), sessions: Default::default() };
+        AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: Some(vault), sessions: Default::default(), mcp };
     server::spawn_background(state.clone());
     let subs = state.subs.clone();
+    let mcp = state.mcp.clone();
     let result = server::serve(state).await;
     // Last chance to save refreshed credentials whose vault write failed.
     if subs.unsaved_count() > 0 {
@@ -341,6 +389,13 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
                 "shutting down with refreshed credentials not saved to the vault; those accounts will need to log in again"
             );
         }
+    }
+    let left = mcp.flush_on_shutdown().await;
+    if left > 0 {
+        tracing::error!(
+            servers = left,
+            "shutting down with refreshed MCP OAuth credentials not saved to the vault; those servers will need to sign in again"
+        );
     }
     guard.shutdown();
     result
@@ -442,6 +497,139 @@ async fn policies(c: Client, cmd: PoliciesCmd) -> Result<()> {
                     m["name"].as_str().unwrap_or("").to_string()
                 };
                 println!("{:<44} {:<56} {:<36} {}", name, list("targets"), list("endpoints"), list("translated_endpoints"));
+            }
+            let tools: Vec<&str> = v["tools"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            if v["mcp_servers"].as_array().is_some_and(|a| !a.is_empty()) {
+                println!("\nMCP TOOLS ({})", tools.len());
+                for t in tools {
+                    println!("  {t}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn mcp(c: Client, cmd: McpCmd) -> Result<()> {
+    match cmd {
+        McpCmd::Servers => {
+            let v = c.get("/admin/mcp/servers").await?;
+            if c.json {
+                return c.print(v);
+            }
+            println!("{:<20} {:<20} {:<7} {:<10} {:>6} {:<24} URL", "NAME", "NAMESPACE", "SOURCE", "STATE", "TOOLS", "SECRET FIELDS");
+            for s in v.as_array().into_iter().flatten() {
+                let fields: Vec<String> = s["secret_fields"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(k, set)| if set.as_bool() == Some(true) { k.clone() } else { format!("{k} (unset)") })
+                    .collect();
+                let state = match (s["connected"].as_bool(), s["last_error"].is_string(), s["oauth"]["needs_login"].as_str()) {
+                    (_, _, Some(_)) => "SIGN-IN",
+                    (_, true, _) => "ERROR",
+                    (Some(true), _, _) => "connected",
+                    _ => "idle",
+                };
+                println!(
+                    "{:<20} {:<20} {:<7} {:<10} {:>6} {:<24} {}",
+                    s["name"].as_str().unwrap_or(""),
+                    s["namespace"].as_str().unwrap_or(""),
+                    s["source"].as_str().unwrap_or(""),
+                    state,
+                    s["tools"].as_u64().unwrap_or(0),
+                    if fields.is_empty() { "-".to_string() } else { fields.join(",") },
+                    s["url"].as_str().unwrap_or("")
+                );
+                if let Some(reason) = s["oauth"]["needs_login"].as_str() {
+                    println!("    OAuth: {reason}; run `xolotl mcp login {}`", s["name"].as_str().unwrap_or(""));
+                } else if let Some(e) = s["last_error"].as_str() {
+                    println!("    {e}");
+                }
+            }
+            Ok(())
+        }
+        McpCmd::Put { file } => {
+            let raw = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+            let def: Value = if file.extension().is_some_and(|e| e == "toml") {
+                serde_json::to_value(toml::from_str::<toml::Value>(&raw)?)?
+            } else {
+                serde_json::from_str(&raw)?
+            };
+            let name = def["name"].as_str().context("the server needs a name")?.to_string();
+            let servers = c.get("/admin/mcp/servers").await?;
+            let existing = servers.as_array().into_iter().flatten().find(|s| s["name"] == name.as_str());
+            match existing.map(|s| s["source"].as_str().unwrap_or("")) {
+                Some("config") => anyhow::bail!("{name} is defined in the config file; change it there"),
+                Some(_) => c.print(c.put(&format!("/admin/mcp/servers/{name}"), def).await?),
+                None => c.print(c.post("/admin/mcp/servers", def).await?),
+            }
+        }
+        McpCmd::Remove { server } => c.print(c.delete(&format!("/admin/mcp/servers/{server}")).await?),
+        McpCmd::Tools { server } => {
+            let v = c.get(&format!("/admin/mcp/servers/{server}/tools")).await?;
+            if c.json {
+                return c.print(v);
+            }
+            for t in v.as_array().into_iter().flatten() {
+                let desc = t["description"].as_str().unwrap_or("").lines().next().unwrap_or("");
+                println!("{:<40} {desc}", t["name"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        McpCmd::Refresh { server: Some(server) } => c.print(c.post(&format!("/admin/mcp/servers/{server}/refresh"), json!({})).await?),
+        McpCmd::Refresh { server: None } => c.print(c.post("/admin/mcp/refresh", json!({})).await?),
+        McpCmd::SetSecret { server, field } => {
+            let value = read_secret(&format!("{field} for {server}: "))?;
+            c.print(c.put(&format!("/admin/mcp/servers/{server}/secret"), json!({"fields": {field: value}})).await?)
+        }
+        McpCmd::UnsetSecret { server, field } => {
+            c.print(c.put(&format!("/admin/mcp/servers/{server}/secret"), json!({"fields": {field: null}})).await?)
+        }
+        McpCmd::Login { server } => {
+            let start = c.post(&format!("/admin/mcp/servers/{server}/oauth/start"), json!({})).await?;
+            let flow_id = start["flow_id"].as_str().context("server returned no flow id")?.to_string();
+            eprintln!("\nOpen this URL in a browser and approve access for xolotl:\n\n  {}\n", start["url"].as_str().unwrap_or(""));
+            let done = if start["callback"].as_bool().unwrap_or(false) {
+                eprintln!("Waiting for the browser to return to xolotl...");
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let s = c.get(&format!("/admin/mcp/oauth/flows/{flow_id}")).await?;
+                    match s["status"].as_str() {
+                        Some("pending") => continue,
+                        Some("complete") => break s,
+                        _ => anyhow::bail!("login failed: {}", s["error"].as_str().unwrap_or("unknown error")),
+                    }
+                }
+            } else {
+                eprintln!("The browser then goes to {} and shows an error page;", start["redirect_uri"].as_str().unwrap_or("a local URL"));
+                eprint!("paste that page's full URL here: ");
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                c.post(&format!("/admin/mcp/oauth/flows/{flow_id}/complete"), json!({"redirect_url": line.trim()})).await?
+            };
+            if c.json {
+                return c.print(done);
+            }
+            println!("Signed in to {server}");
+            Ok(())
+        }
+        McpCmd::Logout { server } => c.print(c.delete(&format!("/admin/mcp/servers/{server}/oauth")).await?),
+        McpCmd::Usage { group_by, since } => {
+            let secs = parse_duration(&since)?;
+            let v = c.get(&format!("/admin/mcp/usage?group_by={group_by}&since_secs={secs}")).await?;
+            if c.json {
+                return c.print(v);
+            }
+            println!("{:<50} {:>8} {:>7} {:>10}", group_by.to_uppercase(), "CALLS", "ERRORS", "AVG MS");
+            for r in v.as_array().into_iter().flatten() {
+                println!(
+                    "{:<50} {:>8} {:>7} {:>10.0}",
+                    r["key"].as_str().unwrap_or("-"),
+                    r["calls"].as_i64().unwrap_or(0),
+                    r["errors"].as_i64().unwrap_or(0),
+                    r["avg_latency_ms"].as_f64().unwrap_or(0.0)
+                );
             }
             Ok(())
         }

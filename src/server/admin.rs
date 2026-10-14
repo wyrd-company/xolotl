@@ -44,6 +44,22 @@ pub fn router() -> Router<AppState> {
         .route("/providers", get(list_providers))
         .route("/providers/{name}/key", post(set_provider_key))
         .route("/usage", get(usage))
+        .route("/mcp/servers", get(mcp_servers).post(mcp_create_server))
+        .route("/mcp/servers/{name}", axum::routing::put(mcp_update_server).delete(mcp_delete_server))
+        .route("/mcp/servers/{name}/tools", get(mcp_tools))
+        .route("/mcp/servers/{name}/refresh", post(mcp_refresh))
+        .route("/mcp/servers/{name}/secret", axum::routing::put(mcp_set_secret))
+        .route("/mcp/servers/{name}/oauth", delete(mcp_logout))
+        .route("/mcp/servers/{name}/oauth/start", post(mcp_login_start))
+        .route("/mcp/oauth/flows/{id}", get(mcp_login_status))
+        .route("/mcp/oauth/flows/{id}/complete", post(mcp_login_complete))
+        // Public: the authorization server redirects the browser here, and
+        // authorization servers fetch the client metadata document.
+        .route("/mcp/oauth/callback", get(mcp_login_callback))
+        .route("/mcp/oauth/client-metadata.json", get(mcp_client_metadata))
+        .route("/mcp/refresh", post(mcp_refresh_all))
+        .route("/mcp/usage", get(mcp_usage))
+        .route("/mcp/calls", get(mcp_calls))
         .route("/reload", post(reload))
         .route("/status", get(status))
 }
@@ -86,7 +102,7 @@ async fn put_policy(State(s): State<AppState>, h: HeaderMap, Path(name): Path<St
     if policy.name != name {
         return Err(json_error(StatusCode::BAD_REQUEST, "policy name must match the URL"));
     }
-    let saved = s.keys.put_policy(policy, &s.catalog.known_providers()).await.map_err(bad)?;
+    let saved = s.keys.put_policy(policy, &s.catalog.known_providers(), &s.mcp.server_names()).await.map_err(bad)?;
     tracing::info!(policy = %saved.name, "saved policy");
     ok(saved.as_ref().clone())
 }
@@ -112,7 +128,7 @@ async fn preview_policy(State(s): State<AppState>, h: HeaderMap, Json(mut policy
     if policy.name.is_empty() {
         policy.name = "preview".into();
     }
-    policy.validate(&s.catalog.known_providers()).map_err(bad)?;
+    policy.validate(&s.catalog.known_providers(), &s.mcp.server_names()).map_err(bad)?;
     ok(view_json(&s, &policy))
 }
 
@@ -134,7 +150,30 @@ fn view_json(s: &AppState, policy: &Policy) -> Value {
             })
         })
         .collect();
-    json!({"policy": policy.name, "models": models, "shared": policy.shared_names(&catalog)})
+    json!({
+        "policy": policy.name,
+        "models": models,
+        "shared": policy.shared_names(&catalog),
+        "mcp_servers": s.mcp.allowed_servers(policy).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        "tools": mcp_view_tools(s, policy),
+    })
+}
+
+/// The `server/tool` names a policy allows, from the cached tool lists.
+fn mcp_view_tools(s: &AppState, policy: &Policy) -> Vec<String> {
+    s.mcp
+        .allowed_servers(policy)
+        .iter()
+        .flat_map(|(server, _)| {
+            s.mcp
+                .server_tools(server)
+                .into_iter()
+                .flat_map(|tools| tools.iter().map(|t| t.name.to_string()).collect::<Vec<_>>())
+                .filter(|t| policy.allows_tool(server, t))
+                .map(|t| format!("{server}/{t}"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 // ---- catalog
@@ -399,6 +438,234 @@ async fn usage(State(s): State<AppState>, h: HeaderMap, Query(q): Query<UsageQue
     let mut rows = s.db.usage_summary(&q.group_by, now() - q.since_secs).await.map_err(bad)?;
     let _ = &mut rows;
     ok(rows)
+}
+
+// ---- MCP gateway
+
+async fn mcp_servers(State(s): State<AppState>, h: HeaderMap) -> Res {
+    admin(&s, &h).await?;
+    ok(s.mcp.servers().await.map_err(internal)?)
+}
+
+/// A server definition from the admin API: the config file's fields plus its
+/// name. Unknown fields are refused, as in the config file.
+fn server_req(mut body: Value) -> Result<(Option<String>, crate::config::McpServerConfig), Response> {
+    let name = match body.as_object_mut().and_then(|m| m.remove("name")) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(n)) => Some(n.trim().to_string()),
+        Some(_) => return Err(json_error(StatusCode::BAD_REQUEST, "name must be a string")),
+    };
+    let server = serde_json::from_value(body).map_err(|e| json_error(StatusCode::BAD_REQUEST, format!("invalid server: {e}")))?;
+    Ok((name, server))
+}
+
+fn server_change_error(e: crate::mcp::ServerChangeError) -> Response {
+    use crate::mcp::ServerChangeError as E;
+    match e {
+        E::NotFound(_) => json_error(StatusCode::NOT_FOUND, e.to_string()),
+        E::Conflict(_) => json_error(StatusCode::CONFLICT, e.to_string()),
+        E::Invalid(_) => json_error(StatusCode::BAD_REQUEST, e.to_string()),
+        E::Store(e) => internal(e),
+    }
+}
+
+async fn mcp_create_server(State(s): State<AppState>, h: HeaderMap, Json(body): Json<Value>) -> Res {
+    admin(&s, &h).await?;
+    let (name, server) = server_req(body)?;
+    let name = name.unwrap_or_default();
+    s.mcp.put_server(&name, server, true).await.map_err(server_change_error)?;
+    tracing::info!(server = %name, "added MCP server");
+    refresh_server_later(&s, &name);
+    ok(json!({"server": name, "created": true}))
+}
+
+async fn mcp_update_server(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>, Json(body): Json<Value>) -> Res {
+    admin(&s, &h).await?;
+    let (body_name, server) = server_req(body)?;
+    if body_name.is_some_and(|n| n != name) {
+        return Err(json_error(StatusCode::BAD_REQUEST, "server name must match the URL; servers can't be renamed"));
+    }
+    s.mcp.put_server(&name, server, false).await.map_err(server_change_error)?;
+    tracing::info!(server = %name, "changed MCP server");
+    refresh_server_later(&s, &name);
+    ok(json!({"server": name, "updated": true}))
+}
+
+async fn mcp_delete_server(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    s.mcp.delete_server(&name, &s.keys.policies()).await.map_err(server_change_error)?;
+    tracing::info!(server = %name, "removed MCP server");
+    ok(json!({"server": name, "deleted": true}))
+}
+
+/// Read a new or changed server's tools in the background, so saving doesn't
+/// wait on the server (or on a login it still needs).
+fn refresh_server_later(s: &AppState, name: &str) {
+    let (hub, name) = (s.mcp.clone(), name.to_string());
+    tokio::spawn(async move {
+        if let Err(e) = hub.refresh(&name).await {
+            tracing::info!(server = %name, error = %format!("{e:#}"), "listing a saved MCP server's tools failed");
+        }
+    });
+}
+
+async fn mcp_tools(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    ok(s.mcp.server_tools(&name).ok_or_else(|| json_error(StatusCode::NOT_FOUND, "no such MCP server"))?.as_ref().clone())
+}
+
+async fn mcp_refresh(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    if !s.mcp.has_server(&name) {
+        return Err(json_error(StatusCode::NOT_FOUND, "no such MCP server"));
+    }
+    let tools = s.mcp.refresh(&name).await.map_err(|e| json_error(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    ok(json!({"server": name, "tools": tools}))
+}
+
+async fn mcp_refresh_all(State(s): State<AppState>, h: HeaderMap) -> Res {
+    admin(&s, &h).await?;
+    s.mcp.refresh_all().await;
+    ok(s.mcp.servers().await.map_err(internal)?)
+}
+
+#[derive(Deserialize)]
+struct McpSecretReq {
+    /// Field -> value; `null` removes the field.
+    fields: serde_json::Map<String, Value>,
+}
+
+async fn mcp_set_secret(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>, Json(req): Json<McpSecretReq>) -> Res {
+    admin(&s, &h).await?;
+    if !s.mcp.has_server(&name) {
+        return Err(json_error(StatusCode::NOT_FOUND, "no such MCP server"));
+    }
+    let fields: Vec<String> = req.fields.keys().cloned().collect();
+    s.mcp.set_secret(&name, req.fields).await.map_err(bad)?;
+    tracing::info!(server = %name, ?fields, "updated MCP server secret");
+    ok(json!({"server": name, "updated": fields}))
+}
+
+async fn mcp_login_start(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    if !s.mcp.has_server(&name) {
+        return Err(json_error(StatusCode::NOT_FOUND, "no such MCP server"));
+    }
+    ok(s.mcp.login_start(&name).await.map_err(|e| json_error(StatusCode::BAD_GATEWAY, format!("{e:#}")))?)
+}
+
+async fn mcp_login_status(State(s): State<AppState>, h: HeaderMap, Path(id): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    let (server, status) = s.mcp.flows.status(&id).ok_or_else(|| json_error(StatusCode::NOT_FOUND, "no such login, or it expired"))?;
+    let mut v = serde_json::to_value(status).map_err(|e| internal(e.into()))?;
+    v["server"] = json!(server);
+    ok(v)
+}
+
+#[derive(Deserialize)]
+struct McpLoginComplete {
+    /// The URL the browser ended on after consent.
+    redirect_url: String,
+}
+
+async fn mcp_login_complete(State(s): State<AppState>, h: HeaderMap, Path(id): Path<String>, Json(req): Json<McpLoginComplete>) -> Res {
+    admin(&s, &h).await?;
+    let server = s.mcp.login_complete(&id, &req.redirect_url).await.map_err(bad)?;
+    ok(json!({"server": server, "status": "complete"}))
+}
+
+#[derive(Deserialize)]
+struct CallbackQuery {
+    state: Option<String>,
+    code: Option<String>,
+}
+
+/// The browser lands here after consent when `server.public_url` is set. The
+/// unguessable `state` of a login an admin started is what authorizes it.
+async fn mcp_login_callback(State(s): State<AppState>, uri: axum::http::Uri, Query(q): Query<CallbackQuery>) -> Response {
+    let page = |status: StatusCode, title: &str, text: &str| {
+        let html = format!(
+            "<!doctype html><meta charset=utf-8><title>{title}</title>\
+             <body style=\"font-family:sans-serif;max-width:36rem;margin:4rem auto\"><h1>{title}</h1><p>{text}</p>"
+        );
+        (
+            status,
+            [(axum::http::header::CONTENT_SECURITY_POLICY, "default-src 'none'; style-src 'unsafe-inline'")],
+            axum::response::Html(html),
+        )
+            .into_response()
+    };
+    let Some(id) = q.state.as_deref().and_then(|st| s.mcp.flows.by_state(st)) else {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Unknown login",
+            "This sign-in link doesn't belong to a login in progress. Start again from xolotl.",
+        );
+    };
+    if q.code.is_none() {
+        return page(StatusCode::BAD_REQUEST, "Sign-in refused", "The authorization server did not grant access. Start again from xolotl.");
+    }
+    // The redirect URL as the authorization server built it, so `iss` and `state` are checked as sent.
+    let url = format!("http://callback{}", uri.path_and_query().map(|p| p.as_str()).unwrap_or(""));
+    match s.mcp.login_complete(&id, &url).await {
+        Ok(server) => page(StatusCode::OK, "Signed in", &format!("xolotl is signed in to {server}. You can close this tab.")),
+        Err(e) => page(StatusCode::BAD_REQUEST, "Sign-in failed", &html_escape(&format!("{e:#}"))),
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+async fn mcp_client_metadata(State(s): State<AppState>) -> Response {
+    match s.mcp.client_metadata() {
+        Some(doc) => Json(doc).into_response(),
+        None => {
+            json_error(StatusCode::NOT_FOUND, "no client metadata document: set server.public_url (https) or mcp.oauth.client_metadata_url")
+        }
+    }
+}
+
+async fn mcp_logout(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    if !s.mcp.has_server(&name) {
+        return Err(json_error(StatusCode::NOT_FOUND, "no such MCP server"));
+    }
+    s.mcp.logout(&name).await.map_err(bad)?;
+    tracing::info!(server = %name, "signed out of MCP server");
+    ok(json!({"server": name, "signed_out": true}))
+}
+
+#[derive(Deserialize)]
+struct McpUsageQuery {
+    #[serde(default = "default_mcp_group")]
+    group_by: String,
+    #[serde(default = "default_since")]
+    since_secs: i64,
+}
+
+fn default_mcp_group() -> String {
+    "server".into()
+}
+
+async fn mcp_usage(State(s): State<AppState>, h: HeaderMap, Query(q): Query<McpUsageQuery>) -> Res {
+    admin(&s, &h).await?;
+    ok(s.db.mcp_usage_summary(&q.group_by, now() - q.since_secs).await.map_err(bad)?)
+}
+
+#[derive(Deserialize)]
+struct McpCallsQuery {
+    #[serde(default = "default_calls_limit")]
+    limit: i64,
+}
+
+fn default_calls_limit() -> i64 {
+    50
+}
+
+async fn mcp_calls(State(s): State<AppState>, h: HeaderMap, Query(q): Query<McpCallsQuery>) -> Res {
+    admin(&s, &h).await?;
+    ok(s.db.recent_mcp_calls(q.limit.clamp(1, 500)).await.map_err(internal)?)
 }
 
 /// Health and settings for the web UI's overview.

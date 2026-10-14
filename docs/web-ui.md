@@ -11,6 +11,7 @@
 | Add account | Codex device or browser login, Claude paste login, OpenCode Go key, import of a CLI credential file | `/admin/auth/...`, `POST /admin/accounts/import` |
 | Policies | Providers, scopes, allow/deny, precedence, winners for shared names, aliases; a live preview of the names a key sees, with native and translated endpoints | `/admin/policies/...`, `POST /admin/policy-preview` |
 | Client keys | Issue, rotate with grace, enable/disable, revoke. Shows the vault path and the `bao` command and Vault policy the client needs, never the key | `/admin/keys/...` |
+| MCP servers | Upstream MCP servers from the config file and OpenBao: add, edit and remove the latter; header secrets; OAuth sign-in; tools; recent tool calls | `/admin/mcp/...` |
 | Providers & models | Gateway providers from the config file and their key state; set a key; the catalog with each model's endpoints | `GET /admin/providers`, `GET /admin/catalog/routes`, `POST /admin/catalog/refresh` |
 | Usage | Request log grouped by client, account, provider or model; link to `telemetry.dashboard_url` | `GET /admin/usage` |
 

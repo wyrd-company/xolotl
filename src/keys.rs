@@ -39,6 +39,8 @@ pub enum Scope {
     Proxy,
     /// CLIProxyAPI-compatible management API (T3Code hubs).
     Management,
+    /// The MCP gateway (`/mcp`), limited to the policy's MCP servers and tools.
+    Mcp,
     /// Full administration. Implies every other scope.
     Admin,
 }
@@ -270,9 +272,9 @@ impl KeyManager {
         self.state.read().policies.get(name).cloned()
     }
 
-    pub async fn put_policy(&self, mut policy: Policy, known: &BTreeSet<String>) -> Result<Arc<Policy>> {
+    pub async fn put_policy(&self, mut policy: Policy, known: &BTreeSet<String>, mcp: &BTreeSet<String>) -> Result<Arc<Policy>> {
         policy.normalize();
-        policy.validate(known)?;
+        policy.validate(known, mcp)?;
         let _writes = self.writes.lock().await;
         let data = match serde_json::to_value(&policy)? {
             Value::Object(m) => m,
@@ -486,7 +488,9 @@ mod tests {
     async fn manager() -> (KeyManager, Secrets) {
         let s: Secrets = Arc::new(MemoryStore::default());
         let km = KeyManager::new(s.clone());
-        km.put_policy(Policy { name: "dev".into(), providers: vec!["claude".into()], ..Default::default() }, &known()).await.unwrap();
+        km.put_policy(Policy { name: "dev".into(), providers: vec!["claude".into()], ..Default::default() }, &known(), &BTreeSet::new())
+            .await
+            .unwrap();
         (km, s)
     }
 
@@ -578,7 +582,9 @@ mod tests {
         let store = Arc::new(crate::secrets::testing::GatedStore::default());
         let s: Secrets = store.clone();
         let km = Arc::new(KeyManager::new(s.clone()));
-        km.put_policy(Policy { name: "dev".into(), providers: vec!["claude".into()], ..Default::default() }, &known()).await.unwrap();
+        km.put_policy(Policy { name: "dev".into(), providers: vec!["claude".into()], ..Default::default() }, &known(), &BTreeSet::new())
+            .await
+            .unwrap();
         km.issue(IssueRequest { policy: "dev".into(), name: "a".into(), ..Default::default() }).await.unwrap();
         let key = vault_key(&s, "dev/a").await;
 
@@ -606,7 +612,9 @@ mod tests {
         let store = Arc::new(crate::secrets::testing::GatedStore::default());
         let s: Secrets = store.clone();
         let km = Arc::new(KeyManager::new(s.clone()));
-        km.put_policy(Policy { name: "dev".into(), providers: vec!["claude".into()], ..Default::default() }, &known()).await.unwrap();
+        km.put_policy(Policy { name: "dev".into(), providers: vec!["claude".into()], ..Default::default() }, &known(), &BTreeSet::new())
+            .await
+            .unwrap();
 
         // A paused reload holds the lock; a policy delete queues, then an issue.
         store.arm("get", "admin");

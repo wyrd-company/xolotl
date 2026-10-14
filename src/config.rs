@@ -18,6 +18,7 @@ pub struct Config {
     pub subscription: SubscriptionConfig,
     pub gateway: GatewayConfig,
     pub catalog: CatalogConfig,
+    pub mcp: McpConfig,
     pub ui: UiConfig,
 }
 
@@ -40,6 +41,162 @@ pub struct OidcConfig {
     pub redirect_url: String,
     /// Only members of this group (the `groups` claim) are signed in.
     pub admin_group: String,
+}
+
+/// The MCP gateway: upstream MCP servers, exposed to clients through one
+/// code-mode MCP endpoint at `/mcp`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    /// Upstream servers keyed by name. Each entry is one instance: the same
+    /// server URL can be listed twice under different names to use two sets
+    /// of credentials. Secrets come from the vault at `mcp/<name>`.
+    pub servers: BTreeMap<String, McpServerConfig>,
+    /// Wall-clock limit for one `execute` call, tool calls included.
+    pub execute_timeout_secs: u64,
+    /// QuickJS heap limit for one `execute` call.
+    pub memory_limit_mb: usize,
+    /// Upstream tool calls allowed in one `execute` call.
+    pub max_tool_calls: usize,
+    /// Larger `execute` results and logs are truncated.
+    pub max_output_bytes: usize,
+    /// `execute` calls that may run at once; more wait.
+    pub max_concurrent_executions: usize,
+    /// How often upstream tool lists are re-read.
+    pub tools_refresh_secs: u64,
+    /// Browser origins allowed to call `/mcp`. Empty rejects every request
+    /// that carries an `Origin` header (MCP clients other than browsers send none).
+    pub allowed_origins: Vec<String>,
+    /// OAuth logins to upstream servers (`auth = "oauth"`).
+    pub oauth: McpOAuthConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpOAuthConfig {
+    /// Where the authorization server sends the browser after consent.
+    /// Default: xolotl's callback under `server.public_url` when that is set,
+    /// otherwise a loopback URL whose (unloadable) page URL is pasted back.
+    pub redirect_uri: Option<String>,
+    /// HTTPS URL of xolotl's OAuth Client ID Metadata Document, used as the
+    /// client id with authorization servers that support it. Defaults to the
+    /// document xolotl serves under `server.public_url` when that is HTTPS.
+    pub client_metadata_url: Option<String>,
+    /// Client name shown on consent screens.
+    pub client_name: String,
+}
+
+impl Default for McpOAuthConfig {
+    fn default() -> Self {
+        Self { redirect_uri: None, client_metadata_url: None, client_name: "xolotl".into() }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpAuth {
+    /// Static headers (with `{field}` placeholders from the vault).
+    #[default]
+    Headers,
+    /// An OAuth login (`xolotl mcp login <server>`); headers are sent as well.
+    Oauth,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerOAuthConfig {
+    /// A client registered with the authorization server beforehand. Its
+    /// secret, if any, goes in the vault secret `mcp/<name>` as `client_secret`.
+    /// Without one, xolotl uses a Client ID Metadata Document or Dynamic
+    /// Client Registration.
+    pub client_id: Option<String>,
+    /// Scopes to request. Default: what the server asks for.
+    pub scopes: Vec<String>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            servers: BTreeMap::new(),
+            execute_timeout_secs: 120,
+            memory_limit_mb: 64,
+            max_tool_calls: 100,
+            max_output_bytes: 100_000,
+            max_concurrent_executions: 8,
+            tools_refresh_secs: 300,
+            allowed_origins: Vec::new(),
+            oauth: McpOAuthConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Streamable HTTP endpoint of the upstream server.
+    pub url: String,
+    /// Shown to clients by `search` and in the admin UI.
+    pub description: String,
+    /// Headers sent upstream. `{field}` is replaced by that field of the
+    /// vault secret `mcp/<name>`, e.g. `Authorization = "Bearer {token}"`.
+    pub headers: BTreeMap<String, String>,
+    /// Limit for one upstream tool call. Default 60.
+    pub timeout_secs: Option<u64>,
+    pub auth: McpAuth,
+    pub oauth: McpServerOAuthConfig,
+}
+
+impl McpServerConfig {
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(60).max(1))
+    }
+
+    /// Checks shared by servers from the config file and from the admin API.
+    pub fn validate(&self, name: &str) -> Result<()> {
+        anyhow::ensure!(
+            valid_mcp_server_name(name),
+            "mcp server name {name:?} must start with a lowercase letter and use lowercase letters, digits, '-' or '_' (max 63)"
+        );
+        anyhow::ensure!(
+            !crate::mcp::codemode::reserved_identifier(&name.replace('-', "_")),
+            "mcp server name {name:?} is a JavaScript keyword or a global in code mode; choose another name"
+        );
+        let url = url::Url::parse(&self.url).with_context(|| format!("mcp server {name:?}: invalid url"))?;
+        anyhow::ensure!(matches!(url.scheme(), "http" | "https"), "mcp server {name:?}: url must be http or https");
+        for (header, value) in &self.headers {
+            anyhow::ensure!(
+                axum::http::HeaderName::from_bytes(header.as_bytes()).is_ok(),
+                "mcp server {name:?}: invalid header name {header:?}"
+            );
+            crate::mcp::template_fields(value).with_context(|| format!("mcp server {name:?}: header {header:?}"))?;
+        }
+        anyhow::ensure!(
+            self.oauth.client_id.is_none() && self.oauth.scopes.is_empty() || self.auth == McpAuth::Oauth,
+            "mcp server {name:?}: oauth settings need auth = \"oauth\""
+        );
+        Ok(())
+    }
+}
+
+/// Server names that become the same JavaScript identifier (`-` turns into `_`).
+pub fn colliding_mcp_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<(&'a str, &'a str)> {
+    let mut idents = BTreeMap::new();
+    for name in names {
+        if let Some(other) = idents.insert(name.replace('-', "_"), name) {
+            return Some((other, name));
+        }
+    }
+    None
+}
+
+/// MCP server names become JavaScript identifiers in code mode (`-` turns
+/// into `_`), so they are lowercase, start with a letter and stay short.
+pub fn valid_mcp_server_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 63
+        && b[0].is_ascii_lowercase()
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -78,11 +235,15 @@ pub struct ServerConfig {
     pub max_body_bytes: usize,
     /// Upstream request timeout in seconds (covers the whole streamed response).
     pub upstream_timeout_secs: u64,
+    /// The URL browsers reach xolotl at, e.g. `https://xolotl.example.lan`.
+    /// When set, OAuth logins to MCP servers redirect back to xolotl, which
+    /// finishes them without pasting a URL.
+    pub public_url: Option<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { listen: "0.0.0.0:8317".parse().unwrap(), max_body_bytes: 64 * 1024 * 1024, upstream_timeout_secs: 600 }
+        Self { listen: "0.0.0.0:8317".parse().unwrap(), max_body_bytes: 64 * 1024 * 1024, upstream_timeout_secs: 600, public_url: None }
     }
 }
 
@@ -346,7 +507,12 @@ impl Config {
         for v in [&mut c.vault.approle.role_id, &mut c.vault.approle.secret_id].into_iter().flatten() {
             *v = HIDDEN.into();
         }
-        let headers = c.telemetry.otlp_headers.values_mut().chain(c.gateway.providers.values_mut().flat_map(|p| p.headers.values_mut()));
+        let headers = c
+            .telemetry
+            .otlp_headers
+            .values_mut()
+            .chain(c.gateway.providers.values_mut().flat_map(|p| p.headers.values_mut()))
+            .chain(c.mcp.servers.values_mut().flat_map(|s| s.headers.values_mut()));
         for v in headers {
             *v = HIDDEN.into();
         }
@@ -395,7 +561,7 @@ impl Config {
                 "provider name {name:?} is reserved for subscription accounts"
             );
             anyhow::ensure!(
-                !["v0", "v1", "admin", "ui", "assets", "backend-api", "healthz", "readyz"].contains(&name.as_str()),
+                !["v0", "v1", "admin", "ui", "assets", "backend-api", "healthz", "readyz", "mcp"].contains(&name.as_str()),
                 "provider name {name:?} collides with a built-in route"
             );
             if p.kind == ProviderKind::OpenaiCompatible {
@@ -417,6 +583,24 @@ impl Config {
                 crate::server::session::CALLBACK_PATH
             );
             anyhow::ensure!(!o.client_id.is_empty() && !o.admin_group.is_empty(), "ui.oidc needs client_id and admin_group");
+        }
+        for (name, server) in &self.mcp.servers {
+            server.validate(name)?;
+        }
+        if let Some((a, b)) = colliding_mcp_names(self.mcp.servers.keys().map(String::as_str)) {
+            anyhow::bail!("mcp servers {a:?} and {b:?} have the same name in code ('-' becomes '_')");
+        }
+        anyhow::ensure!(self.mcp.max_concurrent_executions >= 1, "mcp.max_concurrent_executions must be >= 1");
+        if let Some(u) = &self.server.public_url {
+            let url = url::Url::parse(u).context("server.public_url: invalid url")?;
+            anyhow::ensure!(matches!(url.scheme(), "http" | "https"), "server.public_url must be http or https");
+        }
+        if let Some(u) = &self.mcp.oauth.redirect_uri {
+            url::Url::parse(u).context("mcp.oauth.redirect_uri: invalid url")?;
+        }
+        if let Some(u) = &self.mcp.oauth.client_metadata_url {
+            let url = url::Url::parse(u).context("mcp.oauth.client_metadata_url: invalid url")?;
+            anyhow::ensure!(url.scheme() == "https" && url.path() != "/", "mcp.oauth.client_metadata_url must be an https URL with a path");
         }
         anyhow::ensure!(self.subscription.max_attempts >= 1, "subscription.max_attempts must be >= 1");
         anyhow::ensure!(matches!(self.telemetry.log_format.as_str(), "pretty" | "json"), "telemetry.log_format must be pretty or json");

@@ -12,6 +12,7 @@ const NAV = [
   { to: "/policies", label: "Policies" },
   { to: "/keys", label: "Client keys" },
   { to: "/providers", label: "Providers & models" },
+  { to: "/mcp", label: "MCP servers" },
   { to: "/usage", label: "Usage" },
 ];
 

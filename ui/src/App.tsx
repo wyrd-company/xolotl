@@ -9,6 +9,7 @@ import { AccountsPage } from "@/pages/accounts";
 import { AddAccountPage } from "@/pages/add-account";
 import { KeysPage } from "@/pages/keys";
 import { LoginPage } from "@/pages/login";
+import { McpPage } from "@/pages/mcp";
 import { OverviewPage } from "@/pages/overview";
 import { PoliciesPage } from "@/pages/policies";
 import { ProvidersPage } from "@/pages/providers";
@@ -30,6 +31,7 @@ const router = createHashRouter([
       { path: "policies/:name", element: <PoliciesPage /> },
       { path: "keys", element: <KeysPage /> },
       { path: "providers", element: <ProvidersPage /> },
+      { path: "mcp", element: <McpPage /> },
       { path: "usage", element: <UsagePage /> },
       { path: "*", element: <Navigate to="/" replace /> },
     ],
