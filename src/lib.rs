@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod gateway;
 pub mod keys;
+pub mod mcp;
 pub mod policy;
 pub mod proxy;
 pub mod secrets;

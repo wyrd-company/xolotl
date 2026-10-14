@@ -26,6 +26,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::gateway::Gateway;
 use crate::keys::{KeyManager, Principal, Scope};
+use crate::mcp::McpHub;
 use crate::policy::{Target, View};
 use crate::proxy::{self, forward_request_headers};
 use crate::secrets::Secrets;
@@ -44,6 +45,7 @@ pub struct AppState {
     pub catalog: Arc<ModelCatalog>,
     pub vault: Option<VaultClient>,
     pub sessions: Arc<session::Sessions>,
+    pub mcp: Arc<McpHub>,
 }
 
 impl AppState {
@@ -55,6 +57,7 @@ impl AppState {
 
 pub fn router(state: AppState) -> Router {
     let max_body = state.cfg.server.max_body_bytes;
+    let mcp = Router::new().nest_service("/mcp", mcp_service(&state)).layer(axum::middleware::from_fn_with_state(state.clone(), mcp_auth));
     Router::new()
         .route("/", get(ui::index))
         .route("/assets/{*path}", get(ui::asset))
@@ -73,6 +76,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/admin", admin::router().merge(session::router()))
         .route("/opencode-go/{*rest}", any(opencode_go_passthrough))
         .route("/{provider}/{*rest}", any(passthrough))
+        .merge(mcp)
         .layer(DefaultBodyLimit::max(max_body))
         .layer(
             TraceLayer::new_for_http()
@@ -106,9 +110,66 @@ async fn shutdown_signal() {
     tracing::info!("shutting down");
 }
 
+/// The code-mode MCP server. 2026-07-28 clients are served statelessly; older
+/// clients get no session either (sessions are optional before 2026-07-28),
+/// so any instance can serve any request.
+fn mcp_service(
+    state: &AppState,
+) -> rmcp::transport::StreamableHttpService<
+    crate::mcp::server::CodeModeServer,
+    rmcp::transport::streamable_http_server::session::never::NeverSessionManager,
+> {
+    use rmcp::transport::StreamableHttpServerConfig;
+    let hub = state.mcp.clone();
+    let mut config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_max_request_body_bytes(state.cfg.server.max_body_bytes)
+        // Clients authenticate with a key, not ambient credentials, so DNS
+        // rebinding gains nothing; Origin checks still keep browsers out.
+        .disable_allowed_hosts();
+    config = if state.cfg.mcp.allowed_origins.is_empty() {
+        config.enforce_origin_validation()
+    } else {
+        config.with_allowed_origins(state.cfg.mcp.allowed_origins.clone())
+    };
+    rmcp::transport::StreamableHttpService::new(
+        move || Ok(crate::mcp::server::CodeModeServer::new(hub.clone())),
+        Default::default(),
+        config,
+    )
+}
+
+/// Authenticate `/mcp` requests with a client key that has the `mcp` scope;
+/// the principal travels to the MCP handler in the request's extensions.
+async fn mcp_auth(State(state): State<AppState>, mut req: Request, next: axum::middleware::Next) -> Response {
+    match authorize(&state, req.headers(), Scope::Mcp).await {
+        Ok(p) => {
+            req.extensions_mut().insert(p);
+            next.run(req).await
+        }
+        Err(mut resp) => {
+            if resp.status() == StatusCode::UNAUTHORIZED {
+                resp.headers_mut().insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Bearer"));
+            }
+            resp
+        }
+    }
+}
+
 /// Background maintenance: reload keys and accounts, refresh the model
-/// catalog, poll usage, prune logs.
+/// catalog and MCP tool lists, poll usage, prune logs.
 pub fn spawn_background(state: AppState) {
+    if !state.mcp.server_names().is_empty() {
+        let s = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(s.cfg.mcp.tools_refresh_secs.max(30)));
+            loop {
+                tick.tick().await;
+                s.mcp.refresh_all().await;
+            }
+        });
+    }
     let s = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
@@ -158,7 +219,7 @@ pub fn spawn_background(state: AppState) {
         loop {
             tick.tick().await;
             match state.db.prune(state.cfg.database.retention_days).await {
-                Ok(n) if n > 0 => tracing::info!(rows = n, "pruned request log"),
+                Ok(n) if n > 0 => tracing::info!(rows = n, "pruned request and MCP call logs"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "request log prune failed"),
             }

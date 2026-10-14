@@ -23,6 +23,10 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with(|_| {}).await
+}
+
+async fn harness_with(tweak: impl FnOnce(&mut Config)) -> Harness {
     let upstream = MockServer::start().await;
     let uri = upstream.uri();
     let secrets: Secrets = Arc::new(MemoryStore::default());
@@ -59,6 +63,7 @@ async fn harness() -> Harness {
         grok_api: format!("{uri}/grok/v1"),
         grok_auth: uri.clone(),
     };
+    tweak(&mut cfg);
     let db = Db::in_memory().await.unwrap();
     let http = crate::proxy::upstream_client(std::time::Duration::from_secs(30)).unwrap();
     let keys = Arc::new(KeyManager::new(secrets.clone()));
@@ -66,7 +71,8 @@ async fn harness() -> Harness {
     let subs = Arc::new(Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone()));
     let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()));
     let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
-    let state = AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: None, sessions: Default::default() };
+    let mcp = Arc::new(McpHub::new(&cfg.mcp, secrets.clone(), db.clone()));
+    let state = AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: None, sessions: Default::default(), mcp };
     Harness { state, admin: "boot".into(), upstream }
 }
 
@@ -103,7 +109,7 @@ impl Harness {
     /// Create the policy and issue a key under it; returns the key read from the vault.
     async fn key(&self, p: Policy) -> String {
         let name = p.name.clone();
-        self.state.keys.put_policy(p, &self.state.catalog.known_providers()).await.unwrap();
+        self.state.keys.put_policy(p, &self.state.catalog.known_providers(), &self.state.mcp.server_names()).await.unwrap();
         let info = self.state.keys.issue(IssueRequest { policy: name, name: "client".into(), ..Default::default() }).await.unwrap();
         let rec = self.state.secrets.get(&info.vault_path).await.unwrap().unwrap();
         rec["api_key"].as_str().unwrap().to_string()
@@ -832,4 +838,244 @@ async fn ui_admin_endpoints() {
     assert!(resp.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
     assert!(resp.headers()["content-security-policy"].to_str().unwrap().contains("frame-ancestors 'none'"));
     assert_eq!(h.call("GET", "/assets/../../Cargo.toml", None, None).await.0, 404);
+}
+
+// ------------------------------------------------------------------ MCP
+
+mod mcp_gateway {
+    use std::net::SocketAddr;
+
+    use rmcp::model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientConfig, ContentBlock, Implementation,
+        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
+    };
+    use rmcp::service::{RequestContext, RoleServer};
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+    use rmcp::transport::{StreamableHttpClientTransport, StreamableHttpServerConfig, StreamableHttpService};
+    use rmcp::{ClientLifecycleMode, ClientServiceExt, ErrorData, ServerHandler};
+
+    use super::*;
+    use crate::config::McpServerConfig;
+
+    /// An upstream MCP server with a few tools; `whoami` echoes the
+    /// Authorization header it received.
+    #[derive(Clone)]
+    struct Upstream;
+
+    fn schema(v: Value) -> Arc<serde_json::Map<String, Value>> {
+        Arc::new(v.as_object().unwrap().clone())
+    }
+
+    impl ServerHandler for Upstream {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(&self, _: Option<PaginatedRequestParams>, _: RequestContext<RoleServer>) -> Result<ListToolsResult, ErrorData> {
+            let num = json!({"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}, "required": ["a", "b"]});
+            Ok(ListToolsResult::with_all_items(vec![
+                Tool::new("add", "Add two numbers", schema(num.clone()))
+                    .with_raw_output_schema(schema(json!({"type": "object", "properties": {"sum": {"type": "number"}}}))),
+                Tool::new("whoami", "Who the server thinks you are", schema(json!({"type": "object"}))),
+                Tool::new("delete_everything", "Do not call", schema(json!({"type": "object"}))),
+                Tool::new("fail", "Always fails", schema(json!({"type": "object"}))),
+            ]))
+        }
+
+        async fn call_tool(&self, req: CallToolRequestParams, ctx: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
+            let args = req.arguments.unwrap_or_default();
+            let result = match req.name.as_ref() {
+                "add" => {
+                    let n = |k: &str| args.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+                    CallToolResult::structured(json!({"sum": n("a") + n("b")}))
+                }
+                "whoami" => {
+                    let parts = ctx.extensions.get::<axum::http::request::Parts>().unwrap();
+                    let auth = parts.headers.get("authorization").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+                    CallToolResult::success(vec![ContentBlock::text(auth)])
+                }
+                "fail" => CallToolResult::error(vec![ContentBlock::text("upstream said no")]),
+                _ => CallToolResult::success(vec![ContentBlock::text("deleted")]),
+            };
+            Ok(CallToolResponse::Complete(result))
+        }
+    }
+
+    async fn serve(router: axum::Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        addr
+    }
+
+    async fn upstream() -> SocketAddr {
+        let svc: StreamableHttpService<Upstream, rmcp::transport::streamable_http_server::session::local::LocalSessionManager> =
+            StreamableHttpService::new(|| Ok(Upstream), Default::default(), StreamableHttpServerConfig::default());
+        serve(axum::Router::new().nest_service("/mcp", svc)).await
+    }
+
+    struct Gateway {
+        h: Harness,
+        addr: SocketAddr,
+    }
+
+    async fn gateway() -> Gateway {
+        let up = upstream().await;
+        let h = harness_with(|cfg| {
+            for name in ["calc", "calc-two"] {
+                cfg.mcp.servers.insert(
+                    name.into(),
+                    McpServerConfig {
+                        url: format!("http://{up}/mcp"),
+                        description: format!("Calculator {name}"),
+                        headers: BTreeMap::from([("Authorization".into(), "Bearer {token}".into())]),
+                        ..Default::default()
+                    },
+                );
+            }
+        })
+        .await;
+        h.state.mcp.set_secret("calc", json!({"token": "one"}).as_object().unwrap().clone()).await.unwrap();
+        h.state.mcp.set_secret("calc-two", json!({"token": "two"}).as_object().unwrap().clone()).await.unwrap();
+        let addr = serve(router(h.state.clone())).await;
+        Gateway { h, addr }
+    }
+
+    type Client = rmcp::service::RunningService<rmcp::service::RoleClient, ClientConfig>;
+
+    async fn client(addr: SocketAddr, key: &str, lifecycle: ClientLifecycleMode) -> Client {
+        let cfg = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")).auth_header(key);
+        let transport = StreamableHttpClientTransport::from_config(cfg);
+        ClientConfig::new(ClientCapabilities::default(), Implementation::new("test", "1"))
+            .serve_with_lifecycle(transport, lifecycle)
+            .await
+            .unwrap()
+    }
+
+    fn modern() -> ClientLifecycleMode {
+        ClientLifecycleMode::Discover { preferred_versions: vec![ProtocolVersion::V_2026_07_28] }
+    }
+
+    async fn call(c: &Client, tool: &str, args: Value) -> (bool, String) {
+        let mut p = CallToolRequestParams::new(tool.to_string());
+        p.arguments = args.as_object().cloned();
+        let r = c.call_tool(p).await.unwrap();
+        let text = r.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n");
+        (r.is_error == Some(true), text)
+    }
+
+    fn mcp_policy(servers: &[&str], deny_tools: &[&str]) -> Policy {
+        Policy {
+            name: "agents".into(),
+            scopes: vec![Scope::Mcp],
+            mcp_servers: servers.iter().map(|s| s.to_string()).collect(),
+            deny_tools: deny_tools.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_and_execute_through_the_policy() {
+        let g = gateway().await;
+        let key = g.h.key(mcp_policy(&["calc", "calc-two"], &["delete_*"])).await;
+        let c = client(g.addr, &key, modern()).await;
+
+        let tools = c.list_all_tools().await.unwrap();
+        assert_eq!(tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(), vec!["search", "execute"]);
+        assert!(tools[1].description.as_deref().unwrap().contains("`calc_two`: Calculator calc-two"));
+
+        let (err, ts) = call(&c, "search", json!({"query": "add"})).await;
+        assert!(!err);
+        assert!(ts.contains("declare const calc: {") && ts.contains("declare const calc_two: {"), "{ts}");
+        assert!(ts.contains("add(args: {") && ts.contains("Promise<{\n    sum?: number;\n  }>"), "{ts}");
+        let (_, all) = call(&c, "search", json!({"query": ""})).await;
+        assert!(all.contains("whoami") && !all.contains("delete_everything"), "denied tools are hidden: {all}");
+
+        // Two instances of one server, each with its own credentials.
+        let code = "const s = await calc.add({a: 2, b: 3}); \
+                    return {sum: s.sum, one: await calc.whoami(), two: await calc_two.whoami()};";
+        let (err, out) = call(&c, "execute", json!({"code": code})).await;
+        assert!(!err, "{out}");
+        let out: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["result"], json!({"sum": 5, "one": "Bearer one", "two": "Bearer two"}));
+        assert_eq!(out["calls"].as_array().unwrap().len(), 3);
+
+        // Denied tools and tool errors throw inside the code.
+        let (_, out) = call(&c, "execute", json!({"code": "try { await calc.delete_everything() } catch (e) { return e.message }"})).await;
+        assert!(out.contains("not a tool available to this key"), "{out}");
+        let (err, out) = call(&c, "execute", json!({"code": "await calc.fail()"})).await;
+        assert!(err && out.contains("upstream said no"), "{out}");
+
+        // Upstream calls are logged; denied ones never left the gateway.
+        let (_, calls) = g.h.call("GET", "/admin/mcp/calls", Some(&g.h.admin), None).await;
+        let calls = calls.as_array().unwrap();
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert_eq!(calls[0]["tool"], "fail");
+        assert_eq!(calls[0]["status"], "tool_error");
+        let (_, usage) = g.h.call("GET", "/admin/mcp/usage?group_by=server", Some(&g.h.admin), None).await;
+        assert_eq!(usage[0]["key"], "calc");
+        assert_eq!(usage[0]["calls"], 3);
+        assert_eq!(usage[0]["errors"], 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_clients_auth_and_admin() {
+        let g = gateway().await;
+        let key = g.h.key(mcp_policy(&["calc"], &[])).await;
+
+        // A pre-2026-07-28 client (initialize handshake) works too.
+        let c = client(g.addr, &key, ClientLifecycleMode::Initialize).await;
+        let (err, out) = call(&c, "execute", json!({"code": "return (await calc.add({a: 1, b: 1})).sum"})).await;
+        assert!(!err, "{out}");
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["result"], json!(2));
+        let (_, out) = call(&c, "execute", json!({"code": "return typeof calc_two"})).await;
+        assert!(out.contains("\"undefined\""), "servers outside the policy don't exist: {out}");
+
+        // No key, a key without the mcp scope, and browser origins are refused.
+        let http = reqwest::Client::new();
+        let url = format!("http://{}/mcp", g.addr);
+        let r = http.post(&url).json(&json!({})).send().await.unwrap();
+        assert_eq!(r.status(), 401);
+        assert_eq!(r.headers()["www-authenticate"], "Bearer");
+        let proxy_key = g.h.key(Policy { name: "llm".into(), providers: vec!["*".into()], ..Default::default() }).await;
+        assert_eq!(http.post(&url).bearer_auth(&proxy_key).json(&json!({})).send().await.unwrap().status(), 403);
+        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "x", "version": "1"}}});
+        let r = http
+            .post(&url)
+            .bearer_auth(&key)
+            .header("origin", "https://evil.example")
+            .header("accept", "application/json, text/event-stream")
+            .json(&init)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+
+        // Admin: servers with secret state, tool lists, secrets, policy view.
+        let (_, servers) = g.h.call("GET", "/admin/mcp/servers", Some(&g.h.admin), None).await;
+        assert_eq!(servers[0]["name"], "calc");
+        assert_eq!(servers[0]["namespace"], "calc");
+        assert_eq!(servers[1]["namespace"], "calc_two");
+        assert_eq!(servers[0]["secret_fields"], json!({"token": true}));
+        assert_eq!(servers[0]["tools"], 4);
+        let (status, tools) = g.h.call("POST", "/admin/mcp/servers/calc-two/refresh", Some(&g.h.admin), None).await;
+        assert_eq!((status, tools["tools"].clone()), (200, json!(4)));
+        let (_, tools) = g.h.call("GET", "/admin/mcp/servers/calc/tools", Some(&g.h.admin), None).await;
+        assert_eq!(tools[0]["name"], "add");
+        let body = json!({"fields": {"token": null}});
+        assert_eq!(g.h.call("PUT", "/admin/mcp/servers/calc/secret", Some(&g.h.admin), Some(body)).await.0, 200);
+        let (_, servers) = g.h.call("GET", "/admin/mcp/servers", Some(&g.h.admin), None).await;
+        assert_eq!(servers[0]["secret_fields"], json!({"token": false}));
+        let (_, out) = call(&c, "execute", json!({"code": "await calc.whoami()"})).await;
+        assert!(out.contains("secret field \\\"token\\\" is not set"), "{out}");
+
+        let draft = json!({"name": "x", "scopes": ["mcp"], "mcp_servers": ["calc"], "deny_tools": ["fail", "delete_*"]});
+        let (status, view) = g.h.call("POST", "/admin/policy-preview", Some(&g.h.admin), Some(draft)).await;
+        assert_eq!(status, 200, "{view}");
+        assert_eq!(view["mcp_servers"], json!(["calc"]));
+        assert_eq!(view["tools"], json!(["calc/add", "calc/whoami"]));
+        let bad = json!({"name": "x", "scopes": ["mcp"], "mcp_servers": ["nope"]});
+        assert_eq!(g.h.call("POST", "/admin/policy-preview", Some(&g.h.admin), Some(bad)).await.0, 400);
+    }
 }

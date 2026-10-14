@@ -96,6 +96,13 @@ pub enum Command {
         #[command(subcommand)]
         cmd: ProvidersCmd,
     },
+    /// Inspect the MCP gateway's upstream servers and set their credentials.
+    Mcp {
+        #[command(flatten)]
+        remote: Remote,
+        #[command(subcommand)]
+        cmd: McpCmd,
+    },
     /// Show request/token usage from the request log.
     Usage {
         #[command(flatten)]
@@ -240,6 +247,30 @@ pub enum ProvidersCmd {
 }
 
 #[derive(Subcommand)]
+pub enum McpCmd {
+    /// List upstream MCP servers: connection, tool count, secret fields.
+    Servers,
+    /// List one server's tools (unfiltered by any policy).
+    Tools { server: String },
+    /// Re-read tool lists from every server, or from one.
+    Refresh { server: Option<String> },
+    /// Store a field of a server's vault secret (`mcp/<server>`), used by its
+    /// `{field}` header placeholders. Reads the value from stdin.
+    SetSecret { server: String, field: String },
+    /// Remove a field of a server's vault secret.
+    UnsetSecret { server: String, field: String },
+    /// Show MCP tool calls from the call log.
+    Usage {
+        /// client, server or tool.
+        #[arg(long, default_value = "server")]
+        group_by: String,
+        /// Look-back window, e.g. 1h, 24h, 7d.
+        #[arg(long, default_value = "24h")]
+        since: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum UiCmd {
     /// Set the web UI password. It is hashed (argon2id) here and only the hash
     /// is stored, in the vault `admin` secret. Signs out every UI session.
@@ -283,6 +314,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Mcp { remote, cmd } => mcp(Client::new(&remote)?, cmd).await,
         Command::Usage { remote, group_by, since } => {
             let c = Client::new(&remote)?;
             let secs = parse_duration(&since)?;
@@ -348,8 +380,9 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
     let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()));
     let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
 
+    let mcp = Arc::new(crate::mcp::McpHub::new(&cfg.mcp, secrets.clone(), db.clone()));
     let state =
-        AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: Some(vault), sessions: Default::default() };
+        AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: Some(vault), sessions: Default::default(), mcp };
     server::spawn_background(state.clone());
     let subs = state.subs.clone();
     let result = server::serve(state).await;
@@ -463,6 +496,89 @@ async fn policies(c: Client, cmd: PoliciesCmd) -> Result<()> {
                     m["name"].as_str().unwrap_or("").to_string()
                 };
                 println!("{:<44} {:<56} {:<36} {}", name, list("targets"), list("endpoints"), list("translated_endpoints"));
+            }
+            let tools: Vec<&str> = v["tools"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            if v["mcp_servers"].as_array().is_some_and(|a| !a.is_empty()) {
+                println!("\nMCP TOOLS ({})", tools.len());
+                for t in tools {
+                    println!("  {t}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn mcp(c: Client, cmd: McpCmd) -> Result<()> {
+    match cmd {
+        McpCmd::Servers => {
+            let v = c.get("/admin/mcp/servers").await?;
+            if c.json {
+                return c.print(v);
+            }
+            println!("{:<20} {:<20} {:<10} {:>6} {:<24} URL", "NAME", "NAMESPACE", "STATE", "TOOLS", "SECRET FIELDS");
+            for s in v.as_array().into_iter().flatten() {
+                let fields: Vec<String> = s["secret_fields"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(k, set)| if set.as_bool() == Some(true) { k.clone() } else { format!("{k} (unset)") })
+                    .collect();
+                let state = match (s["connected"].as_bool(), s["last_error"].is_string()) {
+                    (_, true) => "ERROR",
+                    (Some(true), _) => "connected",
+                    _ => "idle",
+                };
+                println!(
+                    "{:<20} {:<20} {:<10} {:>6} {:<24} {}",
+                    s["name"].as_str().unwrap_or(""),
+                    s["namespace"].as_str().unwrap_or(""),
+                    state,
+                    s["tools"].as_u64().unwrap_or(0),
+                    if fields.is_empty() { "-".to_string() } else { fields.join(",") },
+                    s["url"].as_str().unwrap_or("")
+                );
+                if let Some(e) = s["last_error"].as_str() {
+                    println!("    {e}");
+                }
+            }
+            Ok(())
+        }
+        McpCmd::Tools { server } => {
+            let v = c.get(&format!("/admin/mcp/servers/{server}/tools")).await?;
+            if c.json {
+                return c.print(v);
+            }
+            for t in v.as_array().into_iter().flatten() {
+                let desc = t["description"].as_str().unwrap_or("").lines().next().unwrap_or("");
+                println!("{:<40} {desc}", t["name"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        McpCmd::Refresh { server: Some(server) } => c.print(c.post(&format!("/admin/mcp/servers/{server}/refresh"), json!({})).await?),
+        McpCmd::Refresh { server: None } => c.print(c.post("/admin/mcp/refresh", json!({})).await?),
+        McpCmd::SetSecret { server, field } => {
+            let value = read_secret(&format!("{field} for {server}: "))?;
+            c.print(c.put(&format!("/admin/mcp/servers/{server}/secret"), json!({"fields": {field: value}})).await?)
+        }
+        McpCmd::UnsetSecret { server, field } => {
+            c.print(c.put(&format!("/admin/mcp/servers/{server}/secret"), json!({"fields": {field: null}})).await?)
+        }
+        McpCmd::Usage { group_by, since } => {
+            let secs = parse_duration(&since)?;
+            let v = c.get(&format!("/admin/mcp/usage?group_by={group_by}&since_secs={secs}")).await?;
+            if c.json {
+                return c.print(v);
+            }
+            println!("{:<50} {:>8} {:>7} {:>10}", group_by.to_uppercase(), "CALLS", "ERRORS", "AVG MS");
+            for r in v.as_array().into_iter().flatten() {
+                println!(
+                    "{:<50} {:>8} {:>7} {:>10.0}",
+                    r["key"].as_str().unwrap_or("-"),
+                    r["calls"].as_i64().unwrap_or(0),
+                    r["errors"].as_i64().unwrap_or(0),
+                    r["avg_latency_ms"].as_f64().unwrap_or(0.0)
+                );
             }
             Ok(())
         }

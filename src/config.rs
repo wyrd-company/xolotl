@@ -18,6 +18,78 @@ pub struct Config {
     pub subscription: SubscriptionConfig,
     pub gateway: GatewayConfig,
     pub catalog: CatalogConfig,
+    pub mcp: McpConfig,
+}
+
+/// The MCP gateway: upstream MCP servers, exposed to clients through one
+/// code-mode MCP endpoint at `/mcp`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    /// Upstream servers keyed by name. Each entry is one instance: the same
+    /// server URL can be listed twice under different names to use two sets
+    /// of credentials. Secrets come from the vault at `mcp/<name>`.
+    pub servers: BTreeMap<String, McpServerConfig>,
+    /// Wall-clock limit for one `execute` call, tool calls included.
+    pub execute_timeout_secs: u64,
+    /// QuickJS heap limit for one `execute` call.
+    pub memory_limit_mb: usize,
+    /// Upstream tool calls allowed in one `execute` call.
+    pub max_tool_calls: usize,
+    /// Larger `execute` results and logs are truncated.
+    pub max_output_bytes: usize,
+    /// `execute` calls that may run at once; more wait.
+    pub max_concurrent_executions: usize,
+    /// How often upstream tool lists are re-read.
+    pub tools_refresh_secs: u64,
+    /// Browser origins allowed to call `/mcp`. Empty rejects every request
+    /// that carries an `Origin` header (MCP clients other than browsers send none).
+    pub allowed_origins: Vec<String>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            servers: BTreeMap::new(),
+            execute_timeout_secs: 120,
+            memory_limit_mb: 64,
+            max_tool_calls: 100,
+            max_output_bytes: 100_000,
+            max_concurrent_executions: 8,
+            tools_refresh_secs: 300,
+            allowed_origins: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Streamable HTTP endpoint of the upstream server.
+    pub url: String,
+    /// Shown to clients by `search` and in the admin UI.
+    pub description: String,
+    /// Headers sent upstream. `{field}` is replaced by that field of the
+    /// vault secret `mcp/<name>`, e.g. `Authorization = "Bearer {token}"`.
+    pub headers: BTreeMap<String, String>,
+    /// Limit for one upstream tool call. Default 60.
+    pub timeout_secs: Option<u64>,
+}
+
+impl McpServerConfig {
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(60).max(1))
+    }
+}
+
+/// MCP server names become JavaScript identifiers in code mode (`-` turns
+/// into `_`), so they are lowercase, start with a letter and stay short.
+pub fn valid_mcp_server_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 63
+        && b[0].is_ascii_lowercase()
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -324,7 +396,12 @@ impl Config {
         for v in [&mut c.vault.approle.role_id, &mut c.vault.approle.secret_id].into_iter().flatten() {
             *v = HIDDEN.into();
         }
-        let headers = c.telemetry.otlp_headers.values_mut().chain(c.gateway.providers.values_mut().flat_map(|p| p.headers.values_mut()));
+        let headers = c
+            .telemetry
+            .otlp_headers
+            .values_mut()
+            .chain(c.gateway.providers.values_mut().flat_map(|p| p.headers.values_mut()))
+            .chain(c.mcp.servers.values_mut().flat_map(|s| s.headers.values_mut()));
         for v in headers {
             *v = HIDDEN.into();
         }
@@ -373,7 +450,7 @@ impl Config {
                 "provider name {name:?} is reserved for subscription accounts"
             );
             anyhow::ensure!(
-                !["v0", "v1", "admin", "ui", "assets", "backend-api", "healthz", "readyz"].contains(&name.as_str()),
+                !["v0", "v1", "admin", "ui", "assets", "backend-api", "healthz", "readyz", "mcp"].contains(&name.as_str()),
                 "provider name {name:?} collides with a built-in route"
             );
             if p.kind == ProviderKind::OpenaiCompatible {
@@ -386,6 +463,26 @@ impl Config {
                 "catalog.wires.{key:?}: Claude subscription accounts serve only /v1/messages; their wire formats can't be overridden"
             );
         }
+        let mut idents = BTreeMap::new();
+        for (name, server) in &self.mcp.servers {
+            anyhow::ensure!(
+                valid_mcp_server_name(name),
+                "mcp server name {name:?} must start with a lowercase letter and use lowercase letters, digits, '-' or '_' (max 63)"
+            );
+            if let Some(other) = idents.insert(name.replace('-', "_"), name) {
+                anyhow::bail!("mcp servers {other:?} and {name:?} have the same name in code ('-' becomes '_')");
+            }
+            let url = url::Url::parse(&server.url).with_context(|| format!("mcp server {name:?}: invalid url"))?;
+            anyhow::ensure!(matches!(url.scheme(), "http" | "https"), "mcp server {name:?}: url must be http or https");
+            for (header, value) in &server.headers {
+                anyhow::ensure!(
+                    axum::http::HeaderName::from_bytes(header.as_bytes()).is_ok(),
+                    "mcp server {name:?}: invalid header name {header:?}"
+                );
+                crate::mcp::template_fields(value).with_context(|| format!("mcp server {name:?}: header {header:?}"))?;
+            }
+        }
+        anyhow::ensure!(self.mcp.max_concurrent_executions >= 1, "mcp.max_concurrent_executions must be >= 1");
         anyhow::ensure!(self.subscription.max_attempts >= 1, "subscription.max_attempts must be >= 1");
         anyhow::ensure!(matches!(self.telemetry.log_format.as_str(), "pretty" | "json"), "telemetry.log_format must be pretty or json");
         Ok(())

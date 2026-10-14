@@ -85,6 +85,38 @@ pub struct UsageSummary {
     pub cached_tokens: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct McpCallRecord {
+    pub client_id: Option<String>,
+    pub server: String,
+    pub tool: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub latency_ms: i64,
+    pub trace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct McpUsageSummary {
+    pub key: Option<String>,
+    pub calls: i64,
+    pub errors: i64,
+    pub avg_latency_ms: f64,
+}
+
+/// An MCP call log row, as listed by the admin API.
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct LoggedMcpCall {
+    pub ts: i64,
+    pub client_id: Option<String>,
+    pub server: String,
+    pub tool: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub latency_ms: i64,
+    pub trace_id: Option<String>,
+}
+
 /// A request log row, as listed by the admin API.
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct LoggedRequest {
@@ -320,7 +352,57 @@ impl Db {
     pub async fn prune(&self, retention_days: u32) -> Result<u64> {
         let cutoff = now() - i64::from(retention_days) * 86_400;
         let r = sqlx::query("DELETE FROM request_log WHERE ts < ?").bind(cutoff).execute(&self.pool).await?;
-        Ok(r.rows_affected())
+        let m = sqlx::query("DELETE FROM mcp_call_log WHERE ts < ?").bind(cutoff).execute(&self.pool).await?;
+        Ok(r.rows_affected() + m.rows_affected())
+    }
+
+    // ---- MCP call log ----
+
+    pub async fn log_mcp_call(&self, r: &McpCallRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO mcp_call_log (ts, client_id, server, tool, status, error, latency_ms, trace_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(now())
+        .bind(&r.client_id)
+        .bind(&r.server)
+        .bind(&r.tool)
+        .bind(&r.status)
+        .bind(&r.error)
+        .bind(r.latency_ms)
+        .bind(&r.trace_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Aggregate MCP calls since `since` grouped by `client`, `server` or `tool` (`server/tool`).
+    pub async fn mcp_usage_summary(&self, group_by: &str, since: i64) -> Result<Vec<McpUsageSummary>> {
+        let column = match group_by {
+            "client" => "client_id",
+            "server" => "server",
+            "tool" => "server || '/' || tool",
+            other => anyhow::bail!("cannot group MCP calls by {other:?}"),
+        };
+        let sql = format!(
+            "SELECT {column} AS key, COUNT(*) AS calls,
+               SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS errors,
+               CAST(AVG(latency_ms) AS REAL) AS avg_latency_ms
+             FROM mcp_call_log WHERE ts >= ? GROUP BY {column} ORDER BY calls DESC"
+        );
+        // `column` comes from the fixed whitelist above.
+        Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql)).bind(since).fetch_all(&self.pool).await?)
+    }
+
+    /// The latest MCP calls, newest first.
+    pub async fn recent_mcp_calls(&self, limit: i64) -> Result<Vec<LoggedMcpCall>> {
+        Ok(sqlx::query_as(
+            "SELECT ts, client_id, server, tool, status, error, latency_ms, trace_id
+             FROM mcp_call_log ORDER BY ts DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
     }
 }
 

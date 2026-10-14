@@ -9,6 +9,12 @@ providers = ["claude", "codex", "grok", "opencode-go", "vercel"]
 # allow_models = ["claude-*", "gpt-*", "opencode-go/*"]
 deny_models = ["*-preview"]
 
+# MCP gateway (/mcp): add "mcp" to scopes and list the servers. Tool globs
+# match `tool` or `server/tool`; deny wins.
+# scopes = ["proxy", "mcp"]
+# mcp_servers = ["github-work"]
+# deny_tools = ["*/delete_*"]
+
 # Who owns a model name served by several providers. Unlisted providers
 # follow: claude, codex, grok, opencode-go, then gateway providers alphabetically.
 precedence = ["claude", "codex", "grok", "opencode-go", "vercel"]

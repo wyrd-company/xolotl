@@ -44,6 +44,13 @@ pub fn router() -> Router<AppState> {
         .route("/providers", get(list_providers))
         .route("/providers/{name}/key", post(set_provider_key))
         .route("/usage", get(usage))
+        .route("/mcp/servers", get(mcp_servers))
+        .route("/mcp/servers/{name}/tools", get(mcp_tools))
+        .route("/mcp/servers/{name}/refresh", post(mcp_refresh))
+        .route("/mcp/servers/{name}/secret", axum::routing::put(mcp_set_secret))
+        .route("/mcp/refresh", post(mcp_refresh_all))
+        .route("/mcp/usage", get(mcp_usage))
+        .route("/mcp/calls", get(mcp_calls))
         .route("/reload", post(reload))
         .route("/status", get(status))
 }
@@ -86,7 +93,7 @@ async fn put_policy(State(s): State<AppState>, h: HeaderMap, Path(name): Path<St
     if policy.name != name {
         return Err(json_error(StatusCode::BAD_REQUEST, "policy name must match the URL"));
     }
-    let saved = s.keys.put_policy(policy, &s.catalog.known_providers()).await.map_err(bad)?;
+    let saved = s.keys.put_policy(policy, &s.catalog.known_providers(), &s.mcp.server_names()).await.map_err(bad)?;
     tracing::info!(policy = %saved.name, "saved policy");
     ok(saved.as_ref().clone())
 }
@@ -112,7 +119,7 @@ async fn preview_policy(State(s): State<AppState>, h: HeaderMap, Json(mut policy
     if policy.name.is_empty() {
         policy.name = "preview".into();
     }
-    policy.validate(&s.catalog.known_providers()).map_err(bad)?;
+    policy.validate(&s.catalog.known_providers(), &s.mcp.server_names()).map_err(bad)?;
     ok(view_json(&s, &policy))
 }
 
@@ -134,7 +141,30 @@ fn view_json(s: &AppState, policy: &Policy) -> Value {
             })
         })
         .collect();
-    json!({"policy": policy.name, "models": models, "shared": policy.shared_names(&catalog)})
+    json!({
+        "policy": policy.name,
+        "models": models,
+        "shared": policy.shared_names(&catalog),
+        "mcp_servers": s.mcp.allowed_servers(policy).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        "tools": mcp_view_tools(s, policy),
+    })
+}
+
+/// The `server/tool` names a policy allows, from the cached tool lists.
+fn mcp_view_tools(s: &AppState, policy: &Policy) -> Vec<String> {
+    s.mcp
+        .allowed_servers(policy)
+        .iter()
+        .flat_map(|(server, _)| {
+            s.mcp
+                .server_tools(server)
+                .into_iter()
+                .flat_map(|tools| tools.iter().map(|t| t.name.to_string()).collect::<Vec<_>>())
+                .filter(|t| policy.allows_tool(server, t))
+                .map(|t| format!("{server}/{t}"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 // ---- catalog
@@ -399,6 +429,82 @@ async fn usage(State(s): State<AppState>, h: HeaderMap, Query(q): Query<UsageQue
     let mut rows = s.db.usage_summary(&q.group_by, now() - q.since_secs).await.map_err(bad)?;
     let _ = &mut rows;
     ok(rows)
+}
+
+// ---- MCP gateway
+
+async fn mcp_servers(State(s): State<AppState>, h: HeaderMap) -> Res {
+    admin(&s, &h).await?;
+    ok(s.mcp.servers().await.map_err(internal)?)
+}
+
+async fn mcp_tools(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    ok(s.mcp.server_tools(&name).ok_or_else(|| json_error(StatusCode::NOT_FOUND, "no such MCP server"))?.as_ref().clone())
+}
+
+async fn mcp_refresh(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    if !s.mcp.has_server(&name) {
+        return Err(json_error(StatusCode::NOT_FOUND, "no such MCP server"));
+    }
+    let tools = s.mcp.refresh(&name).await.map_err(|e| json_error(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    ok(json!({"server": name, "tools": tools}))
+}
+
+async fn mcp_refresh_all(State(s): State<AppState>, h: HeaderMap) -> Res {
+    admin(&s, &h).await?;
+    s.mcp.refresh_all().await;
+    ok(s.mcp.servers().await.map_err(internal)?)
+}
+
+#[derive(Deserialize)]
+struct McpSecretReq {
+    /// Field -> value; `null` removes the field.
+    fields: serde_json::Map<String, Value>,
+}
+
+async fn mcp_set_secret(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>, Json(req): Json<McpSecretReq>) -> Res {
+    admin(&s, &h).await?;
+    if !s.mcp.has_server(&name) {
+        return Err(json_error(StatusCode::NOT_FOUND, "no such MCP server"));
+    }
+    let fields: Vec<String> = req.fields.keys().cloned().collect();
+    s.mcp.set_secret(&name, req.fields).await.map_err(bad)?;
+    tracing::info!(server = %name, ?fields, "updated MCP server secret");
+    ok(json!({"server": name, "updated": fields}))
+}
+
+#[derive(Deserialize)]
+struct McpUsageQuery {
+    #[serde(default = "default_mcp_group")]
+    group_by: String,
+    #[serde(default = "default_since")]
+    since_secs: i64,
+}
+
+fn default_mcp_group() -> String {
+    "server".into()
+}
+
+async fn mcp_usage(State(s): State<AppState>, h: HeaderMap, Query(q): Query<McpUsageQuery>) -> Res {
+    admin(&s, &h).await?;
+    ok(s.db.mcp_usage_summary(&q.group_by, now() - q.since_secs).await.map_err(bad)?)
+}
+
+#[derive(Deserialize)]
+struct McpCallsQuery {
+    #[serde(default = "default_calls_limit")]
+    limit: i64,
+}
+
+fn default_calls_limit() -> i64 {
+    50
+}
+
+async fn mcp_calls(State(s): State<AppState>, h: HeaderMap, Query(q): Query<McpCallsQuery>) -> Res {
+    admin(&s, &h).await?;
+    ok(s.db.recent_mcp_calls(q.limit.clamp(1, 500)).await.map_err(internal)?)
 }
 
 /// Health and settings for the web UI's overview.

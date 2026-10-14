@@ -76,3 +76,23 @@ grok_client_version = "1.0.52"     # xAI rejects old Grok CLI versions with 426
 # Defaults: claude=messages, codex=responses, grok=responses, opencode-go per model,
 # vercel=chat+responses+messages, others=chat.
 # llamacpp = ["chat", "messages"]
+
+# MCP gateway: upstream MCP servers (Streamable HTTP), exposed to clients at
+# /mcp as one code-mode MCP server (`search` + `execute`). Keys need the `mcp`
+# scope and `mcp_servers` in their policy.
+[mcp]
+execute_timeout_secs = 120      # wall clock per execute call, tool calls included
+memory_limit_mb = 64            # QuickJS heap per execute call
+max_tool_calls = 100            # per execute call
+max_output_bytes = 100000
+max_concurrent_executions = 8
+tools_refresh_secs = 300
+allowed_origins = []            # browser origins allowed to call /mcp; empty refuses any Origin
+
+# One entry per instance; `{field}` in headers comes from the vault secret
+# mcp/<name> (xolotl mcp set-secret <name> <field>). In code, `-` becomes `_`.
+# [mcp.servers.github-work]
+# url = "https://api.githubcopilot.com/mcp/"
+# description = "GitHub, work account"
+# headers = { Authorization = "Bearer {token}" }
+# timeout_secs = 60

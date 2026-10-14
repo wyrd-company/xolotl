@@ -9,6 +9,7 @@
 - Use multiple subscription accounts and track usage/limits
 - Works with T3Code usage reporting via hubs
 - Fast and lightweight
+- One MCP gateway for agents, with per-key access to MCP servers and their credentials kept out of the devcontainer
 
 ## Implementation Notes
 
@@ -42,6 +43,10 @@
             - Batch
         - llama.cpp (OpenAI-compatible)
         - OpenCode Go
+- MCP gateway
+    - Upstream: Streamable HTTP MCP servers, several instances of one server with different credentials (secrets in OpenBao)
+    - Downstream: one code-mode MCP server at `/mcp` (`search` + `execute`, QuickJS sandbox), MCP 2026-07-28 and older clients
+    - Policies select MCP servers and tools
 - T3Code Hubs compatibility (CLIProxyAPI)
     - `GET /v0/management/auth-files` to list accounts. It uses enabled Codex and Claude accounts.
     - `POST /v0/management/api-call` to fetch each account’s provider usage. The provider URLs are Codex’s usage endpoint and Anthropic’s OAuth usage endpoint. For Codex, it also fetches reset credits and can redeem one.
@@ -83,6 +88,7 @@ bao kv put secret/xolotl/telemetry Authorization="Basic ..."
 | `telemetry` | OTLP header values |
 | `providers/<name>` | `api_key` for gateway providers |
 | `accounts/<provider>/<id>` | OAuth tokens / API key for subscription accounts (rewritten on refresh) |
+| `mcp/<server>` | values for the `{field}` placeholders in an MCP server's headers |
 | `policies/<policy>` | client key policy |
 | `keys/<policy>/<client>` | client key record, including `api_key`, for that client to read |
 
@@ -138,6 +144,13 @@ xolotl keys rotate devcontainer/laptop --grace 1h
 xolotl keys revoke devcontainer/laptop
 
 xolotl usage --group-by client --since 7d
+
+# MCP gateway
+xolotl mcp servers                 # connection, tools, secret fields
+xolotl mcp set-secret github-work token   # value on stdin, fills {token} in the headers
+xolotl mcp tools github-work
+xolotl mcp refresh
+xolotl mcp usage --group-by tool
 ```
 
 Imported tokens keep rotating on refresh. Stop using the same login in the local CLI afterwards, or one side ends up with a dead refresh token.
@@ -150,7 +163,8 @@ Every client key belongs to a policy (see [`examples/policies/devcontainer.toml`
 - `allow_models` / `deny_models`: globs matched against `model` or `provider/model`; deny wins.
 - `precedence` and `winners`: who owns a model name served by several providers. The winner serves the plain name (`claude-haiku-5-5`), the others drop it. Without a `precedence` list the order is `claude`, `codex`, `grok`, `opencode-go`, then gateway providers alphabetically.
 - `aliases`: extra names, each a `provider/model` or a list tried in order on 429/5xx. Use them to bring back a model that lost its plain name.
-- `scopes`: `proxy` (default), `management` (T3Code hubs), `admin`.
+- `scopes`: `proxy` (default), `management` (T3Code hubs), `mcp` (MCP gateway), `admin`.
+- `mcp_servers`, `allow_tools` / `deny_tools`: the MCP servers (or `*`) a key may use through `/mcp`, and globs on `tool` or `server/tool` (deny wins). See [MCP gateway](docs/mcp.md).
 
 The explicit `provider/model` form always works for any model the policy allows, even one that lost its plain name. `GET /v1/models` lists the plain names and aliases.
 
@@ -201,6 +215,14 @@ api_backend = "responses"
 
 `GET /v1/models` answers in the Grok CLI's shape when the user agent contains `grok-shell`. Xolotl forwards the CLI's own `x-grok-client-version`; other clients reaching Grok send `catalog.grok_client_version`.
 
+**MCP clients**: add a Streamable HTTP server with URL `http://xolotl:8317/mcp` and header `Authorization: Bearer $XOLOTL_API_KEY`, using a key whose policy has the `mcp` scope. For Claude Code:
+
+```sh
+claude mcp add --transport http xolotl http://xolotl:8317/mcp --header "Authorization: Bearer $XOLOTL_API_KEY"
+```
+
+The client sees two tools: `search` (TypeScript declarations of the tools the key may call) and `execute` (JavaScript that calls them). Upstream servers are configured under `[mcp.servers]` in the config file; see [MCP gateway](docs/mcp.md).
+
 **T3Code hubs**: add a CLIProxyAPI usage source with URL `http://xolotl:8317` and a key whose policy has the `management` scope.
 
 **Anything else** (OpenAI-compatible SDKs): base URL `http://xolotl:8317/v1` and any model name the key's policy exposes.
@@ -213,6 +235,7 @@ api_backend = "responses"
 | `GET /v1/models` | the policy's names, each with its native and translated endpoints; in Anthropic's shape when the request carries `anthropic-version` (Claude Code) |
 | `/opencode-go/<path>` (any method) | OpenCode Go API through the account pool (load balancing, failover, usage) |
 | `/<provider>/<path>` (any method) | raw passthrough with the gateway provider's key, e.g. `POST /mistral/v1/ocr`, `/mistral/v1/batch/jobs`, `/mistral/v1/files`, `GET /vercel/v1/credits`, `/vercel/v1/generation?id=` |
+| `/mcp` | MCP gateway (code mode over the upstream MCP servers the key's policy allows) |
 | `/v0/management/{auth-files,api-call,reset-quota}` | T3Code hubs (CLIProxyAPI-compatible) |
 | `/admin/...` | CLI and web UI |
 | `/`, `/assets/...` | web UI |
@@ -230,6 +253,7 @@ Set `telemetry.otlp_endpoint` (OpenObserve: `http://openobserve:5080/api/<org>`)
 - `xolotl.requests`, `xolotl.request.duration`, `xolotl.tokens` (by provider, model, client, status)
 - `xolotl.account.usage_percent` (by account and window), `xolotl.account.available`
 - `xolotl.upstream.errors`, `xolotl.oauth.refreshes`
+- `xolotl.mcp.tool_calls` (by server, tool, status), `xolotl.mcp.tool_call.duration`, `xolotl.mcp.executions`
 
 ### Development
 
