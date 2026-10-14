@@ -49,14 +49,14 @@ function Gate() {
     },
     staleTime: Infinity,
   });
-  // Set by signing in, or by a 401 (expired session); otherwise the session check decides.
-  const [override, setOverride] = useState<boolean | null>(null);
-  const signedIn = override ?? !!session.data?.authenticated;
+  // Set by a 401 (expired session); otherwise the session check decides.
+  const [expired, setExpired] = useState(false);
+  const signedIn = !expired && !!session.data?.authenticated;
 
   useEffect(() => {
     setUnauthorizedHandler(() => {
       setCsrfToken(null);
-      setOverride(false);
+      setExpired(true);
       qc.clear();
     });
     return () => setUnauthorizedHandler(null);
@@ -64,16 +64,7 @@ function Gate() {
 
   if (session.isPending) return null;
   if (!signedIn) {
-    return (
-      <LoginPage
-        passwordSet={session.data?.password_set ?? true}
-        error={session.error?.message}
-        onSignedIn={(csrf) => {
-          setCsrfToken(csrf);
-          setOverride(true);
-        }}
-      />
-    );
+    return <LoginPage configured={session.data?.configured ?? true} error={session.error?.message} />;
   }
   return <RouterProvider router={router} />;
 }

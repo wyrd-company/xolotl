@@ -63,7 +63,8 @@ export const PROVIDER_NAMES: Record<SubProvider, string> = { claude: "Claude", c
 export interface Session {
   authenticated: boolean;
   csrf_token?: string;
-  password_set?: boolean;
+  user?: string;
+  configured?: boolean;
 }
 
 export interface Health {

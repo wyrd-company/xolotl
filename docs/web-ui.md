@@ -17,12 +17,21 @@
 
 ## Sign-in
 
-- **Password.** One admin password. `xolotl ui set-password` hashes it with argon2id on the operator's machine and sends only the hash (`PUT /admin/ui/password`, admin scope). The hash is stored as `ui_password_hash` in the vault `admin` secret, next to the bootstrap token, with a check-and-set write that keeps the secret's other fields. Changing it signs out every session, and a sign-in that was checked against the old password while the change happened gets no session. Because `bao kv put` replaces the whole secret, change the bootstrap token with `bao kv patch`.
-- **Session.** `POST /admin/session` checks the password and sets `xolotl_session`: `HttpOnly`, `SameSite=Strict`, `Path=/`, 12 hours, and `Secure` when the request arrived with `X-Forwarded-Proto: https`. The response carries a CSRF token; `GET /admin/session` returns it again after a reload. `DELETE /admin/session` signs out.
+- **OpenID Connect.** The UI signs in through an OpenID Connect provider (built against Pocket ID). Xolotl is a confidential client and uses the authorization code flow with PKCE, all on the server; the browser never holds a provider token. `[ui.oidc]` in the config file names the issuer, client ID, redirect URL and admin group. The client secret is the vault secret `oidc` (field `client_secret`). Without `[ui.oidc]`, nobody can sign in to the UI.
+- **Flow.** `GET /admin/session/login` discovers the provider, keeps the `state`, nonce, PKCE verifier and provider metadata in memory for 10 minutes, sets the `xolotl_oidc` cookie to the `state` (`HttpOnly`, `SameSite=Lax` because the callback is a navigation from the provider's site, scoped to the callback path), and redirects to the provider. `GET /admin/session/callback` completes only in the browser that started the sign-in, once per `state`. It exchanges the code, checks the ID token (an asymmetric signature from the provider's keys — RSA, ECDSA or EdDSA, never HMAC — issuer, audience, expiry, nonce), and redirects to `/`. A failed sign-in redirects to `/?signin=<reason>` with one of a fixed set of reasons (`denied`, `expired`, `failed`, `forbidden`, `unavailable`); the details go to the log.
+- **Admin group.** Only a user whose `groups` claim contains `admin_group` gets a session. Xolotl requests the `groups` scope and checks the claim itself, so loosening the client's allowed groups in the provider does not widen admin access.
+- **Session.** The callback sets `xolotl_session`: `HttpOnly`, `SameSite=Strict`, `Path=/`, 12 hours. Both cookies are `Secure` when `redirect_url` is `https`. The session does not depend on the provider's tokens, which are not kept. `GET /admin/session` returns the CSRF token and the user's name (`preferred_username`, or the subject). `DELETE /admin/session` signs out of xolotl only; the provider session stays.
 - **CSRF.** A session authorizes a request only with its CSRF token in `x-csrf-token`, on every method. Browsers never add that header to a cross-site request, and the cookie is `SameSite=Strict` as well.
 - **Scope.** A session is an admin principal for `/admin` routes only; it never authorizes the LLM or management endpoints. A request that presents a key is judged by the key alone.
-- **Lockout.** Five failed attempts from one address lock it out for 15 minutes.
-- **State.** Sessions and failure counts live in memory: a restart signs everyone out, and instances don't share them.
+- **Limits.** At most 256 sign-ins in progress are kept; a new one drops the oldest. Starting a sign-in is unauthenticated, so memory stays bounded, and a burst of requests can't block sign-in for the next 10 minutes. Each start makes two requests to the provider (discovery and its keys); provider responses are limited to 1 MiB. One browser has one sign-in in progress: starting a second (another tab) makes the first fail with `expired`, and the second still completes.
+- **State.** Sessions and sign-ins in progress live in memory: a restart signs everyone out, and instances don't share them.
+
+### Decisions
+
+- **No password sign-in.** When the provider is down, the CLI with the bootstrap admin token does everything the UI does. A second browser sign-in would be one more auth surface to keep safe for no new capability.
+- **Xolotl checks the group.** The provider can also limit a client to groups, but that setting lives outside xolotl and is easy to change without thinking of admin access. Checking `groups` in xolotl keeps the admin boundary in xolotl's own config.
+- **Discovery per sign-in.** Sign-ins are rare (sessions last 12 hours), so xolotl discovers the provider on each one instead of caching metadata and keys. That keeps signing-key rotation correct without a cache to expire, and the server starts when the provider is down.
+- **Local sign-out.** Signing out of the UI does not end the provider session, which other applications share.
 
 ## Build and serving
 

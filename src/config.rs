@@ -19,6 +19,28 @@ pub struct Config {
     pub gateway: GatewayConfig,
     pub catalog: CatalogConfig,
     pub mcp: McpConfig,
+    pub ui: UiConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiConfig {
+    /// Web UI sign-in. Without it the UI can't be signed in to; the CLI and
+    /// API keys still work.
+    pub oidc: Option<OidcConfig>,
+}
+
+/// An OpenID Connect provider (e.g. Pocket ID). The client secret is the
+/// vault secret `oidc` (field `client_secret`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcConfig {
+    pub issuer: String,
+    pub client_id: String,
+    /// `https://<xolotl>/admin/session/callback`, as registered with the provider.
+    pub redirect_url: String,
+    /// Only members of this group (the `groups` claim) are signed in.
+    pub admin_group: String,
 }
 
 /// The MCP gateway: upstream MCP servers, exposed to clients through one
@@ -552,6 +574,16 @@ impl Config {
                 "catalog.wires.{key:?}: Claude subscription accounts serve only /v1/messages; their wire formats can't be overridden"
             );
         }
+        if let Some(o) = &self.ui.oidc {
+            url::Url::parse(&o.issuer).context("ui.oidc.issuer must be a URL")?;
+            let redirect = url::Url::parse(&o.redirect_url).context("ui.oidc.redirect_url must be a URL")?;
+            anyhow::ensure!(
+                redirect.path() == crate::server::session::CALLBACK_PATH,
+                "ui.oidc.redirect_url must end in {}",
+                crate::server::session::CALLBACK_PATH
+            );
+            anyhow::ensure!(!o.client_id.is_empty() && !o.admin_group.is_empty(), "ui.oidc needs client_id and admin_group");
+        }
         for (name, server) in &self.mcp.servers {
             server.validate(name)?;
         }
@@ -612,6 +644,19 @@ mod tests {
         }
         let cfg: Config = toml::from_str("[catalog.wires]\nllamacpp = [\"chat\", \"messages\"]\n").unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn oidc_redirect_must_be_the_callback() {
+        let oidc = |redirect: &str| {
+            format!(
+                "[ui.oidc]\nissuer = \"https://id.example.test\"\nclient_id = \"c\"\nredirect_url = \"{redirect}\"\nadmin_group = \"admins\"\n"
+            )
+        };
+        let cfg: Config = toml::from_str(&oidc("https://gw.example.test/admin/session/callback")).unwrap();
+        cfg.validate().unwrap();
+        let cfg: Config = toml::from_str(&oidc("https://gw.example.test/callback")).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
