@@ -285,7 +285,7 @@ export interface McpCall {
   client_id: string | null;
   server: string;
   tool: string;
-  status: "ok" | "tool_error" | "error";
+  status: "ok" | "tool_error" | "error" | "cancelled";
   error: string | null;
   latency_ms: number;
   trace_id: string | null;

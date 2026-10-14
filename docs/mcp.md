@@ -229,7 +229,8 @@ Every upstream tool call is logged to SQLite table `mcp_call_log` with client, s
 
 - `ok`;
 - `tool_error`: the tool ran and reported an error;
-- `error`: there is no result (connection failure, timeout, protocol error).
+- `error`: there is no result (connection failure, timeout, protocol error);
+- `cancelled`: the execution ended (deadline, return or client gone) before a result arrived. The upstream may still have carried the call out, so its outcome is unknown.
 
 Calls refused by the policy never reach an upstream and aren't logged. The log is pruned with the request log (`database.retention_days`).
 

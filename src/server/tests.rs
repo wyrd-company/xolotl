@@ -1042,6 +1042,9 @@ mod mcp_gateway {
 
         async fn call_tool(&self, req: CallToolRequestParams, ctx: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
             let args = req.arguments.unwrap_or_default();
+            if let Some(ms) = args.get("delay_ms").and_then(Value::as_u64) {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
             let result = match req.name.as_ref() {
                 "add" => {
                     let n = |k: &str| args.get(k).and_then(Value::as_f64).unwrap_or(0.0);
@@ -1235,6 +1238,27 @@ mod mcp_gateway {
         assert_eq!(view["tools"], json!(["calc/add", "calc/whoami"]));
         let bad = json!({"name": "x", "scopes": ["mcp"], "mcp_servers": ["nope"]});
         assert_eq!(g.h.call("POST", "/admin/policy-preview", Some(&g.h.admin), Some(bad)).await.0, 400);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_cut_off_by_the_deadline_is_still_logged() {
+        let up = upstream().await;
+        let h = harness_with(|cfg| {
+            cfg.mcp.execute_timeout_secs = 1;
+            cfg.mcp.servers.insert("calc".into(), McpServerConfig { url: format!("http://{up}/mcp"), ..Default::default() });
+        })
+        .await;
+        let addr = serve(router(h.state.clone())).await;
+        let key = h.key(mcp_policy(&["calc"], &[])).await;
+        let c = client(addr, &key, modern()).await;
+        // The upstream accepts the call and takes 3 s; the execution ends after 1 s.
+        let (err, out) = call(&c, "execute", json!({"code": "return await calc.whoami({delay_ms: 3000})"})).await;
+        assert!(err && out.contains("timed out"), "{out}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let calls = h.state.db.recent_mcp_calls(10).await.unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!((calls[0].tool.as_str(), calls[0].status.as_str()), ("whoami", "cancelled"));
+        assert!(calls[0].error.as_deref().unwrap().contains("outcome is unknown"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

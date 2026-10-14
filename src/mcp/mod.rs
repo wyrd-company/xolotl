@@ -519,27 +519,28 @@ impl McpHub {
         if up.has_tool_list() && !up.tools().iter().any(|t| t.name == tool) {
             return Err(format!("{server} has no tool {tool:?}"));
         }
-        let started = Instant::now();
+        // Logged however the call ends, including when it's cancelled (the
+        // execution ended) before a result arrives.
+        let mut log = CallLog {
+            db: self.db.clone(),
+            started: Instant::now(),
+            record: Some(McpCallRecord {
+                client_id: principal.client_id().map(str::to_string),
+                server: server.to_string(),
+                tool: tool.to_string(),
+                trace_id: crate::telemetry::current_trace_id(),
+                ..Default::default()
+            }),
+        };
         let result = up.call(tool, arguments).await;
-        let latency = started.elapsed();
         let (status, error) = match &result {
             Ok(r) if r.is_error == Some(true) => ("tool_error", Some(text_of(r))),
             Ok(_) => ("ok", None),
             Err(e) => ("error", Some(e.to_string())),
         };
-        let attrs = [KeyValue::new("server", server.to_string()), KeyValue::new("tool", tool.to_string()), KeyValue::new("status", status)];
-        metrics().mcp_tool_calls.add(1, &attrs);
-        metrics().mcp_tool_call_duration.record(latency.as_secs_f64(), &attrs[..2]);
-        let record = McpCallRecord {
-            client_id: principal.client_id().map(str::to_string),
-            server: server.to_string(),
-            tool: tool.to_string(),
-            status: status.to_string(),
-            error: error.map(|e| truncate(&e, 500)),
-            latency_ms: latency.as_millis() as i64,
-            trace_id: crate::telemetry::current_trace_id(),
-        };
-        if let Err(e) = self.db.log_mcp_call(&record).await {
+        if let Some(record) = log.finish(status, error)
+            && let Err(e) = self.db.log_mcp_call(&record).await
+        {
             tracing::warn!(error = %e, "writing MCP call log failed");
         }
         result.map_err(|e| format!("{server}/{tool}: {e}"))
@@ -548,6 +549,51 @@ impl McpHub {
     /// Wait for an execution slot.
     pub async fn execution_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
         self.executions.clone().acquire_owned().await.expect("semaphore is never closed")
+    }
+}
+
+/// One upstream call's log row and metrics. A call dropped before it
+/// finishes is recorded as `cancelled`: it may have reached the upstream.
+struct CallLog {
+    db: Db,
+    started: Instant,
+    record: Option<McpCallRecord>,
+}
+
+impl CallLog {
+    /// Emit the metrics and return the row to write.
+    fn finish(&mut self, status: &str, error: Option<String>) -> Option<McpCallRecord> {
+        let mut record = self.record.take()?;
+        let latency = self.started.elapsed();
+        let attrs = [
+            KeyValue::new("server", record.server.clone()),
+            KeyValue::new("tool", record.tool.clone()),
+            KeyValue::new("status", status.to_string()),
+        ];
+        metrics().mcp_tool_calls.add(1, &attrs);
+        metrics().mcp_tool_call_duration.record(latency.as_secs_f64(), &attrs[..2]);
+        record.status = status.to_string();
+        record.error = error.map(|e| truncate(&e, 500));
+        record.latency_ms = latency.as_millis() as i64;
+        Some(record)
+    }
+}
+
+impl Drop for CallLog {
+    fn drop(&mut self) {
+        let error = "cancelled before a result arrived (the execution ended); the upstream outcome is unknown".to_string();
+        let Some(record) = self.finish("cancelled", Some(error)) else { return };
+        let db = self.db.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    if let Err(e) = db.log_mcp_call(&record).await {
+                        tracing::warn!(error = %e, "writing MCP call log failed");
+                    }
+                });
+            }
+            Err(_) => tracing::warn!(server = %record.server, tool = %record.tool, "MCP call cancelled outside a runtime; not logged"),
+        }
     }
 }
 

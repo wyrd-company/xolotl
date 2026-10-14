@@ -688,7 +688,9 @@ function Calls() {
                   {c.status === "ok" ? (
                     <Badge variant="success">ok</Badge>
                   ) : (
-                    <Badge variant="destructive">{c.status === "tool_error" ? "tool error" : "failed"}</Badge>
+                    <Badge variant={c.status === "cancelled" ? "warning" : "destructive"}>
+                      {c.status === "tool_error" ? "tool error" : c.status === "cancelled" ? "cancelled" : "failed"}
+                    </Badge>
                   )}
                 </TableCell>
                 <TableCell className="text-right font-mono">{num(c.latency_ms)}</TableCell>
