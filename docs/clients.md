@@ -80,7 +80,9 @@ See [MCP gateway](mcp-gateway).
 
 Add a CLIProxyAPI usage source with URL `http://xolotl:8317` and a key whose
 policy has the `management` scope. T3 Code then shows the usage of your Codex
-and Claude accounts, and can redeem Codex reset credits.
+and Claude accounts. When T3 Code resets an account's quota, xolotl clears that
+account's cooldown and last error and polls its usage again. It sends no
+request to the provider to reset the quota.
 
 ## Endpoints
 
