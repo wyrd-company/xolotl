@@ -29,6 +29,11 @@ precedence = ["claude", "codex", "grok", "opencode-go", "vercel"]
 [winners]
 # "kimi-k3" = "vercel"
 
+# The name keys see instead of a model's plain name. The plain name goes to
+# the next provider that serves it.
+[renames]
+# "vercel/moonshotai/kimi-k3" = "kimi-vercel"
+
 # Extra names; a list is tried in order (fallback on 429/5xx). Use these to
 # bring back a model that lost its plain name to another provider.
 [aliases]

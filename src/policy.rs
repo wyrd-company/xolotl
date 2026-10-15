@@ -7,7 +7,9 @@
 //! (subscription pools first, then gateway providers alphabetically). The
 //! other providers drop that plain name, but the explicit `provider/model`
 //! form always works for any model the policy allows, and aliases can expose
-//! a losing provider's model under any name.
+//! a losing provider's model under any name. A renamed model is offered under
+//! its new name instead of its plain name, and leaves the plain name to the
+//! other providers.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,6 +46,9 @@ pub struct Policy {
     /// Client-visible name -> `provider/model` target(s), tried in order.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, AliasTargets>,
+    /// `provider/model` -> the name keys see instead of its plain name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub renames: BTreeMap<String, String>,
     /// What keys under this policy may do. Defaults to `proxy`.
     #[serde(default = "default_scopes")]
     pub scopes: Vec<Scope>,
@@ -110,11 +115,44 @@ pub struct SharedName {
     pub winner: String,
 }
 
+/// A catalog model of an allowed provider, and what the policy does with it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Candidate {
+    pub provider: String,
+    pub model: String,
+    pub allowed: bool,
+    /// The `allow_models` / `deny_models` glob that decided; `None` when no
+    /// glob matched (allowed by an empty allow list, or missing from it).
+    pub rule: Option<String>,
+    /// The name keys see this model under: its rename, or its plain name if
+    /// it won it. `None` if it is denied, lost its plain name, or its name
+    /// was taken (`taken_by`).
+    pub name: Option<String>,
+    /// What serves the name this model would have had instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taken_by: Option<TakenBy>,
+}
+
+/// What took a model's plain name.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum TakenBy {
+    /// An alias of the same name.
+    Alias,
+    /// Another model renamed to it.
+    Rename { target: String },
+}
+
 /// The model names a policy exposes for a catalog.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct View {
     /// Plain names and aliases -> targets (aliases may have fallbacks).
     pub names: BTreeMap<String, Vec<Target>>,
+}
+
+/// A client-visible name: an alias or a rename.
+fn valid_model_name(name: &str) -> bool {
+    !name.is_empty() && !name.chars().any(char::is_whitespace)
 }
 
 fn valid_name(name: &str) -> bool {
@@ -156,6 +194,11 @@ impl Policy {
                 !s.is_empty()
             });
         }
+        self.renames = std::mem::take(&mut self.renames)
+            .into_iter()
+            .map(|(t, n)| (t.trim().to_string(), n.trim().to_string()))
+            .filter(|(_, n)| !n.is_empty())
+            .collect();
         if self.scopes.is_empty() {
             self.scopes = default_scopes();
         }
@@ -181,7 +224,7 @@ impl Policy {
             anyhow::ensure!(self.allows_provider(p), "winner for {model:?} is {p:?}, which the policy does not allow");
         }
         for (name, targets) in &self.aliases {
-            anyhow::ensure!(!name.is_empty() && !name.chars().any(char::is_whitespace), "alias {name:?} is not a valid name");
+            anyhow::ensure!(valid_model_name(name), "alias {name:?} is not a valid name");
             anyhow::ensure!(!targets.list().is_empty(), "alias {name:?} has no targets");
             for t in targets.list() {
                 let target = Target::parse(t).ok_or_else(|| anyhow::anyhow!("alias {name:?}: target {t:?} must be provider/model"))?;
@@ -192,6 +235,15 @@ impl Policy {
                     target.provider
                 );
             }
+        }
+        let mut renamed = BTreeSet::new();
+        for (target, name) in &self.renames {
+            let t = Target::parse(target).ok_or_else(|| anyhow::anyhow!("rename {target:?} must be provider/model"))?;
+            anyhow::ensure!(known.contains(&t.provider), "rename {target:?}: unknown provider {:?}", t.provider);
+            anyhow::ensure!(self.allows_provider(&t.provider), "rename {target:?}: the policy does not allow provider {:?}", t.provider);
+            anyhow::ensure!(valid_model_name(name), "rename {target:?}: {name:?} is not a valid name");
+            anyhow::ensure!(!self.aliases.contains_key(name), "rename {target:?}: {name:?} is also an alias");
+            anyhow::ensure!(renamed.insert(name), "two models are renamed to {name:?}");
         }
         Ok(())
     }
@@ -205,15 +257,26 @@ impl Policy {
     }
 
     pub fn allows_model(&self, provider: &str, model: &str) -> bool {
-        if !self.allows_provider(provider) {
-            return false;
-        }
+        self.allows_provider(provider) && self.model_rule(provider, model).0
+    }
+
+    /// Whether the model globs allow `provider/model`, and the glob that
+    /// decided: the first matching deny glob, else the first matching allow glob.
+    fn model_rule<'a>(&'a self, provider: &str, model: &str) -> (bool, Option<&'a str>) {
         let qualified = format!("{provider}/{model}");
-        let hit = |patterns: &[String]| patterns.iter().any(|p| glob_match(p, model) || glob_match(p, &qualified));
-        if hit(&self.deny_models) {
-            return false;
+        let hit = |patterns: &'a [String]| patterns.iter().find(|p| glob_match(p, model) || glob_match(p, &qualified)).map(String::as_str);
+        if let Some(p) = hit(&self.deny_models) {
+            return (false, Some(p));
         }
-        self.allow_models.is_empty() || hit(&self.allow_models)
+        match hit(&self.allow_models) {
+            Some(p) => (true, Some(p)),
+            None => (self.allow_models.is_empty(), None),
+        }
+    }
+
+    /// The name a rename gives `provider/model`.
+    fn rename(&self, provider: &str, model: &str) -> Option<&str> {
+        self.renames.get(&format!("{provider}/{model}")).map(String::as_str)
     }
 
     pub fn allows_mcp_server(&self, server: &str) -> bool {
@@ -242,12 +305,13 @@ impl Policy {
         (2, 0, provider.to_string())
     }
 
-    /// Every allowed model -> the allowed providers serving it, in precedence order.
+    /// Every allowed model that keeps its plain name -> the allowed providers
+    /// serving it, in precedence order. Renamed models are left out.
     fn by_model<'a>(&self, catalog: &'a Catalog) -> BTreeMap<&'a str, Vec<&'a str>> {
         let mut by_model: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (provider, models) in catalog {
             for m in models {
-                if self.allows_model(provider, m) {
+                if self.allows_model(provider, m) && self.rename(provider, m).is_none() {
                     by_model.entry(m.as_str()).or_default().push(provider.as_str());
                 }
             }
@@ -283,6 +347,14 @@ impl Policy {
             let winner = self.winner(model, &providers);
             view.names.insert(model.to_string(), vec![Target { provider: winner.into(), model: model.into() }]);
         }
+        // Renamed models shadow plain names.
+        for (provider, models) in catalog {
+            for m in models {
+                if let Some(name) = self.rename(provider, m).filter(|_| self.allows_model(provider, m)) {
+                    view.names.insert(name.to_string(), vec![Target { provider: provider.clone(), model: m.clone() }]);
+                }
+            }
+        }
         // Aliases are explicit grants and shadow catalog names.
         for (name, targets) in &self.aliases {
             let ts: Vec<Target> =
@@ -292,6 +364,35 @@ impl Policy {
             }
         }
         view
+    }
+
+    /// Every catalog model of an allowed provider, allowed or not, with the
+    /// name keys see it under in the resolved view.
+    pub fn candidates(&self, catalog: &Catalog) -> Vec<Candidate> {
+        let view = self.resolve(catalog);
+        catalog
+            .iter()
+            .filter(|(provider, _)| self.allows_provider(provider))
+            .flat_map(|(provider, models)| models.iter().map(move |m| (provider, m)))
+            .map(|(provider, model)| {
+                let (allowed, rule) = self.model_rule(provider, model);
+                let me = Target { provider: provider.clone(), model: model.clone() };
+                let renamed = self.rename(provider, model);
+                // The name this model asks for, and what the view serves under it.
+                let wanted = renamed.unwrap_or(model);
+                let served = view.names.get(wanted).map(|ts| &ts[0]);
+                let taken_by = if !allowed || served == Some(&me) {
+                    None
+                } else if self.aliases.contains_key(wanted) {
+                    Some(TakenBy::Alias)
+                } else {
+                    // Another model renamed to this name; a plain winner on another provider is not "taken".
+                    served.filter(|t| self.rename(&t.provider, &t.model) == Some(wanted)).map(|t| TakenBy::Rename { target: t.qualified() })
+                };
+                let name = (allowed && served == Some(&me)).then(|| wanted.to_string());
+                Candidate { provider: provider.clone(), model: model.clone(), allowed, rule: rule.map(str::to_string), name, taken_by }
+            })
+            .collect()
     }
 }
 
@@ -382,6 +483,98 @@ mod tests {
     }
 
     #[test]
+    fn renames_replace_the_plain_name() {
+        let mut p = policy();
+        p.renames.insert("claude/claude-haiku-5-5".into(), "haiku".into());
+        p.renames.insert("vercel/kimi-k3".into(), "kimi-vercel".into());
+        let v = p.resolve(&catalog());
+        let k = known();
+        assert_eq!(v.names["haiku"], vec![Target { provider: "claude".into(), model: "claude-haiku-5-5".into() }]);
+        assert_eq!(v.names["claude-haiku-5-5"][0].provider, "opencode-go", "the plain name goes to the next provider");
+        assert_eq!(v.names["kimi-vercel"][0].provider, "vercel");
+        assert_eq!(v.names["kimi-k3"][0].provider, "opencode-go");
+        assert!(v.lookup(&p, &k, "claude/claude-haiku-5-5").is_some(), "explicit form still works");
+        assert!(p.shared_names(&catalog()).iter().all(|s| s.model != "claude-haiku-5-5"), "a renamed model no longer shares the name");
+
+        // A rename overrides a plain name of the same spelling.
+        p.renames.insert("opencode-go/minimax-m3".into(), "claude-opus-5".into());
+        assert_eq!(p.resolve(&catalog()).names["claude-opus-5"][0].provider, "opencode-go");
+
+        // A denied model is not exposed under its new name.
+        p.deny_models = vec!["claude/*".into()];
+        assert!(!p.resolve(&catalog()).names.contains_key("haiku"));
+    }
+
+    #[test]
+    fn candidates_cover_denied_models() {
+        let mut p = policy();
+        p.providers = vec!["claude".into(), "opencode-go".into()];
+        p.deny_models = vec!["opencode-go/kimi-*".into()];
+        p.renames.insert("opencode-go/minimax-m3".into(), "minimax".into());
+        let c = p.candidates(&catalog());
+        let get = |provider: &str, model: &str| c.iter().find(|x| x.provider == provider && x.model == model).unwrap().clone();
+        assert_eq!(c.len(), 5, "every model of the allowed providers, none of the others");
+        assert_eq!(get("claude", "claude-haiku-5-5").name.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(get("opencode-go", "claude-haiku-5-5").name, None, "lost the plain name");
+        assert!(get("opencode-go", "claude-haiku-5-5").allowed);
+        let kimi = get("opencode-go", "kimi-k3");
+        assert_eq!((kimi.allowed, kimi.rule.as_deref(), kimi.name), (false, Some("opencode-go/kimi-*"), None));
+        assert_eq!(get("opencode-go", "minimax-m3").name.as_deref(), Some("minimax"));
+
+        p.deny_models.clear();
+        p.allow_models = vec!["claude-*".into()];
+        let c = p.candidates(&catalog());
+        let minimax = c.iter().find(|x| x.model == "minimax-m3").unwrap();
+        assert_eq!((minimax.allowed, minimax.rule.as_deref(), minimax.name.as_deref()), (false, None, None), "not in the allow list");
+        let haiku = c.iter().find(|x| x.provider == "claude" && x.model == "claude-haiku-5-5").unwrap();
+        assert_eq!(haiku.rule.as_deref(), Some("claude-*"));
+    }
+
+    #[test]
+    fn candidate_names_follow_shadowing() {
+        let mut p = policy();
+        p.providers = vec!["codex".into(), "opencode-go".into()];
+        // minimax-m3 is renamed onto kimi-k3's plain name; an alias takes gpt-6-codex.
+        p.renames.insert("opencode-go/minimax-m3".into(), "kimi-k3".into());
+        p.aliases.insert("gpt-6-codex".into(), AliasTargets::One("opencode-go/kimi-k3".into()));
+        let c = p.candidates(&catalog());
+        let get = |model: &str| c.iter().find(|x| x.model == model).unwrap().clone();
+        let v = p.resolve(&catalog());
+        assert_eq!(v.names["kimi-k3"][0].model, "minimax-m3", "the rename serves the name");
+        assert_eq!(get("minimax-m3").name.as_deref(), Some("kimi-k3"));
+        let kimi = get("kimi-k3");
+        assert_eq!((kimi.name, kimi.taken_by), (None, Some(TakenBy::Rename { target: "opencode-go/minimax-m3".into() })));
+        let codex = get("gpt-6-codex");
+        assert_eq!((codex.name, codex.taken_by), (None, Some(TakenBy::Alias)));
+        assert_eq!(get("claude-haiku-5-5").taken_by, None);
+
+        // Every reported name is served by its own row.
+        for x in &c {
+            if let Some(n) = &x.name {
+                assert_eq!(v.names[n], vec![Target { provider: x.provider.clone(), model: x.model.clone() }], "{n}");
+            }
+        }
+
+        // A shared name taken by an alias is taken for the winner and the losers alike.
+        let mut p = policy();
+        p.aliases.insert("kimi-k3".into(), AliasTargets::One("codex/gpt-6-codex".into()));
+        let c = p.candidates(&catalog());
+        for provider in ["opencode-go", "vercel"] {
+            let k = c.iter().find(|x| x.provider == provider && x.model == "kimi-k3").unwrap();
+            assert_eq!((k.name.as_deref(), &k.taken_by), (None, &Some(TakenBy::Alias)), "{provider}");
+        }
+        let lost = c.iter().find(|x| x.provider == "opencode-go" && x.model == "claude-haiku-5-5").unwrap();
+        assert_eq!((lost.name.as_deref(), &lost.taken_by), (None, &None), "lost to a plain winner, not taken");
+
+        // An alias of the plain name that tries this model first keeps the name here.
+        let mut p = policy();
+        p.aliases.insert("gpt-6-codex".into(), AliasTargets::Many(vec!["codex/gpt-6-codex".into(), "vercel/kimi-k3".into()]));
+        let c = p.candidates(&catalog());
+        let codex = c.iter().find(|x| x.model == "gpt-6-codex").unwrap();
+        assert_eq!((codex.name.as_deref(), &codex.taken_by), (Some("gpt-6-codex"), &None));
+    }
+
+    #[test]
     fn validation() {
         let k = known();
         let mut p = policy();
@@ -398,6 +591,32 @@ mod tests {
         assert!(p.validate(&k, &BTreeSet::new()).is_err());
         let parsed: Policy = serde_json::from_str(r#"{"name":"a","providers":["*"]}"#).unwrap();
         assert_eq!(parsed.scopes, vec![Scope::Proxy]);
+
+        let rename = |target: &str, name: &str| {
+            let mut p = policy();
+            p.providers = vec!["claude".into(), "codex".into()];
+            p.renames.insert(target.into(), name.into());
+            p
+        };
+        rename("claude/claude-opus-5", "opus").validate(&k, &BTreeSet::new()).unwrap();
+        for (target, name, why) in [
+            ("claude-opus-5", "opus", "must be provider/model"),
+            ("nope/x", "opus", "unknown provider"),
+            ("vercel/kimi-k3", "kimi", "does not allow"),
+            ("claude/claude-opus-5", "my opus", "not a valid name"),
+        ] {
+            let err = rename(target, name).validate(&k, &BTreeSet::new()).unwrap_err().to_string();
+            assert!(err.contains(why), "{target} -> {name}: {err}");
+        }
+        let mut p = rename("claude/claude-opus-5", "opus");
+        p.renames.insert("codex/gpt-6-codex".into(), "opus".into());
+        assert!(p.validate(&k, &BTreeSet::new()).unwrap_err().to_string().contains("two models"));
+        let mut p = rename("claude/claude-opus-5", "opus");
+        p.aliases.insert("opus".into(), AliasTargets::One("codex/gpt-6-codex".into()));
+        assert!(p.validate(&k, &BTreeSet::new()).unwrap_err().to_string().contains("also an alias"));
+        let mut p = rename(" claude/claude-opus-5 ", "  ");
+        p.normalize();
+        assert!(p.renames.is_empty(), "a blank name removes the rename");
     }
 
     #[test]

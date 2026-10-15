@@ -720,6 +720,24 @@ async fn admin_policies_keys_and_accounts() {
     let names: Vec<&str> = view["models"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
     assert_eq!(names, vec!["claude-haiku-5-5", "claude-opus-5", "haiku-go", "kimi-k3"]);
 
+    // The preview lists denied models too, with the name each one is served under.
+    let draft = json!({
+        "name": "dev", "providers": ["claude", "opencode-go"], "deny_models": ["opencode-go/kimi-k3"],
+        "renames": {"claude/claude-opus-5": "opus"},
+    });
+    let (status, view) = h.call("POST", "/admin/policy-preview", Some(&h.admin), Some(draft)).await;
+    assert_eq!(status, 200, "{view}");
+    let row = |provider: &str, model: &str| {
+        view["catalog"].as_array().unwrap().iter().find(|c| c["provider"] == provider && c["model"] == model).cloned().unwrap()
+    };
+    assert_eq!(
+        row("opencode-go", "kimi-k3"),
+        json!({"provider": "opencode-go", "model": "kimi-k3", "allowed": false, "rule": "opencode-go/kimi-k3", "name": null})
+    );
+    assert_eq!(row("claude", "claude-opus-5")["name"], "opus");
+    let names: Vec<&str> = view["models"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["claude-haiku-5-5", "opus"]);
+
     // Keys: issued into the vault, never returned.
     let (status, issued) =
         h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "dev", "name": "laptop", "ttl_secs": 3600}))).await;
