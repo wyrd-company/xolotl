@@ -24,7 +24,12 @@
 - **Serialized per account:** refresh tokens are single-use, so each account's credential sits behind its own async mutex. Two concurrent requests can't spend the same refresh token. This only holds within one process ([#6](https://github.com/wyrd-company/xolotl/issues/6)).
 - **Failures:**
   - A dead grant (`invalid_grant`, `refresh_token_reused`, …) marks the account "re-login needed" and takes it out of rotation.
-  - Anything else is transient: the current token keeps being used while still valid, and the refresh is retried on next use.
+  - Connection or request-construction failures mean the token request was not sent.
+  - Other transport failures, lost response bodies and unusable successful responses have an **unknown outcome**: the provider may have spent the single-use refresh token. These produce an error-level log, `xolotl.oauth.refreshes` with `result=uncertain`, and an account error. A later dead-grant rejection still requires a new login; xolotl cannot recover a token it never received.
+  - Non-terminal failures back off per account: 5, 10, 20, 40, 80, 160, then at most 300 seconds between attempts. Requests, polls and forced refreshes share this delay. The next use after the delay retries; no task sleeps or sends a background retry. A successful refresh or new login clears the delay. Retry state lives in memory.
+  - The current access token keeps serving during backoff only while its known expiry permits it. A forced refresh after a 401 never falls back to that rejected token.
+  - A `refresh_token_reused` rejection suggests checking for a login shared with a local CLI or another instance. It does not prove which client spent the token.
+- **Claude imports:** a credential with a refresh token but no `expiresAt` refreshes on first use. An import time cannot establish the age of an existing access token. An explicit expiry is preserved; an access-token-only import still waits for a 401.
 - **Codex refresh responses** without email, plan or account id keep the previous values, so a paid account isn't reset to "free".
 
 ### When the vault write fails
@@ -36,7 +41,9 @@ A refreshed credential is written back to OpenBao immediately. If that write fai
 - retries the write every 15 s, and once more on graceful shutdown (logging an error if any remain);
 - never lets the periodic account sync replace an in-memory credential with the vault copy.
 
-`/readyz` doesn't fail on unsaved credentials: an orchestrator restart is exactly what would lose them. A crash during an OpenBao outage still loses the token ([#4](https://github.com/wyrd-company/xolotl/issues/4)).
+`/readyz` doesn't fail on unsaved credentials: an orchestrator restart is exactly what would lose them. A crash during an OpenBao outage still loses the token. OpenBao remains the only persistent secret store; xolotl does not write a recovery copy to SQLite, disk or environment variables. An encrypted local copy would still introduce another persistent secret store and key-management requirements. Monitor unsaved credentials, restore OpenBao and allow the writes to finish before restarting xolotl. After a crash that loses an unsaved token, log in again.
+
+A SQLite index failure cannot prevent a rotated credential from being saved to OpenBao or marked unsaved in memory.
 
 ## Selecting an account
 

@@ -175,7 +175,7 @@ pub async fn refresh(http: &reqwest::Client, ep: &Endpoints, cred: &Credential) 
         .form(&[("client_id", CLIENT_ID), ("grant_type", "refresh_token"), ("refresh_token", rt), ("scope", "openid profile email")])
         .send()
         .await
-        .map_err(|e| RefreshError::Transient(e.to_string()))?;
+        .map_err(RefreshError::from_send_error)?;
     RefreshError::from_response(resp).await
 }
 
