@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ExternalLink, X } from "lucide-react";
 import { Link, useSearchParams } from "react-router";
@@ -12,51 +13,12 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { get, type GroupBy, type Status, type UsageRow } from "@/lib/api";
 import { num } from "@/lib/format";
+import { GROUPS, narrowTo, PERIODS, readView, withParams } from "@/lib/usage-view";
 
-const GROUPS: [GroupBy, string][] = [
-  ["client", "Client"],
-  ["account", "Account"],
-  ["provider", "Provider"],
-  ["model", "Model"],
-];
-const PERIODS: [string, number][] = [
-  ["Last 24 hours", 86_400],
-  ["Last 7 days", 7 * 86_400],
-  ["Last 30 days", 30 * 86_400],
-  ["Last 90 days", 90 * 86_400],
-];
 const EMPTY_KEY: Record<GroupBy, string> = { client: "admin token", account: "no account (gateway)", provider: "-", model: "no model" };
-// After narrowing to a row, show the first of these that is not already narrowed.
-const NEXT_GROUP: GroupBy[] = ["model", "account", "client", "provider"];
-
-// The view lives in the hash route (`/#/usage?group=model&client=…`) so it can be linked to.
-// A filter is a `client`, `account`, `provider` or `model` parameter; an empty value is the row with no key.
-function readView(params: URLSearchParams) {
-  const groupParam = params.get("group");
-  const group = GROUPS.find(([g]) => g === groupParam)?.[0] ?? "client";
-  const sinceParam = params.get("since");
-  const period = PERIODS.find(([, secs]) => String(secs) === sinceParam)?.[1] ?? PERIODS[0][1];
-  const filters = GROUPS.flatMap(([g]) => {
-    const value = params.get(g);
-    return value === null ? [] : [[g, value] as const];
-  });
-  return { group, period, filters };
-}
-
-function withParams(params: URLSearchParams, change: Record<string, string | null>) {
-  const next = new URLSearchParams(params);
-  for (const [name, value] of Object.entries(change)) {
-    if (value === null) next.delete(name);
-    else next.set(name, value);
-  }
-  return `?${next}`;
-}
-
 export function UsagePage() {
   const [params, setParams] = useSearchParams();
   const { group, period, filters } = readView(params);
-  const filtered = new Set(filters.map(([g]) => g));
-  const next = NEXT_GROUP.find((g) => g !== group && !filtered.has(g));
   const api = new URLSearchParams({ group_by: group, since_secs: String(period), ...Object.fromEntries(filters) });
   const status = useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/admin/status") });
   const usage = useQuery({
@@ -146,17 +108,9 @@ export function UsagePage() {
             {rows.map((r) => (
               <TableRow key={r.key ?? ""}>
                 <TableCell>
-                  {next ? (
-                    <Link
-                      to={withParams(params, { [group]: r.key ?? "", group: next })}
-                      title={`Narrow to this ${group}`}
-                      className="hover:text-primary underline-offset-4 hover:underline"
-                    >
-                      <Key row={r} group={group} />
-                    </Link>
-                  ) : (
+                  <NarrowLink to={narrowTo(params, r.key)} group={group}>
                     <Key row={r} group={group} />
-                  )}
+                  </NarrowLink>
                 </TableCell>
                 <TableCell className="text-right">{num(r.requests)}</TableCell>
                 <TableCell className="text-right">{num(r.errors)}</TableCell>
@@ -177,4 +131,13 @@ export function UsagePage() {
 
 function Key({ row, group }: { row: UsageRow; group: GroupBy }) {
   return row.key ?? <span className="text-muted-foreground font-sans">{EMPTY_KEY[group]}</span>;
+}
+
+function NarrowLink({ to, group, children }: { to: string | null; group: GroupBy; children: ReactNode }) {
+  if (!to) return children;
+  return (
+    <Link to={to} title={`Narrow to this ${group}`} className="hover:text-primary underline-offset-4 hover:underline">
+      {children}
+    </Link>
+  );
 }
