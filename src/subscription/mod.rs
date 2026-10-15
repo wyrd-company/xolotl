@@ -233,6 +233,7 @@ pub struct Subscriptions {
 struct RefreshRetry {
     failures: u32,
     after: Instant,
+    error: String,
 }
 
 type CredLock = Arc<tokio::sync::Mutex<Credential>>;
@@ -425,7 +426,7 @@ impl Subscriptions {
         if expiring || forced {
             let waiting = self.refresh_retries.lock().get(id).is_some_and(|r| r.after > Instant::now());
             if waiting {
-                anyhow::ensure!(!forced && cred.expires_at.is_some_and(|e| e > now()), "token refresh retry pending for account {id}");
+                anyhow::ensure!(!forced, "token refresh retry pending for account {id}");
                 return Ok(cred.clone());
             }
             self.refresh_locked(id, &mut cred, !forced).await?;
@@ -473,6 +474,7 @@ impl Subscriptions {
                 Ok(())
             }
             Err(RefreshError::Terminal(msg)) => {
+                self.refresh_retries.lock().remove(id);
                 metrics().token_refreshes.add(1, &attrs("terminal"));
                 tracing::warn!(account = id, error = %msg, "refresh token rejected; account needs to log in again");
                 self.db.mark_auth_failed(id, true, Some(&format!("re-login required: {msg}"))).await?;
@@ -487,16 +489,17 @@ impl Subscriptions {
                 } else {
                     tracing::warn!(account = id, error = %msg, "token refresh failed");
                 }
-                let delay = {
+                let error = {
                     let mut retries = self.refresh_retries.lock();
                     let failures = retries.get(id).map_or(1, |r| (r.failures + 1).min(7));
                     let delay = Duration::from_secs((5 * (1u64 << (failures - 1))).min(300));
-                    retries.insert(id.to_string(), RefreshRetry { failures, after: Instant::now() + delay });
-                    delay.as_secs()
+                    let error = format!("{msg}; refresh retry in {}s", delay.as_secs());
+                    retries.insert(id.to_string(), RefreshRetry { failures, after: Instant::now() + delay, error: error.clone() });
+                    error
                 };
-                let _ = self.db.record_account_result(id, Some(&format!("{msg}; refresh retry in {delay}s"))).await;
-                // Keep the current access token while its known lifetime allows it.
-                if allow_current && cred.expires_at.is_some_and(|e| e > now()) { Ok(()) } else { Err(anyhow!("{msg}")) }
+                let _ = self.db.record_account_result(id, Some(&error)).await;
+                // Only a forced refresh follows an access token rejected with 401.
+                if allow_current { Ok(()) } else { Err(anyhow!("{msg}")) }
             }
         }
     }
@@ -535,7 +538,7 @@ impl Subscriptions {
             match self.persist(&id, &cred).await {
                 Ok(()) => {
                     self.unsaved.lock().remove(&id);
-                    let _ = self.db.record_account_result(&id, None).await;
+                    let _ = self.record_account_result_locked(&id, None).await;
                     tracing::info!(account = %id, "refreshed credential saved to the vault");
                 }
                 Err(e) => tracing::warn!(account = %id, error = %e, "credential still not saved to the vault"),
@@ -622,6 +625,19 @@ impl Subscriptions {
             m.retain(|_, (_, at)| at.elapsed() < ttl);
         }
         m.insert(s.to_string(), (account.to_string(), Instant::now()));
+    }
+
+    /// Keep a pending refresh diagnostic when recording a later proxy result.
+    async fn record_account_result(&self, id: &str, error: Option<&str>) -> Result<()> {
+        // Serialize the check and SQLite write with refresh and new logins, so
+        // a delayed response cannot clear a diagnostic recorded in between.
+        let _cred = self.lock_current(id).await?;
+        self.record_account_result_locked(id, error).await
+    }
+
+    async fn record_account_result_locked(&self, id: &str, error: Option<&str>) -> Result<()> {
+        let refresh_error = self.refresh_retries.lock().get(id).map(|r| r.error.clone());
+        self.db.record_account_result(id, refresh_error.as_deref().or(error)).await
     }
 
     // ------------------------------------------------------------ execution
@@ -719,7 +735,7 @@ impl Subscriptions {
                         metrics()
                             .upstream_errors
                             .add(1, &[KeyValue::new("provider", provider.as_str()), KeyValue::new("kind", "transport")]);
-                        let _ = self.db.record_account_result(&account.id, Some(&e.to_string())).await;
+                        let _ = self.record_account_result(&account.id, Some(&e.to_string())).await;
                         last = Some((
                             502,
                             Default::default(),
@@ -756,20 +772,20 @@ impl Subscriptions {
                                 continue 'accounts;
                             }
                         }
-                        let _ = self.db.record_account_result(&account.id, None).await;
+                        let _ = self.record_account_result(&account.id, None).await;
                         self.pin_session(session.as_deref(), &account.id);
                         accounting.record.account_id = Some(account.id.clone());
                         return proxy::relay_sse(status, &resp_headers, prefix, stream, Some(accounting));
                     }
                     if provider == SubProvider::Grok && proxy::is_sse(resp.headers()) {
-                        let _ = self.db.record_account_result(&account.id, None).await;
+                        let _ = self.record_account_result(&account.id, None).await;
                         self.pin_session(session.as_deref(), &account.id);
                         accounting.record.account_id = Some(account.id.clone());
                         let resp_headers = resp.headers().clone();
                         let stream = grok::KeepaliveFilter::new(resp.bytes_stream().boxed()).boxed();
                         return proxy::relay_sse(status, &resp_headers, Vec::new(), stream, Some(accounting));
                     }
-                    let _ = self.db.record_account_result(&account.id, None).await;
+                    let _ = self.record_account_result(&account.id, None).await;
                     self.pin_session(session.as_deref(), &account.id);
                     accounting.record.account_id = Some(account.id.clone());
                     return proxy::relay(resp, Some(accounting));
@@ -796,7 +812,7 @@ impl Subscriptions {
                 }
                 if provider == SubProvider::Grok && status == 426 {
                     let version = grok::client_version(&headers, &self.grok_client_version);
-                    let _ = self.db.record_account_result(&account.id, Some("upstream status 426")).await;
+                    let _ = self.record_account_result(&account.id, Some("upstream status 426")).await;
                     accounting.record.account_id = Some(account.id.clone());
                     accounting.finish(426, Default::default());
                     let msg = format!(
@@ -805,13 +821,13 @@ impl Subscriptions {
                     return self.error_for(provider, path, StatusCode::UPGRADE_REQUIRED, "invalid_request_error", &msg);
                 }
                 if failure == Failure::Fatal {
-                    let _ = self.db.record_account_result(&account.id, reason.as_deref()).await;
+                    let _ = self.record_account_result(&account.id, reason.as_deref()).await;
                     accounting.record.account_id = Some(account.id.clone());
                     return proxy::relay_buffered(status, &resp_headers, bytes, Some(accounting));
                 }
                 self.handle_failure(&account, provider, &failure, status).await;
                 if let Some(reason) = reason.as_deref() {
-                    let _ = self.db.record_account_result(&account.id, Some(reason)).await;
+                    let _ = self.record_account_result(&account.id, Some(reason)).await;
                 }
                 last = Some((status, resp_headers, bytes, account.id.clone()));
                 continue 'accounts;
@@ -863,7 +879,7 @@ impl Subscriptions {
         if let Err(e) = res {
             tracing::warn!(error = %e, "failed to record account failure");
         }
-        let _ = self.db.record_account_result(&account.id, Some(&format!("upstream status {status}"))).await;
+        let _ = self.record_account_result(&account.id, Some(&format!("upstream status {status}"))).await;
     }
 
     /// Merge usage windows observed on a response into the stored snapshot.

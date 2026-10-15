@@ -964,7 +964,7 @@ async fn uncertain_refresh_is_visible_and_backs_off_without_relogin() {
         .expect(2)
         .mount(&server)
         .await;
-    assert!(subs.credential(&row.id, None).await.is_err());
+    assert!(subs.credential(&row.id, Some("old")).await.is_err());
     let state = subs.db.get_account(&row.id).await.unwrap().unwrap();
     assert!(!state.auth_failed);
     let error = state.last_error.unwrap();
@@ -972,10 +972,10 @@ async fn uncertain_refresh_is_visible_and_backs_off_without_relogin() {
     assert!(error.contains("refresh retry in 5s"));
     assert!(!error.contains("unusable-response-with-secret"));
     for _ in 0..3 {
-        assert!(subs.credential(&row.id, None).await.unwrap_err().to_string().contains("retry pending"));
+        assert!(subs.credential(&row.id, Some("old")).await.unwrap_err().to_string().contains("retry pending"));
     }
     subs.refresh_retries.lock().get_mut(&row.id).unwrap().after = Instant::now();
-    assert!(subs.credential(&row.id, None).await.is_err());
+    assert!(subs.credential(&row.id, Some("old")).await.is_err());
     assert!(subs.db.get_account(&row.id).await.unwrap().unwrap().last_error.unwrap().contains("refresh retry in 10s"));
     // A new login of the same identity must not inherit the previous backoff.
     subs.save_account(codex_cred("acct-a", "new-login")).await.unwrap();
@@ -1072,7 +1072,7 @@ async fn refresh_backoff_caps_and_success_clears_it() {
     let row = subs.save_account(cred).await.unwrap();
     Mock::given(path("/oauth/token")).respond_with(ResponseTemplate::new(503)).expect(8).mount(&server).await;
     for delay in [5, 10, 20, 40, 80, 160, 300, 300] {
-        assert!(subs.credential(&row.id, None).await.is_err());
+        assert!(subs.credential(&row.id, Some("old")).await.is_err());
         assert!(subs.db.get_account(&row.id).await.unwrap().unwrap().last_error.unwrap().contains(&format!("retry in {delay}s")));
         subs.refresh_retries.lock().get_mut(&row.id).unwrap().after = Instant::now();
     }
@@ -1099,4 +1099,63 @@ async fn empty_successful_token_is_an_uncertain_refresh() {
     let error = RefreshError::from_response(response).await.unwrap_err();
     assert!(matches!(error, RefreshError::Uncertain(_)));
     assert!(!error.to_string().contains("secret-value"));
+}
+
+#[tokio::test]
+async fn claude_unknown_expiry_keeps_serving_during_refresh_outage() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let cred = claude::import(&json!({"accessToken": "old", "refreshToken": "rt"})).unwrap();
+    let row = subs.save_account(cred).await.unwrap();
+    Mock::given(path("/v1/oauth/token")).respond_with(ResponseTemplate::new(503)).expect(1).mount(&server).await;
+    assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "old");
+    assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "old");
+    assert!(subs.credential(&row.id, Some("old")).await.is_err());
+    assert!(!subs.db.get_account(&row.id).await.unwrap().unwrap().auth_failed);
+}
+
+#[tokio::test]
+async fn unknown_refresh_outcome_survives_proxy_success_and_failure() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = MockServer::start().await;
+    let (mut subs, _) = setup(&server, Strategy::FillFirst).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    Arc::get_mut(&mut subs).unwrap().cfg.endpoints.codex_auth = format!("http://{addr}");
+    Arc::get_mut(&mut subs).unwrap().http = reqwest::Client::builder().no_proxy().retry(reqwest::retry::never()).build().unwrap();
+    let dropped_response = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        socket.shutdown().await.unwrap();
+    });
+    let mut cred = codex_cred("acct-a", "old");
+    cred.expires_at = Some(now() + 120);
+    let row = subs.save_account(cred).await.unwrap();
+    Mock::given(path("/backend-api/codex/responses"))
+        .and(header("authorization", "Bearer old"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SSE_OK, "text/event-stream"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(run(&subs, SubProvider::Codex, "/v1/responses", HeaderMap::new(), responses_body()).await.0, 200);
+    dropped_response.await.unwrap();
+    let diagnostic = subs.db.get_account(&row.id).await.unwrap().unwrap().last_error.unwrap();
+    assert!(diagnostic.contains("outcome unknown"), "{diagnostic}");
+    assert_eq!(subs.accounts(None).await.unwrap()[0].row.last_error.as_deref(), Some(diagnostic.as_str()));
+    server.verify().await;
+    server.reset().await;
+    Mock::given(path("/backend-api/codex/responses")).respond_with(ResponseTemplate::new(503)).expect(1).mount(&server).await;
+    assert_eq!(run(&subs, SubProvider::Codex, "/v1/responses", HeaderMap::new(), responses_body()).await.0, 503);
+    assert_eq!(subs.db.get_account(&row.id).await.unwrap().unwrap().last_error.as_deref(), Some(diagnostic.as_str()));
+    assert!(subs.credential(&row.id, Some("old")).await.is_err());
+    Arc::get_mut(&mut subs).unwrap().cfg.endpoints.codex_auth = server.uri();
+    subs.refresh_retries.lock().get_mut(&row.id).unwrap().after = Instant::now();
+    Mock::given(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token": "fresh", "refresh_token": "rotated"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "fresh");
+    assert!(subs.db.get_account(&row.id).await.unwrap().unwrap().last_error.is_none());
 }
