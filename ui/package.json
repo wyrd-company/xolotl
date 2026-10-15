@@ -6,7 +6,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b",
-    "test": "vitest run && node --test tests/*.test.mjs"
+    "test": "vitest run --exclude 'tests/*.test.mjs' && node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "^5.3.0",
