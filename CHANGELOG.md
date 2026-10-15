@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0
+
+### Features
+
+- Policies can set rate limits: requests and tokens per minute and per day, counted per key or shared by the policy. A request over a limit gets 429 with retry-after in the endpoint's error shape. Consumption shows in `xolotl keys list`, the admin API, the web UI and metrics.
+- Narrow usage by client, account, provider or model: `GET /admin/usage` and `xolotl usage` take filters, and selecting a row on the web UI's Usage page narrows the view to it, with the filters kept in the link.
+- Show Codex reset credits on the overview and account details.
+- The policy editor shows a policy's models as one list: allow or deny each model (or all shown models), filter by provider, sort, rename models inline, add more names with fallbacks, and pick who serves a shared name. Each route shows its provider's account count or key state, and providers without usable accounts are greyed out. Policies gain `renames` (`provider/model` → the name keys see instead of the plain name).
+- Add the xolotl emblem: SVG masters and icon derivatives in `brand/`, the emblem in the web UI's sidebar and sign-in card, a favicon, Apple touch icon and web manifest served at the root, and a UI palette that takes its ink and rust from the emblem.
+- The web UI has a dark theme. It follows the system color scheme, and a sidebar toggle can pick light or dark.
+
+### Fixes
+
+- Refresh model lists in place and show per-provider discovery status.
+- Diagnose uncertain OAuth refreshes, back off retries, and refresh Claude imports with unknown expiry before use.
+- Fix OpenCode Go session forwarding, request refusals, and account error diagnostics
+- Make account recovery provider-aware, replace API keys in place, and refresh models after recovery.
+- Add user documentation, published to wyrd.foo, with a demo of issuing a client key.
+
 ## 0.2.0
 
 ### Features
