@@ -128,7 +128,7 @@ export interface Account {
   available: boolean;
   expires_at: number | null;
   unsaved: boolean;
-  usage: { account_id: string; fetched_at: number; windows: UsageWindow[] } | null;
+  usage: { account_id: string; fetched_at: number; windows: UsageWindow[]; raw?: { reset_credits?: number | null } | null } | null;
 }
 
 export interface FlowStart {

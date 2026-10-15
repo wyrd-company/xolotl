@@ -183,6 +183,12 @@ function AccountDetails({ account: a }: { account: Account }) {
           )}
           <dt className="text-muted-foreground">Plan</dt>
           <dd>{a.plan ?? "-"}</dd>
+          {a.provider === "codex" && (
+            <>
+              <dt className="text-muted-foreground">Reset credits</dt>
+              <dd>{a.usage?.raw?.reset_credits ?? "Unknown"}</dd>
+            </>
+          )}
           {a.cooldown_reason && (
             <>
               <dt className="text-muted-foreground">Cooldown reason</dt>
