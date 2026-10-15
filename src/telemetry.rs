@@ -123,6 +123,7 @@ pub struct Metrics {
     pub mcp_tool_calls: Counter<u64>,
     pub mcp_tool_call_duration: Histogram<f64>,
     pub mcp_executions: Counter<u64>,
+    pub limit_rejections: Counter<u64>,
 }
 
 pub fn metrics() -> &'static Metrics {
@@ -156,6 +157,10 @@ pub fn metrics() -> &'static Metrics {
                 .with_description("Upstream MCP tool call duration")
                 .build(),
             mcp_executions: meter.u64_counter("xolotl.mcp.executions").with_description("Code-mode executions by outcome").build(),
+            limit_rejections: meter
+                .u64_counter("xolotl.limit.rejections")
+                .with_description("Requests refused by a policy's rate limits, by policy, client and limit")
+                .build(),
         }
     })
 }

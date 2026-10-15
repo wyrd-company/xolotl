@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::gateway::Gateway;
 use crate::keys::KeyManager;
+use crate::limits::Limiter;
 use crate::secrets::Secrets;
 use crate::server::{self, AppState};
 use crate::subscription::{SubProvider, Subscriptions};
@@ -381,20 +382,36 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
     let keys = Arc::new(KeyManager::new(secrets.clone()));
     let (policies, n) = keys.reload().await.context("loading policies and client keys from the vault")?;
     tracing::info!(policies, keys = n, "loaded policies and client keys");
+    let limiter = Arc::new(Limiter::default());
+    let n = limiter.seed(&db, crate::db::now()).await.context("loading rate limit counters from the request log")?;
+    tracing::debug!(rows = n, "loaded rate limit counters");
+    limiter.register_metrics();
     let subs = Arc::new(
         Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone())
-            .with_grok_client_version(cfg.catalog.grok_client_version.clone()),
+            .with_grok_client_version(cfg.catalog.grok_client_version.clone())
+            .with_limiter(limiter.clone()),
     );
     let n = subs.sync().await.context("loading accounts from the vault")?;
     tracing::info!(accounts = n, "loaded subscription accounts");
-    let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()));
+    let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()).with_limiter(limiter.clone()));
     let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
 
     let mcp = Arc::new(crate::mcp::McpHub::new(&cfg, secrets.clone(), db.clone()));
     let n = mcp.reload().await.context("loading MCP servers from the vault")?;
     tracing::info!(config = cfg.mcp.servers.len(), vault = n, "loaded MCP servers");
-    let state =
-        AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: Some(vault), sessions: Default::default(), mcp };
+    let state = AppState {
+        cfg: Arc::new(cfg),
+        db,
+        secrets,
+        keys,
+        subs,
+        gateway,
+        catalog,
+        vault: Some(vault),
+        sessions: Default::default(),
+        mcp,
+        limiter,
+    };
     server::spawn_background(state.clone());
     let subs = state.subs.clone();
     let mcp = state.mcp.clone();
@@ -443,15 +460,19 @@ async fn keys(c: Client, cmd: KeysCmd) -> Result<()> {
             if c.json {
                 return c.print(v);
             }
-            println!("{:<36} {:<16} {:<9} {:<17} {:<17} DESCRIPTION", "CLIENT", "POLICY", "STATE", "ROTATED", "EXPIRES");
+            println!(
+                "{:<36} {:<16} {:<9} {:<17} {:<17} {:<44} DESCRIPTION",
+                "CLIENT", "POLICY", "STATE", "ROTATED", "EXPIRES", "USAGE (REQ/MIN REQ/DAY TOK/MIN TOK/DAY)"
+            );
             for k in v.as_array().into_iter().flatten() {
                 println!(
-                    "{:<36} {:<16} {:<9} {:<17} {:<17} {}",
+                    "{:<36} {:<16} {:<9} {:<17} {:<17} {:<44} {}",
                     k["client_id"].as_str().unwrap_or(""),
                     k["policy"].as_str().unwrap_or(""),
                     if k["disabled"].as_bool().unwrap_or(false) { "disabled" } else { "active" },
                     fmt_rfc3339(k.get("rotated_at").filter(|v| !v.is_null()).or(k.get("created_at"))),
                     fmt_rfc3339(k.get("expires_at")),
+                    fmt_key_usage(k),
                     k["description"].as_str().unwrap_or("")
                 );
             }
@@ -788,6 +809,34 @@ fn fmt_rfc3339(v: Option<&Value>) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
+/// A key's consumption per window, as `used/limit` where a limit is set.
+/// Under `per = "policy"` the limited windows show the policy's total, marked `(policy)`.
+fn fmt_key_usage(k: &Value) -> String {
+    let limits = k.get("limits");
+    let shared = limits.and_then(|l| l["per"].as_str()) == Some("policy");
+    let windows = ["requests_per_minute", "requests_per_day", "tokens_per_minute", "tokens_per_day"];
+    let mut parts: Vec<String> = windows
+        .iter()
+        .map(|w| match limits.and_then(|l| l[*w].as_u64()) {
+            Some(limit) => format!("{}/{}", fmt_count(k["limit_usage"][*w].as_u64().unwrap_or(0)), fmt_count(limit)),
+            None => fmt_count(k["usage"][*w].as_u64().unwrap_or(0)),
+        })
+        .collect();
+    if shared {
+        parts.push("(policy)".into());
+    }
+    parts.join(" ")
+}
+
+/// 1234 -> `1.2k`, 2500000 -> `2.5M`.
+fn fmt_count(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3).replace(".0k", "k"),
+        _ => format!("{:.1}M", n as f64 / 1e6).replace(".0M", "M"),
+    }
+}
+
 fn fmt_ts(v: Option<&Value>) -> String {
     v.and_then(Value::as_i64)
         .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
@@ -846,6 +895,22 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_usage_columns() {
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(1_000), "1k");
+        assert_eq!(fmt_count(1_250), "1.2k");
+        assert_eq!(fmt_count(2_500_000), "2.5M");
+        let usage = json!({"requests_per_minute": 3, "requests_per_day": 40, "tokens_per_minute": 1500, "tokens_per_day": 9000});
+        assert_eq!(fmt_key_usage(&json!({"usage": usage})), "3 40 1.5k 9k");
+        let limited = json!({
+            "usage": usage,
+            "limits": {"per": "policy", "requests_per_minute": 60, "tokens_per_day": 2_000_000},
+            "limit_usage": {"requests_per_minute": 7, "requests_per_day": 50, "tokens_per_minute": 2000, "tokens_per_day": 12000},
+        });
+        assert_eq!(fmt_key_usage(&limited), "7/60 40 1.5k 12k/2M (policy)");
+    }
 
     #[test]
     fn durations() {

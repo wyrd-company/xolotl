@@ -26,6 +26,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::gateway::Gateway;
 use crate::keys::{KeyManager, Principal, Scope};
+use crate::limits::Limiter;
 use crate::mcp::McpHub;
 use crate::policy::{Target, View};
 use crate::proxy::{self, forward_request_headers};
@@ -46,6 +47,7 @@ pub struct AppState {
     pub vault: Option<VaultClient>,
     pub sessions: Arc<session::Sessions>,
     pub mcp: Arc<McpHub>,
+    pub limiter: Arc<Limiter>,
 }
 
 impl AppState {
@@ -183,6 +185,7 @@ pub fn spawn_background(state: AppState) {
             if let Err(e) = s.mcp.reload().await {
                 tracing::warn!(error = %e, "MCP server reload failed");
             }
+            s.limiter.prune(crate::db::now());
         }
     });
     let s = state.clone();
@@ -275,6 +278,22 @@ pub fn json_error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(json!({"error": {"type": status_kind(status), "message": msg}}))).into_response()
 }
 
+/// Count a request against its policy's limits. A reached limit answers 429
+/// with `retry-after`, in the Anthropic error shape for Messages clients.
+fn admit(state: &AppState, principal: &Principal, anthropic: bool) -> Result<(), Response> {
+    let Some(client) = principal.client_id() else { return Ok(()) };
+    state.limiter.admit(client, &principal.policy, crate::db::now()).map_err(|e| {
+        let msg = e.message(&principal.policy.name);
+        let mut resp = if anthropic {
+            proxy::anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+        } else {
+            proxy::error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+        };
+        resp.headers_mut().insert(header::RETRY_AFTER, e.retry_after.into());
+        resp
+    })
+}
+
 fn status_kind(s: StatusCode) -> &'static str {
     match s.as_u16() {
         401 => "authentication_error",
@@ -348,6 +367,9 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             .unwrap_or_default();
         return err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("model {model:?} is not available on {path}{hint}"));
     }
+    if let Err(resp) = admit(state, &principal, anthropic) {
+        return resp;
+    }
 
     let fwd = forward_request_headers(&headers);
     let client_id = principal.client_id().map(str::to_string);
@@ -417,6 +439,8 @@ async fn send(
     client_id: Option<&str>,
     model: &str,
 ) -> Response {
+    // Mistral and Grok drop `stream_options`; they report usage anyway.
+    proxy::request_stream_usage(path, &mut body);
     match pool(&target.provider) {
         Some(p) => {
             body["model"] = Value::String(target.model.clone());
@@ -526,11 +550,14 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
 }
 
 /// Read a passthrough body: JSON bodies are buffered so their `model` can be
-/// checked against the policy; anything else streams.
+/// checked against the policy; anything else streams. With `stream_usage`, a
+/// Chat Completions stream is asked for its usage chunk (rate limits count it).
 async fn passthrough_body(
     state: &AppState,
     principal: &Principal,
     provider: &str,
+    path: &str,
+    stream_usage: bool,
     headers: &HeaderMap,
     body: Body,
 ) -> Result<(Option<Bytes>, Option<String>, Option<Body>), Response> {
@@ -544,12 +571,18 @@ async fn passthrough_body(
     let bytes = axum::body::to_bytes(body, state.cfg.server.max_body_bytes)
         .await
         .map_err(|_| json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?;
-    let model = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string));
+    let mut json = serde_json::from_slice::<Value>(&bytes).ok();
+    let model = json.as_ref().and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string));
     if let Some(m) = &model
         && !principal.policy.allows_model(provider, m)
     {
         return Err(json_error(StatusCode::FORBIDDEN, format!("model {m} is not allowed for this key")));
     }
+    let rewrite = stream_usage && json.as_mut().is_some_and(|v| proxy::request_stream_usage(path, v));
+    let bytes = match json {
+        Some(v) if rewrite => Bytes::from(serde_json::to_vec(&v).unwrap_or_default()),
+        _ => bytes,
+    };
     Ok((Some(bytes), model, None))
 }
 
@@ -572,10 +605,14 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
         Ok(p) => p,
         Err(r) => return r,
     };
-    let (bytes, model, stream) = match passthrough_body(&state, &principal, &provider, &parts.headers, body).await {
+    let stream_usage = state.gateway.kind(&provider) != Some(crate::config::ProviderKind::Mistral);
+    let (bytes, model, stream) = match passthrough_body(&state, &principal, &provider, &rest, stream_usage, &parts.headers, body).await {
         Ok(x) => x,
         Err(r) => return r,
     };
+    if let Err(resp) = admit(&state, &principal, rest.starts_with("v1/messages")) {
+        return resp;
+    }
     let path = path_and_query(&rest, &parts.uri);
     let fwd = forward_request_headers(&parts.headers);
     let label = model.map(|m| format!("{provider}/{m}"));
@@ -596,10 +633,13 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
         Err(r) => return r,
     };
     let provider = SubProvider::OpencodeGo.as_str();
-    let (bytes, model, stream) = match passthrough_body(&state, &principal, provider, &parts.headers, body).await {
+    let (bytes, model, stream) = match passthrough_body(&state, &principal, provider, &rest, true, &parts.headers, body).await {
         Ok(x) => x,
         Err(r) => return r,
     };
+    if let Err(resp) = admit(&state, &principal, rest.starts_with("v1/messages")) {
+        return resp;
+    }
     // Failover may resend the body, so it is always buffered here.
     let bytes = match (bytes, stream) {
         (Some(b), _) => b,

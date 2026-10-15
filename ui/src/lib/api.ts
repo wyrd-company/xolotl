@@ -156,7 +156,21 @@ export interface Policy {
   mcp_servers?: string[];
   allow_tools?: string[];
   deny_tools?: string[];
+  limits?: Limits;
 }
+
+/** A policy's rate limits and token budgets; a missing field is unlimited. */
+export interface Limits {
+  /** Whose consumption counts: each key on its own (default) or all keys of the policy together. */
+  per?: "key" | "policy";
+  requests_per_minute?: number;
+  requests_per_day?: number;
+  tokens_per_minute?: number;
+  tokens_per_day?: number;
+}
+
+/** Consumption in the sliding minute and day windows. */
+export type Consumption = Required<Omit<Limits, "per">>;
 
 export interface PolicyView {
   policy: string;
@@ -165,6 +179,8 @@ export interface PolicyView {
   mcp_servers: string[];
   /** `server/tool` names the policy allows. */
   tools: string[];
+  /** Consumption of all keys of the policy together. */
+  usage: Consumption;
 }
 
 export interface KeyInfo {
@@ -178,6 +194,12 @@ export interface KeyInfo {
   expires_at: string | null;
   disabled: boolean;
   previous_expires_at?: string;
+  /** Only in the key list. */
+  usage?: Consumption;
+  /** The key's policy limits, when it has any. */
+  limits?: Limits;
+  /** What the limits are checked against: the key's usage, or the policy's total with `per = "policy"`. */
+  limit_usage?: Consumption;
 }
 
 export interface GatewayProvider {

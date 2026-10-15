@@ -33,6 +33,10 @@ export function dateTime(ts: number): string {
 const nf = new Intl.NumberFormat();
 export const num = (n: number) => nf.format(n);
 
+const compactNf = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
+/** 1234 -> "1.2K". */
+export const compact = (n: number) => compactNf.format(n);
+
 /** Endpoint paths shortened for tables: /v1/chat/completions -> chat. */
 export function endpointName(path: string): string {
   return path.replace(/^\/v1\//, "").replace("chat/completions", "chat");

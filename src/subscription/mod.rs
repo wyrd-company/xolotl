@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{Strategy, SubscriptionConfig};
 use crate::db::{AccountRow, AccountUsage, Db, UsageWindow, now};
+use crate::limits::Limiter;
 use crate::proxy::{self, Accounting};
 use crate::secrets::{Secrets, get_typed, put_typed};
 use crate::telemetry::metrics;
@@ -228,6 +229,7 @@ pub struct Subscriptions {
     pub flows: Flows,
     /// Sent to Grok's chat proxy (`catalog.grok_client_version`).
     grok_client_version: String,
+    limiter: Arc<Limiter>,
 }
 
 struct RefreshRetry {
@@ -261,7 +263,14 @@ impl Subscriptions {
             refresh_retries: Mutex::new(HashMap::new()),
             flows: Flows::default(),
             grok_client_version: crate::config::CatalogConfig::default().grok_client_version,
+            limiter: Default::default(),
         }
+    }
+
+    /// Count response tokens against client rate limits.
+    pub fn with_limiter(mut self, limiter: Arc<Limiter>) -> Self {
+        self.limiter = limiter;
+        self
     }
 
     pub fn with_grok_client_version(mut self, version: impl Into<String>) -> Self {
@@ -680,7 +689,7 @@ impl Subscriptions {
             SubProvider::OpencodeGo => Some(opencode_go::session_key(&headers, client_id)),
             SubProvider::Grok => grok::session_key(&headers, body_json.as_ref().unwrap_or(&Value::Null)),
         };
-        let mut accounting = Accounting::new(self.db.clone(), provider.as_str(), path, client_id, model);
+        let mut accounting = Accounting::new(self.db.clone(), provider.as_str(), path, client_id, model).with_limiter(&self.limiter);
         let mut tried = HashSet::new();
         // Last failed upstream response, returned if every attempt fails.
         let mut last: Option<(u16, reqwest::header::HeaderMap, Bytes, String)> = None;

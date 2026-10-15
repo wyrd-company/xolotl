@@ -3,6 +3,7 @@
 //! for the request log and metrics.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -15,6 +16,7 @@ use opentelemetry::KeyValue;
 use serde_json::Value;
 
 use crate::db::{Db, RequestRecord};
+use crate::limits::Limiter;
 use crate::telemetry::metrics;
 
 /// Request headers never forwarded upstream: hop-by-hop headers, client
@@ -136,11 +138,13 @@ impl TokenUsage {
     }
 }
 
-/// Finalises a request: writes the request log row and records metrics.
+/// Finalises a request: writes the request log row, records metrics and
+/// counts the tokens against the client's rate limits.
 pub struct Accounting {
     pub db: Db,
     pub record: RequestRecord,
     pub started: Instant,
+    limiter: Option<Arc<Limiter>>,
 }
 
 impl Accounting {
@@ -148,6 +152,7 @@ impl Accounting {
         Self {
             db,
             record: RequestRecord {
+                started_at: Some(crate::db::now()),
                 client_id: client_id.map(str::to_string),
                 provider: provider.to_string(),
                 model: model.map(str::to_string),
@@ -156,7 +161,13 @@ impl Accounting {
                 ..Default::default()
             },
             started: Instant::now(),
+            limiter: None,
         }
+    }
+
+    pub fn with_limiter(mut self, limiter: &Arc<Limiter>) -> Self {
+        self.limiter = Some(limiter.clone());
+        self
     }
 
     pub fn finish(mut self, status: u16, usage: TokenUsage) {
@@ -166,6 +177,10 @@ impl Accounting {
         self.record.cached_tokens = usage.cached;
         self.record.latency_ms = self.started.elapsed().as_millis() as i64;
         let r = &self.record;
+        if let (Some(limiter), Some(client)) = (&self.limiter, &r.client_id) {
+            let tokens = usage.input.unwrap_or(0).max(0) + usage.output.unwrap_or(0).max(0);
+            limiter.record_tokens(client, tokens as u64, crate::db::now());
+        }
         let attrs = [
             KeyValue::new("provider", r.provider.clone()),
             KeyValue::new("model", r.model.clone().unwrap_or_default()),
@@ -204,6 +219,27 @@ impl Accounting {
             }
         });
     }
+}
+
+/// Ask a Chat Completions upstream to end its stream with a usage chunk, so
+/// the request's tokens can be counted against rate limits. It is requested
+/// even when the client didn't ask or said no; such a client gets one extra
+/// chunk with empty `choices`. Returns whether the body changed.
+pub fn request_stream_usage(path: &str, body: &mut Value) -> bool {
+    let chat = path.split('?').next().unwrap_or(path).ends_with("/chat/completions");
+    if !chat || body.get("stream").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let Some(obj) = body.as_object_mut() else { return false };
+    let opts = obj.entry("stream_options").or_insert_with(|| Value::Object(Default::default()));
+    if !opts.is_object() {
+        *opts = Value::Object(Default::default());
+    }
+    if opts.get("include_usage") == Some(&Value::Bool(true)) {
+        return false;
+    }
+    opts["include_usage"] = Value::Bool(true);
+    true
 }
 
 /// Max bytes of a non-streamed body buffered for usage parsing.
@@ -415,6 +451,25 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let s = db.usage_summary("client", 0, &Default::default()).await.unwrap();
         assert_eq!(s[0].output_tokens, 4);
+    }
+
+    #[test]
+    fn stream_usage_is_requested_on_chat_streams_only() {
+        for opts in [None, Some(json!({"include_usage": false})), Some(json!(null))] {
+            let mut body = json!({"model": "m", "stream": true});
+            if let Some(o) = opts {
+                body["stream_options"] = o;
+            }
+            assert!(request_stream_usage("/v1/chat/completions", &mut body));
+            assert_eq!(body["stream_options"]["include_usage"], true);
+        }
+        let mut asked = json!({"stream": true, "stream_options": {"include_usage": true}});
+        assert!(!request_stream_usage("/v1/chat/completions", &mut asked));
+        let mut not_streaming = json!({"stream": false});
+        assert!(!request_stream_usage("/v1/chat/completions", &mut not_streaming));
+        assert!(not_streaming.get("stream_options").is_none());
+        let mut responses = json!({"stream": true});
+        assert!(!request_stream_usage("/v1/responses", &mut responses));
     }
 
     #[test]
