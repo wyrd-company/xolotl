@@ -48,7 +48,7 @@ export function WindowBars({ windows, softLimit }: { windows: UsageWindow[]; sof
           <Progress
             value={w.used_percent}
             aria-label={`${w.name} window used`}
-            indicatorClassName={softLimit !== undefined && w.used_percent >= softLimit ? "bg-[#b45309]" : undefined}
+            indicatorClassName={softLimit !== undefined && w.used_percent >= softLimit ? "bg-usage-high" : undefined}
           />
         </div>
       ))}

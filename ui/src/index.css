@@ -6,38 +6,55 @@
 @import "@fontsource/ibm-plex-mono/latin-400.css";
 @import "@fontsource/ibm-plex-mono/latin-500.css";
 
-/* Palette: the emblem's ink and rust (see brand/README.md), cool greys between them. */
+/*
+ * Palette: the emblem's ink and rust (see brand/README.md), cool greys between them.
+ * Theme-dependent colors use `light-dark(<light>, <dark>)`. The color scheme follows the
+ * system unless the theme toggle sets `data-theme` on <html>.
+ */
 :root {
+  color-scheme: light dark;
   --radius: 0.5rem;
-  --background: #f4f5f7;
-  --foreground: #192029;
-  --card: #ffffff;
-  --card-foreground: #192029;
-  --popover: #ffffff;
-  --popover-foreground: #192029;
-  --primary: #b2411a;
-  --primary-foreground: #ffffff;
-  --secondary: #e6e8ec;
-  --secondary-foreground: #192029;
-  --muted: #f9fafb;
-  --muted-foreground: #555b66;
-  --accent: #eef0f3;
-  --accent-foreground: #192029;
-  --destructive: #b91c1c;
-  --border: #dde0e5;
-  --input: #b9bec7;
-  --ring: #b2411a;
+  --background: light-dark(#f4f5f7, #1b1d22);
+  --foreground: light-dark(#192029, #e6e8ec);
+  --card: light-dark(#ffffff, #23262c);
+  --card-foreground: light-dark(#192029, #e6e8ec);
+  --popover: light-dark(#ffffff, #23262c);
+  --popover-foreground: light-dark(#192029, #e6e8ec);
+  --primary: light-dark(#b2411a, #e8733d);
+  --primary-foreground: light-dark(#ffffff, #16181d);
+  --secondary: light-dark(#e6e8ec, #30333b);
+  --secondary-foreground: light-dark(#192029, #e6e8ec);
+  --muted: light-dark(#f9fafb, #272a31);
+  --muted-foreground: light-dark(#555b66, #9aa1ac);
+  --accent: light-dark(#eef0f3, #2c2f36);
+  --accent-foreground: light-dark(#192029, #e6e8ec);
+  --destructive: light-dark(#b91c1c, #f87171);
+  --destructive-foreground: light-dark(#ffffff, #16181d);
+  --border: light-dark(#dde0e5, #363a42);
+  --input: light-dark(#b9bec7, #4a4f59);
+  --ring: light-dark(#b2411a, #e8733d);
   --sidebar: #192029;
   --sidebar-foreground: #c9cdd4;
   --sidebar-accent: #2b323d;
   --sidebar-accent-foreground: #ffffff;
-  --success: #166534;
-  --success-muted: #e3f4e8;
-  --warning: #92400e;
-  --warning-muted: #fff4ec;
-  --info: #1e40af;
-  --info-muted: #e6eefb;
-  --danger-muted: #fde8e8;
+  --success: light-dark(#166534, #6ee7a0);
+  --success-muted: light-dark(#e3f4e8, #15301f);
+  --warning: light-dark(#92400e, #f8b77a);
+  --warning-muted: light-dark(#fff4ec, #3a2716);
+  --warning-border: light-dark(#f3c9ae, #6b4223);
+  --info: light-dark(#1e40af, #9cb8f7);
+  --info-muted: light-dark(#e6eefb, #1a2742);
+  --danger-muted: light-dark(#fde8e8, #3d1d20);
+  /* A usage bar at or over its soft limit. */
+  --usage-high: light-dark(#b45309, #f59e0b);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
 }
 
 @theme inline {
@@ -62,6 +79,7 @@
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
@@ -73,9 +91,11 @@
   --color-success-muted: var(--success-muted);
   --color-warning: var(--warning);
   --color-warning-muted: var(--warning-muted);
+  --color-warning-border: var(--warning-border);
   --color-info: var(--info);
   --color-info-muted: var(--info-muted);
   --color-danger-muted: var(--danger-muted);
+  --color-usage-high: var(--usage-high);
 }
 
 @layer base {
