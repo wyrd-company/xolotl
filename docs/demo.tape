@@ -25,7 +25,7 @@ Set WindowBar "Colorful"
 Set TypingSpeed 28ms
 
 Hide
-Type "source docs/demo-env.sh && cd /tmp/xolotl-demo && export PS1='demo> ' && clear" Enter
+Type `source docs/demo-env.sh && cd "$XOLOTL_DEMO_DIR" && export PS1='demo> ' && clear` Enter
 Sleep 15s
 Show
 
