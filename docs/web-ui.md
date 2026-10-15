@@ -9,7 +9,7 @@
 | Overview | OpenBao and SQLite health, pool availability and usage windows, 24 h totals, gateway providers, recent failed requests | `GET /admin/status`, `/admin/accounts`, `/admin/providers`, `/admin/usage` |
 | Accounts | List by provider; refresh usage, enable/disable, priority, clear cooldown, remove; details | `/admin/accounts/...` |
 | Add account | Codex device or browser login, Claude paste login, OpenCode Go key, import of a CLI credential file | `/admin/auth/...`, `POST /admin/accounts/import` |
-| Policies | Providers, scopes, allow/deny, precedence, winners for shared names, aliases, rate limits with the policy's consumption; a live preview of the names a key sees, with native and translated endpoints | `/admin/policies/...`, `POST /admin/policy-preview` |
+| Policies | Providers with their account or key state, scopes, precedence, MCP access, rate limits with the policy's consumption. The model list shows every model of the allowed providers: allow/deny toggles (with allow/deny all for the filtered rows), filter by provider, sort, inline rename, more names with fallbacks, the winner of a shared name, and the provider's account state. The toggles write exact `provider/model` entries to `allow_models` / `deny_models`; the globs stay editable under Model patterns | `/admin/policies/...`, `POST /admin/policy-preview`, `GET /admin/accounts`, `GET /admin/providers` |
 | Client keys | Issue, rotate with grace, enable/disable, revoke. Consumption against the policy's rate limits. Shows the vault path and the `bao` command and Vault policy the client needs, never the key | `/admin/keys/...` |
 | MCP servers | Upstream MCP servers from the config file and OpenBao: add, edit and remove the latter; header secrets; OAuth sign-in; tools; recent tool calls | `/admin/mcp/...` |
 | Providers & models | Gateway providers from the config file and their key state; set a key; the catalog with each model's endpoints | `GET /admin/providers`, `GET /admin/catalog/routes`, `POST /admin/catalog/refresh` |
@@ -18,8 +18,8 @@
 ## Model discovery
 
 Model lists and counts include a shared **Refresh models** control, the age of the
-catalog, and each provider's model count or discovery error. The policy preview
-uses its selected providers. Account views use their provider pools: discovery
+catalog, and each provider's model count or discovery error. The policy model list
+uses its selected providers, narrowed to the provider filter when set. Account views use their provider pools: discovery
 is shared across accounts of a provider, not performed for one account. A failed
 discovery keeps cached and configured static models visible and labels the error.
 A successful empty response is shown as **Provider returned no models**.
@@ -62,4 +62,4 @@ all open model queries immediately after completion.
 - The UI has a light and a dark theme. It follows the browser's color scheme unless a theme is picked in the sidebar (system, light or dark); the choice is kept in `localStorage`. Theme-dependent colors in `ui/src/index.css` use `light-dark()` pairs; the sidebar is dark in both themes.
 - `index.html` is served with `no-cache` and a strict Content-Security-Policy (same-origin scripts, styles, fonts and requests; no framing). Hashed files under `/assets/` are cached for a year; the root icon files for a day. Fonts (IBM Plex) are bundled, so the UI loads nothing from other hosts.
 - The emblem and its icons are described in `brand/README.md`.
-- The Docker image builds the UI in a Node stage; CI runs `pnpm build` (which type-checks) in its own job, and the release workflow builds the UI before the binary.
+- The Docker image builds the UI in a Node stage; CI runs `pnpm test` (Vitest on `ui/src` and `ui/test`) and `pnpm build` (which type-checks) in its own job, and the release workflow builds the UI before the binary.

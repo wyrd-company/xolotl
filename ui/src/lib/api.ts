@@ -1,6 +1,8 @@
 // Client for xolotl's /admin API. The session cookie is HttpOnly; the CSRF
 // token from sign-in goes in `x-csrf-token` on every request.
 
+import type { Candidate } from "./policy-models";
+
 let csrfToken: string | null = null;
 let onUnauthorized: (() => void) | null = null;
 
@@ -55,6 +57,8 @@ export const put = <T>(path: string, body: unknown) => api<T>("PUT", path, body)
 export const del = <T>(path: string) => api<T>("DELETE", path);
 
 // ---- types (mirroring the Rust structs)
+
+export type { Candidate };
 
 export type SubProvider = "claude" | "codex" | "grok" | "opencode-go";
 export const SUB_PROVIDERS: SubProvider[] = ["claude", "codex", "grok", "opencode-go"];
@@ -152,6 +156,8 @@ export interface Policy {
   precedence?: string[];
   winners?: Record<string, string>;
   aliases?: Record<string, string | string[]>;
+  /** `provider/model` -> the name keys see instead of the plain name. */
+  renames?: Record<string, string>;
   scopes: Scope[];
   mcp_servers?: string[];
   allow_tools?: string[];
@@ -176,6 +182,8 @@ export interface PolicyView {
   policy: string;
   models: { name: string; targets: string[]; endpoints: string[]; translated_endpoints: string[]; alias: boolean }[];
   shared: { model: string; providers: string[]; winner: string }[];
+  /** Every model of the allowed providers, allowed or not. */
+  catalog: Candidate[];
   mcp_servers: string[];
   /** `server/tool` names the policy allows. */
   tools: string[];

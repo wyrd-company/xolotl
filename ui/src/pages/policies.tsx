@@ -1,11 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, Plus, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, Plus } from "lucide-react";
 import { Link, Navigate, useNavigate, useParams } from "react-router";
 
-import { CatalogRefresh } from "@/components/catalog-refresh";
 import { Confirm } from "@/components/confirm";
-import { Endpoints, EndpointsLegend } from "@/components/endpoints";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
 import { PolicyLimits } from "@/components/policy-limits";
 import { Badge } from "@/components/ui/badge";
@@ -14,8 +12,6 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import {
   del,
@@ -23,6 +19,7 @@ import {
   post,
   put,
   SUB_PROVIDERS,
+  type Account,
   type GatewayProvider,
   type KeyInfo,
   type Limits,
@@ -32,7 +29,10 @@ import {
   type Scope,
 } from "@/lib/api";
 import { useAction } from "@/lib/hooks";
+import { providerHealth, usable } from "@/lib/policy-models";
 import { cn } from "@/lib/utils";
+
+import { HealthBadge, lines, ModelList } from "./policy-model-list";
 
 /** Route segment for an unsaved policy; `+` can't appear in policy names. */
 const NEW = "+new";
@@ -98,7 +98,7 @@ export function PoliciesPage() {
   );
 }
 
-interface Draft {
+export interface Draft {
   name: string;
   description: string;
   providers: string[];
@@ -108,11 +108,14 @@ interface Draft {
   precedence: string[];
   winners: Record<string, string>;
   aliases: { name: string; targets: string }[];
+  renames: Record<string, string>;
   mcpServers: string[];
   allowTools: string;
   denyTools: string;
   limits: Limits;
 }
+
+export type SetDraft = <K extends keyof Draft>(k: K, v: Draft[K]) => void;
 
 function toDraft(p: Policy | null): Draft {
   return {
@@ -125,6 +128,7 @@ function toDraft(p: Policy | null): Draft {
     precedence: p?.precedence ?? [],
     winners: p?.winners ?? {},
     aliases: Object.entries(p?.aliases ?? {}).map(([name, t]) => ({ name, targets: (Array.isArray(t) ? t : [t]).join(", ") })),
+    renames: p?.renames ?? {},
     mcpServers: p?.mcp_servers ?? [],
     allowTools: (p?.allow_tools ?? []).join("\n"),
     denyTools: (p?.deny_tools ?? []).join("\n"),
@@ -133,11 +137,6 @@ function toDraft(p: Policy | null): Draft {
 }
 
 function toPolicy(d: Draft): Policy {
-  const lines = (s: string) =>
-    s
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean);
   const aliases: Record<string, string | string[]> = {};
   for (const a of d.aliases) {
     const targets = a.targets
@@ -146,6 +145,12 @@ function toPolicy(d: Draft): Policy {
       .filter(Boolean);
     if (a.name.trim()) aliases[a.name.trim()] = targets.length === 1 ? targets[0] : targets;
   }
+  // A blank name, or the plain name itself, is no rename.
+  const renames = Object.fromEntries(
+    Object.entries(d.renames)
+      .map(([t, n]) => [t, n.trim()])
+      .filter(([t, n]) => n && n !== t.slice(t.indexOf("/") + 1)),
+  );
   return {
     name: d.name.trim(),
     description: d.description.trim() || undefined,
@@ -156,6 +161,7 @@ function toPolicy(d: Draft): Policy {
     precedence: d.precedence,
     winners: d.winners,
     aliases,
+    renames,
     mcp_servers: d.mcpServers,
     allow_tools: lines(d.allowTools),
     deny_tools: lines(d.denyTools),
@@ -182,10 +188,12 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
   const navigate = useNavigate();
   const isNew = initial === null;
   const [draft, setDraft] = useState<Draft>(() => toDraft(initial));
-  const set = <K extends keyof Draft>(k: K, v: Draft[K]) => setDraft((d) => ({ ...d, [k]: v }));
+  const set: SetDraft = (k, v) => setDraft((d) => ({ ...d, [k]: v }));
 
   const gateway = useQuery({ queryKey: ["providers"], queryFn: () => get<GatewayProvider[]>("/admin/providers") });
+  const accounts = useQuery({ queryKey: ["accounts"], queryFn: () => get<Account[]>("/admin/accounts"), refetchInterval: 30_000 });
   const known = [...SUB_PROVIDERS, ...(gateway.data ?? []).filter((p) => p.enabled).map((p) => p.name)];
+  const health = (p: string) => providerHealth(p, SUB_PROVIDERS, accounts.data ?? [], gateway.data ?? []);
   const all = draft.providers.includes("*");
   const allowed = all ? known : known.filter((p) => draft.providers.includes(p));
   // Precedence as shown: the saved order first, then the rest in default order.
@@ -253,9 +261,10 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
             <legend className="pb-3 text-sm font-medium">Providers</legend>
             <div className="flex flex-wrap gap-x-6 gap-y-3">
               {known.map((p) => (
-                <label key={p} className="flex items-center gap-2 text-sm">
+                <label key={p} className={cn("flex items-center gap-2 text-sm", accounts.isSuccess && !usable(health(p)) && "text-muted-foreground")}>
                   <Checkbox checked={all || draft.providers.includes(p)} disabled={all} onCheckedChange={(c) => toggleProvider(p, c === true)} />
                   <span className="font-mono">{p}</span>
+                  {accounts.isSuccess && <HealthBadge health={health(p)} />}
                 </label>
               ))}
               <label className="flex items-center gap-2 text-sm">
@@ -278,16 +287,29 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
               ))}
             </div>
           </fieldset>
-          <div className="grid gap-4 md:grid-cols-2">
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="p-allow">Allow models (globs, one per line; empty allows all)</Label>
-              <Textarea id="p-allow" className="font-mono" rows={3} value={draft.allow} onChange={(e) => set("allow", e.target.value)} />
+        </CardContent>
+      </Card>
+
+      <ModelList allowedProviders={allowed} draft={draft} set={set} view={preview.data} fetching={preview.isFetching} error={preview.error} health={health} />
+
+      <Card>
+        <CardContent>
+          <details>
+            <summary className="cursor-pointer text-sm font-medium">Model patterns</summary>
+            <p className="text-muted-foreground pt-2 text-sm">
+              The toggles above write exact <Mono>provider/model</Mono> entries here. Globs match <Mono>model</Mono> or <Mono>provider/model</Mono>.
+            </p>
+            <div className="grid gap-4 pt-4 md:grid-cols-2">
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="p-allow">Allow models (one per line; empty allows all)</Label>
+                <Textarea id="p-allow" className="font-mono" rows={3} value={draft.allow} onChange={(e) => set("allow", e.target.value)} />
+              </div>
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="p-deny">Deny models (deny wins)</Label>
+                <Textarea id="p-deny" className="font-mono" rows={3} value={draft.deny} onChange={(e) => set("deny", e.target.value)} />
+              </div>
             </div>
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="p-deny">Deny models (deny wins)</Label>
-              <Textarea id="p-deny" className="font-mono" rows={3} value={draft.deny} onChange={(e) => set("deny", e.target.value)} />
-            </div>
-          </div>
+          </details>
         </CardContent>
       </Card>
 
@@ -295,7 +317,8 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
         <CardHeader>
           <CardTitle className="text-base">Precedence</CardTitle>
           <CardDescription>
-            Who serves a model name that several providers offer. The others drop the plain name; <Mono>provider/model</Mono> still reaches them.
+            Who serves a model name that several providers offer, unless the model list picks one. The others drop the plain name;{" "}
+            <Mono>provider/model</Mono> still reaches them.
             {draft.precedence.length === 0 ? " Using the default order." : null}
           </CardDescription>
         </CardHeader>
@@ -326,105 +349,12 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
               Reset to the default order
             </Button>
           )}
-          <SharedNames
-            shared={preview.data?.shared ?? []}
-            winners={draft.winners}
-            onChange={(model, winner) => {
-              const w = { ...draft.winners };
-              if (winner) w[model] = winner;
-              else delete w[model];
-              set("winners", w);
-            }}
-          />
         </CardContent>
       </Card>
 
       <McpAccess draft={draft} set={set} tools={preview.data?.tools ?? []} />
 
       <PolicyLimits limits={draft.limits} onChange={(l) => set("limits", l)} usage={isNew ? undefined : preview.data?.usage} />
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Aliases</CardTitle>
-          <CardDescription>Extra names, each for one or more comma-separated provider/model targets, tried in order on 429 or 5xx.</CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-2">
-          {draft.aliases.map((a, i) => (
-            <div key={i} className="flex flex-wrap gap-2">
-              <Input
-                aria-label="Alias name"
-                className="w-48 font-mono"
-                placeholder="fast"
-                value={a.name}
-                onChange={(e) => set("aliases", draft.aliases.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)))}
-              />
-              <Input
-                aria-label="Targets"
-                className="min-w-64 flex-1 font-mono"
-                placeholder="codex/gpt-6-codex-mini, vercel/openai/gpt-6-mini"
-                value={a.targets}
-                onChange={(e) => set("aliases", draft.aliases.map((x, j) => (j === i ? { ...x, targets: e.target.value } : x)))}
-              />
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                aria-label={`Remove alias ${a.name}`}
-                onClick={() => set("aliases", draft.aliases.filter((_, j) => j !== i))}
-              >
-                <Trash2 />
-              </Button>
-            </div>
-          ))}
-          <Button type="button" variant="outline" size="sm" className="self-start" onClick={() => set("aliases", [...draft.aliases, { name: "", targets: "" }])}>
-            <Plus /> Add alias
-          </Button>
-        </CardContent>
-      </Card>
-
-      <Card className="pb-0">
-        <CardHeader>
-          <CardTitle className="text-base">What keys under this policy see</CardTitle>
-          <CardDescription>
-            Updates as you edit. <Mono>GET /v1/models</Mono> lists these names with the endpoints each is reachable on. Claude subscription accounts
-            serve only <Mono>/v1/messages</Mono> and are never translated.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3">
-          <CatalogRefresh providers={allowed} />
-          <EndpointsLegend />
-          {preview.error && <p className="bg-danger-muted text-destructive rounded-md px-3 py-2 text-sm">{preview.error.message}</p>}
-        </CardContent>
-        <Table className="min-w-[720px]">
-          <TableHeader>
-            <TableRow>
-              <TableHead>Name</TableHead>
-              <TableHead>Routes to</TableHead>
-              <TableHead>Endpoints</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody className={cn(preview.isFetching && "opacity-60")}>
-            {(preview.data?.models ?? []).map((m) => (
-              <TableRow key={m.name}>
-                <TableCell className="font-mono text-xs">
-                  {m.name}
-                  {m.alias && (
-                    <Badge variant="outline" className="ml-2 font-sans">
-                      alias
-                    </Badge>
-                  )}
-                </TableCell>
-                <TableCell className="font-mono text-xs">{m.targets.join(", ")}</TableCell>
-                <TableCell>
-                  <Endpoints native={m.endpoints} translated={m.translated_endpoints} />
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-        {draft.providers.length === 0 && <Empty>No providers: keys under this policy see no models.</Empty>}
-        {preview.data?.models.length === 0 && draft.providers.length > 0 && <Empty>No models match this policy.</Empty>}
-      </Card>
 
       <div className="flex flex-wrap items-center gap-3">
         <Button type="submit" disabled={!dirty || !policy.name || !!preview.error || save.isPending}>
@@ -462,7 +392,7 @@ function McpAccess({
   tools,
 }: {
   draft: Draft;
-  set: <K extends keyof Draft>(k: K, v: Draft[K]) => void;
+  set: SetDraft;
   tools: string[];
 }) {
   const servers = useQuery({ queryKey: ["mcp-servers"], queryFn: () => get<McpServer[]>("/admin/mcp/servers") });
@@ -539,63 +469,5 @@ function McpAccess({
         )}
       </CardContent>
     </Card>
-  );
-}
-
-function SharedNames({
-  shared,
-  winners,
-  onChange,
-}: {
-  shared: PolicyView["shared"];
-  winners: Record<string, string>;
-  onChange: (model: string, winner: string | null) => void;
-}) {
-  if (!shared.length) return null;
-  const PRECEDENCE = "__precedence";
-  return (
-    <div className="flex flex-col gap-2">
-      <h3 className="text-sm font-semibold">Shared model names</h3>
-      <div className="overflow-hidden rounded-md border">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Model</TableHead>
-              <TableHead>Served by</TableHead>
-              <TableHead>Winner</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {shared.map((s) => {
-              const id = `winner-${s.model}`;
-              return (
-                <TableRow key={s.model}>
-                  <TableCell className="font-mono text-xs">{s.model}</TableCell>
-                  <TableCell className="font-mono text-xs">{s.providers.join(", ")}</TableCell>
-                  <TableCell>
-                    <Label htmlFor={id} className="sr-only">
-                      Winner for {s.model}
-                    </Label>
-                    <Select value={winners[s.model] ?? PRECEDENCE} onValueChange={(v) => onChange(s.model, v === PRECEDENCE ? null : v)}>
-                      <SelectTrigger id={id} className="h-9 w-64">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value={PRECEDENCE}>by precedence ({s.providers[0]})</SelectItem>
-                        {s.providers.map((p) => (
-                          <SelectItem key={p} value={p}>
-                            {p}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </TableCell>
-                </TableRow>
-              );
-            })}
-          </TableBody>
-        </Table>
-      </div>
-    </div>
   );
 }
