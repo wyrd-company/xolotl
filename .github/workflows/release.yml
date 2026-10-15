@@ -140,3 +140,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # A release made with GITHUB_TOKEN starts no `release` workflows, so the
+  # docs are published from here.
+  docs:
+    needs: [guard, binary, image]
+    if: needs.guard.outputs.release == 'true'
+    uses: ./.github/workflows/publish-docs.yml
+    secrets: inherit
