@@ -354,6 +354,23 @@ impl Subscriptions {
         self.db.get_account(&id).await?.context("account vanished after save")
     }
 
+    /// Replace an API key without changing the account identity or usage history.
+    pub async fn replace_key(&self, id: &str, api_key: &str) -> Result<AccountRow> {
+        anyhow::ensure!(!api_key.trim().is_empty(), "API key must not be empty");
+        let _membership = self.membership.lock().await;
+        let row = self.db.get_account(id).await?.context("no such account")?;
+        anyhow::ensure!(row.provider == SubProvider::OpencodeGo.as_str(), "account does not use an API key");
+        let lock = self.creds.read().get(id).cloned().context("account credentials not loaded")?;
+        let mut cred = lock.lock().await;
+        let mut replacement = cred.clone();
+        replacement.api_key = Some(api_key.trim().to_string());
+        self.persist(id, &replacement).await?;
+        *cred = replacement;
+        self.db.clear_cooldown(id).await?;
+        self.db.mark_auth_failed(id, false, None).await?;
+        self.db.get_account(id).await?.context("account vanished after replacement")
+    }
+
     pub async fn remove_account(&self, id: &str) -> Result<bool> {
         let _membership = self.membership.lock().await;
         let Some(row) = self.db.get_account(id).await? else { return Ok(false) };

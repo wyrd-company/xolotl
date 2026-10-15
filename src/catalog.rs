@@ -171,6 +171,18 @@ impl ModelCatalog {
         *self.snapshot.write() = Arc::new(Snapshot { models, discovery, refreshed: Some(Instant::now()) });
     }
 
+    /// Refresh one subscription pool and preserve other providers' catalogs.
+    pub async fn refresh_provider(&self, subs: &Subscriptions, provider: SubProvider) -> anyhow::Result<usize> {
+        let discovered = subs.fetch_models(provider, &self.cfg.codex_client_version).await?;
+        let mut snapshot = self.snapshot.write();
+        let mut models = snapshot.models.clone();
+        models.insert(provider.as_str().to_string(), discovered.into_iter().collect());
+        let models = self.with_static(models);
+        let count = models.get(provider.as_str()).map_or(0, BTreeSet::len);
+        *snapshot = Arc::new(Snapshot { models, refreshed: snapshot.refreshed });
+        Ok(count)
+    }
+
     /// Wire formats that reach `provider/model`.
     pub fn wires(&self, provider: &str, model: &str) -> Vec<Wire> {
         // Claude subscription accounts speak only Messages; overrides don't apply.

@@ -2120,3 +2120,95 @@ async fn concurrent_scoped_catalog_refreshes_preserve_both_results() {
     assert!(status["llama"].refreshed_at.is_some());
     assert!(status["opencode-go"].refreshed_at.is_some());
 }
+
+#[tokio::test]
+async fn account_key_replacement_preserves_identity_and_survives_reload() {
+    let h = harness().await;
+    let id = h
+        .account(Credential {
+            provider: SubProvider::OpencodeGo,
+            api_key: Some("old-key".into()),
+            label: Some("Example".into()),
+            ..Default::default()
+        })
+        .await;
+    h.state.db.set_account_priority(&id, 17).await.unwrap();
+    h.state.db.set_account_enabled(&id, false).await.unwrap();
+    h.state.db.mark_auth_failed(&id, true, Some("rejected (401)")).await.unwrap();
+    h.state.db.set_cooldown(&id, now() + 100, "rate limited").await.unwrap();
+    h.state.db.put_usage(&crate::db::AccountUsage { account_id: id.clone(), fetched_at: 123, windows: vec![], raw: None }).await.unwrap();
+    let before = h.state.db.get_account(&id).await.unwrap().unwrap();
+    let url = format!("/admin/accounts/{id}/key");
+    assert_eq!(h.call("POST", &url, None, Some(json!({"api_key":"new-key"}))).await.0, 401);
+    assert_eq!(h.call("POST", &url, Some(&h.admin), Some(json!({"api_key":"  "}))).await.0, 400);
+    let (status, response) = h.call("POST", &url, Some(&h.admin), Some(json!({"api_key":"new-key"}))).await;
+    assert_eq!(status, 200);
+    assert!(!response.to_string().contains("new-key"));
+    let after = h.state.db.get_account(&id).await.unwrap().unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.label, before.label);
+    assert_eq!(after.priority, 17);
+    assert_eq!(h.state.db.get_usage(&id).await.unwrap().unwrap().fetched_at, 123);
+    assert_eq!(after.created_at, before.created_at);
+    assert!(!after.enabled);
+    assert!(!after.auth_failed);
+    assert!(after.cooldown_until.is_none());
+    assert!(after.last_error.is_none());
+    let record = h.state.secrets.get(&format!("accounts/opencode-go/{id}")).await.unwrap().unwrap();
+    assert_eq!(record["api_key"], "new-key");
+    // A fresh pool must use the replacement from storage too.
+    let subs = Subscriptions::new(h.state.cfg.subscription.clone(), h.state.db.clone(), h.state.secrets.clone(), reqwest::Client::new());
+    subs.sync().await.unwrap();
+    h.state.db.set_account_enabled(&id, true).await.unwrap();
+    Mock::given(method("GET"))
+        .and(path("/zen/go/v1/models"))
+        .and(header("authorization", "Bearer new-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"sample-model"}]})))
+        .expect(2)
+        .mount(&h.upstream)
+        .await;
+    assert_eq!(subs.fetch_models(SubProvider::OpencodeGo, "example").await.unwrap(), vec!["sample-model"]);
+    assert_eq!(h.state.subs.fetch_models(SubProvider::OpencodeGo, "example").await.unwrap(), vec!["sample-model"]);
+    assert_eq!(h.state.db.list_accounts(None).await.unwrap().len(), 1);
+    let oauth = h.codex_account().await;
+    assert_eq!(h.call("POST", &format!("/admin/accounts/{oauth}/key"), Some(&h.admin), Some(json!({"api_key":"new-key"}))).await.0, 400);
+    assert_eq!(h.call("POST", "/admin/accounts/missing/key", Some(&h.admin), Some(json!({"api_key":"new-key"}))).await.0, 404);
+}
+
+#[tokio::test]
+async fn account_recovery_refreshes_models_and_reports_discovery_errors() {
+    let h = harness_with(|cfg| {
+        cfg.catalog.static_models.remove("opencode-go");
+    })
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/zen/go/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"sample-model"}]})))
+        .mount(&h.upstream)
+        .await;
+    let (status, added) = h
+        .call("POST", "/admin/accounts/import", Some(&h.admin), Some(json!({"provider":"opencode-go", "data":{"api_key":"sample-key"}})))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(added["catalog_refresh"]["models"], 1);
+    let id = added["id"].as_str().unwrap();
+    h.state.db.mark_auth_failed(id, true, Some("rejected (401)")).await.unwrap();
+    h.state.db.set_cooldown(id, now() + 100, "rate limited").await.unwrap();
+    h.state.catalog.refresh_provider(&h.state.subs, SubProvider::OpencodeGo).await.unwrap();
+    assert!(h.state.catalog.models()["opencode-go"].is_empty());
+    let other_models = h.state.catalog.models()["codex"].clone();
+    let (status, reset) = h.call("POST", &format!("/admin/accounts/{id}/reset"), Some(&h.admin), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(reset["catalog_refresh"]["models"], 1);
+    assert!(h.state.catalog.models()["opencode-go"].contains("sample-model"));
+    assert_eq!(h.state.catalog.models()["codex"], other_models);
+    h.upstream.reset().await;
+    let (status, result) = h.call("POST", &format!("/admin/accounts/{id}/models"), Some(&h.admin), None).await;
+    assert_eq!(status, 200);
+    assert!(result["error"].as_str().unwrap().contains("404"));
+    assert!(h.state.catalog.models()["opencode-go"].contains("sample-model"));
+    let (_, replaced) =
+        h.call("POST", &format!("/admin/accounts/{id}/key"), Some(&h.admin), Some(json!({"api_key":"replacement-key"}))).await;
+    assert_eq!(replaced["replaced"], true);
+    assert!(replaced["catalog_refresh"]["error"].is_string());
+}
