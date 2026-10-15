@@ -1,4 +1,8 @@
-# Known limitations
+---
+title: Known limitations
+order: 11
+docs: true
+---
 
 | Limitation | Tracked in |
 |---|---|
