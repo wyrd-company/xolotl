@@ -12,7 +12,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { del, get, post, type KeyInfo, type Policy, type Status, type UsageRow } from "@/lib/api";
-import { num, relativeIso } from "@/lib/format";
+import { compact, num, relativeIso } from "@/lib/format";
 import { useAction } from "@/lib/hooks";
 
 const WEEK = 7 * 86_400;
@@ -78,6 +78,7 @@ export function KeysPage() {
               <TableHead>Rotated</TableHead>
               <TableHead>Expires</TableHead>
               <TableHead className="text-right">Requests (7d)</TableHead>
+              <TableHead>Rate limits</TableHead>
               <TableHead>
                 <span className="sr-only">Actions</span>
               </TableHead>
@@ -185,6 +186,33 @@ function keyState(k: KeyInfo): { label: string; variant: "success" | "secondary"
   return { label: "Active", variant: "success" };
 }
 
+const WINDOWS = [
+  ["requests_per_minute", "req/min"],
+  ["requests_per_day", "req/day"],
+  ["tokens_per_minute", "tok/min"],
+  ["tokens_per_day", "tok/day"],
+] as const;
+
+/** Consumption against each limit of the key's policy. */
+function LimitUsage({ k }: { k: KeyInfo }) {
+  const limited = WINDOWS.filter(([w]) => k.limits?.[w] != null);
+  if (!limited.length) return <span className="text-muted-foreground">none</span>;
+  return (
+    <div className="flex flex-col font-mono">
+      {limited.map(([w, label]) => {
+        const used = k.limit_usage?.[w] ?? 0;
+        const limit = k.limits![w]!;
+        return (
+          <span key={w} className={used >= limit ? "text-destructive" : undefined}>
+            {compact(used)}/{compact(limit)} {label}
+          </span>
+        );
+      })}
+      {k.limits?.per === "policy" && <span className="text-muted-foreground font-sans">shared by the policy</span>}
+    </div>
+  );
+}
+
 function KeyRow({ k, requests }: { k: KeyInfo; requests: number }) {
   const path = `/admin/keys/${k.policy}/${k.name}`;
   const inv = { invalidate: [["keys"]] };
@@ -211,6 +239,9 @@ function KeyRow({ k, requests }: { k: KeyInfo; requests: number }) {
       <TableCell className="whitespace-nowrap">{relativeIso(k.rotated_at)}</TableCell>
       <TableCell className="whitespace-nowrap">{k.expires_at ? relativeIso(k.expires_at) : "never"}</TableCell>
       <TableCell className="text-right font-mono">{num(requests)}</TableCell>
+      <TableCell className="text-xs whitespace-nowrap">
+        <LimitUsage k={k} />
+      </TableCell>
       <TableCell>
         <div className="flex justify-end gap-2">
           <RotateKey k={k} />

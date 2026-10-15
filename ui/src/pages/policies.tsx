@@ -6,6 +6,7 @@ import { Link, Navigate, useNavigate, useParams } from "react-router";
 import { Confirm } from "@/components/confirm";
 import { Endpoints, EndpointsLegend } from "@/components/endpoints";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
+import { PolicyLimits } from "@/components/policy-limits";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -23,6 +24,7 @@ import {
   SUB_PROVIDERS,
   type GatewayProvider,
   type KeyInfo,
+  type Limits,
   type McpServer,
   type Policy,
   type PolicyView,
@@ -108,6 +110,7 @@ interface Draft {
   mcpServers: string[];
   allowTools: string;
   denyTools: string;
+  limits: Limits;
 }
 
 function toDraft(p: Policy | null): Draft {
@@ -124,6 +127,7 @@ function toDraft(p: Policy | null): Draft {
     mcpServers: p?.mcp_servers ?? [],
     allowTools: (p?.allow_tools ?? []).join("\n"),
     denyTools: (p?.deny_tools ?? []).join("\n"),
+    limits: p?.limits ?? {},
   };
 }
 
@@ -154,6 +158,7 @@ function toPolicy(d: Draft): Policy {
     mcp_servers: d.mcpServers,
     allow_tools: lines(d.allowTools),
     deny_tools: lines(d.denyTools),
+    limits: d.limits,
   };
 }
 
@@ -334,6 +339,8 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
       </Card>
 
       <McpAccess draft={draft} set={set} tools={preview.data?.tools ?? []} />
+
+      <PolicyLimits limits={draft.limits} onChange={(l) => set("limits", l)} usage={isNew ? undefined : preview.data?.usage} />
 
       <Card>
         <CardHeader>
