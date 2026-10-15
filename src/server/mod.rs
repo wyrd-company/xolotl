@@ -439,6 +439,8 @@ async fn send(
     client_id: Option<&str>,
     model: &str,
 ) -> Response {
+    // Mistral and Grok drop `stream_options`; they report usage anyway.
+    proxy::request_stream_usage(path, &mut body);
     match pool(&target.provider) {
         Some(p) => {
             body["model"] = Value::String(target.model.clone());
@@ -548,11 +550,14 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
 }
 
 /// Read a passthrough body: JSON bodies are buffered so their `model` can be
-/// checked against the policy; anything else streams.
+/// checked against the policy; anything else streams. With `stream_usage`, a
+/// Chat Completions stream is asked for its usage chunk (rate limits count it).
 async fn passthrough_body(
     state: &AppState,
     principal: &Principal,
     provider: &str,
+    path: &str,
+    stream_usage: bool,
     headers: &HeaderMap,
     body: Body,
 ) -> Result<(Option<Bytes>, Option<String>, Option<Body>), Response> {
@@ -566,12 +571,18 @@ async fn passthrough_body(
     let bytes = axum::body::to_bytes(body, state.cfg.server.max_body_bytes)
         .await
         .map_err(|_| json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?;
-    let model = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string));
+    let mut json = serde_json::from_slice::<Value>(&bytes).ok();
+    let model = json.as_ref().and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string));
     if let Some(m) = &model
         && !principal.policy.allows_model(provider, m)
     {
         return Err(json_error(StatusCode::FORBIDDEN, format!("model {m} is not allowed for this key")));
     }
+    let rewrite = stream_usage && json.as_mut().is_some_and(|v| proxy::request_stream_usage(path, v));
+    let bytes = match json {
+        Some(v) if rewrite => Bytes::from(serde_json::to_vec(&v).unwrap_or_default()),
+        _ => bytes,
+    };
     Ok((Some(bytes), model, None))
 }
 
@@ -594,7 +605,8 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
         Ok(p) => p,
         Err(r) => return r,
     };
-    let (bytes, model, stream) = match passthrough_body(&state, &principal, &provider, &parts.headers, body).await {
+    let stream_usage = state.gateway.kind(&provider) != Some(crate::config::ProviderKind::Mistral);
+    let (bytes, model, stream) = match passthrough_body(&state, &principal, &provider, &rest, stream_usage, &parts.headers, body).await {
         Ok(x) => x,
         Err(r) => return r,
     };
@@ -621,7 +633,7 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
         Err(r) => return r,
     };
     let provider = SubProvider::OpencodeGo.as_str();
-    let (bytes, model, stream) = match passthrough_body(&state, &principal, provider, &parts.headers, body).await {
+    let (bytes, model, stream) = match passthrough_body(&state, &principal, provider, &rest, true, &parts.headers, body).await {
         Ok(x) => x,
         Err(r) => return r,
     };

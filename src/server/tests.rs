@@ -633,6 +633,30 @@ async fn policy_limits_answer_429_in_the_endpoint_shape() {
 }
 
 #[tokio::test]
+async fn chat_streams_report_usage_for_token_limits() {
+    let h = harness().await;
+    // A conforming upstream sends usage only when asked to.
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+               data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/llama/v1/chat/completions"))
+        .and(body_partial_json(json!({"stream_options": {"include_usage": true}})))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .mount(&h.upstream)
+        .await;
+    let limits = Limits { tokens_per_day: Some(13), ..Default::default() };
+    let key = h.key(Policy { limits, ..policy("st") }).await;
+    let omitted = json!({"model": "llama/qwen3", "messages": [], "stream": true});
+    let refused = json!({"model": "llama/qwen3", "messages": [], "stream": true, "stream_options": {"include_usage": false}});
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(omitted.clone())).await.0, 200);
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(refused.clone())).await.0, 200);
+    // The passthrough asks too.
+    assert_eq!(h.call("POST", "/llama/v1/chat/completions", Some(&key), Some(refused)).await.0, 200);
+    assert_eq!(h.state.limiter.consumption("st/client", now()).tokens_per_day, 18);
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(omitted)).await.0, 429);
+}
+
+#[tokio::test]
 async fn t3code_management_endpoints() {
     let h = harness().await;
     let id = h.codex_account().await;

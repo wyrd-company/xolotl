@@ -220,6 +220,27 @@ impl Accounting {
     }
 }
 
+/// Ask a Chat Completions upstream to end its stream with a usage chunk, so
+/// the request's tokens can be counted against rate limits. It is requested
+/// even when the client didn't ask or said no; such a client gets one extra
+/// chunk with empty `choices`. Returns whether the body changed.
+pub fn request_stream_usage(path: &str, body: &mut Value) -> bool {
+    let chat = path.split('?').next().unwrap_or(path).ends_with("/chat/completions");
+    if !chat || body.get("stream").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let Some(obj) = body.as_object_mut() else { return false };
+    let opts = obj.entry("stream_options").or_insert_with(|| Value::Object(Default::default()));
+    if !opts.is_object() {
+        *opts = Value::Object(Default::default());
+    }
+    if opts.get("include_usage") == Some(&Value::Bool(true)) {
+        return false;
+    }
+    opts["include_usage"] = Value::Bool(true);
+    true
+}
+
 /// Max bytes of a non-streamed body buffered for usage parsing.
 const MAX_JSON_SCAN: usize = 4 * 1024 * 1024;
 
@@ -429,6 +450,25 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let s = db.usage_summary("client", 0, &Default::default()).await.unwrap();
         assert_eq!(s[0].output_tokens, 4);
+    }
+
+    #[test]
+    fn stream_usage_is_requested_on_chat_streams_only() {
+        for opts in [None, Some(json!({"include_usage": false})), Some(json!(null))] {
+            let mut body = json!({"model": "m", "stream": true});
+            if let Some(o) = opts {
+                body["stream_options"] = o;
+            }
+            assert!(request_stream_usage("/v1/chat/completions", &mut body));
+            assert_eq!(body["stream_options"]["include_usage"], true);
+        }
+        let mut asked = json!({"stream": true, "stream_options": {"include_usage": true}});
+        assert!(!request_stream_usage("/v1/chat/completions", &mut asked));
+        let mut not_streaming = json!({"stream": false});
+        assert!(!request_stream_usage("/v1/chat/completions", &mut not_streaming));
+        assert!(not_streaming.get("stream_options").is_none());
+        let mut responses = json!({"stream": true});
+        assert!(!request_stream_usage("/v1/responses", &mut responses));
     }
 
     #[test]

@@ -48,6 +48,10 @@ impl Gateway {
         self.providers.contains_key(name)
     }
 
+    pub fn kind(&self, name: &str) -> Option<ProviderKind> {
+        self.providers.get(name).map(|p| p.kind)
+    }
+
     pub fn kinds(&self) -> BTreeMap<String, ProviderKind> {
         self.providers.iter().map(|(k, v)| (k.clone(), v.kind)).collect()
     }

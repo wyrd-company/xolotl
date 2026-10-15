@@ -18,7 +18,7 @@ Every field is optional; a missing one is unlimited. Values must be at least 1: 
 | Limit | Counts |
 |---|---|
 | `requests_per_minute`, `requests_per_day` | Requests admitted to an LLM endpoint: `/v1/...`, `/backend-api/codex/...`, gateway passthroughs (`/<provider>/...`) and `/opencode-go/...`. An alias that falls back to its next target is one request. |
-| `tokens_per_minute`, `tokens_per_day` | Input plus output tokens, as the upstream reports them in the response. Input includes cache reads and writes. |
+| `tokens_per_minute`, `tokens_per_day` | Input plus output tokens, as the upstream reports them in the response. Input includes cache reads and writes. A streamed Chat Completions request (also through a passthrough) always asks the upstream for its usage chunk (`stream_options.include_usage`), so the client gets one extra chunk with empty `choices` even if it didn't ask for it. |
 
 There is no spend limit. Subscription accounts have no per-request price, and xolotl has no price list for gateway providers. Token budgets apply to both.
 
