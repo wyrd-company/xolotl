@@ -2174,7 +2174,10 @@ async fn account_key_replacement_preserves_identity_and_survives_reload() {
     assert_eq!(h.state.subs.fetch_models(SubProvider::OpencodeGo, "example").await.unwrap(), vec!["sample-model"]);
     assert_eq!(h.state.db.list_accounts(None).await.unwrap().len(), 1);
     let oauth = h.codex_account().await;
-    assert_eq!(h.call("POST", &format!("/admin/accounts/{oauth}/key"), Some(&h.admin), Some(json!({"api_key":"new-key"}))).await.0, 400);
+    assert_eq!(
+        h.call("POST", &format!("/admin/accounts/{oauth}/key"), Some(&h.admin), Some(json!({"api_key":"oauth-invalid-key"}))).await.0,
+        400
+    );
     assert_eq!(h.call("POST", "/admin/accounts/missing/key", Some(&h.admin), Some(json!({"api_key":"new-key"}))).await.0, 404);
 }
 
