@@ -60,7 +60,7 @@ Other `POST /v1/*` endpoints (embeddings, OCR, …) have no wire format. They ar
 
 ## Policies
 
-A policy (`src/policy.rs`) is stored in OpenBao at `policies/<name>`, and every client key belongs to one. Fields are described in the project README; the example is [`examples/policies/devcontainer.toml`](../examples/policies/devcontainer.toml).
+A policy (`src/policy.rs`) is stored in OpenBao at `policies/<name>`, and every client key belongs to one. Fields are described in the user documentation ([Policies and client keys](../policies-and-keys.md)); the example is [`examples/policies/devcontainer.toml`](../../examples/policies/devcontainer.toml).
 
 `Policy::resolve` builds the policy's **view**: client-visible name → list of targets.
 
