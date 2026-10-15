@@ -117,6 +117,8 @@ function DeviceCode({ flow, name, onDone }: { flow: FlowStart; name: string; onD
   useEffect(() => {
     const s = status.data;
     if (s?.status === "complete") {
+      // Device logins finish outside the admin mutation handlers.
+      void post(`/admin/catalog/refresh?providers=${encodeURIComponent(flow.provider)}`).catch((error: Error) => toast.error(error.message));
       loggedIn(s.email);
       onDone();
     } else if (s?.status === "failed") {

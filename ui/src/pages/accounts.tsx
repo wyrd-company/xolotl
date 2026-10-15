@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router";
 
+import { CatalogRefresh } from "@/components/catalog-refresh";
 import { accountName, AccountStateBadge, WindowBars, WindowsSummary } from "@/components/account-state";
 import { Confirm } from "@/components/confirm";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
@@ -53,6 +54,8 @@ export function AccountsPage() {
           ))}
         </TabsList>
       </Tabs>
+
+      <CatalogRefresh providers={filter === "all" ? SUB_PROVIDERS : [filter]} />
 
       <Card className="py-0">
         <Table className="min-w-[960px]">
@@ -166,6 +169,7 @@ function AccountDetails({ account: a }: { account: Account }) {
             </Mono>
           </DialogDescription>
         </DialogHeader>
+        <CatalogRefresh providers={[a.provider]} />
         <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
           <dt className="text-muted-foreground">State</dt>
           <dd>

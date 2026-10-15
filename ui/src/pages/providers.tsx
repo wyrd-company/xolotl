@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { RefreshCw } from "lucide-react";
+import { CatalogRefresh } from "@/components/catalog-refresh";
 
 import { Endpoints, EndpointsLegend } from "@/components/endpoints";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
@@ -10,8 +10,7 @@ import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle }
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { get, post, type CatalogRoute, type GatewayProvider, type Status } from "@/lib/api";
-import { relative } from "@/lib/format";
+import { get, post, type CatalogRoute, type GatewayProvider } from "@/lib/api";
 import { useAction } from "@/lib/hooks";
 import { KeyState } from "@/pages/overview";
 
@@ -24,29 +23,13 @@ const KINDS: Record<GatewayProvider["kind"], string> = {
 export function ProvidersPage() {
   const providers = useQuery({ queryKey: ["providers"], queryFn: () => get<GatewayProvider[]>("/admin/providers") });
   const routes = useQuery({ queryKey: ["catalog-routes"], queryFn: () => get<CatalogRoute[]>("/admin/catalog/routes") });
-  const status = useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/admin/status") });
-  const refresh = useAction(() => post("/admin/catalog/refresh"), {
-    invalidate: [["catalog-routes"], ["status"], ["policy-view"]],
-    success: "Catalog refreshed",
-  });
-  const ago = status.data?.catalog_refreshed_secs_ago;
 
   return (
     <>
       <PageHeader
         title="Providers & models"
-        description={
-          <>
-            Providers come from the config file; their keys live in OpenBao. Catalog refreshed{" "}
-            {ago == null ? "not yet" : relative(Date.now() / 1000 - ago)}.
-          </>
-        }
-      >
-        <Button variant="outline" disabled={refresh.isPending} onClick={() => refresh.mutate(undefined)}>
-          <RefreshCw className={refresh.isPending ? "animate-spin" : undefined} />
-          Refresh catalog
-        </Button>
-      </PageHeader>
+        description="Providers come from the config file; their keys live in OpenBao."
+      />
       <QueryError error={providers.error ?? routes.error} />
 
       <section aria-label="Gateway providers" className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -139,7 +122,8 @@ function Catalog({ routes }: { routes: CatalogRoute[] }) {
           <Input id="catalog-filter" type="search" placeholder="Filter, e.g. haiku" className="w-56" value={filter} onChange={(e) => setFilter(e.target.value)} />
         </CardAction>
       </CardHeader>
-      <CardContent>
+      <CardContent className="flex flex-col gap-3">
+        <CatalogRefresh />
         <EndpointsLegend />
       </CardContent>
       <Table className="min-w-[760px]">

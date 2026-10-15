@@ -69,13 +69,22 @@ const OPENCODE_GO_MESSAGES: &[&str] = &["claude-haiku-5-5", "minimax-m3", "minim
 const OPENCODE_GO_RESPONSES: &[&str] =
     &["grok-4.7", "grok-4.6", "gpt-6-luna", "gpt-5.6-luna", "muse-spark-1.3-contributor", "muse-spark-1.2-contributor"];
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DiscoveryStatus {
+    pub refreshed_at: Option<i64>,
+    pub models: usize,
+    pub error: Option<String>,
+}
+
 #[derive(Default)]
 struct Snapshot {
     models: Catalog,
     refreshed: Option<Instant>,
+    discovery: BTreeMap<String, DiscoveryStatus>,
 }
 
 pub struct ModelCatalog {
+    refresh_lock: tokio::sync::Mutex<()>,
     cfg: CatalogConfig,
     /// Gateway provider name -> kind.
     gateway_kinds: BTreeMap<String, ProviderKind>,
@@ -84,10 +93,11 @@ pub struct ModelCatalog {
 
 impl ModelCatalog {
     pub fn new(cfg: CatalogConfig, gateway_kinds: BTreeMap<String, ProviderKind>) -> Self {
-        let me = Self { cfg, gateway_kinds, snapshot: RwLock::new(Arc::new(Snapshot::default())) };
+        let me =
+            Self { refresh_lock: tokio::sync::Mutex::new(()), cfg, gateway_kinds, snapshot: RwLock::new(Arc::new(Snapshot::default())) };
         // Start with the static entries so routing works before discovery.
         let models = me.with_static(Catalog::new());
-        *me.snapshot.write() = Arc::new(Snapshot { models, refreshed: None });
+        *me.snapshot.write() = Arc::new(Snapshot { models, ..Default::default() });
         me
     }
 
@@ -114,34 +124,51 @@ impl ModelCatalog {
         c
     }
 
-    /// Re-discover models. Providers that fail keep their previous list.
+    /// Discovery results include failed attempts even when cached or static models remain.
+    pub fn discovery_status(&self) -> BTreeMap<String, DiscoveryStatus> {
+        let snapshot = self.snapshot.read();
+        snapshot
+            .models
+            .iter()
+            .map(|(provider, models)| {
+                let mut status = snapshot.discovery.get(provider).cloned().unwrap_or_default();
+                status.models = models.len();
+                (provider.clone(), status)
+            })
+            .collect()
+    }
+
+    /// Re-discover all providers. Providers that fail keep their previous list.
     pub async fn refresh(&self, subs: &Subscriptions, gateway: &Gateway) {
-        let previous = self.models();
-        let mut fresh = Catalog::new();
-        for p in SubProvider::ALL {
-            let models = match subs.fetch_models(p, &self.cfg.codex_client_version).await {
-                Ok(m) => m.into_iter().collect(),
-                Err(e) => {
-                    tracing::debug!(provider = %p, error = %e, "model discovery failed");
-                    previous.get(p.as_str()).cloned().unwrap_or_default()
-                }
+        self.refresh_providers(subs, gateway, &self.known_providers()).await;
+    }
+
+    /// Serialize refreshes so a scoped refresh cannot overwrite another provider's result.
+    pub async fn refresh_providers(&self, subs: &Subscriptions, gateway: &Gateway, providers: &BTreeSet<String>) {
+        let _guard = self.refresh_lock.lock().await;
+        let mut fresh = self.models();
+        let mut discovery = self.snapshot.read().discovery.clone();
+        for name in providers {
+            let result = match name.parse::<SubProvider>() {
+                Ok(provider) => subs.fetch_models(provider, &self.cfg.codex_client_version).await,
+                Err(_) => gateway.fetch_models(name).await,
             };
-            fresh.insert(p.as_str().to_string(), models);
-        }
-        for name in self.gateway_kinds.keys() {
-            let models = match gateway.fetch_models(name).await {
-                Ok(m) => m.into_iter().collect(),
+            let error = match result {
+                Ok(models) => {
+                    fresh.insert(name.clone(), models.into_iter().collect());
+                    None
+                }
                 Err(e) => {
                     tracing::debug!(provider = %name, error = %e, "model discovery failed");
-                    previous.get(name).cloned().unwrap_or_default()
+                    Some(format!("{e:#}"))
                 }
             };
-            fresh.insert(name.clone(), models);
+            discovery.insert(name.clone(), DiscoveryStatus { refreshed_at: Some(crate::db::now()), error, models: 0 });
         }
         let models = self.with_static(fresh);
         let total: usize = models.values().map(BTreeSet::len).sum();
         tracing::info!(models = total, "model catalog refreshed");
-        *self.snapshot.write() = Arc::new(Snapshot { models, refreshed: Some(Instant::now()) });
+        *self.snapshot.write() = Arc::new(Snapshot { models, discovery, refreshed: Some(Instant::now()) });
     }
 
     /// Wire formats that reach `provider/model`.
