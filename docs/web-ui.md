@@ -70,4 +70,4 @@ Overview attention links open the affected account's details. OAuth accounts sho
 
 Cooldowns show their reason and remaining time on the account row and in details. **Retry** clears the auth failure and cooldown. It permits another attempt with the same credential; it does not reset upstream quota. Disabled accounts stay disabled.
 
-Adding an API-key account, replacing a key and Retry refresh that provider's catalog. **Refresh models** beside **Refresh usage** also runs discovery and reports the model count or discovery error. A discovery error preserves the previous catalog and does not undo a saved key or reset. The policy editor identifies providers with an empty catalog and links to account recovery.
+Adding an API-key account, replacing a key and Retry refresh that provider's catalog. **Refresh models** beside **Refresh usage** also runs discovery and reports the model count or discovery error. A discovery error preserves the previous catalog and does not undo a saved key or reset. The policy editor shows each provider’s discovery result beside the model list.

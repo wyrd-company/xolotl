@@ -105,7 +105,7 @@ export function AccountsPage() {
 
 function AccountRow({ account: a, open, onOpenChange }: { account: Account; open: boolean; onOpenChange: (open: boolean) => void }) {
   const inv = {
-    invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["policy-view"]],
+    invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"]],
   };
   const refresh = useAction(() => post(`/admin/accounts/${a.id}/usage`), {
     ...inv,
@@ -160,7 +160,7 @@ function AccountDetails({
 }) {
   const [priority, setPriority] = useState(String(a.priority));
   const inv = {
-    invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["policy-view"]],
+    invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"]],
   };
   const setPrio = useAction((p: number) => post(`/admin/accounts/${a.id}/priority`, { priority: p }), {
     ...inv,
@@ -312,7 +312,7 @@ function showModels(r: ModelRefresh) {
 
 function RefreshModels({ account: a }: { account: Account }) {
   const refresh = useAction(() => post<ModelRefresh>(`/admin/accounts/${a.id}/models`), {
-    invalidate: [["catalog"], ["catalog-routes"], ["policy-view"], ["status"]],
+    invalidate: [["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"], ["status"]],
     onSuccess: showModels,
   });
   return (
@@ -330,7 +330,7 @@ function ReplaceKey({ account: a }: { account: Account }) {
         api_key: key.trim(),
       }),
     {
-      invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["policy-view"]],
+      invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"]],
       success: "Key replaced",
       onSuccess: (r) => {
         setKey("");

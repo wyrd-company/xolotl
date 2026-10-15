@@ -62,6 +62,7 @@ function useLoggedIn() {
     qc.invalidateQueries({ queryKey: ["status"] });
     qc.invalidateQueries({ queryKey: ["catalog"] });
     qc.invalidateQueries({ queryKey: ["catalog-routes"] });
+    qc.invalidateQueries({ queryKey: ["catalog-status"] });
     qc.invalidateQueries({ queryKey: ["policy-view"] });
   };
 }

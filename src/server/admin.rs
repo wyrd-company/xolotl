@@ -363,9 +363,12 @@ async fn reset_account(State(s): State<AppState>, h: HeaderMap, Path(id): Path<S
 
 // Discovery failure must not hide a successful credential write or reset.
 async fn account_models(s: &AppState, provider: SubProvider) -> Value {
-    match s.catalog.refresh_provider(&s.subs, provider).await {
-        Ok(models) => json!({"provider": provider, "models": models}),
-        Err(e) => json!({"provider": provider, "error": format!("{e:#}")}),
+    let providers = [provider.as_str().to_string()].into_iter().collect();
+    s.catalog.refresh_providers(&s.subs, &s.gateway, &providers).await;
+    let status = s.catalog.discovery_status().remove(provider.as_str()).expect("subscription provider is in catalog");
+    match status.error {
+        Some(error) => json!({"provider": provider, "error": error}),
+        None => json!({"provider": provider, "models": status.models}),
     }
 }
 

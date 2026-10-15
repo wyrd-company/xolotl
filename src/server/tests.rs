@@ -2079,17 +2079,7 @@ async fn resetting_account_automatically_rediscovers_models() {
         .mount(&h.upstream)
         .await;
     assert_eq!(h.call("POST", &format!("/admin/accounts/{id}/reset"), Some(&h.admin), None).await.0, 200);
-    // The mutation responds before background discovery completes.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if h.state.catalog.models()["opencode-go"].contains("sample-model") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    assert!(h.state.catalog.models()["opencode-go"].contains("sample-model"));
     assert!(h.state.catalog.discovery_status()["opencode-go"].error.is_none());
 }
 
@@ -2200,20 +2190,26 @@ async fn account_recovery_refreshes_models_and_reports_discovery_errors() {
     let id = added["id"].as_str().unwrap();
     h.state.db.mark_auth_failed(id, true, Some("rejected (401)")).await.unwrap();
     h.state.db.set_cooldown(id, now() + 100, "rate limited").await.unwrap();
-    h.state.catalog.refresh_provider(&h.state.subs, SubProvider::OpencodeGo).await.unwrap();
-    assert!(h.state.catalog.models()["opencode-go"].is_empty());
+    h.state.catalog.refresh_providers(&h.state.subs, &h.state.gateway, &["opencode-go".to_string()].into_iter().collect()).await;
+    assert!(h.state.catalog.models()["opencode-go"].contains("sample-model"));
+    assert_eq!(h.state.catalog.discovery_status()["opencode-go"].error.as_deref(), Some("no available accounts"));
     h.codex_account().await;
     Mock::given(method("GET"))
         .and(path("/backend-api/codex/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[{"slug":"another-model"}]})))
         .mount(&h.upstream)
         .await;
-    h.state.catalog.refresh_provider(&h.state.subs, SubProvider::Codex).await.unwrap();
+    h.state.catalog.refresh_providers(&h.state.subs, &h.state.gateway, &["codex".to_string()].into_iter().collect()).await;
     let other_models = h.state.catalog.models()["codex"].clone();
     assert!(other_models.contains("another-model"));
     let (status, reset) = h.call("POST", &format!("/admin/accounts/{id}/reset"), Some(&h.admin), None).await;
     assert_eq!(status, 200);
     assert_eq!(reset["catalog_refresh"]["models"], 1);
+    let (_, discovery) = h.call("GET", "/admin/catalog/status", Some(&h.admin), None).await;
+    assert_eq!(discovery["opencode-go"]["models"], 1);
+    assert!(discovery["opencode-go"]["error"].is_null());
+    assert!(discovery["opencode-go"]["refreshed_at"].is_number());
+    assert_eq!(h.upstream.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/backend-api/codex/models").count(), 1);
     let recovered = h.state.db.get_account(id).await.unwrap().unwrap();
     assert!(!recovered.auth_failed);
     assert!(recovered.cooldown_until.is_none());
@@ -2232,6 +2228,9 @@ async fn account_recovery_refreshes_models_and_reports_discovery_errors() {
         h.call("POST", &format!("/admin/accounts/{id}/key"), Some(&h.admin), Some(json!({"api_key":"replacement-key"}))).await;
     assert_eq!(replaced["replaced"], true);
     assert!(replaced["catalog_refresh"]["error"].is_string());
+    let (_, discovery) = h.call("GET", "/admin/catalog/status", Some(&h.admin), None).await;
+    assert!(discovery["opencode-go"]["error"].as_str().unwrap().contains("404"));
+    assert_eq!(discovery["opencode-go"]["models"], 1);
 }
 
 #[tokio::test]
@@ -2287,6 +2286,11 @@ async fn account_recovery_waits_for_inflight_full_catalog_refresh() {
         harness_with_secrets(
             |cfg| {
                 cfg.catalog.static_models.remove("opencode-go");
+                // Sort the gateway after the account pool so it gates a refresh
+                // that has already observed the failed account.
+                let mut gateway = cfg.gateway.providers.remove("llama").unwrap();
+                gateway.secret = Some("providers/llama".into());
+                cfg.gateway.providers.insert("zz-example".into(), gateway);
             },
             store.clone(),
         )
