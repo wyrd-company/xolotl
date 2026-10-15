@@ -222,7 +222,7 @@ pub async fn refresh(http: &reqwest::Client, ep: &Endpoints, cred: &Credential) 
         .form(&[("grant_type", "refresh_token"), ("client_id", CLIENT_ID), ("refresh_token", rt)])
         .send()
         .await
-        .map_err(|e| RefreshError::Transient(e.to_string()))?;
+        .map_err(RefreshError::from_send_error)?;
     RefreshError::from_response(resp).await
 }
 

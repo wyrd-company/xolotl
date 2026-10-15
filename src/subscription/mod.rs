@@ -144,6 +144,8 @@ pub enum RefreshError {
     /// The grant is dead; the account must log in again.
     Terminal(String),
     Transient(String),
+    /// The request may have spent the refresh token, but no usable response arrived.
+    Uncertain(String),
 }
 
 impl fmt::Display for RefreshError {
@@ -151,19 +153,39 @@ impl fmt::Display for RefreshError {
         match self {
             RefreshError::Terminal(m) => write!(f, "refresh rejected: {m}"),
             RefreshError::Transient(m) => write!(f, "refresh failed: {m}"),
+            RefreshError::Uncertain(m) => write!(f, "refresh outcome unknown: {m}"),
         }
     }
 }
 
 impl RefreshError {
+    fn from_send_error(error: reqwest::Error) -> Self {
+        // Only a connection/build failure proves the token request was not sent.
+        // Do not log the request URL or provider body: either can contain secrets.
+        if error.is_connect() || error.is_builder() {
+            Self::Transient("token request was not sent (connection or request construction failed)".into())
+        } else {
+            Self::Uncertain("token response was lost; the provider may have rotated the refresh token".into())
+        }
+    }
+
     async fn from_response(resp: reqwest::Response) -> Result<TokenResponse, RefreshError> {
         let status = resp.status().as_u16();
-        let text = resp.text().await.map_err(|e| RefreshError::Transient(e.to_string()))?;
+        let text = resp.text().await.map_err(|_| Self::Uncertain("token response body was lost; the refresh token may be spent".into()))?;
         if (200..300).contains(&status) {
-            return serde_json::from_str(&text).map_err(|e| RefreshError::Transient(format!("bad token response: {e}")));
+            return serde_json::from_str::<TokenResponse>(&text)
+                .ok()
+                .filter(|t| !t.access_token.is_empty())
+                .ok_or_else(|| Self::Uncertain("unusable successful token response; the refresh token may be spent".into()));
         }
-        let msg = format!("{status}: {}", text.chars().take(300).collect::<String>());
-        if oauth::is_terminal_grant_error(status, &text) { Err(RefreshError::Terminal(msg)) } else { Err(RefreshError::Transient(msg)) }
+        // Provider error descriptions can echo tokens. Keep only known diagnostics.
+        let msg = if oauth::is_reused_grant_error(&text) {
+            "refresh token was reused; this login may also be in use by a local CLI or another instance. Stop sharing the login and log in again"
+                .to_string()
+        } else {
+            format!("token endpoint returned HTTP {status}")
+        };
+        if oauth::is_terminal_grant_error(status, &text) { Err(Self::Terminal(msg)) } else { Err(Self::Transient(msg)) }
     }
 }
 
@@ -202,9 +224,16 @@ pub struct Subscriptions {
     /// Accounts whose refreshed credential has not reached the vault yet.
     /// The old refresh token is already spent, so these are retried until saved.
     unsaved: Mutex<HashSet<String>>,
+    refresh_retries: Mutex<HashMap<String, RefreshRetry>>,
     pub flows: Flows,
     /// Sent to Grok's chat proxy (`catalog.grok_client_version`).
     grok_client_version: String,
+}
+
+struct RefreshRetry {
+    failures: u32,
+    after: Instant,
+    error: String,
 }
 
 type CredLock = Arc<tokio::sync::Mutex<Credential>>;
@@ -229,6 +258,7 @@ impl Subscriptions {
             rr: Mutex::new(HashMap::new()),
             affinity: Mutex::new(HashMap::new()),
             unsaved: Mutex::new(HashSet::new()),
+            refresh_retries: Mutex::new(HashMap::new()),
             flows: Flows::default(),
             grok_client_version: crate::config::CatalogConfig::default().grok_client_version,
         }
@@ -306,7 +336,9 @@ impl Subscriptions {
         self.db.upsert_account(&self.row_for(&id, &cred)).await?;
         // A fresh login supersedes a previous auth failure.
         self.db.mark_auth_failed(&id, false, None).await?;
+        self.db.record_account_result(&id, None).await?;
         self.creds.write().insert(id.clone(), Arc::new(tokio::sync::Mutex::new(cred)));
+        self.refresh_retries.lock().remove(&id);
         if self.unsaved.lock().remove(&id) {
             self.report_unsaved();
         }
@@ -324,6 +356,7 @@ impl Subscriptions {
             None => None,
         };
         self.creds.write().remove(id);
+        self.refresh_retries.lock().remove(id);
         if self.unsaved.lock().remove(id) {
             self.report_unsaved();
         }
@@ -383,17 +416,27 @@ impl Subscriptions {
         if !cred.provider.uses_oauth() {
             return Ok(cred.clone());
         }
-        let expiring = cred.expires_at.is_some_and(|e| e - self.cfg.refresh_margin_secs <= now());
+        // Imported Claude tokens can have unknown age, including imports already
+        // stored in OpenBao. Establish their lifetime on first use.
+        let unknown_expiry = cred.provider == SubProvider::Claude
+            && cred.expires_at.is_none()
+            && cred.refresh_token.as_deref().is_some_and(|t| !t.is_empty());
+        let expiring = unknown_expiry || cred.expires_at.is_some_and(|e| e - self.cfg.refresh_margin_secs <= now());
         let forced = force_if_token.is_some_and(|t| t == cred.access_token);
         if expiring || forced {
-            self.refresh_locked(id, &mut cred).await?;
+            let waiting = self.refresh_retries.lock().get(id).is_some_and(|r| r.after > Instant::now());
+            if waiting {
+                anyhow::ensure!(!forced, "token refresh retry pending for account {id}");
+                return Ok(cred.clone());
+            }
+            self.refresh_locked(id, &mut cred, !forced).await?;
         }
         Ok(cred.clone())
     }
 
     /// Refresh while holding the account's lock, so a single-use refresh token
     /// is never sent twice.
-    async fn refresh_locked(&self, id: &str, cred: &mut Credential) -> Result<()> {
+    async fn refresh_locked(&self, id: &str, cred: &mut Credential, allow_current: bool) -> Result<()> {
         let ep = &self.cfg.endpoints;
         let result = match cred.provider {
             SubProvider::Codex => codex::refresh(&self.http, ep, cred).await,
@@ -412,7 +455,7 @@ impl Subscriptions {
                     SubProvider::OpencodeGo => {}
                 }
                 metrics().token_refreshes.add(1, &attrs("ok"));
-                self.db.mark_auth_failed(id, false, None).await?;
+                self.refresh_retries.lock().remove(id);
                 tracing::info!(account = id, "refreshed access token");
                 // The old refresh token is now spent, so the new one must reach
                 // the vault. On failure keep serving from memory and retry the
@@ -420,22 +463,43 @@ impl Subscriptions {
                 if let Err(e) = self.persist(id, cred).await {
                     tracing::error!(account = id, error = %e, "refreshed token could not be written to the vault; will retry");
                     self.mark_unsaved(id, Some(&e.to_string())).await;
-                } else if self.unsaved.lock().remove(id) {
-                    self.report_unsaved();
+                } else {
+                    if self.unsaved.lock().remove(id) {
+                        self.report_unsaved();
+                    }
+                    // A SQLite failure must not prevent saving a rotated token.
+                    let _ = self.db.mark_auth_failed(id, false, None).await;
+                    let _ = self.db.record_account_result(id, None).await;
                 }
                 Ok(())
             }
             Err(RefreshError::Terminal(msg)) => {
+                self.refresh_retries.lock().remove(id);
                 metrics().token_refreshes.add(1, &attrs("terminal"));
                 tracing::warn!(account = id, error = %msg, "refresh token rejected; account needs to log in again");
                 self.db.mark_auth_failed(id, true, Some(&format!("re-login required: {msg}"))).await?;
                 Err(anyhow!("account {id} needs to log in again"))
             }
-            Err(RefreshError::Transient(msg)) => {
-                metrics().token_refreshes.add(1, &attrs("error"));
-                tracing::warn!(account = id, error = %msg, "token refresh failed");
-                // Keep using the current token while it is still valid.
-                if cred.expires_at.is_some_and(|e| e > now()) { Ok(()) } else { Err(anyhow!("token refresh failed: {msg}")) }
+            Err(error) => {
+                let uncertain = matches!(error, RefreshError::Uncertain(_));
+                let msg = error.to_string();
+                metrics().token_refreshes.add(1, &attrs(if uncertain { "uncertain" } else { "error" }));
+                if uncertain {
+                    tracing::error!(account = id, error = %msg, "OAuth refresh may have spent a single-use token; re-login may be required");
+                } else {
+                    tracing::warn!(account = id, error = %msg, "token refresh failed");
+                }
+                let error = {
+                    let mut retries = self.refresh_retries.lock();
+                    let failures = retries.get(id).map_or(1, |r| (r.failures + 1).min(7));
+                    let delay = Duration::from_secs((5 * (1u64 << (failures - 1))).min(300));
+                    let error = format!("{msg}; refresh retry in {}s", delay.as_secs());
+                    retries.insert(id.to_string(), RefreshRetry { failures, after: Instant::now() + delay, error: error.clone() });
+                    error
+                };
+                let _ = self.db.record_account_result(id, Some(&error)).await;
+                // Only a forced refresh follows an access token rejected with 401.
+                if allow_current { Ok(()) } else { Err(anyhow!("{msg}")) }
             }
         }
     }
@@ -474,7 +538,7 @@ impl Subscriptions {
             match self.persist(&id, &cred).await {
                 Ok(()) => {
                     self.unsaved.lock().remove(&id);
-                    let _ = self.db.record_account_result(&id, None).await;
+                    let _ = self.record_account_result_locked(&id, None).await;
                     tracing::info!(account = %id, "refreshed credential saved to the vault");
                 }
                 Err(e) => tracing::warn!(account = %id, error = %e, "credential still not saved to the vault"),
@@ -561,6 +625,19 @@ impl Subscriptions {
             m.retain(|_, (_, at)| at.elapsed() < ttl);
         }
         m.insert(s.to_string(), (account.to_string(), Instant::now()));
+    }
+
+    /// Keep a pending refresh diagnostic when recording a later proxy result.
+    async fn record_account_result(&self, id: &str, error: Option<&str>) -> Result<()> {
+        // Serialize the check and SQLite write with refresh and new logins, so
+        // a delayed response cannot clear a diagnostic recorded in between.
+        let _cred = self.lock_current(id).await?;
+        self.record_account_result_locked(id, error).await
+    }
+
+    async fn record_account_result_locked(&self, id: &str, error: Option<&str>) -> Result<()> {
+        let refresh_error = self.refresh_retries.lock().get(id).map(|r| r.error.clone());
+        self.db.record_account_result(id, refresh_error.as_deref().or(error)).await
     }
 
     // ------------------------------------------------------------ execution
@@ -658,7 +735,7 @@ impl Subscriptions {
                         metrics()
                             .upstream_errors
                             .add(1, &[KeyValue::new("provider", provider.as_str()), KeyValue::new("kind", "transport")]);
-                        let _ = self.db.record_account_result(&account.id, Some(&e.to_string())).await;
+                        let _ = self.record_account_result(&account.id, Some(&e.to_string())).await;
                         last = Some((
                             502,
                             Default::default(),
@@ -695,20 +772,20 @@ impl Subscriptions {
                                 continue 'accounts;
                             }
                         }
-                        let _ = self.db.record_account_result(&account.id, None).await;
+                        let _ = self.record_account_result(&account.id, None).await;
                         self.pin_session(session.as_deref(), &account.id);
                         accounting.record.account_id = Some(account.id.clone());
                         return proxy::relay_sse(status, &resp_headers, prefix, stream, Some(accounting));
                     }
                     if provider == SubProvider::Grok && proxy::is_sse(resp.headers()) {
-                        let _ = self.db.record_account_result(&account.id, None).await;
+                        let _ = self.record_account_result(&account.id, None).await;
                         self.pin_session(session.as_deref(), &account.id);
                         accounting.record.account_id = Some(account.id.clone());
                         let resp_headers = resp.headers().clone();
                         let stream = grok::KeepaliveFilter::new(resp.bytes_stream().boxed()).boxed();
                         return proxy::relay_sse(status, &resp_headers, Vec::new(), stream, Some(accounting));
                     }
-                    let _ = self.db.record_account_result(&account.id, None).await;
+                    let _ = self.record_account_result(&account.id, None).await;
                     self.pin_session(session.as_deref(), &account.id);
                     accounting.record.account_id = Some(account.id.clone());
                     return proxy::relay(resp, Some(accounting));
@@ -735,7 +812,7 @@ impl Subscriptions {
                 }
                 if provider == SubProvider::Grok && status == 426 {
                     let version = grok::client_version(&headers, &self.grok_client_version);
-                    let _ = self.db.record_account_result(&account.id, Some("upstream status 426")).await;
+                    let _ = self.record_account_result(&account.id, Some("upstream status 426")).await;
                     accounting.record.account_id = Some(account.id.clone());
                     accounting.finish(426, Default::default());
                     let msg = format!(
@@ -744,13 +821,13 @@ impl Subscriptions {
                     return self.error_for(provider, path, StatusCode::UPGRADE_REQUIRED, "invalid_request_error", &msg);
                 }
                 if failure == Failure::Fatal {
-                    let _ = self.db.record_account_result(&account.id, reason.as_deref()).await;
+                    let _ = self.record_account_result(&account.id, reason.as_deref()).await;
                     accounting.record.account_id = Some(account.id.clone());
                     return proxy::relay_buffered(status, &resp_headers, bytes, Some(accounting));
                 }
                 self.handle_failure(&account, provider, &failure, status).await;
                 if let Some(reason) = reason.as_deref() {
-                    let _ = self.db.record_account_result(&account.id, Some(reason)).await;
+                    let _ = self.record_account_result(&account.id, Some(reason)).await;
                 }
                 last = Some((status, resp_headers, bytes, account.id.clone()));
                 continue 'accounts;
@@ -802,7 +879,7 @@ impl Subscriptions {
         if let Err(e) = res {
             tracing::warn!(error = %e, "failed to record account failure");
         }
-        let _ = self.db.record_account_result(&account.id, Some(&format!("upstream status {status}"))).await;
+        let _ = self.record_account_result(&account.id, Some(&format!("upstream status {status}"))).await;
     }
 
     /// Merge usage windows observed on a response into the stored snapshot.

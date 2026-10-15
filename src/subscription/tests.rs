@@ -173,7 +173,9 @@ async fn terminal_refresh_failure_marks_account_for_relogin() {
         .await;
     let (status, _) = run(&subs, SubProvider::Codex, "/v1/responses", HeaderMap::new(), responses_body()).await;
     assert_eq!(status, 503);
-    assert!(subs.db.get_account(&a.id).await.unwrap().unwrap().auth_failed);
+    let row = subs.db.get_account(&a.id).await.unwrap().unwrap();
+    assert!(row.auth_failed);
+    assert!(row.last_error.unwrap().contains("Stop sharing the login"));
 }
 
 #[tokio::test]
@@ -919,4 +921,241 @@ async fn opencode_errors_preserve_reason_without_disabling_on_403() {
             assert!(subs.db.get_account(&a.id).await.unwrap().unwrap().last_error.is_none());
         }
     }
+}
+
+#[tokio::test]
+async fn claude_import_without_expiry_refreshes_before_use() {
+    let server = MockServer::start().await;
+    let (subs, secrets) = setup(&server, Strategy::FillFirst).await;
+    let cred = claude::import(&json!({"claudeAiOauth": {"accessToken": "old", "refreshToken": "rt"}})).unwrap();
+    assert_eq!(cred.expires_at, None);
+    let row = subs.save_account(cred).await.unwrap();
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"access_token": "fresh", "refresh_token": "rotated", "expires_in": 3600})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "fresh");
+    assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "fresh");
+    let stored: Credential = get_typed(&*secrets, &format!("accounts/claude/{}", row.id)).await.unwrap().unwrap();
+    assert_eq!(stored.refresh_token.as_deref(), Some("rotated"));
+    let known = claude::import(&json!({"accessToken": "at", "refreshToken": "rt", "expiresAt": 2000000000000i64})).unwrap();
+    assert_eq!(known.expires_at, Some(2000000000));
+    let known = subs.save_account(known).await.unwrap();
+    assert_eq!(subs.credential(&known.id, None).await.unwrap().access_token, "at");
+    let access_only = claude::import(&json!({"accessToken": "at"})).unwrap();
+    assert_eq!(access_only.expires_at, None);
+    let access_only = subs.save_account(access_only).await.unwrap();
+    assert_eq!(subs.credential(&access_only.id, None).await.unwrap().access_token, "at");
+}
+
+#[tokio::test]
+async fn uncertain_refresh_is_visible_and_backs_off_without_relogin() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let mut cred = codex_cred("acct-a", "old");
+    cred.expires_at = Some(now() - 1);
+    let row = subs.save_account(cred).await.unwrap();
+    Mock::given(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("unusable-response-with-secret"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    assert!(subs.credential(&row.id, Some("old")).await.is_err());
+    let state = subs.db.get_account(&row.id).await.unwrap().unwrap();
+    assert!(!state.auth_failed);
+    let error = state.last_error.unwrap();
+    assert!(error.contains("outcome unknown"));
+    assert!(error.contains("refresh retry in 5s"));
+    assert!(!error.contains("unusable-response-with-secret"));
+    for _ in 0..3 {
+        assert!(subs.credential(&row.id, Some("old")).await.unwrap_err().to_string().contains("retry pending"));
+    }
+    subs.refresh_retries.lock().get_mut(&row.id).unwrap().after = Instant::now();
+    assert!(subs.credential(&row.id, Some("old")).await.is_err());
+    assert!(subs.db.get_account(&row.id).await.unwrap().unwrap().last_error.unwrap().contains("refresh retry in 10s"));
+    // A new login of the same identity must not inherit the previous backoff.
+    subs.save_account(codex_cred("acct-a", "new-login")).await.unwrap();
+    assert!(!subs.refresh_retries.lock().contains_key(&row.id));
+}
+
+#[tokio::test]
+async fn transient_refresh_keeps_valid_token_but_never_reuses_a_rejected_one() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let mut cred = codex_cred("acct-a", "old");
+    cred.expires_at = Some(now() + 120);
+    let row = subs.save_account(cred).await.unwrap();
+    Mock::given(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error_description": "secret-value"})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "old");
+    assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "old");
+    assert!(subs.credential(&row.id, Some("old")).await.is_err());
+    subs.refresh_retries.lock().get_mut(&row.id).unwrap().after = Instant::now();
+    assert!(subs.credential(&row.id, Some("old")).await.is_err());
+    let row = subs.db.get_account(&row.id).await.unwrap().unwrap();
+    assert!(!row.auth_failed);
+    assert!(!row.last_error.unwrap().contains("secret-value"));
+}
+
+#[tokio::test]
+async fn refresh_transport_distinguishes_unsent_from_lost_response() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let http = reqwest::Client::builder().no_proxy().retry(reqwest::retry::never()).build().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let error = http.post(format!("http://{addr}/token")).send().await.unwrap_err();
+    assert!(matches!(RefreshError::from_send_error(error), RefreshError::Transient(m) if m.contains("not sent")));
+
+    // Accept the token request and drop the response, as if the provider rotated it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        socket.shutdown().await.unwrap();
+    });
+    let error = http.post(format!("http://{addr}/token")).send().await.unwrap_err();
+    assert!(matches!(RefreshError::from_send_error(error), RefreshError::Uncertain(_)));
+    task.await.unwrap();
+
+    // A truncated successful response is also uncertain, even after headers arrived.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{}").await.unwrap();
+        socket.shutdown().await.unwrap();
+    });
+    let response = http.post(format!("http://{addr}/token")).send().await.unwrap();
+    assert!(matches!(RefreshError::from_response(response).await, Err(RefreshError::Uncertain(_))));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn rotated_token_is_saved_even_when_sqlite_index_fails() {
+    let server = MockServer::start().await;
+    let (subs, secrets) = setup(&server, Strategy::FillFirst).await;
+    let mut cred = codex_cred("acct-a", "old");
+    cred.expires_at = Some(now() - 1);
+    let row = subs.save_account(cred).await.unwrap();
+    Mock::given(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token": "fresh", "refresh_token": "rotated"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    {
+        let mut connection = subs.db.hold().await;
+        sqlx::query("DROP TABLE accounts").execute(&mut *connection).await.unwrap();
+    }
+    assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "fresh");
+    let stored: Credential = get_typed(&*secrets, &format!("accounts/codex/{}", row.id)).await.unwrap().unwrap();
+    assert_eq!(stored.refresh_token.as_deref(), Some("rotated"));
+}
+
+#[tokio::test]
+async fn refresh_backoff_caps_and_success_clears_it() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let mut cred = codex_cred("acct-a", "old");
+    cred.expires_at = Some(now() - 1);
+    let row = subs.save_account(cred).await.unwrap();
+    Mock::given(path("/oauth/token")).respond_with(ResponseTemplate::new(503)).expect(8).mount(&server).await;
+    for delay in [5, 10, 20, 40, 80, 160, 300, 300] {
+        assert!(subs.credential(&row.id, Some("old")).await.is_err());
+        assert!(subs.db.get_account(&row.id).await.unwrap().unwrap().last_error.unwrap().contains(&format!("retry in {delay}s")));
+        subs.refresh_retries.lock().get_mut(&row.id).unwrap().after = Instant::now();
+    }
+    server.verify().await;
+    server.reset().await;
+    Mock::given(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token": "fresh", "refresh_token": "rotated"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "fresh");
+    assert!(!subs.refresh_retries.lock().contains_key(&row.id));
+    assert!(subs.db.get_account(&row.id).await.unwrap().unwrap().last_error.is_none());
+}
+
+#[tokio::test]
+async fn empty_successful_token_is_an_uncertain_refresh() {
+    let server = MockServer::start().await;
+    Mock::given(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token": "", "refresh_token": "secret-value"})))
+        .mount(&server)
+        .await;
+    let response = reqwest::Client::new().post(format!("{}/token", server.uri())).send().await.unwrap();
+    let error = RefreshError::from_response(response).await.unwrap_err();
+    assert!(matches!(error, RefreshError::Uncertain(_)));
+    assert!(!error.to_string().contains("secret-value"));
+}
+
+#[tokio::test]
+async fn claude_unknown_expiry_keeps_serving_during_refresh_outage() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let cred = claude::import(&json!({"accessToken": "old", "refreshToken": "rt"})).unwrap();
+    let row = subs.save_account(cred).await.unwrap();
+    Mock::given(path("/v1/oauth/token")).respond_with(ResponseTemplate::new(503)).expect(1).mount(&server).await;
+    assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "old");
+    assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "old");
+    assert!(subs.credential(&row.id, Some("old")).await.is_err());
+    assert!(!subs.db.get_account(&row.id).await.unwrap().unwrap().auth_failed);
+}
+
+#[tokio::test]
+async fn unknown_refresh_outcome_survives_proxy_success_and_failure() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = MockServer::start().await;
+    let (mut subs, _) = setup(&server, Strategy::FillFirst).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    Arc::get_mut(&mut subs).unwrap().cfg.endpoints.codex_auth = format!("http://{addr}");
+    Arc::get_mut(&mut subs).unwrap().http = reqwest::Client::builder().no_proxy().retry(reqwest::retry::never()).build().unwrap();
+    let dropped_response = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        socket.shutdown().await.unwrap();
+    });
+    let mut cred = codex_cred("acct-a", "old");
+    cred.expires_at = Some(now() + 120);
+    let row = subs.save_account(cred).await.unwrap();
+    Mock::given(path("/backend-api/codex/responses"))
+        .and(header("authorization", "Bearer old"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SSE_OK, "text/event-stream"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(run(&subs, SubProvider::Codex, "/v1/responses", HeaderMap::new(), responses_body()).await.0, 200);
+    dropped_response.await.unwrap();
+    let diagnostic = subs.db.get_account(&row.id).await.unwrap().unwrap().last_error.unwrap();
+    assert!(diagnostic.contains("outcome unknown"), "{diagnostic}");
+    assert_eq!(subs.accounts(None).await.unwrap()[0].row.last_error.as_deref(), Some(diagnostic.as_str()));
+    server.verify().await;
+    server.reset().await;
+    Mock::given(path("/backend-api/codex/responses")).respond_with(ResponseTemplate::new(503)).expect(1).mount(&server).await;
+    assert_eq!(run(&subs, SubProvider::Codex, "/v1/responses", HeaderMap::new(), responses_body()).await.0, 503);
+    assert_eq!(subs.db.get_account(&row.id).await.unwrap().unwrap().last_error.as_deref(), Some(diagnostic.as_str()));
+    assert!(subs.credential(&row.id, Some("old")).await.is_err());
+    Arc::get_mut(&mut subs).unwrap().cfg.endpoints.codex_auth = server.uri();
+    subs.refresh_retries.lock().get_mut(&row.id).unwrap().after = Instant::now();
+    Mock::given(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token": "fresh", "refresh_token": "rotated"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "fresh");
+    assert!(subs.db.get_account(&row.id).await.unwrap().unwrap().last_error.is_none());
 }

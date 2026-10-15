@@ -86,6 +86,14 @@ pub fn is_terminal_grant_error(status: u16, body: &str) -> bool {
     ) || body.contains("invalid_grant")
 }
 
+/// A specific reuse rejection is evidence of a spent token, not proof of who spent it.
+pub fn is_reused_grant_error(body: &str) -> bool {
+    serde_json::from_str::<Value>(body).ok().is_some_and(|v| {
+        let error = &v["error"];
+        error.as_str().or_else(|| error.get("code").and_then(Value::as_str)) == Some("refresh_token_reused")
+    })
+}
+
 /// Extract `(code, state)` from whatever the user pasted: a full callback URL,
 /// `code#state`, or a bare code.
 pub fn parse_pasted_code(input: &str) -> Option<(String, Option<String>)> {
