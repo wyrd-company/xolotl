@@ -110,13 +110,16 @@ do not need a new login. Then:
 
 1. **Session affinity.** A request with a session ID (Codex, Claude Code and
    Grok send one) goes to the account the session used before, for up to
-   `session_affinity_secs` (one hour). This keeps prompt caches warm.
+   `session_affinity_secs` (one hour). This keeps prompt caches warm. It
+   applies only while that account is below `soft_limit_percent`.
 2. **Soft limit.** Accounts below `soft_limit_percent` (95%) in every usage
    window come first.
 3. **Priority.** Higher priority first.
 4. **Strategy.** Among equal accounts: `round-robin` (default), `fill-first`
-   (use one account until it is limited) or `least-used` (most quota left in
-   its shortest window).
+   (use one account until it is limited) or `least-used`. `least-used` takes
+   each account's highest usage across all its windows and picks the account
+   where that is lowest. For example, an account at 10% in its 5-hour window
+   and 99% in its 7-day window loses to an account at 40% in both.
 
 Set these in [`[subscription]`](configuration#subscription).
 
