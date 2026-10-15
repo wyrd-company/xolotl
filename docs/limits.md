@@ -34,7 +34,7 @@ There is no spend limit. Subscription accounts have no per-request price, and xo
 
 ## Enforcement
 
-The counters are in memory. At startup they are rebuilt from the request log of the last 24 h (one request per log row, plus its tokens). This matches the single-instance deployment; several instances would each count only their own requests.
+The counters are in memory. At startup they are rebuilt from the request log of the last 24 h: each log row counts one request at the time it was admitted (`started_at`) and its tokens at the time it finished (`ts`), as live counting does. This matches the single-instance deployment; several instances would each count only their own requests.
 
 Every 60 s keys with nothing left in the day window are dropped.
 

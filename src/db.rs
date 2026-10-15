@@ -62,6 +62,8 @@ pub struct AccountUsage {
 
 #[derive(Debug, Clone, Default)]
 pub struct RequestRecord {
+    /// When the request was admitted (Unix seconds); the row's `ts` is when it finished.
+    pub started_at: Option<i64>,
     pub client_id: Option<String>,
     pub provider: String,
     pub account_id: Option<String>,
@@ -75,7 +77,8 @@ pub struct RequestRecord {
     pub trace_id: Option<String>,
 }
 
-/// Requests and tokens of one client in one second, for rebuilding rate limit counters.
+/// Requests admitted or tokens finished by one client in one second, for
+/// rebuilding rate limit counters.
 #[derive(Debug, Clone, FromRow)]
 pub struct RequestCount {
     pub client_id: String,
@@ -344,11 +347,12 @@ impl Db {
 
     pub async fn log_request(&self, r: &RequestRecord) -> Result<()> {
         sqlx::query(
-            "INSERT INTO request_log (ts, client_id, provider, account_id, model, endpoint, status,
+            "INSERT INTO request_log (ts, started_at, client_id, provider, account_id, model, endpoint, status,
                input_tokens, output_tokens, cached_tokens, latency_ms, trace_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(now())
+        .bind(r.started_at)
         .bind(&r.client_id)
         .bind(&r.provider)
         .bind(&r.account_id)
@@ -408,13 +412,20 @@ impl Db {
         Ok(query.fetch_all(&self.pool).await?)
     }
 
-    /// Requests and tokens (input plus output) per client and second, after `since`.
+    /// Requests per client and second of admission, and tokens (input plus
+    /// output) per client and second of completion, after `since`. Rows
+    /// without an admission time count the request at completion.
     pub async fn request_counts_since(&self, since: i64) -> Result<Vec<RequestCount>> {
         Ok(sqlx::query_as(
-            "SELECT client_id, ts, COUNT(*) AS requests,
+            "SELECT client_id, COALESCE(started_at, ts) AS ts, COUNT(*) AS requests, 0 AS tokens
+             FROM request_log WHERE COALESCE(started_at, ts) > ? AND client_id IS NOT NULL
+             GROUP BY client_id, COALESCE(started_at, ts)
+             UNION ALL
+             SELECT client_id, ts, 0 AS requests,
                COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0) AS tokens
              FROM request_log WHERE ts > ? AND client_id IS NOT NULL GROUP BY client_id, ts",
         )
+        .bind(since)
         .bind(since)
         .fetch_all(&self.pool)
         .await?)

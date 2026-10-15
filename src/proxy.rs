@@ -152,6 +152,7 @@ impl Accounting {
         Self {
             db,
             record: RequestRecord {
+                started_at: Some(crate::db::now()),
                 client_id: client_id.map(str::to_string),
                 provider: provider.to_string(),
                 model: model.map(str::to_string),

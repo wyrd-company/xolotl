@@ -476,4 +476,29 @@ mod tests {
         assert_eq!(later.seed(&db, now + DAY + MINUTE).await.unwrap(), 0);
         assert_eq!(later.consumption("p/a", now + DAY + MINUTE), Consumption::default());
     }
+
+    #[tokio::test]
+    async fn replay_matches_live_counting_across_a_window_boundary() {
+        let db = Db::in_memory().await.unwrap();
+        let now = crate::db::now();
+        let p = policy("p", Limits { requests_per_minute: Some(1), ..Default::default() });
+        // Admitted 61 s ago, finished now.
+        let live = Arc::new(Limiter::default());
+        live.admit("p/a", &p, now - 61).unwrap();
+        let mut acc = crate::proxy::Accounting::new(db.clone(), "codex", "/v1/responses", Some("p/a"), None).with_limiter(&live);
+        acc.record.started_at = Some(now - 61);
+        acc.finish(200, crate::proxy::TokenUsage { input: Some(5), output: Some(3), cached: None });
+        for _ in 0..50 {
+            if !db.request_counts_since(0).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let replayed = Limiter::default();
+        replayed.seed(&db, now).await.unwrap();
+        let expected = Consumption { requests_per_minute: 0, requests_per_day: 1, tokens_per_minute: 8, tokens_per_day: 8 };
+        assert_eq!(live.consumption("p/a", now), expected);
+        assert_eq!(replayed.consumption("p/a", now), expected);
+        assert!(replayed.admit("p/a", &p, now).is_ok(), "the request left the minute window before the restart");
+    }
 }
