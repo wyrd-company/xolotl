@@ -154,6 +154,7 @@ fn view_json(s: &AppState, policy: &Policy) -> Value {
     json!({
         "policy": policy.name,
         "models": models,
+        "catalog": policy.candidates(&catalog),
         "shared": policy.shared_names(&catalog),
         "mcp_servers": s.mcp.allowed_servers(policy).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
         "tools": mcp_view_tools(s, policy),

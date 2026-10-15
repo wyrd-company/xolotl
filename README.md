@@ -177,12 +177,13 @@ Every client key belongs to a policy (see [`examples/policies/devcontainer.toml`
 - `providers`: which providers the key may use (`claude`, `codex`, `grok`, `opencode-go`, gateway provider names, or `*`).
 - `allow_models` / `deny_models`: globs matched against `model` or `provider/model`; deny wins.
 - `precedence` and `winners`: who owns a model name served by several providers. The winner serves the plain name (`claude-haiku-5-5`), the others drop it. Without a `precedence` list the order is `claude`, `codex`, `grok`, `opencode-go`, then gateway providers alphabetically.
+- `renames`: `provider/model` → the name keys see instead of its plain name. The plain name then goes to the next provider that serves it.
 - `aliases`: extra names, each a `provider/model` or a list tried in order on 429/5xx. Use them to bring back a model that lost its plain name.
 - `scopes`: `proxy` (default), `management` (T3Code hubs), `mcp` (MCP gateway), `admin`.
 - `mcp_servers`, `allow_tools` / `deny_tools`: the MCP servers (or `*`) a key may use through `/mcp`, and globs on `tool` or `server/tool` (deny wins). See [MCP gateway](docs/mcp.md).
 - `limits`: `requests_per_minute`, `requests_per_day`, `tokens_per_minute`, `tokens_per_day` on the LLM endpoints, counted per key or, with `per = "policy"`, shared by all keys of the policy. Over a limit a request gets 429 with `retry-after`. `xolotl keys list` shows each key's consumption. See [Rate limits](docs/limits.md).
 
-The explicit `provider/model` form always works for any model the policy allows, even one that lost its plain name. `GET /v1/models` lists the plain names and aliases.
+The explicit `provider/model` form always works for any model the policy allows, even one that lost its plain name. `GET /v1/models` lists the plain names, renames and aliases.
 
 Keys are issued into the vault and never printed. A client reads its own key with a Vault policy scoped to its record:
 

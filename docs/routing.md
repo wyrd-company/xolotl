@@ -65,14 +65,15 @@ A policy (`src/policy.rs`) is stored in OpenBao at `policies/<name>`, and every 
 `Policy::resolve` builds the policy's **view**: client-visible name → list of targets.
 
 1. For every catalog model, keep it if the provider is allowed and the model passes `allow_models` / `deny_models`. The globs match either `model` or `provider/model`, and deny wins.
-2. Group the remaining models by plain name. When several providers serve the same name, one wins it:
+2. Group the remaining models that are not renamed by plain name. When several providers serve the same name, one wins it:
    1. the provider in `winners[model]`, if it serves the model;
    2. otherwise, the earliest provider in `precedence`;
    3. otherwise, the earliest in the default order: `claude`, `codex`, `grok`, `opencode-go`;
    4. otherwise, alphabetical.
 
    Providers left out of `precedence` rank after every provider in it. The losing providers don't get the plain name.
-3. Add the aliases. Each one maps a name to one target or an ordered list of targets. An alias overrides a plain name of the same spelling. Targets on providers the policy doesn't allow are dropped.
+3. Add the renamed models. `renames` maps `provider/model` to the name keys see instead of the plain name. A renamed model doesn't take part in step 2, so its plain name goes to the next provider that serves it. A rename overrides a plain name of the same spelling. A rename doesn't allow a model: a denied model stays hidden.
+4. Add the aliases. Each one maps a name to one target or an ordered list of targets. An alias overrides a plain name of the same spelling. Targets on providers the policy doesn't allow are dropped. An alias and a rename can't share a name, and two models can't be renamed to the same name.
 
 `View::lookup` handles a requested name:
 - a name in the view returns its targets;
@@ -82,11 +83,13 @@ The resolved view for any policy can be inspected with `xolotl policies view <na
 
 ### Example
 
-The catalog has `claude-haiku-5-5` on `claude` and on `opencode-go`. With the default order, a key sees `claude-haiku-5-5` → `claude/claude-haiku-5-5`. The OpenCode Go copy is still reachable as `opencode-go/claude-haiku-5-5`, or under a friendlier name through an alias:
+The catalog has `claude-haiku-5-5` on `claude` and on `opencode-go`. With the default order, a key sees `claude-haiku-5-5` → `claude/claude-haiku-5-5`. The OpenCode Go copy is still reachable as `opencode-go/claude-haiku-5-5`, or under a friendlier name through a rename or an alias:
 
 ```toml
+[renames]
+"opencode-go/claude-haiku-5-5" = "haiku-go"   # replaces the plain name for this provider
+
 [aliases]
-haiku-go = "opencode-go/claude-haiku-5-5"
 fast = ["codex/gpt-6-codex", "vercel/moonshotai/kimi-k3"]   # tried in order on 429/5xx
 ```
 
