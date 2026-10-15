@@ -39,6 +39,7 @@
 
 - `pnpm build` writes `ui/dist`. Release builds embed it with `rust-embed`; debug builds read it from disk, so a rebuilt UI shows up after a reload. A binary built without `ui/dist` serves a page saying so.
 - The app claims `/`, `/assets/*` and the icon files browsers look for at the root (`favicon.ico`, `favicon.svg`, `apple-touch-icon.png`, `site.webmanifest` and the manifest's icons, from `ui/public`). Every screen is in the URL fragment, so no other path is taken from the `/<provider>/...` passthrough; `assets` (like `ui`) is rejected as a gateway provider name.
+- The UI has a light and a dark theme. It follows the browser's color scheme unless a theme is picked in the sidebar (system, light or dark); the choice is kept in `localStorage`. Theme-dependent colors in `ui/src/index.css` use `light-dark()` pairs; the sidebar is dark in both themes.
 - `index.html` is served with `no-cache` and a strict Content-Security-Policy (same-origin scripts, styles, fonts and requests; no framing). Hashed files under `/assets/` are cached for a year; the root icon files for a day. Fonts (IBM Plex) are bundled, so the UI loads nothing from other hosts.
 - The emblem and its icons are described in `brand/README.md`.
 - The Docker image builds the UI in a Node stage; CI runs `pnpm build` (which type-checks) in its own job, and the release workflow builds the UI before the binary.

@@ -4,6 +4,7 @@ import { NavLink, Outlet } from "react-router";
 import { toast } from "sonner";
 
 import { Emblem } from "@/components/emblem";
+import { ThemeToggle } from "@/components/theme-toggle";
 import { del, get, setCsrfToken, type Session, type Status } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -69,6 +70,9 @@ export function Layout() {
           )}
           {status.data && <span className="block pt-1">v{status.data.version}</span>}
           {user && <span className="block pt-1">Signed in as {user}</span>}
+        </div>
+        <div className="px-3 pt-3">
+          <ThemeToggle />
         </div>
         <button type="button" onClick={signOut} className="rounded-md px-3 py-2.5 text-left text-sm hover:bg-sidebar-accent hover:text-white">
           Sign out
