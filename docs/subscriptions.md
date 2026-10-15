@@ -5,7 +5,8 @@
 ## Accounts
 
 - **Storage:** credentials live in OpenBao at `accounts/<provider>/<id>`.
-  - The id is `<provider>-` followed by the first 10 hex characters of a SHA-256 of the account's external identity (ChatGPT account id, Anthropic account uuid, xAI `sub`, email, or key). Logging in to the same account twice updates it instead of adding a duplicate.
+  - OAuth account IDs are `<provider>-` followed by the first 10 hex characters of a SHA-256 of the external identity (ChatGPT account id, Anthropic account uuid, xAI `sub`, or email). Logging in to the same account twice updates it instead of adding a duplicate.
+  - An API-key account keeps its ID when its key is replaced. Adding a key already stored on an account updates that account. A new key starts with an ID derived from its hash; if that ID belongs to another key after replacement, it gets a new random ID. Replacing a key with one stored on another account is rejected so one key cannot occupy two pool slots.
   - SQLite holds an index row per account: label, email, plan, enabled, priority, cooldown, "re-login needed" flag, last error.
 - **Adding accounts:**
   - **Codex, device code** (default): `xolotl auth login codex`. The server starts the flow and polls the token endpoint in the background; the CLI polls `/admin/auth/flows/<id>`.

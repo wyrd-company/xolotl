@@ -329,11 +329,24 @@ impl Subscriptions {
     }
 
     pub async fn save_account(&self, cred: Credential) -> Result<AccountRow> {
-        let id = match cred.external_identity() {
+        let _membership = self.membership.lock().await;
+        let mut id = match cred.external_identity() {
             Some(ext) => format!("{}-{}", cred.provider, &hex::encode(Sha256::digest(ext.as_bytes()))[..10]),
             None => format!("{}-{}", cred.provider, crate::keys::random_id(10)),
         };
-        let _membership = self.membership.lock().await;
+        if cred.provider == SubProvider::OpencodeGo {
+            let key = cred.api_key.as_deref().filter(|key| !key.is_empty()).context("API key is required")?;
+            let stored = self.api_key_accounts().await?;
+            if let Some((existing_id, _)) = stored.iter().find(|(_, existing)| existing.api_key.as_deref() == Some(key)) {
+                id = existing_id.clone();
+            } else {
+                // Replacement keeps the original ID, so its hash slot may now
+                // belong to a different key. Never overwrite that account.
+                while stored.iter().any(|(existing_id, _)| existing_id == &id) {
+                    id = format!("opencode-go-{}", crate::keys::random_id(10));
+                }
+            }
+        }
         // Wait for any refresh of the previous login to finish, so it can't
         // overwrite this one; its lock then goes stale.
         let previous = self.creds.read().get(&id).cloned();
@@ -354,12 +367,32 @@ impl Subscriptions {
         self.db.get_account(&id).await?.context("account vanished after save")
     }
 
+    /// Read the authoritative API-key records while holding the membership lock.
+    /// Imports must also find accounts that have not reached the local sync yet.
+    async fn api_key_accounts(&self) -> Result<Vec<(String, Credential)>> {
+        let mut accounts = Vec::new();
+        for id in self.secrets.list("accounts/opencode-go").await? {
+            if id.ends_with('/') {
+                continue;
+            }
+            if let Some(cred) = get_typed::<Credential>(&*self.secrets, &format!("accounts/opencode-go/{id}")).await? {
+                accounts.push((id, cred));
+            }
+        }
+        Ok(accounts)
+    }
+
     /// Replace an API key without changing the account identity or usage history.
     pub async fn replace_key(&self, id: &str, api_key: &str) -> Result<AccountRow> {
         anyhow::ensure!(!api_key.trim().is_empty(), "API key must not be empty");
         let _membership = self.membership.lock().await;
         let row = self.db.get_account(id).await?.context("no such account")?;
         anyhow::ensure!(row.provider == SubProvider::OpencodeGo.as_str(), "account does not use an API key");
+        let stored = self.api_key_accounts().await?;
+        anyhow::ensure!(
+            stored.iter().all(|(existing_id, existing)| existing_id == id || existing.api_key.as_deref() != Some(api_key.trim())),
+            "API key is already stored on another account"
+        );
         let lock = self.creds.read().get(id).cloned().context("account credentials not loaded")?;
         let mut cred = lock.lock().await;
         let mut replacement = cred.clone();
