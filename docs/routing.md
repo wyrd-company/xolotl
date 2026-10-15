@@ -6,8 +6,10 @@ A client sends a model name. Xolotl turns it into one or more **targets** (`prov
 
 `src/catalog.rs` keeps the list of models each provider serves.
 
-- **Discovery** runs at startup and every `catalog.refresh_secs` (default 600 s), on `POST /admin/catalog/refresh` (`xolotl models --refresh`), and after an account login or import.
-  - Codex, Claude and OpenCode Go are asked using one of their accounts. For Codex, `catalog.codex_client_version` is sent, because the backend filters models by client version.
+- **Discovery** runs at startup and every `catalog.refresh_secs` (default 600 s), on `POST /admin/catalog/refresh` (`xolotl models --refresh`), after account login/import, reset, enable/disable or removal, after provider key changes, and on admin reload.
+  - The refresh endpoint accepts an optional comma-separated `providers` query to refresh selected providers; omit it to refresh the whole catalog. Only enabled gateway providers are eligible.
+  - Account views refresh the provider pool; discovery is shared across its accounts. Completed device logins in the web UI trigger refresh through this endpoint.
+  - Codex, Claude, Grok and OpenCode Go are asked using one of their accounts. For Codex, `catalog.codex_client_version` is sent, because the backend filters models by client version.
   - Gateway providers are asked via `GET /v1/models`.
 - **Static models** from `[catalog.static_models]` are added on top. Before the first discovery completes, the catalog holds only these, so routing works from the start.
 - If discovery fails for a provider, its previous list is kept.

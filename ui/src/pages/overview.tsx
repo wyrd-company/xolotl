@@ -147,7 +147,7 @@ export function OverviewPage() {
           </CardAction>
         </CardHeader>
         <CardContent>
-          <CatalogRefresh providers={(providers.data ?? []).map((p) => p.name)} />
+          <CatalogRefresh providers={(providers.data ?? []).filter((p) => p.enabled).map((p) => p.name)} />
         </CardContent>
         <Table>
           <TableHeader>

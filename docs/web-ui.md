@@ -31,8 +31,8 @@ refreshes those providers; omit the query to refresh all providers. Its response
 remains the provider-to-model-list map used by the CLI.
 
 Account imports, completed logins, reset, enable/disable, removal, and provider key
-changes trigger discovery. The UI checks discovery status every 30 seconds and
-updates model lists after background discovery completes. Manual refresh updates
+changes trigger discovery, as does admin reload. The UI checks discovery status
+every 30 seconds and updates model lists after background discovery completes. Manual refresh updates
 all open model queries immediately after completion.
 
 ## Sign-in
