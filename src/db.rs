@@ -75,6 +75,15 @@ pub struct RequestRecord {
     pub trace_id: Option<String>,
 }
 
+/// Requests and tokens of one client in one second, for rebuilding rate limit counters.
+#[derive(Debug, Clone, FromRow)]
+pub struct RequestCount {
+    pub client_id: String,
+    pub ts: i64,
+    pub requests: i64,
+    pub tokens: i64,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct UsageSummary {
     pub key: Option<String>,
@@ -397,6 +406,18 @@ impl Db {
             query = query.bind(value);
         }
         Ok(query.fetch_all(&self.pool).await?)
+    }
+
+    /// Requests and tokens (input plus output) per client and second, after `since`.
+    pub async fn request_counts_since(&self, since: i64) -> Result<Vec<RequestCount>> {
+        Ok(sqlx::query_as(
+            "SELECT client_id, ts, COUNT(*) AS requests,
+               COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0) AS tokens
+             FROM request_log WHERE ts > ? AND client_id IS NOT NULL GROUP BY client_id, ts",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn prune(&self, retention_days: u32) -> Result<u64> {

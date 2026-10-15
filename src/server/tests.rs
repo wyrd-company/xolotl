@@ -12,6 +12,7 @@ use super::*;
 use crate::config::{CatalogConfig, Endpoints, GatewayConfig, ProviderConfig, ProviderKind};
 use crate::db::now;
 use crate::keys::IssueRequest;
+use crate::limits::Limits;
 use crate::policy::{AliasTargets, Policy};
 use crate::secrets::MemoryStore;
 use crate::subscription::{Credential, auth_index};
@@ -68,11 +69,14 @@ async fn harness_with(tweak: impl FnOnce(&mut Config)) -> Harness {
     let http = crate::proxy::upstream_client(std::time::Duration::from_secs(30)).unwrap();
     let keys = Arc::new(KeyManager::new(secrets.clone()));
     keys.reload().await.unwrap();
-    let subs = Arc::new(Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone()));
-    let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()));
+    let limiter = Arc::new(Limiter::default());
+    let subs =
+        Arc::new(Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone()).with_limiter(limiter.clone()));
+    let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()).with_limiter(limiter.clone()));
     let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
     let mcp = Arc::new(McpHub::new(&cfg, secrets.clone(), db.clone()));
-    let state = AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: None, sessions: Default::default(), mcp };
+    let state =
+        AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: None, sessions: Default::default(), mcp, limiter };
     Harness { state, admin: "boot".into(), upstream }
 }
 
@@ -559,6 +563,73 @@ async fn messages_accept_x_api_key() {
     // Authenticated, but no Claude accounts yet: Anthropic-shaped 503.
     assert_eq!(status, 503);
     assert_eq!(v["type"], "error");
+}
+
+#[tokio::test]
+async fn policy_limits_answer_429_in_the_endpoint_shape() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path("/llama/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"choices": [], "usage": {"prompt_tokens": 30, "completion_tokens": 12}})),
+        )
+        .mount(&h.upstream)
+        .await;
+    let limits = Limits { requests_per_minute: Some(2), tokens_per_day: Some(1_000), ..Default::default() };
+    let key = h.key(Policy { limits, ..policy("lim") }).await;
+    let chat = || json!({"model": "llama/qwen3", "messages": []});
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat())).await.0, 200);
+
+    // Keys list: the key's consumption, its policy's limits, and the consumption they check.
+    let (_, keys) = h.call("GET", "/admin/keys", Some(&h.admin), None).await;
+    let k = keys.as_array().unwrap().iter().find(|k| k["client_id"] == "lim/client").unwrap();
+    assert_eq!(k["usage"], json!({"requests_per_minute": 1, "requests_per_day": 1, "tokens_per_minute": 42, "tokens_per_day": 42}));
+    assert_eq!(k["limits"], json!({"requests_per_minute": 2, "tokens_per_day": 1000}));
+    assert_eq!(k["limit_usage"]["tokens_per_day"], 42);
+
+    // The second request is the last one this minute; passthroughs count too.
+    Mock::given(method("GET")).and(path("/llama/v1/props")).respond_with(ResponseTemplate::new(200)).mount(&h.upstream).await;
+    assert_eq!(h.call("GET", "/llama/v1/props", Some(&key), None).await.0, 200);
+    let raw = |uri: &str, body: Option<Value>| {
+        let mut req = Request::builder()
+            .method(if body.is_some() { "POST" } else { "GET" })
+            .uri(uri)
+            .header("authorization", format!("Bearer {key}"));
+        if body.is_some() {
+            req = req.header("content-type", "application/json");
+        }
+        let req = req.body(body.map(|b| Body::from(b.to_string())).unwrap_or_default()).unwrap();
+        router(h.state.clone()).oneshot(req)
+    };
+    let resp = raw("/v1/chat/completions", Some(chat())).await.unwrap();
+    assert_eq!(resp.status(), 429);
+    let retry: i64 = resp.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!((1..=60).contains(&retry), "{retry}");
+    let body: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert!(body["error"]["message"].as_str().unwrap().contains("requests_per_minute of 2 for this key"));
+    // Messages clients get Anthropic's error shape.
+    let (status, body) = h.call("POST", "/v1/messages", Some(&key), Some(json!({"model": "llama/qwen3", "messages": []}))).await;
+    assert_eq!(status, 429, "{body}");
+    assert_eq!((body["type"].as_str(), body["error"]["type"].as_str()), (Some("error"), Some("rate_limit_error")));
+    let resp = raw("/llama/v1/props", None).await.unwrap();
+    assert_eq!(resp.status(), 429);
+    let resp = raw("/opencode-go/v1/models", None).await.unwrap();
+    assert_eq!(resp.status(), 429, "limited before the pool is asked");
+    let resp = raw("/llama/v1/messages", Some(json!({"model": "qwen3"}))).await.unwrap();
+    assert_eq!(resp.status(), 429);
+    let body: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["type"], "error", "Anthropic shape on a Messages passthrough: {body}");
+    // Refused requests are not counted, whether by a limit or by the policy.
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(json!({"model": "nope"}))).await.0, 404);
+    assert_eq!(h.state.limiter.consumption("lim/client", now()).requests_per_minute, 2);
+
+    // Limits are validated on save.
+    let zero = json!({"name": "zero", "providers": ["*"], "limits": {"requests_per_day": 0}});
+    let (status, body) = h.call("PUT", "/admin/policies/zero", Some(&h.admin), Some(zero)).await;
+    assert_eq!(status, 400, "{body}");
+    let unknown = json!({"name": "spend", "providers": ["*"], "limits": {"dollars_per_day": 5}});
+    assert_eq!(h.call("PUT", "/admin/policies/spend", Some(&h.admin), Some(unknown)).await.0, 422);
 }
 
 #[tokio::test]

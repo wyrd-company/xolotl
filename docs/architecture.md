@@ -28,7 +28,7 @@ clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web
 | Store | Holds | Why |
 |---|---|---|
 | OpenBao, KV v2 under `secret/xolotl/` | admin token, telemetry headers, provider keys, account credentials, MCP servers added at runtime and their secrets, policies, client key records | Secrets stay off disk and out of env vars. Writes that can race use check-and-set. |
-| SQLite (`database.path`) | accounts index, cooldowns, usage snapshots, request log and MCP call log (pruned after `retention_days`, default 90) | Cheap, frequently changing state. Holds no secrets and is rebuilt from OpenBao if lost. |
+| SQLite (`database.path`) | accounts index, cooldowns, usage snapshots, request log and MCP call log (pruned after `retention_days`, default 90) | Cheap, frequently changing state. Holds no secrets and is rebuilt from OpenBao if lost. Rate limit counters are rebuilt from the request log at startup. |
 
 `src/vault.rs` is the OpenBao client: AppRole login, re-login on 403, KV v2 get/put/list/delete, versioned reads, check-and-set writes and version destroy. It implements the `SecretStore` trait (`src/secrets.rs`); tests use the in-memory `MemoryStore`.
 
@@ -36,8 +36,8 @@ clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web
 
 1. `authorize` takes the key from `Authorization` (Bearer or bare), `x-api-key` or `x-management-key`, and resolves it to a principal: client id plus policy. The bootstrap admin token resolves to an unrestricted policy. Without a key, an `/admin` route also accepts a web UI session.
 2. The route checks the scope it needs (`proxy`, `management` or `admin`).
-3. LLM endpoints resolve `model` through the policy and dispatch to a pool or a gateway provider, translating the request when the provider doesn't speak the endpoint's format ([Routing](routing.md)). Passthroughs check only the provider (and `model`, when the body is JSON).
-4. Responses are relayed as they arrive. `TapStream` (`src/proxy.rs`) reads token usage from the upstream JSON or SSE body on the way through, and `Accounting` writes the request log row and metrics when the response finishes. A translated response is translated after this tap, so usage always comes from what the upstream sent.
+3. LLM endpoints resolve `model` through the policy, count the request against the policy's [rate limits](limits.md) (429 when one is reached) and dispatch to a pool or a gateway provider, translating the request when the provider doesn't speak the endpoint's format ([Routing](routing.md)). Passthroughs check only the provider (and `model`, when the body is JSON).
+4. Responses are relayed as they arrive. `TapStream` (`src/proxy.rs`) reads token usage from the upstream JSON or SSE body on the way through, and `Accounting` writes the request log row and metrics, and counts the tokens against the rate limits, when the response finishes. A translated response is translated after this tap, so usage always comes from what the upstream sent.
 
 ## Background tasks
 
@@ -45,7 +45,7 @@ Started by `server::spawn_background`:
 
 | Every | Task |
 |---|---|
-| 60 s | Reload client keys, policies and MCP servers from OpenBao; sync accounts (picks up added and removed accounts; keeps the in-memory credentials of accounts it already holds) |
+| 60 s | Reload client keys, policies and MCP servers from OpenBao; sync accounts (picks up added and removed accounts; keeps the in-memory credentials of accounts it already holds); drop idle rate limit counters |
 | `catalog.refresh_secs` (600 s) | Re-discover models from every provider |
 | `mcp.tools_refresh_secs` (300 s) | Re-read upstream MCP tool lists (only when MCP servers are configured) |
 | 15 s | Retry OpenBao writes of refreshed OAuth credentials that failed: subscription accounts ([details](subscriptions.md#when-the-vault-write-fails)) and MCP server logins |
@@ -70,6 +70,7 @@ On graceful shutdown the server makes one last attempt to save unsaved credentia
 | `ui/` | Web UI source (Vite, React, Tailwind, shadcn/ui) |
 | `src/server/management.rs` | T3Code hubs endpoints (`/v0/management/*`) |
 | `src/policy.rs` | Policies and model-name resolution |
+| `src/limits.rs` | Rate limits on policies and the consumption counters |
 | `src/catalog.rs` | Model catalog, wire formats and routes (native or translated) |
 | `src/keys.rs` | Client keys and policy storage |
 | `src/subscription/` | Account pools: `mod.rs` (selection, failover, refresh), `codex.rs`, `claude.rs`, `opencode_go.rs`, `oauth.rs` (PKCE, token errors) |

@@ -26,6 +26,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::gateway::Gateway;
 use crate::keys::{KeyManager, Principal, Scope};
+use crate::limits::Limiter;
 use crate::mcp::McpHub;
 use crate::policy::{Target, View};
 use crate::proxy::{self, forward_request_headers};
@@ -46,6 +47,7 @@ pub struct AppState {
     pub vault: Option<VaultClient>,
     pub sessions: Arc<session::Sessions>,
     pub mcp: Arc<McpHub>,
+    pub limiter: Arc<Limiter>,
 }
 
 impl AppState {
@@ -183,6 +185,7 @@ pub fn spawn_background(state: AppState) {
             if let Err(e) = s.mcp.reload().await {
                 tracing::warn!(error = %e, "MCP server reload failed");
             }
+            s.limiter.prune(crate::db::now());
         }
     });
     let s = state.clone();
@@ -275,6 +278,22 @@ pub fn json_error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(json!({"error": {"type": status_kind(status), "message": msg}}))).into_response()
 }
 
+/// Count a request against its policy's limits. A reached limit answers 429
+/// with `retry-after`, in the Anthropic error shape for Messages clients.
+fn admit(state: &AppState, principal: &Principal, anthropic: bool) -> Result<(), Response> {
+    let Some(client) = principal.client_id() else { return Ok(()) };
+    state.limiter.admit(client, &principal.policy, crate::db::now()).map_err(|e| {
+        let msg = e.message(&principal.policy.name);
+        let mut resp = if anthropic {
+            proxy::anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+        } else {
+            proxy::error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+        };
+        resp.headers_mut().insert(header::RETRY_AFTER, e.retry_after.into());
+        resp
+    })
+}
+
 fn status_kind(s: StatusCode) -> &'static str {
     match s.as_u16() {
         401 => "authentication_error",
@@ -347,6 +366,9 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             })
             .unwrap_or_default();
         return err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("model {model:?} is not available on {path}{hint}"));
+    }
+    if let Err(resp) = admit(state, &principal, anthropic) {
+        return resp;
     }
 
     let fwd = forward_request_headers(&headers);
@@ -576,6 +598,9 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
         Ok(x) => x,
         Err(r) => return r,
     };
+    if let Err(resp) = admit(&state, &principal, rest.starts_with("v1/messages")) {
+        return resp;
+    }
     let path = path_and_query(&rest, &parts.uri);
     let fwd = forward_request_headers(&parts.headers);
     let label = model.map(|m| format!("{provider}/{m}"));
@@ -600,6 +625,9 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
         Ok(x) => x,
         Err(r) => return r,
     };
+    if let Err(resp) = admit(&state, &principal, rest.starts_with("v1/messages")) {
+        return resp;
+    }
     // Failover may resend the body, so it is always buffered here.
     let bytes = match (bytes, stream) {
         (Some(b), _) => b,

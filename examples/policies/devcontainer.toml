@@ -19,6 +19,12 @@ deny_models = ["*-preview"]
 # follow: claude, codex, grok, opencode-go, then gateway providers alphabetically.
 precedence = ["claude", "codex", "grok", "opencode-go", "vercel"]
 
+# Rate limits on the LLM endpoints; a missing field is unlimited. Counted per
+# key, or with per = "policy" shared by all keys of the policy.
+# [limits]
+# requests_per_minute = 60
+# tokens_per_day = 5000000
+
 # Per-model overrides of precedence.
 [winners]
 # "kimi-k3" = "vercel"

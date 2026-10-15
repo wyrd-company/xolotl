@@ -180,6 +180,7 @@ Every client key belongs to a policy (see [`examples/policies/devcontainer.toml`
 - `aliases`: extra names, each a `provider/model` or a list tried in order on 429/5xx. Use them to bring back a model that lost its plain name.
 - `scopes`: `proxy` (default), `management` (T3Code hubs), `mcp` (MCP gateway), `admin`.
 - `mcp_servers`, `allow_tools` / `deny_tools`: the MCP servers (or `*`) a key may use through `/mcp`, and globs on `tool` or `server/tool` (deny wins). See [MCP gateway](docs/mcp.md).
+- `limits`: `requests_per_minute`, `requests_per_day`, `tokens_per_minute`, `tokens_per_day` on the LLM endpoints, counted per key or, with `per = "policy"`, shared by all keys of the policy. Over a limit a request gets 429 with `retry-after`. `xolotl keys list` shows each key's consumption. See [Rate limits](docs/limits.md).
 
 The explicit `provider/model` form always works for any model the policy allows, even one that lost its plain name. `GET /v1/models` lists the plain names and aliases.
 
@@ -269,6 +270,7 @@ Set `telemetry.otlp_endpoint` (OpenObserve: `http://openobserve:5080/api/<org>`)
 - `xolotl.account.usage_percent` (by account and window), `xolotl.account.available`
 - `xolotl.upstream.errors`, `xolotl.oauth.refreshes`
 - `xolotl.mcp.tool_calls` (by server, tool, status), `xolotl.mcp.tool_call.duration`, `xolotl.mcp.executions`
+- `xolotl.limit.consumption` (by client, unit and window), `xolotl.limit.rejections` (by policy, client and limit)
 
 ### Development
 

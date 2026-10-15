@@ -15,6 +15,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::keys::{Scope, glob_match};
+use crate::limits::Limits;
 
 /// Default precedence before any gateway providers.
 pub const DEFAULT_PRECEDENCE: &[&str] = &["claude", "codex", "grok", "opencode-go"];
@@ -56,6 +57,9 @@ pub struct Policy {
     /// Globs that remove tools; deny wins over allow.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_tools: Vec<String>,
+    /// Rate limits and token budgets of the LLM endpoints.
+    #[serde(default, skip_serializing_if = "Limits::is_empty")]
+    pub limits: Limits,
 }
 
 fn default_scopes() -> Vec<Scope> {
@@ -169,6 +173,7 @@ impl Policy {
             anyhow::ensure!(s == "*" || mcp.contains(s), "unknown MCP server {s:?}");
         }
         anyhow::ensure!(self.mcp_servers.is_empty() || self.has_scope(Scope::Mcp), "mcp_servers needs the mcp scope");
+        self.limits.validate()?;
         for p in self.providers.iter().chain(&self.precedence).chain(self.winners.values()) {
             anyhow::ensure!(p == "*" || known.contains(p), "unknown provider {p:?}");
         }

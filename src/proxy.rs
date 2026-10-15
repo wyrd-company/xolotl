@@ -3,6 +3,7 @@
 //! for the request log and metrics.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -15,6 +16,7 @@ use opentelemetry::KeyValue;
 use serde_json::Value;
 
 use crate::db::{Db, RequestRecord};
+use crate::limits::Limiter;
 use crate::telemetry::metrics;
 
 /// Request headers never forwarded upstream: hop-by-hop headers, client
@@ -136,11 +138,13 @@ impl TokenUsage {
     }
 }
 
-/// Finalises a request: writes the request log row and records metrics.
+/// Finalises a request: writes the request log row, records metrics and
+/// counts the tokens against the client's rate limits.
 pub struct Accounting {
     pub db: Db,
     pub record: RequestRecord,
     pub started: Instant,
+    limiter: Option<Arc<Limiter>>,
 }
 
 impl Accounting {
@@ -156,7 +160,13 @@ impl Accounting {
                 ..Default::default()
             },
             started: Instant::now(),
+            limiter: None,
         }
+    }
+
+    pub fn with_limiter(mut self, limiter: &Arc<Limiter>) -> Self {
+        self.limiter = Some(limiter.clone());
+        self
     }
 
     pub fn finish(mut self, status: u16, usage: TokenUsage) {
@@ -166,6 +176,10 @@ impl Accounting {
         self.record.cached_tokens = usage.cached;
         self.record.latency_ms = self.started.elapsed().as_millis() as i64;
         let r = &self.record;
+        if let (Some(limiter), Some(client)) = (&self.limiter, &r.client_id) {
+            let tokens = usage.input.unwrap_or(0).max(0) + usage.output.unwrap_or(0).max(0);
+            limiter.record_tokens(client, tokens as u64, crate::db::now());
+        }
         let attrs = [
             KeyValue::new("provider", r.provider.clone()),
             KeyValue::new("model", r.model.clone().unwrap_or_default()),

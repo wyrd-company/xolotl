@@ -156,6 +156,7 @@ fn view_json(s: &AppState, policy: &Policy) -> Value {
         "shared": policy.shared_names(&catalog),
         "mcp_servers": s.mcp.allowed_servers(policy).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
         "tools": mcp_view_tools(s, policy),
+        "usage": s.limiter.policy_consumption(&policy.name, now()),
     })
 }
 
@@ -214,9 +215,27 @@ fn refresh_catalog_later(s: &AppState) {
 
 // ---- keys
 
+/// Every key with its consumption (`usage`). Under a policy with limits,
+/// also the `limits` and the consumption they are checked against
+/// (`limit_usage`: the key's own, or the policy's total with `per = "policy"`).
 async fn list_keys(State(s): State<AppState>, h: HeaderMap) -> Res {
     admin(&s, &h).await?;
-    ok(s.keys.list())
+    let at = now();
+    let keys: Vec<Value> = s
+        .keys
+        .list()
+        .into_iter()
+        .map(|k| {
+            let mut v = json!(k);
+            v["usage"] = json!(s.limiter.consumption(&k.client_id, at));
+            if let Some(p) = s.keys.policy(&k.policy).filter(|p| !p.limits.is_empty()) {
+                v["limits"] = json!(p.limits);
+                v["limit_usage"] = json!(s.limiter.counted(&k.client_id, &p, at));
+            }
+            v
+        })
+        .collect();
+    ok(keys)
 }
 
 /// Issues a key into the vault. The key itself is never returned: the client
