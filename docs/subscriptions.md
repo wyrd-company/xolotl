@@ -97,7 +97,7 @@ They are stored per account in SQLite, shown by `xolotl accounts list` / `usage`
 
 ### Codex reset credits
 
-Each Codex usage poll also reads `/wham/rate-limit-reset-credits` with the account's credentials. The count includes only credits with `status: "available"`, `reset_type: "codex_rate_limits"`, and a future `expires_at`, matching T3Code hubs.
+Each Codex usage poll also reads `/wham/rate-limit-reset-credits` with the account's credentials. The count includes only credits with `status: "available"`, `reset_type: "codex_rate_limits"`, and either no expiry (`expires_at` absent or `null`) or a future `expires_at`. Credits with invalid expiry values are skipped.
 
 The count is stored as `raw.reset_credits` in the account's usage snapshot. Response-header updates preserve it. If the credit lookup fails or has an invalid response, the count is `null` (unknown); quota windows still update. The next successful poll replaces it, including with zero.
 

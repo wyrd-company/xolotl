@@ -1177,7 +1177,7 @@ async fn codex_reset_credits_are_filtered_persisted_and_survive_headers() {
     };
     let credits = json!({"credits": [
         credit("first", "available", "codex_rate_limits", "2099-01-01T00:00:00Z"),
-        credit("second", "available", "codex_rate_limits", "2099-02-01T00:00:00Z"),
+        json!({"id": "second", "status": "available", "reset_type": "codex_rate_limits", "granted_at": "2026-06-18T00:00:00Z", "expires_at": null}),
         credit("old", "available", "codex_rate_limits", "2000-01-01T00:00:00Z"),
         credit("used", "redeemed", "codex_rate_limits", "2099-01-01T00:00:00Z"),
         credit("other", "available", "other", "2099-01-01T00:00:00Z")

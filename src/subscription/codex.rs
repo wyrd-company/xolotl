@@ -260,16 +260,19 @@ pub fn reset_credits_request(http: &reqwest::Client, ep: &Endpoints, cred: &Cred
     req.header("openai-beta", "codex-1").header("originator", "Codex Desktop")
 }
 
-/// Count available, unexpired account-wide credits, matching T3Code hubs.
+/// Count available account-wide credits, including credits with no expiry.
 pub fn parse_reset_credits(body: &Value, at: i64) -> anyhow::Result<usize> {
     let credits = body.get("credits").and_then(Value::as_array).ok_or_else(|| anyhow::anyhow!("missing credits array"))?;
     let mut count = 0;
     for credit in credits {
         let status = credit.get("status").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("missing credit status"))?;
         let reset_type = credit.get("reset_type").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("missing credit reset_type"))?;
-        let expires_at = credit.get("expires_at").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("missing credit expiry"))?;
-        let expiry = chrono::DateTime::parse_from_rfc3339(expires_at)?;
-        if status == "available" && reset_type == "codex_rate_limits" && expiry.timestamp() > at {
+        let unexpired = match credit.get("expires_at") {
+            None | Some(Value::Null) => true,
+            Some(Value::String(expiry)) => chrono::DateTime::parse_from_rfc3339(expiry).is_ok_and(|expiry| expiry.timestamp() > at),
+            Some(_) => false,
+        };
+        if status == "available" && reset_type == "codex_rate_limits" && unexpired {
             count += 1;
         }
     }
@@ -452,19 +455,44 @@ mod tests {
         let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z").unwrap().timestamp();
         assert_eq!(parse_reset_credits(&json!({"credits": [credit.clone()]}), expiry - 1).unwrap(), 1);
         assert_eq!(parse_reset_credits(&json!({"credits": [credit.clone()]}), expiry).unwrap(), 0);
-        for field in ["status", "reset_type", "expires_at"] {
+        for field in ["status", "reset_type"] {
             let mut invalid = credit.clone();
             invalid.as_object_mut().unwrap().remove(field);
             assert!(parse_reset_credits(&json!({"credits": [invalid]}), expiry).is_err());
         }
-        assert!(
-            parse_reset_credits(
-                &json!({"credits": [{"status": "available", "reset_type": "codex_rate_limits", "expires_at": "bad"}]}),
-                expiry
-            )
-            .is_err()
-        );
+        for value in [Value::Null, json!("bad"), json!(42)] {
+            let mut changed = credit.clone();
+            changed["expires_at"] = value.clone();
+            let expected = if value.is_null() { 2 } else { 1 };
+            assert_eq!(parse_reset_credits(&json!({"credits": [credit.clone(), changed]}), expiry - 1).unwrap(), expected);
+        }
+        let mut no_expiry = credit.clone();
+        no_expiry.as_object_mut().unwrap().remove("expires_at");
+        assert_eq!(parse_reset_credits(&json!({"credits": [no_expiry]}), expiry).unwrap(), 1);
         assert!(parse_reset_credits(&json!({"credits": null}), expiry).is_err());
+    }
+
+    #[test]
+    fn reset_credits_codex_http_contract_fixture() {
+        // Codex backend-client/src/client/rate_limit_resets_tests.rs contract shape.
+        let body = json!({
+            "credits": [
+                {
+                    "id": "credit-1", "reset_type": "codex_rate_limits", "status": "available",
+                    "granted_at": "2026-06-17T00:00:00Z", "expires_at": "2026-07-17T00:00:00Z",
+                    "redeem_started_at": null, "redeemed_at": null,
+                    "profile_image_url": "https://example.test/avatar.png", "profile_user_id": "@example-user",
+                    "title": "Full reset (Weekly + 5 hr)", "description": "Ready to redeem"
+                },
+                {
+                    "id": "credit-2", "reset_type": "codex_rate_limits", "status": "available",
+                    "granted_at": "2026-06-18T00:00:00Z", "expires_at": null
+                }
+            ],
+            "available_count": 2, "total_earned_count": 4
+        });
+        let at = chrono::DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z").unwrap().timestamp();
+        assert_eq!(parse_reset_credits(&body, at).unwrap(), 2);
     }
 
     #[test]
