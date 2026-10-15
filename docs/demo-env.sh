@@ -104,6 +104,9 @@ providers = ["local"]
 
 [aliases]
 fast = "local/gemma-4-12b"
+
+[limits]
+requests_per_minute = 60
 TOML
 
   "$PWD/target/debug/xolotl" serve --config "$XOLOTL_DEMO_DIR/config.toml" >"$XOLOTL_DEMO_DIR/server.log" 2>&1 &
