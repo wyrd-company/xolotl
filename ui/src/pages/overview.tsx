@@ -21,6 +21,7 @@ import {
   type UsageRow,
 } from "@/lib/api";
 import { clock, num, relative } from "@/lib/format";
+import { resetCreditsSummary } from "@/lib/reset-credits";
 
 const DAY = 86_400;
 
@@ -120,6 +121,9 @@ export function OverviewPage() {
                   </>
                 ) : (
                   <div className="text-muted-foreground text-sm">{pool.length ? "No usage reported yet." : "No accounts."}</div>
+                )}
+                {p === "codex" && pool.length > 0 && (
+                  <div className="text-muted-foreground text-sm">{resetCreditsSummary(pool)}</div>
                 )}
                 <Link to="/accounts" className="text-primary text-sm">
                   View accounts

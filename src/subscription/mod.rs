@@ -942,7 +942,7 @@ impl Subscriptions {
         }
         let ep = &self.cfg.endpoints;
         let mut attempt = 0;
-        let body: Value = loop {
+        let mut body: Value = loop {
             let req = match provider {
                 SubProvider::Codex => codex::usage_request(&self.http, ep, &cred),
                 SubProvider::Claude => claude::usage_request(&self.http, ep, &cred),
@@ -982,8 +982,33 @@ impl Subscriptions {
                 self.db.set_cooldown(id, w.resets_at.unwrap_or(t), &format!("{} window exhausted", w.name)).await?;
             }
         }
+        if provider == SubProvider::Codex {
+            anyhow::ensure!(body.is_object(), "Codex usage response is not an object");
+            // Credit lookup failures must not discard quota windows or retain an old count.
+            let credits = match self.poll_reset_credits(id, cred).await {
+                Ok(count) => Some(count),
+                Err(e) => {
+                    tracing::warn!(account = id, error = %e, "reset credit poll failed");
+                    None
+                }
+            };
+            body["reset_credits"] = serde_json::to_value(credits)?;
+        }
         self.record_usage(id, provider, windows, Some(body)).await;
         self.db.get_usage(id).await?.context("usage vanished")
+    }
+
+    async fn poll_reset_credits(&self, id: &str, mut cred: Credential) -> Result<usize> {
+        for attempt in 0..2 {
+            let resp = codex::reset_credits_request(&self.http, &self.cfg.endpoints, &cred).timeout(Duration::from_secs(15)).send().await?;
+            if resp.status() == StatusCode::UNAUTHORIZED && attempt == 0 {
+                cred = self.credential(id, Some(&cred.access_token)).await?;
+                continue;
+            }
+            let body: Value = resp.error_for_status()?.json().await?;
+            return codex::parse_reset_credits(&body, now());
+        }
+        unreachable!("second attempt returns")
     }
 
     pub async fn poll_all(&self) {

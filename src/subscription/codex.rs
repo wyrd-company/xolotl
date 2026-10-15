@@ -251,6 +251,31 @@ pub fn usage_request(http: &reqwest::Client, ep: &Endpoints, cred: &Credential) 
     req
 }
 
+/// Same account and authentication headers as the usage endpoint.
+pub fn reset_credits_request(http: &reqwest::Client, ep: &Endpoints, cred: &Credential) -> reqwest::RequestBuilder {
+    let mut req = http.get(format!("{}/wham/rate-limit-reset-credits", ep.codex_backend.trim_end_matches('/')));
+    for (k, v) in usage_headers(cred) {
+        req = req.header(k, v);
+    }
+    req.header("openai-beta", "codex-1").header("originator", "Codex Desktop")
+}
+
+/// Count available, unexpired account-wide credits, matching T3Code hubs.
+pub fn parse_reset_credits(body: &Value, at: i64) -> anyhow::Result<usize> {
+    let credits = body.get("credits").and_then(Value::as_array).ok_or_else(|| anyhow::anyhow!("missing credits array"))?;
+    let mut count = 0;
+    for credit in credits {
+        let status = credit.get("status").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("missing credit status"))?;
+        let reset_type = credit.get("reset_type").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("missing credit reset_type"))?;
+        let expires_at = credit.get("expires_at").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("missing credit expiry"))?;
+        let expiry = chrono::DateTime::parse_from_rfc3339(expires_at)?;
+        if status == "available" && reset_type == "codex_rate_limits" && expiry.timestamp() > at {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// The model roster; upstream filters it by the client version it is told.
 pub fn models_request(http: &reqwest::Client, ep: &Endpoints, cred: &Credential, client_version: &str) -> reqwest::RequestBuilder {
     let mut url = url::Url::parse(&format!("{}/codex/models", ep.codex_backend.trim_end_matches('/'))).expect("valid url");
@@ -418,6 +443,28 @@ mod tests {
         assert_eq!(w[0].name, "5h");
         assert_eq!(w[1].name, "7d");
         assert_eq!(w[1].used_percent, 100.0);
+    }
+
+    #[test]
+    fn reset_credits_expiry_and_invalid_responses() {
+        let credit =
+            json!({"id": "credit-a", "status": "available", "reset_type": "codex_rate_limits", "expires_at": "2030-01-01T00:00:00Z"});
+        let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z").unwrap().timestamp();
+        assert_eq!(parse_reset_credits(&json!({"credits": [credit.clone()]}), expiry - 1).unwrap(), 1);
+        assert_eq!(parse_reset_credits(&json!({"credits": [credit.clone()]}), expiry).unwrap(), 0);
+        for field in ["status", "reset_type", "expires_at"] {
+            let mut invalid = credit.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(parse_reset_credits(&json!({"credits": [invalid]}), expiry).is_err());
+        }
+        assert!(
+            parse_reset_credits(
+                &json!({"credits": [{"status": "available", "reset_type": "codex_rate_limits", "expires_at": "bad"}]}),
+                expiry
+            )
+            .is_err()
+        );
+        assert!(parse_reset_credits(&json!({"credits": null}), expiry).is_err());
     }
 
     #[test]

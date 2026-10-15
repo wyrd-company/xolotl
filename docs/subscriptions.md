@@ -95,6 +95,14 @@ Usage windows (percent used, reset time) come from two sources:
 
 They are stored per account in SQLite, shown by `xolotl accounts list` / `usage`, exported as `xolotl.account.usage_percent`, and used by selection (soft limit, least-used).
 
+### Codex reset credits
+
+Each Codex usage poll also reads `/wham/rate-limit-reset-credits` with the account's credentials. The count includes only credits with `status: "available"`, `reset_type: "codex_rate_limits"`, and a future `expires_at`, matching T3Code hubs.
+
+The count is stored as `raw.reset_credits` in the account's usage snapshot. Response-header updates preserve it. If the credit lookup fails or has an invalid response, the count is `null` (unknown); quota windows still update. The next successful poll replaces it, including with zero.
+
+The overview shows the Codex pool total across all accounts, including disabled and cooling accounts. When some counts are unknown, it labels the total as partial. Account details show the per-account count. These are snapshots from the last poll; credits can expire or be redeemed elsewhere between polls. Credit redemption is available through T3Code hubs.
+
 ## T3Code hubs
 
 `src/server/management.rs` implements CLIProxyAPI's management API for keys with the `management` scope:

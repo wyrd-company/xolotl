@@ -1159,3 +1159,109 @@ async fn unknown_refresh_outcome_survives_proxy_success_and_failure() {
     assert_eq!(subs.credential(&row.id, None).await.unwrap().access_token, "fresh");
     assert!(subs.db.get_account(&row.id).await.unwrap().unwrap().last_error.is_none());
 }
+
+#[tokio::test]
+async fn codex_reset_credits_are_filtered_persisted_and_survive_headers() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
+    Mock::given(path("/backend-api/wham/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plan_type": "pro", "rate_limit": {
+            "primary_window": {"used_percent": 25, "limit_window_seconds": 18000}}})))
+        .mount(&server)
+        .await;
+    let credit = |id: &str, status: &str, reset_type: &str, expires_at: &str| {
+        json!({
+            "id": id, "status": status, "reset_type": reset_type, "expires_at": expires_at
+        })
+    };
+    let credits = json!({"credits": [
+        credit("first", "available", "codex_rate_limits", "2099-01-01T00:00:00Z"),
+        credit("second", "available", "codex_rate_limits", "2099-02-01T00:00:00Z"),
+        credit("old", "available", "codex_rate_limits", "2000-01-01T00:00:00Z"),
+        credit("used", "redeemed", "codex_rate_limits", "2099-01-01T00:00:00Z"),
+        credit("other", "available", "other", "2099-01-01T00:00:00Z")
+    ]});
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/rate-limit-reset-credits"))
+        .and(header("authorization", "Bearer tok-a"))
+        .and(header("chatgpt-account-id", "acct-a"))
+        .and(header("openai-beta", "codex-1"))
+        .and(header("originator", "Codex Desktop"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(credits))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let usage = subs.poll_usage(&a.id).await.unwrap();
+    assert_eq!(usage.raw.as_ref().unwrap()["reset_credits"], 2);
+    assert_eq!(usage.windows[0].used_percent, 25.0);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-codex-primary-used-percent", "40".parse().unwrap());
+    headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+    subs.observe_headers(&a.id, SubProvider::Codex, &headers).await;
+    let accounts = subs.accounts(Some(SubProvider::Codex)).await.unwrap();
+    let serialized = serde_json::to_value(&accounts).unwrap();
+    assert_eq!(serialized[0]["usage"]["raw"]["reset_credits"], 2);
+    assert_eq!(serialized[0]["usage"]["windows"][0]["used_percent"], 40.0);
+
+    server.reset().await;
+    Mock::given(path("/backend-api/wham/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"rate_limit": {
+            "primary_window": {"used_percent": 50, "limit_window_seconds": 18000}}})))
+        .mount(&server)
+        .await;
+    // A failed credit lookup replaces the previous count with unknown, not zero.
+    for (response, expected) in [
+        (ResponseTemplate::new(503).set_body_json(json!({"credits": []})), serde_json::Value::Null),
+        (ResponseTemplate::new(200).set_body_json(json!({"unexpected": []})), serde_json::Value::Null),
+        (ResponseTemplate::new(200).set_body_json(json!({"credits": []})), json!(0)),
+    ] {
+        let guard = Mock::given(path("/backend-api/wham/rate-limit-reset-credits")).respond_with(response).mount_as_scoped(&server).await;
+        let usage = subs.poll_usage(&a.id).await.unwrap();
+        assert_eq!(usage.windows[0].used_percent, 50.0);
+        assert_eq!(usage.raw.unwrap()["reset_credits"], expected);
+        drop(guard);
+    }
+}
+
+#[tokio::test]
+async fn codex_reset_credits_refresh_on_401() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let a = subs.save_account(codex_cred("acct-a", "stale")).await.unwrap();
+    Mock::given(path("/backend-api/wham/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"rate_limit": {}})))
+        .mount(&server)
+        .await;
+    Mock::given(path("/backend-api/wham/rate-limit-reset-credits"))
+        .and(header("authorization", "Bearer stale"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"access_token": "fresh", "refresh_token": "new", "expires_in": 86400})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/backend-api/wham/rate-limit-reset-credits"))
+        .and(header("authorization", "Bearer fresh"))
+        .and(header("chatgpt-account-id", "acct-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"credits": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(subs.poll_usage(&a.id).await.unwrap().raw.unwrap()["reset_credits"], 0);
+}
+
+#[tokio::test]
+async fn codex_reset_credits_reject_non_object_usage_without_panicking() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
+    Mock::given(path("/backend-api/wham/usage")).respond_with(ResponseTemplate::new(200).set_body_json(json!([]))).mount(&server).await;
+    assert!(subs.poll_usage(&a.id).await.is_err());
+    assert!(subs.db.get_usage(&a.id).await.unwrap().is_none());
+}
