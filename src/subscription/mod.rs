@@ -600,7 +600,7 @@ impl Subscriptions {
         let session = match provider {
             SubProvider::Codex => codex::session_key(&headers, body_json.as_ref().unwrap_or(&Value::Null)),
             SubProvider::Claude => claude::session_key(&headers, body_json.as_ref().unwrap_or(&Value::Null)),
-            SubProvider::OpencodeGo => opencode_go::session_key(&headers),
+            SubProvider::OpencodeGo => Some(opencode_go::session_key(&headers, client_id)),
             SubProvider::Grok => grok::session_key(&headers, body_json.as_ref().unwrap_or(&Value::Null)),
         };
         let mut accounting = Accounting::new(self.db.clone(), provider.as_str(), path, client_id, model);
@@ -642,7 +642,7 @@ impl Subscriptions {
                 match provider {
                     SubProvider::Codex => codex::prepare(&mut h, &mut b, &cred, path),
                     SubProvider::Claude => claude::prepare(&mut h, &mut b, &cred, path),
-                    SubProvider::OpencodeGo => opencode_go::prepare(&mut h, &mut b, &cred, path),
+                    SubProvider::OpencodeGo => opencode_go::prepare(&mut h, &mut b, &cred, path, session.as_deref().unwrap_or_default()),
                     SubProvider::Grok => grok::prepare(&mut h, &mut b, &cred, &self.grok_client_version),
                 }
                 let mut req = self.http.request(method.clone(), &url).headers(h);
@@ -727,7 +727,8 @@ impl Subscriptions {
                 metrics()
                     .upstream_errors
                     .add(1, &[KeyValue::new("provider", provider.as_str()), KeyValue::new("status", i64::from(status))]);
-                tracing::info!(account = %account.id, status, ?failure, "upstream error");
+                let reason = (provider == SubProvider::OpencodeGo).then(|| opencode_go::error_reason(status, &bytes, &cred));
+                tracing::info!(account = %account.id, status, ?failure, reason = reason.as_deref(), "upstream error");
                 if failure == Failure::Auth && force.is_none() && provider.uses_oauth() {
                     force = Some(cred.access_token.clone());
                     continue;
@@ -743,11 +744,14 @@ impl Subscriptions {
                     return self.error_for(provider, path, StatusCode::UPGRADE_REQUIRED, "invalid_request_error", &msg);
                 }
                 if failure == Failure::Fatal {
-                    let _ = self.db.record_account_result(&account.id, None).await;
+                    let _ = self.db.record_account_result(&account.id, reason.as_deref()).await;
                     accounting.record.account_id = Some(account.id.clone());
                     return proxy::relay_buffered(status, &resp_headers, bytes, Some(accounting));
                 }
                 self.handle_failure(&account, provider, &failure, status).await;
+                if let Some(reason) = reason.as_deref() {
+                    let _ = self.db.record_account_result(&account.id, Some(reason)).await;
+                }
                 last = Some((status, resp_headers, bytes, account.id.clone()));
                 continue 'accounts;
             }

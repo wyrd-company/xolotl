@@ -1820,3 +1820,46 @@ mod mcp_gateway {
         }
     }
 }
+
+#[tokio::test]
+async fn opencode_sessions_reach_upstream_on_native_translated_and_passthrough_routes() {
+    let h = harness().await;
+    h.account(Credential { provider: SubProvider::OpencodeGo, api_key: Some("test-key".into()), ..Default::default() }).await;
+    let key = h.key(policy("session-test")).await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})),
+        )
+        .mount(&h.upstream)
+        .await;
+    for route in ["/v1/chat/completions", "/v1/messages", "/opencode-go/v1/chat/completions"] {
+        for source in [None, Some("x-opencode-session"), Some("x-claude-code-session-id"), Some("session_id")] {
+            let auth = format!("Bearer {key}");
+            let mut headers = vec![("authorization", auth.as_str()), ("user-agent", "sample-client/1.0")];
+            if let Some(source) = source {
+                headers.push((source, "conversation-1"));
+            }
+            let (status, body) = h
+                .call_with(
+                    "POST",
+                    route,
+                    &headers,
+                    Some(json!({
+                        "model": "opencode-go/kimi-k3", "max_tokens": 16,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })),
+                )
+                .await;
+            assert_eq!(status, 200, "{route}: {body}");
+        }
+    }
+    let requests = h.upstream.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 12);
+    let derived = requests[0].headers["x-opencode-session"].to_str().unwrap();
+    assert!(derived.starts_with("xolotl-"));
+    for (i, req) in requests.iter().enumerate() {
+        assert_eq!(req.headers["x-opencode-session"], if i % 4 == 0 { derived } else { "conversation-1" });
+        assert_eq!(req.headers["user-agent"], concat!("xolotl/", env!("CARGO_PKG_VERSION"), " (sample-client/1.0)"));
+    }
+}
