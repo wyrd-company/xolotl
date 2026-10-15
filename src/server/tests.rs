@@ -28,9 +28,12 @@ async fn harness() -> Harness {
 }
 
 async fn harness_with(tweak: impl FnOnce(&mut Config)) -> Harness {
+    harness_with_secrets(tweak, Arc::new(MemoryStore::default())).await
+}
+
+async fn harness_with_secrets(tweak: impl FnOnce(&mut Config), secrets: Secrets) -> Harness {
     let upstream = MockServer::start().await;
     let uri = upstream.uri();
-    let secrets: Secrets = Arc::new(MemoryStore::default());
     secrets.put("admin", json!({"token": "boot"}).as_object().unwrap().clone()).await.unwrap();
     secrets.put("providers/llama", json!({"api_key": "llama-key"}).as_object().unwrap().clone()).await.unwrap();
 
@@ -2076,17 +2079,7 @@ async fn resetting_account_automatically_rediscovers_models() {
         .mount(&h.upstream)
         .await;
     assert_eq!(h.call("POST", &format!("/admin/accounts/{id}/reset"), Some(&h.admin), None).await.0, 200);
-    // The mutation responds before background discovery completes.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if h.state.catalog.models()["opencode-go"].contains("sample-model") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    assert!(h.state.catalog.models()["opencode-go"].contains("sample-model"));
     assert!(h.state.catalog.discovery_status()["opencode-go"].error.is_none());
 }
 
@@ -2119,4 +2112,251 @@ async fn concurrent_scoped_catalog_refreshes_preserve_both_results() {
     let status = h.state.catalog.discovery_status();
     assert!(status["llama"].refreshed_at.is_some());
     assert!(status["opencode-go"].refreshed_at.is_some());
+}
+
+#[tokio::test]
+async fn account_key_replacement_preserves_identity_and_survives_reload() {
+    let h = harness().await;
+    let id = h
+        .account(Credential {
+            provider: SubProvider::OpencodeGo,
+            api_key: Some("old-key".into()),
+            label: Some("Example".into()),
+            ..Default::default()
+        })
+        .await;
+    h.state.db.set_account_priority(&id, 17).await.unwrap();
+    h.state.db.set_account_enabled(&id, false).await.unwrap();
+    h.state.db.mark_auth_failed(&id, true, Some("rejected (401)")).await.unwrap();
+    h.state.db.set_cooldown(&id, now() + 100, "rate limited").await.unwrap();
+    h.state.db.put_usage(&crate::db::AccountUsage { account_id: id.clone(), fetched_at: 123, windows: vec![], raw: None }).await.unwrap();
+    let before = h.state.db.get_account(&id).await.unwrap().unwrap();
+    let url = format!("/admin/accounts/{id}/key");
+    assert_eq!(h.call("POST", &url, None, Some(json!({"api_key":"new-key"}))).await.0, 401);
+    assert_eq!(h.call("POST", &url, Some(&h.admin), Some(json!({"api_key":"  "}))).await.0, 400);
+    let (status, response) = h.call("POST", &url, Some(&h.admin), Some(json!({"api_key":"new-key"}))).await;
+    assert_eq!(status, 200);
+    assert!(!response.to_string().contains("new-key"));
+    let after = h.state.db.get_account(&id).await.unwrap().unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.label, before.label);
+    assert_eq!(after.priority, 17);
+    assert_eq!(h.state.db.get_usage(&id).await.unwrap().unwrap().fetched_at, 123);
+    assert_eq!(after.created_at, before.created_at);
+    assert!(!after.enabled);
+    assert!(!after.auth_failed);
+    assert!(after.cooldown_until.is_none());
+    assert!(after.last_error.is_none());
+    let record = h.state.secrets.get(&format!("accounts/opencode-go/{id}")).await.unwrap().unwrap();
+    assert_eq!(record["api_key"], "new-key");
+    // A fresh pool must use the replacement from storage too.
+    let subs = Subscriptions::new(h.state.cfg.subscription.clone(), h.state.db.clone(), h.state.secrets.clone(), reqwest::Client::new());
+    subs.sync().await.unwrap();
+    h.state.db.set_account_enabled(&id, true).await.unwrap();
+    Mock::given(method("GET"))
+        .and(path("/zen/go/v1/models"))
+        .and(header("authorization", "Bearer new-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"sample-model"}]})))
+        .expect(2)
+        .mount(&h.upstream)
+        .await;
+    assert_eq!(subs.fetch_models(SubProvider::OpencodeGo, "example").await.unwrap(), vec!["sample-model"]);
+    assert_eq!(h.state.subs.fetch_models(SubProvider::OpencodeGo, "example").await.unwrap(), vec!["sample-model"]);
+    assert_eq!(h.state.db.list_accounts(None).await.unwrap().len(), 1);
+    let oauth = h.codex_account().await;
+    assert_eq!(
+        h.call("POST", &format!("/admin/accounts/{oauth}/key"), Some(&h.admin), Some(json!({"api_key":"oauth-invalid-key"}))).await.0,
+        400
+    );
+    assert_eq!(h.call("POST", "/admin/accounts/missing/key", Some(&h.admin), Some(json!({"api_key":"new-key"}))).await.0, 404);
+}
+
+#[tokio::test]
+async fn account_recovery_refreshes_models_and_reports_discovery_errors() {
+    let h = harness_with(|cfg| {
+        cfg.catalog.static_models.remove("opencode-go");
+    })
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/zen/go/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"sample-model"}]})))
+        .mount(&h.upstream)
+        .await;
+    let (status, added) = h
+        .call("POST", "/admin/accounts/import", Some(&h.admin), Some(json!({"provider":"opencode-go", "data":{"api_key":"sample-key"}})))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(added["catalog_refresh"]["models"], 1);
+    let id = added["id"].as_str().unwrap();
+    h.state.db.mark_auth_failed(id, true, Some("rejected (401)")).await.unwrap();
+    h.state.db.set_cooldown(id, now() + 100, "rate limited").await.unwrap();
+    h.state.catalog.refresh_providers(&h.state.subs, &h.state.gateway, &["opencode-go".to_string()].into_iter().collect()).await;
+    assert!(h.state.catalog.models()["opencode-go"].contains("sample-model"));
+    assert_eq!(h.state.catalog.discovery_status()["opencode-go"].error.as_deref(), Some("no available accounts"));
+    h.codex_account().await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/codex/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[{"slug":"another-model"}]})))
+        .mount(&h.upstream)
+        .await;
+    h.state.catalog.refresh_providers(&h.state.subs, &h.state.gateway, &["codex".to_string()].into_iter().collect()).await;
+    let other_models = h.state.catalog.models()["codex"].clone();
+    assert!(other_models.contains("another-model"));
+    let (status, reset) = h.call("POST", &format!("/admin/accounts/{id}/reset"), Some(&h.admin), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(reset["catalog_refresh"]["models"], 1);
+    let (_, discovery) = h.call("GET", "/admin/catalog/status", Some(&h.admin), None).await;
+    assert_eq!(discovery["opencode-go"]["models"], 1);
+    assert!(discovery["opencode-go"]["error"].is_null());
+    assert!(discovery["opencode-go"]["refreshed_at"].is_number());
+    assert_eq!(h.upstream.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/backend-api/codex/models").count(), 1);
+    let recovered = h.state.db.get_account(id).await.unwrap().unwrap();
+    assert!(!recovered.auth_failed);
+    assert!(recovered.cooldown_until.is_none());
+    assert!(recovered.last_error.is_none());
+    assert!(h.state.catalog.models()["opencode-go"].contains("sample-model"));
+    assert_eq!(h.state.catalog.models()["codex"], other_models);
+    let (_, replaced) =
+        h.call("POST", &format!("/admin/accounts/{id}/key"), Some(&h.admin), Some(json!({"api_key":"replacement-key"}))).await;
+    assert_eq!(replaced["catalog_refresh"]["models"], 1);
+    h.upstream.reset().await;
+    let (status, result) = h.call("POST", &format!("/admin/accounts/{id}/models"), Some(&h.admin), None).await;
+    assert_eq!(status, 200);
+    assert!(result["error"].as_str().unwrap().contains("404"));
+    assert!(h.state.catalog.models()["opencode-go"].contains("sample-model"));
+    let (_, replaced) =
+        h.call("POST", &format!("/admin/accounts/{id}/key"), Some(&h.admin), Some(json!({"api_key":"replacement-key"}))).await;
+    assert_eq!(replaced["replaced"], true);
+    assert!(replaced["catalog_refresh"]["error"].is_string());
+    let (_, discovery) = h.call("GET", "/admin/catalog/status", Some(&h.admin), None).await;
+    assert!(discovery["opencode-go"]["error"].as_str().unwrap().contains("404"));
+    assert_eq!(discovery["opencode-go"]["models"], 1);
+}
+
+#[tokio::test]
+async fn api_key_imports_preserve_replacements_and_deduplicate() {
+    let h = harness().await;
+    assert!(h.state.subs.save_account(Credential { provider: SubProvider::OpencodeGo, ..Default::default() }).await.is_err());
+    assert!(
+        h.state
+            .subs
+            .save_account(Credential { provider: SubProvider::OpencodeGo, api_key: Some(String::new()), ..Default::default() })
+            .await
+            .is_err()
+    );
+    let import = |key: &str| json!({"provider":"opencode-go", "data":{"api_key":key}});
+    let (_, first) = h.call("POST", "/admin/accounts/import", Some(&h.admin), Some(import("key-a"))).await;
+    let first_id = first["id"].as_str().unwrap();
+    let key_url = format!("/admin/accounts/{first_id}/key");
+    assert_eq!(h.call("POST", &key_url, Some(&h.admin), Some(json!({"api_key":"key-b"}))).await.0, 200);
+    let (_, second) = h.call("POST", "/admin/accounts/import", Some(&h.admin), Some(import("key-a"))).await;
+    let second_id = second["id"].as_str().unwrap();
+    assert_ne!(first_id, second_id);
+    let record = h.state.secrets.get(&format!("accounts/opencode-go/{first_id}")).await.unwrap().unwrap();
+    assert_eq!(record["api_key"], "key-b");
+    let (_, duplicate) = h.call("POST", "/admin/accounts/import", Some(&h.admin), Some(import("key-b"))).await;
+    assert_eq!(duplicate["id"], first_id);
+    let second_url = format!("/admin/accounts/{second_id}/key");
+    assert_eq!(h.call("POST", &second_url, Some(&h.admin), Some(json!({"api_key":"key-b"}))).await.0, 400);
+    let record = h.state.secrets.get(&format!("accounts/opencode-go/{second_id}")).await.unwrap().unwrap();
+    assert_eq!(record["api_key"], "key-a");
+    // Deduplication also covers vault accounts not loaded in a new pool yet.
+    let subs = Subscriptions::new(h.state.cfg.subscription.clone(), h.state.db.clone(), h.state.secrets.clone(), reqwest::Client::new());
+    assert_eq!(subs.import(SubProvider::OpencodeGo, &json!({"api_key":"key-b"}), None).await.unwrap().id, first_id);
+    assert_eq!(h.state.secrets.list("accounts/opencode-go").await.unwrap().len(), 2);
+    let (a, b) = tokio::join!(
+        h.call("POST", &key_url, Some(&h.admin), Some(json!({"api_key":"key-c"}))),
+        h.call("POST", &second_url, Some(&h.admin), Some(json!({"api_key":"key-c"})))
+    );
+    let mut statuses = [a.0, b.0];
+    statuses.sort();
+    assert_eq!(statuses, [200, 400]);
+    let mut keys = Vec::new();
+    for id in h.state.secrets.list("accounts/opencode-go").await.unwrap() {
+        let record = h.state.secrets.get(&format!("accounts/opencode-go/{id}")).await.unwrap().unwrap();
+        keys.push(record["api_key"].as_str().unwrap().to_string());
+    }
+    assert_eq!(keys.iter().filter(|key| *key == "key-c").count(), 1);
+}
+
+#[tokio::test]
+async fn account_recovery_waits_for_inflight_full_catalog_refresh() {
+    let store = Arc::new(crate::secrets::testing::GatedStore::default());
+    let h = Arc::new(
+        harness_with_secrets(
+            |cfg| {
+                cfg.catalog.static_models.remove("opencode-go");
+                // Sort the gateway after the account pool so it gates a refresh
+                // that has already observed the failed account.
+                let mut gateway = cfg.gateway.providers.remove("llama").unwrap();
+                gateway.secret = Some("providers/llama".into());
+                cfg.gateway.providers.insert("zz-example".into(), gateway);
+            },
+            store.clone(),
+        )
+        .await,
+    );
+    let id = h.account(Credential { provider: SubProvider::OpencodeGo, api_key: Some("sample-key".into()), ..Default::default() }).await;
+    h.state.db.mark_auth_failed(&id, true, Some("rejected (401)")).await.unwrap();
+    Mock::given(method("GET"))
+        .and(path("/zen/go/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"sample-model"}]})))
+        .mount(&h.upstream)
+        .await;
+    // The full refresh has already skipped the failed account when it reaches
+    // the gateway's credential read. Hold it there while Retry clears the flag.
+    store.arm("get", "providers/llama");
+    let full = tokio::spawn({
+        let h = h.clone();
+        async move { h.state.catalog.refresh(&h.state.subs, &h.state.gateway).await }
+    });
+    store.reached.notified().await;
+    let mut retry = tokio::spawn({
+        let h = h.clone();
+        let id = id.clone();
+        async move { h.call("POST", &format!("/admin/accounts/{id}/reset"), Some(&h.admin), None).await }
+    });
+    while h.state.db.get_account(&id).await.unwrap().unwrap().auth_failed {
+        tokio::task::yield_now().await;
+    }
+    let premature = tokio::time::timeout(std::time::Duration::from_millis(50), &mut retry).await;
+    // Release the live fixture before asserting, including when the lock is
+    // deliberately removed for mutation verification.
+    store.release.notify_one();
+    full.await.unwrap();
+    let waited = premature.is_err();
+    let result = match premature {
+        Ok(result) => result.unwrap(),
+        Err(_) => retry.await.unwrap(),
+    };
+    assert_eq!(result.0, 200);
+    assert!(waited, "Retry discovery bypassed the full refresh");
+    assert!(h.state.catalog.models()["opencode-go"].contains("sample-model"));
+}
+
+#[tokio::test]
+async fn api_key_import_waits_for_replacement_before_deduplicating() {
+    let store = Arc::new(crate::secrets::testing::GatedStore::default());
+    let h = Arc::new(harness_with_secrets(|_| {}, store.clone()).await);
+    let id = h.account(Credential { provider: SubProvider::OpencodeGo, api_key: Some("key-a".into()), ..Default::default() }).await;
+    store.arm("put", &format!("accounts/opencode-go/{id}"));
+    let replacement = tokio::spawn({
+        let h = h.clone();
+        let id = id.clone();
+        async move { h.state.subs.replace_key(&id, "key-b").await }
+    });
+    store.reached.notified().await;
+    let mut import = tokio::spawn({
+        let h = h.clone();
+        async move { h.state.subs.import(SubProvider::OpencodeGo, &json!({"api_key":"key-b"}), None).await }
+    });
+    let premature = tokio::time::timeout(std::time::Duration::from_millis(50), &mut import).await;
+    store.release.notify_one();
+    replacement.await.unwrap().unwrap();
+    let imported = match premature {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => import.await.unwrap().unwrap(),
+    };
+    assert_eq!(imported.id, id);
+    assert_eq!(h.state.secrets.list("accounts/opencode-go").await.unwrap().len(), 1);
 }

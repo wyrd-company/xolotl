@@ -39,6 +39,8 @@ pub fn router() -> Router<AppState> {
         .route("/accounts/{id}/reset", post(reset_account))
         .route("/accounts/{id}/priority", post(set_priority))
         .route("/accounts/{id}/usage", post(refresh_usage))
+        .route("/accounts/{id}/key", post(replace_account_key))
+        .route("/accounts/{id}/models", post(refresh_account_models))
         .route("/auth/{provider}/start", post(start_login))
         .route("/auth/flows/{id}", get(flow_status))
         .route("/auth/flows/{id}/complete", post(complete_login))
@@ -324,8 +326,10 @@ async fn import_account(State(s): State<AppState>, h: HeaderMap, Json(req): Json
     admin(&s, &h).await?;
     let row = s.subs.import(req.provider, &req.data, req.label).await.map_err(bad)?;
     tracing::info!(account = %row.id, "imported account");
-    refresh_catalog_later(&s);
-    ok(row)
+    let discovery = account_models(&s, req.provider).await;
+    let mut response = serde_json::to_value(row).map_err(|e| internal(e.into()))?;
+    response["catalog_refresh"] = discovery;
+    ok(response)
 }
 
 async fn remove_account(State(s): State<AppState>, h: HeaderMap, Path(id): Path<String>) -> Res {
@@ -352,8 +356,33 @@ async fn reset_account(State(s): State<AppState>, h: HeaderMap, Path(id): Path<S
         return Err(json_error(StatusCode::NOT_FOUND, "no such account"));
     }
     s.db.mark_auth_failed(&id, false, None).await.map_err(internal)?;
-    refresh_catalog_later(&s);
-    ok(json!({"id": id, "reset": true}))
+    let row = s.db.get_account(&id).await.map_err(internal)?.ok_or_else(|| json_error(StatusCode::NOT_FOUND, "no such account"))?;
+    let provider = row.provider.parse().map_err(internal)?;
+    ok(json!({"id": id, "reset": true, "catalog_refresh": account_models(&s, provider).await}))
+}
+
+// Discovery failure must not hide a successful credential write or reset.
+async fn account_models(s: &AppState, provider: SubProvider) -> Value {
+    let providers = [provider.as_str().to_string()].into_iter().collect();
+    s.catalog.refresh_providers(&s.subs, &s.gateway, &providers).await;
+    let status = s.catalog.discovery_status().remove(provider.as_str()).expect("subscription provider is in catalog");
+    match status.error {
+        Some(error) => json!({"provider": provider, "error": error}),
+        None => json!({"provider": provider, "models": status.models}),
+    }
+}
+
+async fn refresh_account_models(State(s): State<AppState>, h: HeaderMap, Path(id): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    let row = s.db.get_account(&id).await.map_err(internal)?.ok_or_else(|| json_error(StatusCode::NOT_FOUND, "no such account"))?;
+    ok(account_models(&s, row.provider.parse().map_err(internal)?).await)
+}
+
+async fn replace_account_key(State(s): State<AppState>, h: HeaderMap, Path(id): Path<String>, Json(req): Json<ProviderKeyReq>) -> Res {
+    admin(&s, &h).await?;
+    let row = s.db.get_account(&id).await.map_err(internal)?.ok_or_else(|| json_error(StatusCode::NOT_FOUND, "no such account"))?;
+    s.subs.replace_key(&id, &req.api_key).await.map_err(bad)?;
+    ok(json!({"id": id, "replaced": true, "catalog_refresh": account_models(&s, row.provider.parse().map_err(internal)?).await}))
 }
 
 #[derive(Deserialize)]

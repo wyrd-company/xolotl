@@ -1,6 +1,8 @@
 import { useState } from "react";
+import { toast } from "sonner";
+import { AccountLogin } from "@/pages/add-account";
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "react-router";
+import { Link, useSearchParams } from "react-router";
 
 import { CatalogRefresh } from "@/components/catalog-refresh";
 import { accountName, AccountStateBadge, WindowBars, WindowsSummary } from "@/components/account-state";
@@ -18,9 +20,17 @@ import { dateTime, relative } from "@/lib/format";
 import { useAction } from "@/lib/hooks";
 
 export function AccountsPage() {
+  const [search, setSearch] = useSearchParams();
   const [filter, setFilter] = useState("all");
-  const accounts = useQuery({ queryKey: ["accounts"], queryFn: () => get<Account[]>("/admin/accounts"), refetchInterval: 30_000 });
-  const status = useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/admin/status") });
+  const accounts = useQuery({
+    queryKey: ["accounts"],
+    queryFn: () => get<Account[]>("/admin/accounts"),
+    refetchInterval: 30_000,
+  });
+  const status = useQuery({
+    queryKey: ["status"],
+    queryFn: () => get<Status>("/admin/status"),
+  });
   const all = accounts.data ?? [];
   const shown = filter === "all" ? all : all.filter((a) => a.provider === filter);
   const sub = status.data?.subscription;
@@ -74,7 +84,12 @@ export function AccountsPage() {
           </TableHeader>
           <TableBody>
             {shown.map((a) => (
-              <AccountRow key={a.id} account={a} />
+              <AccountRow
+                key={a.id}
+                account={a}
+                open={search.get("account") === a.id}
+                onOpenChange={(open) => setSearch(open ? { account: a.id } : {})}
+              />
             ))}
           </TableBody>
         </Table>
@@ -88,9 +103,14 @@ export function AccountsPage() {
   );
 }
 
-function AccountRow({ account: a }: { account: Account }) {
-  const inv = { invalidate: [["accounts"], ["status"]] };
-  const refresh = useAction(() => post(`/admin/accounts/${a.id}/usage`), { ...inv, success: "Usage refreshed" });
+function AccountRow({ account: a, open, onOpenChange }: { account: Account; open: boolean; onOpenChange: (open: boolean) => void }) {
+  const inv = {
+    invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"]],
+  };
+  const refresh = useAction(() => post(`/admin/accounts/${a.id}/usage`), {
+    ...inv,
+    success: "Usage refreshed",
+  });
   const toggle = useAction(() => post(`/admin/accounts/${a.id}/${a.enabled ? "disable" : "enable"}`), {
     ...inv,
     success: a.enabled ? "Account disabled" : "Account enabled",
@@ -115,31 +135,42 @@ function AccountRow({ account: a }: { account: Account }) {
       <TableCell className="whitespace-nowrap">{relative(a.last_used_at)}</TableCell>
       <TableCell>
         <div className="flex justify-end gap-2">
-          {a.auth_failed && a.provider !== "opencode-go" ? (
-            <Button asChild size="sm" variant="secondary">
-              <Link to="/accounts/add">Log in again</Link>
-            </Button>
-          ) : (
-            <Button size="sm" variant="outline" disabled={refresh.isPending || !a.enabled} onClick={() => refresh.mutate(undefined)}>
-              Refresh usage
-            </Button>
-          )}
+          <Button size="sm" variant="outline" disabled={refresh.isPending || !a.enabled} onClick={() => refresh.mutate(undefined)}>
+            Refresh usage
+          </Button>
+          <RefreshModels account={a} />
           <Button size="sm" variant="outline" disabled={toggle.isPending} onClick={() => toggle.mutate(undefined)}>
             {a.enabled ? "Disable" : "Enable"}
           </Button>
-          <AccountDetails account={a} />
+          <AccountDetails account={a} open={open} onOpenChange={onOpenChange} />
         </div>
       </TableCell>
     </TableRow>
   );
 }
 
-function AccountDetails({ account: a }: { account: Account }) {
-  const [open, setOpen] = useState(false);
+function AccountDetails({
+  account: a,
+  open,
+  onOpenChange: setOpen,
+}: {
+  account: Account;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
   const [priority, setPriority] = useState(String(a.priority));
-  const inv = { invalidate: [["accounts"], ["status"]] };
-  const setPrio = useAction((p: number) => post(`/admin/accounts/${a.id}/priority`, { priority: p }), { ...inv, success: "Priority saved" });
-  const reset = useAction(() => post(`/admin/accounts/${a.id}/reset`), { ...inv, success: "Cooldown and auth failure cleared" });
+  const inv = {
+    invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"]],
+  };
+  const setPrio = useAction((p: number) => post(`/admin/accounts/${a.id}/priority`, { priority: p }), {
+    ...inv,
+    success: "Priority saved",
+  });
+  const reset = useAction(() => post<{ catalog_refresh: ModelRefresh }>(`/admin/accounts/${a.id}/reset`), {
+    ...inv,
+    success: "Cooldown and auth failure cleared",
+    onSuccess: (r) => showModels(r.catalog_refresh),
+  });
   const remove = useAction(() => del(`/admin/accounts/${a.id}`), {
     ...inv,
     success: "Account removed",
@@ -160,7 +191,7 @@ function AccountDetails({ account: a }: { account: Account }) {
           Details
         </Button>
       </DialogTrigger>
-      <DialogContent className="sm:max-w-xl">
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{accountName(a)}</DialogTitle>
           <DialogDescription>
@@ -248,13 +279,18 @@ function AccountDetails({ account: a }: { account: Account }) {
             Save
           </Button>
         </form>
+        <p className="text-muted-foreground text-sm">
+          Retry clears the auth failure and cooldown so this account can be tried again. It does not change the credential or reset upstream
+          quota.
+        </p>
+        {a.provider === "opencode-go" ? <ReplaceKey account={a} /> : <AccountLogin provider={a.provider} />}
         <div className="flex flex-wrap gap-2 border-t pt-4">
           <Button variant="outline" disabled={!coolingOrFailed || reset.isPending} onClick={() => reset.mutate(undefined)}>
-            Clear cooldown
+            Retry
           </Button>
           <Confirm
             title="Remove this account?"
-            description="Its credentials are deleted from OpenBao. Log in again to add it back."
+            description="Its credentials are deleted from OpenBao. Add the account again to restore it."
             action="Remove"
             onConfirm={() => remove.mutate(undefined)}
           >
@@ -265,5 +301,56 @@ function AccountDetails({ account: a }: { account: Account }) {
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+
+type ModelRefresh = { provider: string; models?: number; error?: string };
+function showModels(r: ModelRefresh) {
+  if (r.error) toast.error(`${r.provider}: ${r.error}`);
+  else toast.success(`${r.provider}: ${r.models} models found`);
+}
+
+function RefreshModels({ account: a }: { account: Account }) {
+  const refresh = useAction(() => post<ModelRefresh>(`/admin/accounts/${a.id}/models`), {
+    invalidate: [["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"], ["status"]],
+    onSuccess: showModels,
+  });
+  return (
+    <Button size="sm" variant="outline" disabled={refresh.isPending} onClick={() => refresh.mutate(undefined)}>
+      Refresh models
+    </Button>
+  );
+}
+
+function ReplaceKey({ account: a }: { account: Account }) {
+  const [key, setKey] = useState("");
+  const replace = useAction(
+    () =>
+      post<{ catalog_refresh: ModelRefresh }>(`/admin/accounts/${a.id}/key`, {
+        api_key: key.trim(),
+      }),
+    {
+      invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"]],
+      success: "Key replaced",
+      onSuccess: (r) => {
+        setKey("");
+        showModels(r.catalog_refresh);
+      },
+    },
+  );
+  return (
+    <form
+      className="flex flex-col gap-2"
+      onSubmit={(e) => {
+        e.preventDefault();
+        replace.mutate(undefined);
+      }}
+    >
+      <Label htmlFor={`key-${a.id}`}>Replace key</Label>
+      <Input id={`key-${a.id}`} type="password" autoComplete="off" value={key} onChange={(e) => setKey(e.target.value)} />
+      <Button type="submit" className="self-start" disabled={!key.trim() || replace.isPending}>
+        Replace key
+      </Button>
+    </form>
   );
 }

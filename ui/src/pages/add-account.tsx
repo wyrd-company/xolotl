@@ -33,6 +33,15 @@ export function AddAccountPage() {
   );
 }
 
+export function AccountLogin({ provider }: { provider: "codex" | "claude" | "grok" }) {
+  return (
+    <div>
+      <h3 className="mb-2 font-medium">Log in again</h3>
+      {provider === "codex" ? <CodexLogin /> : provider === "claude" ? <ClaudeLogin /> : <GrokLogin />}
+    </div>
+  );
+}
+
 function Section({ title, description, children }: { title: string; description: ReactNode; children: ReactNode }) {
   return (
     <Card>
@@ -51,6 +60,10 @@ function useLoggedIn() {
     toast.success(email ? `Logged in ${email}` : "Account added");
     qc.invalidateQueries({ queryKey: ["accounts"] });
     qc.invalidateQueries({ queryKey: ["status"] });
+    qc.invalidateQueries({ queryKey: ["catalog"] });
+    qc.invalidateQueries({ queryKey: ["catalog-routes"] });
+    qc.invalidateQueries({ queryKey: ["catalog-status"] });
+    qc.invalidateQueries({ queryKey: ["policy-view"] });
   };
 }
 
@@ -221,10 +234,25 @@ function OpencodeGoKey() {
   const [key, setKey] = useState("");
   const loggedIn = useLoggedIn();
   const add = useAction(
-    () => post<Account>("/admin/accounts/import", { provider: "opencode-go", data: { api_key: key.trim() }, label: label.trim() || null }),
+    () =>
+      post<
+        Account & {
+          catalog_refresh: {
+            provider: string;
+            models?: number;
+            error?: string;
+          };
+        }
+      >("/admin/accounts/import", {
+        provider: "opencode-go",
+        data: { api_key: key.trim() },
+        label: label.trim() || null,
+      }),
     {
-      onSuccess: () => {
+      onSuccess: (r) => {
         loggedIn();
+        if (r.catalog_refresh.error) toast.error(r.catalog_refresh.error);
+        else toast.success(`${r.catalog_refresh.provider}: ${r.catalog_refresh.models} models found`);
         setKey("");
         setLabel("");
       },
@@ -245,7 +273,14 @@ function OpencodeGoKey() {
         </div>
         <div className="flex flex-col gap-2">
           <Label htmlFor="ocg-key">API key</Label>
-          <Input id="ocg-key" type="password" autoComplete="off" className="font-mono" value={key} onChange={(e) => setKey(e.target.value)} />
+          <Input
+            id="ocg-key"
+            type="password"
+            autoComplete="off"
+            className="font-mono"
+            value={key}
+            onChange={(e) => setKey(e.target.value)}
+          />
         </div>
         <Button type="submit" className="self-start" disabled={!key.trim() || add.isPending}>
           Add key
@@ -283,8 +318,9 @@ function ImportLogin() {
       title="Import a login"
       description={
         <>
-          Codex <span className="font-mono">~/.codex/auth.json</span> or Claude Code <span className="font-mono">~/.claude/.credentials.json</span>.
-          Stop using that login locally afterwards: refresh tokens rotate, and only one side keeps a working one.
+          Codex <span className="font-mono">~/.codex/auth.json</span> or Claude Code{" "}
+          <span className="font-mono">~/.claude/.credentials.json</span>. Stop using that login locally afterwards: refresh tokens rotate,
+          and only one side keeps a working one.
         </>
       }
     >

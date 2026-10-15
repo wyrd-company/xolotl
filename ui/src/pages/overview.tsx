@@ -4,7 +4,7 @@ import { AlertTriangle } from "lucide-react";
 import { Link } from "react-router";
 
 import { CatalogRefresh } from "@/components/catalog-refresh";
-import { accountName, peakUsage, WindowBars } from "@/components/account-state";
+import { accountName, accountPath, accountState, peakUsage, WindowBars } from "@/components/account-state";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -26,10 +26,24 @@ import { resetCreditsSummary } from "@/lib/reset-credits";
 const DAY = 86_400;
 
 export function OverviewPage() {
-  const status = useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/admin/status"), refetchInterval: 30_000 });
-  const accounts = useQuery({ queryKey: ["accounts"], queryFn: () => get<Account[]>("/admin/accounts"), refetchInterval: 30_000 });
-  const providers = useQuery({ queryKey: ["providers"], queryFn: () => get<GatewayProvider[]>("/admin/providers") });
-  const routes = useQuery({ queryKey: ["catalog-routes"], queryFn: () => get<CatalogRoute[]>("/admin/catalog/routes") });
+  const status = useQuery({
+    queryKey: ["status"],
+    queryFn: () => get<Status>("/admin/status"),
+    refetchInterval: 30_000,
+  });
+  const accounts = useQuery({
+    queryKey: ["accounts"],
+    queryFn: () => get<Account[]>("/admin/accounts"),
+    refetchInterval: 30_000,
+  });
+  const providers = useQuery({
+    queryKey: ["providers"],
+    queryFn: () => get<GatewayProvider[]>("/admin/providers"),
+  });
+  const routes = useQuery({
+    queryKey: ["catalog-routes"],
+    queryFn: () => get<CatalogRoute[]>("/admin/catalog/routes"),
+  });
   const usage = useQuery({
     queryKey: ["usage", "provider", DAY],
     queryFn: () => get<UsageRow[]>(`/admin/usage?group_by=provider&since_secs=${DAY}`),
@@ -61,15 +75,15 @@ export function OverviewPage() {
     if (a.auth_failed)
       attention.push(
         <>
-          <strong>{accountName(a)}</strong> ({a.provider}) needs to log in again{a.last_error ? ` (${a.last_error})` : ""} ·{" "}
-          <Link to="/accounts/add">Log in</Link>
+          <strong>{accountName(a)}</strong> ({a.provider}) {accountState(a).label}
+          {a.last_error ? ` (${a.last_error})` : ""} · <Link to={accountPath(a.id)}>Review account</Link>
         </>,
       );
     else if (a.cooldown_until && a.cooldown_until > now)
       attention.push(
         <>
           <strong>{accountName(a)}</strong> ({a.provider}) is cooling down until {clock(a.cooldown_until)}
-          {a.cooldown_reason ? ` (${a.cooldown_reason})` : ""}
+          {a.cooldown_reason ? ` (${a.cooldown_reason})` : ""} · <Link to={accountPath(a.id)}>Review account</Link>
         </>,
       );
   }

@@ -7,7 +7,7 @@
 | Screen | Covers | API |
 |---|---|---|
 | Overview | OpenBao and SQLite health, pool availability and usage windows, 24 h totals, gateway providers, recent failed requests | `GET /admin/status`, `/admin/accounts`, `/admin/providers`, `/admin/usage` |
-| Accounts | List by provider; refresh usage, enable/disable, priority, clear cooldown, remove; details | `/admin/accounts/...` |
+| Accounts | List by provider; refresh usage, enable/disable, priority, Retry, replace API key, refresh models, remove; details | `/admin/accounts/...` |
 | Add account | Codex device or browser login, Claude paste login, OpenCode Go key, import of a CLI credential file | `/admin/auth/...`, `POST /admin/accounts/import` |
 | Policies | Providers with their account or key state, scopes, precedence, MCP access, rate limits with the policy's consumption. The model list shows every model of the allowed providers: allow/deny toggles (with allow/deny all for the filtered rows), filter by provider, sort, inline rename, more names with fallbacks, the winner of a shared name, and the provider's account state. The toggles write exact `provider/model` entries to `allow_models` / `deny_models`; the globs stay editable under Model patterns | `/admin/policies/...`, `POST /admin/policy-preview`, `GET /admin/accounts`, `GET /admin/providers` |
 | Client keys | Issue, rotate with grace, enable/disable, revoke. Consumption against the policy's rate limits. Shows the vault path and the `bao` command and Vault policy the client needs, never the key | `/admin/keys/...` |
@@ -63,3 +63,11 @@ all open model queries immediately after completion.
 - `index.html` is served with `no-cache` and a strict Content-Security-Policy (same-origin scripts, styles, fonts and requests; no framing). Hashed files under `/assets/` are cached for a year; the root icon files for a day. Fonts (IBM Plex) are bundled, so the UI loads nothing from other hosts.
 - The emblem and its icons are described in `brand/README.md`.
 - The Docker image builds the UI in a Node stage; CI runs `pnpm test` (Vitest on `ui/src` and `ui/test`) and `pnpm build` (which type-checks) in its own job, and the release workflow builds the UI before the binary.
+
+## Recovering an account
+
+Overview attention links open the affected account's details. OAuth accounts show **Re-login needed** and an inline login flow. API-key accounts show **Key rejected** for a 401 or **Refused** for another recorded 4xx; their details show the last error and **Replace key**. Replacement keeps the account ID, label, priority, enabled state and usage history.
+
+Cooldowns show their reason and remaining time on the account row and in details. **Retry** clears the auth failure and cooldown. It permits another attempt with the same credential; it does not reset upstream quota. Disabled accounts stay disabled.
+
+Adding an API-key account, replacing a key and Retry refresh that provider's catalog. **Refresh models** beside **Refresh usage** also runs discovery and reports the model count or discovery error. A discovery error preserves the previous catalog and does not undo a saved key or reset. The policy editor shows each provider’s discovery result beside the model list.
