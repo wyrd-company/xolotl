@@ -11,7 +11,19 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import type { PolicyView } from "@/lib/api";
-import { qualified, rulesAllow, setAllowed, sortRows, usable, type Candidate, type Health, type SortBy } from "@/lib/policy-models";
+import {
+  aliasesReaching,
+  qualified,
+  rulesAllow,
+  splitTargets,
+  withoutTarget,
+  setAllowed,
+  sortRows,
+  usable,
+  type Candidate,
+  type Health,
+  type SortBy,
+} from "@/lib/policy-models";
 import { cn } from "@/lib/utils";
 
 import type { Draft, SetDraft } from "./policies";
@@ -35,12 +47,6 @@ export function HealthBadge({ health }: { health: Health }) {
   if (health.kind === "gateway" && !health.ready) return <Badge variant="warning">no key</Badge>;
   return null;
 }
-
-const splitTargets = (s: string) =>
-  s
-    .split(",")
-    .map((t) => t.trim())
-    .filter(Boolean);
 
 /** The targets after the first, as typed. */
 function fallbacks(targets: string): string {
@@ -183,6 +189,8 @@ export function ModelList({
             const k = qualified(c);
             const h = health(c.provider);
             const mine = aliasesOf(k);
+            const reaching = aliasesReaching(draft.aliases, k);
+            const asFallback = reaching.filter((r) => r.fallback);
             const expanded = open.has(k);
             const shared = view?.shared.find((s) => s.model === c.model && s.providers.includes(c.provider));
             return [
@@ -203,7 +211,13 @@ export function ModelList({
                       <span className="font-mono">{k}</span>
                       <RowNote candidate={c} target={k} shared={shared} winners={draft.winners} renamed={!!draft.renames[k]} setWinner={setWinner} />
                     </span>
-                    {mine.length > 0 && (
+                    {!c.allowed && reaching.length > 0 && (
+                      <span className="text-warning text-xs">
+                        Still reachable as {reaching.map((r, j) => [j > 0 && ", ", <Mono key={r.index}>{r.name || "…"}</Mono>])}: more names are
+                        explicit grants. Remove them to deny it.
+                      </span>
+                    )}
+                    {reaching.length > 0 && (
                       <span className="flex flex-wrap gap-1">
                         {mine.map(({ a, i }) => (
                           <Badge key={i} variant="outline" className="font-mono">
@@ -211,6 +225,12 @@ export function ModelList({
                             {splitTargets(a.targets).length > 1 && (
                               <span className="text-muted-foreground font-sans">+{splitTargets(a.targets).length - 1} fallback</span>
                             )}
+                          </Badge>
+                        ))}
+                        {asFallback.map((r) => (
+                          <Badge key={r.index} variant="outline" className="font-mono">
+                            {r.name || "…"}
+                            <span className="text-muted-foreground font-sans">as fallback</span>
                           </Badge>
                         ))}
                       </span>
@@ -254,6 +274,19 @@ export function ModelList({
                           onChange={(name, rest) => setAlias(i, { name, targets: rest.trim() ? `${k}, ${rest}` : k })}
                           onRemove={() => setAlias(i, null)}
                         />
+                      ))}
+                      {asFallback.map((r) => (
+                        <div key={r.index} className="flex flex-wrap items-center gap-2 text-sm">
+                          <Mono>{r.name || "…"}</Mono> tries this model as a fallback.
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setAlias(r.index, { name: r.name, targets: withoutTarget(draft.aliases[r.index].targets, k) })}
+                          >
+                            Remove from its fallbacks
+                          </Button>
+                        </div>
                       ))}
                       <Button type="button" variant="outline" size="sm" className="self-start" onClick={() => addAlias(k)}>
                         <Plus /> Add a name
@@ -315,6 +348,14 @@ function RowNote({
         denied by <Mono>{c.rule}</Mono> (model patterns)
       </span>
     ) : null;
+  }
+  if (c.taken_by) {
+    return (
+      <span>
+        <Mono>{c.model}</Mono> is taken by {c.taken_by.kind === "alias" ? "an alias of that name" : <Mono>{c.taken_by.target}</Mono>}
+        {c.taken_by.kind === "rename" ? " (renamed)" : ""}
+      </span>
+    );
   }
   if (renamed || !shared) return null;
   if (shared.winner !== c.provider) {

@@ -1,5 +1,5 @@
 // The policy editor's model list: allow/deny toggles written as exact
-// `provider/model` entries, sorting, and provider health. No imports, so
+// `provider/model` entries, sorting, more names, and provider health. No imports, so
 // `node --test` runs it without a bundler.
 
 /** A catalog model of an allowed provider (`Policy::candidates`). */
@@ -9,9 +9,34 @@ export interface Candidate {
   allowed: boolean;
   /** The glob that decided, if any. */
   rule: string | null;
-  /** The name keys see it under; null if denied or it lost its plain name. */
+  /** The name that reaches it first; null if denied, it lost its plain name, or the name was taken. */
   name: string | null;
+  /** What serves the name it would have had instead. */
+  taken_by?: { kind: "alias" } | { kind: "rename"; target: string };
 }
+
+export const splitTargets = (s: string) =>
+  s
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+
+/**
+ * Every alias with `target` among its targets. Aliases are explicit grants:
+ * they reach the target even when the model globs deny it.
+ */
+export function aliasesReaching(aliases: { name: string; targets: string }[], target: string) {
+  return aliases.flatMap((a, index) => {
+    const at = splitTargets(a.targets).indexOf(target);
+    return at < 0 ? [] : [{ index, name: a.name, fallback: at > 0 }];
+  });
+}
+
+/** `targets` without `target`. */
+export const withoutTarget = (targets: string, target: string) =>
+  splitTargets(targets)
+    .filter((t) => t !== target)
+    .join(", ");
 
 export const qualified = (c: { provider: string; model: string }) => `${c.provider}/${c.model}`;
 

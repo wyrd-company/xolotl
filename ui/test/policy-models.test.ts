@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 
-import { globMatch, providerHealth, rulesAllow, setAllowed, sortRows, usable, type Candidate } from "../src/lib/policy-models.ts";
+import {
+  aliasesReaching,
+  globMatch,
+  providerHealth,
+  rulesAllow,
+  setAllowed,
+  withoutTarget,
+  sortRows,
+  usable,
+  type Candidate,
+} from "../src/lib/policy-models.ts";
 
 const row = (provider: string, model: string, allowed = true, name: string | null = model): Candidate => ({
   provider,
@@ -93,4 +103,18 @@ test("provider health counts available accounts and gateway keys", () => {
     ["codex", "opencode-go", "vercel", "llama"].map((p) => usable(h(p))),
     [true, false, false, true],
   );
+});
+
+test("aliasesReaching finds first targets and fallbacks", () => {
+  const aliases = [
+    { name: "short", targets: "codex/a" },
+    { name: "fast", targets: "codex/b, codex/a" },
+    { name: "other", targets: "codex/b" },
+    { name: "near", targets: "codex/aa" },
+  ];
+  assert.deepEqual(aliasesReaching(aliases, "codex/a"), [
+    { index: 0, name: "short", fallback: false },
+    { index: 1, name: "fast", fallback: true },
+  ]);
+  assert.equal(withoutTarget("codex/b, codex/a ,codex/c", "codex/a"), "codex/b, codex/c");
 });

@@ -389,7 +389,7 @@ impl Policy {
                     // Another model renamed to this name; a plain winner on another provider is not "taken".
                     served.filter(|t| self.rename(&t.provider, &t.model) == Some(wanted)).map(|t| TakenBy::Rename { target: t.qualified() })
                 };
-                let name = (allowed && served == Some(&me) && view.names[wanted].len() == 1).then(|| wanted.to_string());
+                let name = (allowed && served == Some(&me)).then(|| wanted.to_string());
                 Candidate { provider: provider.clone(), model: model.clone(), allowed, rule: rule.map(str::to_string), name, taken_by }
             })
             .collect()
@@ -565,6 +565,13 @@ mod tests {
         }
         let lost = c.iter().find(|x| x.provider == "opencode-go" && x.model == "claude-haiku-5-5").unwrap();
         assert_eq!((lost.name.as_deref(), &lost.taken_by), (None, &None), "lost to a plain winner, not taken");
+
+        // An alias of the plain name that tries this model first keeps the name here.
+        let mut p = policy();
+        p.aliases.insert("gpt-6-codex".into(), AliasTargets::Many(vec!["codex/gpt-6-codex".into(), "vercel/kimi-k3".into()]));
+        let c = p.candidates(&catalog());
+        let codex = c.iter().find(|x| x.model == "gpt-6-codex").unwrap();
+        assert_eq!((codex.name.as_deref(), &codex.taken_by), (Some("gpt-6-codex"), &None));
     }
 
     #[test]
