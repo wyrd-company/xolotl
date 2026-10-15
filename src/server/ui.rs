@@ -2,7 +2,8 @@
 //!
 //! Release builds embed the files; debug builds read them from disk, so a
 //! rebuilt UI shows up without recompiling. The app lives at `/` and routes
-//! with the URL fragment (`/#/accounts`), so it claims only `/` and `/assets/`.
+//! with the URL fragment (`/#/accounts`), so it claims only `/`, `/assets/` and
+//! the icon files browsers look for at the root ([`ROOT_FILES`]).
 
 use axum::extract::Path;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -19,6 +20,10 @@ const CSP: &str = "default-src 'self'; img-src 'self' data:; style-src 'self' 'u
 
 const NOT_BUILT: &str = "<!doctype html><meta charset=utf-8><title>xolotl</title>\
     <p>The admin UI was not built into this binary. Run <code>pnpm install &amp;&amp; pnpm build</code> in <code>ui/</code>, then rebuild xolotl.</p>";
+
+/// Files from `ui/public` that browsers and web manifests expect at the root.
+pub const ROOT_FILES: &[&str] =
+    &["favicon.ico", "favicon.svg", "apple-touch-icon.png", "site.webmanifest", "icon-192.png", "icon-512.png", "icon-maskable-512.png"];
 
 pub async fn index() -> Response {
     let mut resp = match Dist::get("index.html") {
@@ -38,14 +43,26 @@ pub async fn asset(Path(path): Path<String>) -> Response {
     if path.split('/').any(|seg| seg == "..") {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some(f) = Dist::get(&format!("assets/{path}")) else {
+    file(&format!("assets/{path}"), "public, max-age=31536000, immutable")
+}
+
+/// One of [`ROOT_FILES`]: an icon or the web manifest, cached for a day.
+pub async fn root_file(name: &'static str) -> Response {
+    file(name, "public, max-age=86400")
+}
+
+fn file(path: &str, cache: &'static str) -> Response {
+    let Some(f) = Dist::get(path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let mime = HeaderValue::from_str(f.metadata.mimetype()).unwrap_or(HeaderValue::from_static("application/octet-stream"));
+    let mime = match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("webmanifest") => HeaderValue::from_static("application/manifest+json"),
+        _ => HeaderValue::from_str(f.metadata.mimetype()).unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    };
     (
         [
             (header::CONTENT_TYPE, mime),
-            (header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable")),
+            (header::CACHE_CONTROL, HeaderValue::from_static(cache)),
             (header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
         ],
         f.data.into_owned(),

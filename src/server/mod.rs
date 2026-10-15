@@ -58,9 +58,11 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     let max_body = state.cfg.server.max_body_bytes;
     let mcp = Router::new().nest_service("/mcp", mcp_service(&state)).layer(axum::middleware::from_fn_with_state(state.clone(), mcp_auth));
-    Router::new()
-        .route("/", get(ui::index))
-        .route("/assets/{*path}", get(ui::asset))
+    let mut router = Router::new().route("/", get(ui::index)).route("/assets/{*path}", get(ui::asset));
+    for name in ui::ROOT_FILES {
+        router = router.route(&format!("/{name}"), get(move || ui::root_file(name)));
+    }
+    router
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .route("/v1/models", get(models))

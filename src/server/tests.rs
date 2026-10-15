@@ -938,6 +938,16 @@ async fn ui_admin_endpoints() {
     assert!(resp.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
     assert!(resp.headers()["content-security-policy"].to_str().unwrap().contains("frame-ancestors 'none'"));
     assert_eq!(h.call("GET", "/assets/../../Cargo.toml", None, None).await.0, 404);
+    // The icons browsers look for at the root come from the UI build too.
+    let resp = router(h.state.clone()).oneshot(Request::builder().uri("/favicon.svg").body(Body::empty()).unwrap()).await.unwrap();
+    if resp.status() == 200 {
+        assert_eq!(resp.headers()["content-type"], "image/svg+xml");
+        assert_eq!(resp.headers()["cache-control"], "public, max-age=86400");
+    }
+    let resp = router(h.state.clone()).oneshot(Request::builder().uri("/site.webmanifest").body(Body::empty()).unwrap()).await.unwrap();
+    if resp.status() == 200 {
+        assert_eq!(resp.headers()["content-type"], "application/manifest+json");
+    }
 }
 
 #[tokio::test]
