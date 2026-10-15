@@ -1,0 +1,16 @@
+name: xolotl
+tagline: One proxy for your LLM subscriptions, AI gateways and MCP servers.
+blurb: >-
+  A self-hosted Rust proxy that gives coding agents one URL and one client key
+  for Codex, Claude, Grok and OpenCode Go subscriptions, gateway providers and
+  MCP servers, with every real credential kept in OpenBao.
+category: Agent Infrastructure
+language: Rust
+status: preview
+repo: https://github.com/wyrd-company/xolotl
+order: 7
+install:
+  - label: Docker
+    command: docker pull ghcr.io/wyrd-company/xolotl:latest
+assets:
+  - assets/demo.gif

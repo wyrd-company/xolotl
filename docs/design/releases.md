@@ -38,7 +38,8 @@ Intentional finds tags by name, so the release history survives a squash merge o
 
 On pushes to `main` and on pull requests:
 - `cargo fmt --check`, `clippy -D warnings` and `cargo test`;
-- a Docker build.
+- the web UI: `pnpm test` and `pnpm build` (which type-checks);
+- a Docker build per architecture, each on a native runner (`amd64` on `ubuntu-latest`, `arm64` on `ubuntu-24.04-arm`), with a separate build cache per architecture.
 
 Intentional is not checked here. `intentional check` only validates the config and intent files (it doesn't require a change to carry an intent), so it runs once, as the release gate. A malformed intent therefore shows up when a release is cut, not on the PR that added it.
 
@@ -56,6 +57,11 @@ Triggered by any `X.Y.Z` tag. A `guard` job decides whether the tag is a real re
 Only when the guard outputs `release=true` do the other jobs run:
 - tests;
 - a Linux x86_64 binary on a GitHub release, with notes from the CHANGELOG section;
-- the GHCR image `ghcr.io/wyrd-company/xolotl` for amd64 and arm64, tagged `X.Y.Z`, `X.Y` and `latest`.
+- the GHCR image `ghcr.io/wyrd-company/xolotl` for amd64 and arm64, tagged `X.Y.Z`, `X.Y` and `latest`;
+- after the binary and the image, the user documentation is published to wyrd.foo by `.github/workflows/publish-docs.yml`.
+
+The docs are published from this workflow, not from a `release` event: the GitHub release is created with `GITHUB_TOKEN`, and a release created that way starts no other workflows. It uses wyrd.foo's `publish-docs` action, which needs the org secrets `WYRD_TOOLS_DOCS_PUBLISHER_APP_ID` and `WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY`.
+
+When `WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY` is not available to the repository, `publish-docs.yml` skips the publish step and emits a warning naming the secret, so the release still succeeds. The docs on wyrd.foo then stay at their previous version. To publish them later, without a new release, run the workflow by hand on the latest release tag: **Actions → publish-docs → Run workflow** with that tag, or `gh workflow run publish-docs.yml --ref <X.Y.Z>`. It publishes `docs/` as it is on the chosen ref, so running it on `main` publishes docs for unreleased changes.
 
 The guard script was tested locally against a baseline tag, a release tag, a hand-made annotated tag and a lightweight tag.
