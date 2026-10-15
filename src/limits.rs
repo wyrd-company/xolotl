@@ -486,6 +486,8 @@ mod tests {
         let live = Arc::new(Limiter::default());
         live.admit("p/a", &p, now - 61).unwrap();
         let mut acc = crate::proxy::Accounting::new(db.clone(), "codex", "/v1/responses", Some("p/a"), None).with_limiter(&live);
+        // Accounting starts with the request, so it records the admission time.
+        assert!(acc.record.started_at.is_some_and(|t| (now..=now + 1).contains(&t)));
         acc.record.started_at = Some(now - 61);
         acc.finish(200, crate::proxy::TokenUsage { input: Some(5), output: Some(3), cached: None });
         for _ in 0..50 {
