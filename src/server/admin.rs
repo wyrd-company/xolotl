@@ -24,6 +24,7 @@ pub fn router() -> Router<AppState> {
         .route("/policy-preview", post(preview_policy))
         .route("/catalog", get(catalog))
         .route("/catalog/routes", get(catalog_routes))
+        .route("/catalog/status", get(catalog_status))
         .route("/catalog/refresh", post(refresh_catalog))
         .route("/keys", get(list_keys).post(issue_key))
         .route("/keys/{policy}/{name}", delete(revoke_key))
@@ -201,9 +202,27 @@ async fn catalog_routes(State(s): State<AppState>, h: HeaderMap) -> Res {
     ok(rows)
 }
 
-async fn refresh_catalog(State(s): State<AppState>, h: HeaderMap) -> Res {
+async fn catalog_status(State(s): State<AppState>, h: HeaderMap) -> Res {
     admin(&s, &h).await?;
-    s.catalog.refresh(&s.subs, &s.gateway).await;
+    ok(s.catalog.discovery_status())
+}
+
+#[derive(Deserialize)]
+struct CatalogRefreshQuery {
+    /// Comma-separated provider names; omitted means the whole catalog.
+    providers: Option<String>,
+}
+
+async fn refresh_catalog(State(s): State<AppState>, h: HeaderMap, Query(q): Query<CatalogRefreshQuery>) -> Res {
+    admin(&s, &h).await?;
+    let providers = match q.providers {
+        None => s.catalog.known_providers(),
+        Some(names) => names.split(',').filter(|name| !name.is_empty()).map(str::to_owned).collect(),
+    };
+    if !providers.is_subset(&s.catalog.known_providers()) {
+        return Err(json_error(StatusCode::BAD_REQUEST, "unknown catalog provider"));
+    }
+    s.catalog.refresh_providers(&s.subs, &s.gateway, &providers).await;
     ok(s.catalog.models())
 }
 
@@ -313,6 +332,7 @@ async fn remove_account(State(s): State<AppState>, h: HeaderMap, Path(id): Path<
     if !s.subs.remove_account(&id).await.map_err(internal)? {
         return Err(json_error(StatusCode::NOT_FOUND, "no such account"));
     }
+    refresh_catalog_later(&s);
     ok(json!({"removed": id}))
 }
 
@@ -321,6 +341,7 @@ async fn set_account_enabled(State(s): State<AppState>, h: HeaderMap, Path(id): 
     if !s.db.set_account_enabled(&id, enabled).await.map_err(internal)? {
         return Err(json_error(StatusCode::NOT_FOUND, "no such account"));
     }
+    refresh_catalog_later(&s);
     ok(json!({"id": id, "enabled": enabled}))
 }
 
@@ -330,6 +351,7 @@ async fn reset_account(State(s): State<AppState>, h: HeaderMap, Path(id): Path<S
         return Err(json_error(StatusCode::NOT_FOUND, "no such account"));
     }
     s.db.mark_auth_failed(&id, false, None).await.map_err(internal)?;
+    refresh_catalog_later(&s);
     ok(json!({"id": id, "reset": true}))
 }
 
@@ -433,6 +455,7 @@ async fn set_provider_key(State(s): State<AppState>, h: HeaderMap, Path(name): P
     let secrets: &dyn SecretStore = &*s.secrets;
     secrets.put(&format!("providers/{name}"), data).await.map_err(internal)?;
     s.gateway.invalidate_keys();
+    refresh_catalog_later(&s);
     ok(json!({"provider": name, "stored": true}))
 }
 

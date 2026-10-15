@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ArrowDown, ArrowUp, Plus, Trash2 } from "lucide-react";
 import { Link, Navigate, useNavigate, useParams } from "react-router";
 
+import { CatalogRefresh } from "@/components/catalog-refresh";
 import { Confirm } from "@/components/confirm";
 import { Endpoints, EndpointsLegend } from "@/components/endpoints";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
@@ -390,6 +391,7 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
+          <CatalogRefresh providers={allowed} />
           <EndpointsLegend />
           {preview.error && <p className="bg-danger-muted text-destructive rounded-md px-3 py-2 text-sm">{preview.error.message}</p>}
         </CardContent>

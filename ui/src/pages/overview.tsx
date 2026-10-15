@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle } from "lucide-react";
 import { Link } from "react-router";
 
+import { CatalogRefresh } from "@/components/catalog-refresh";
 import { accountName, peakUsage, WindowBars } from "@/components/account-state";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -78,10 +79,7 @@ export function OverviewPage() {
         title="Overview"
         description={
           s && (
-            <>
-              Catalog refreshed {s.catalog_refreshed_secs_ago == null ? "not yet" : relative(now - s.catalog_refreshed_secs_ago)} · strategy{" "}
-              {s.subscription.strategy}
-            </>
+            <>Strategy: {s.subscription.strategy}</>
           )
         }
       />
@@ -148,6 +146,9 @@ export function OverviewPage() {
             </Link>
           </CardAction>
         </CardHeader>
+        <CardContent>
+          <CatalogRefresh providers={(providers.data ?? []).map((p) => p.name)} />
+        </CardContent>
         <Table>
           <TableHeader>
             <TableRow>

@@ -312,3 +312,6 @@ export interface McpCall {
   latency_ms: number;
   trace_id: string | null;
 }
+
+/** Per-provider discovery attempt; failures retain the catalog's cached/static models. */
+export type CatalogDiscovery = Record<string, { refreshed_at: number | null; models: number; error: string | null }>;

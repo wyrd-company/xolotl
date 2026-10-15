@@ -1989,3 +1989,116 @@ async fn opencode_sessions_reach_upstream_on_native_translated_and_passthrough_r
         assert_eq!(req.headers["user-agent"], concat!("xolotl/", env!("CARGO_PKG_VERSION"), " (sample-client/1.0)"));
     }
 }
+
+#[tokio::test]
+async fn catalog_discovery_reports_scope_errors_and_cached_models() {
+    let h = harness().await;
+    let (status, initial) = h.call("GET", "/admin/catalog/status", Some(&h.admin), None).await;
+    assert_eq!(status, 200);
+    assert!(initial["llama"]["refreshed_at"].is_null());
+    assert_eq!(initial["llama"]["models"], 2);
+    assert_eq!(h.call("GET", "/admin/catalog/status", None, None).await.0, 401);
+    assert_eq!(h.call("POST", "/admin/catalog/refresh?providers=missing", Some(&h.admin), None).await.0, 400);
+    assert_eq!(h.call("GET", "/admin/catalog/status", Some(&h.admin), None).await.1, initial);
+
+    Mock::given(method("GET"))
+        .and(path("/llama/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "sample-model"}]})))
+        .expect(1)
+        .mount(&h.upstream)
+        .await;
+    let (status, models) = h.call("POST", "/admin/catalog/refresh?providers=llama", Some(&h.admin), None).await;
+    assert_eq!(status, 200);
+    // The existing CLI response remains a provider -> model list map.
+    assert!(models["llama"].as_array().unwrap().contains(&json!("sample-model")));
+    let (_, discovered) = h.call("GET", "/admin/catalog/status", Some(&h.admin), None).await;
+    assert!(discovered["llama"]["refreshed_at"].as_i64().is_some());
+    assert_eq!(discovered["llama"]["models"], 3);
+    assert!(discovered["llama"]["error"].is_null());
+    assert_eq!(discovered["codex"], initial["codex"], "scoped refresh must leave other providers untouched");
+
+    h.upstream.reset().await;
+    Mock::given(method("GET")).and(path("/llama/v1/models")).respond_with(ResponseTemplate::new(403)).mount(&h.upstream).await;
+    assert_eq!(h.call("POST", "/admin/catalog/refresh?providers=llama,opencode-go", Some(&h.admin), None).await.0, 200);
+    let (_, failed) = h.call("GET", "/admin/catalog/status", Some(&h.admin), None).await;
+    assert!(failed["llama"]["error"].as_str().unwrap().contains("403"));
+    assert_eq!(failed["llama"]["models"], 3, "failed discovery retains cached and static models");
+    assert_eq!(failed["opencode-go"]["error"], "no available accounts");
+    let (_, retained) = h.call("GET", "/admin/catalog", Some(&h.admin), None).await;
+    assert_eq!(retained["llama"], models["llama"]);
+}
+
+#[tokio::test]
+async fn catalog_refresh_distinguishes_empty_success_from_failure() {
+    let h = harness_with(|cfg| cfg.catalog.static_models.clear()).await;
+    Mock::given(method("GET"))
+        .and(path("/llama/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .mount(&h.upstream)
+        .await;
+    assert_eq!(h.call("POST", "/admin/catalog/refresh", Some(&h.admin), None).await.0, 200);
+    let (_, status) = h.call("GET", "/admin/catalog/status", Some(&h.admin), None).await;
+    assert_eq!(status["llama"]["models"], 0);
+    assert!(status["llama"]["error"].is_null());
+    assert!(status["llama"]["refreshed_at"].as_i64().is_some());
+    assert_eq!(status["opencode-go"]["models"], 0);
+    assert_eq!(status["opencode-go"]["error"], "no available accounts");
+}
+
+#[tokio::test]
+async fn resetting_account_automatically_rediscovers_models() {
+    let h = harness_with(|cfg| cfg.catalog.static_models.clear()).await;
+    let id = h.account(Credential { provider: SubProvider::OpencodeGo, api_key: Some("sample-key".into()), ..Default::default() }).await;
+    h.state.db.mark_auth_failed(&id, true, Some("sample failure")).await.unwrap();
+    h.call("POST", "/admin/catalog/refresh?providers=opencode-go", Some(&h.admin), None).await;
+    assert_eq!(h.state.catalog.discovery_status()["opencode-go"].error.as_deref(), Some("no available accounts"));
+    Mock::given(method("GET"))
+        .and(path("/zen/go/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "sample-model"}]})))
+        .mount(&h.upstream)
+        .await;
+    assert_eq!(h.call("POST", &format!("/admin/accounts/{id}/reset"), Some(&h.admin), None).await.0, 200);
+    // The mutation responds before background discovery completes.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if h.state.catalog.models()["opencode-go"].contains("sample-model") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(h.state.catalog.discovery_status()["opencode-go"].error.is_none());
+}
+
+#[tokio::test]
+async fn concurrent_scoped_catalog_refreshes_preserve_both_results() {
+    let h = harness_with(|cfg| cfg.catalog.static_models.clear()).await;
+    h.account(Credential { provider: SubProvider::OpencodeGo, api_key: Some("sample-key".into()), ..Default::default() }).await;
+    Mock::given(method("GET"))
+        .and(path("/llama/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(50))
+                .set_body_json(json!({"data": [{"id": "sample-one"}]})),
+        )
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/zen/go/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "sample-two"}]})))
+        .mount(&h.upstream)
+        .await;
+    let (a, b) = tokio::join!(
+        h.call("POST", "/admin/catalog/refresh?providers=llama", Some(&h.admin), None),
+        h.call("POST", "/admin/catalog/refresh?providers=opencode-go", Some(&h.admin), None),
+    );
+    assert_eq!((a.0, b.0), (200, 200));
+    let models = h.state.catalog.models();
+    assert!(models["llama"].contains("sample-one"));
+    assert!(models["opencode-go"].contains("sample-two"));
+    let status = h.state.catalog.discovery_status();
+    assert!(status["llama"].refreshed_at.is_some());
+    assert!(status["opencode-go"].refreshed_at.is_some());
+}

@@ -1051,7 +1051,7 @@ impl Subscriptions {
         }
         match last_err {
             Some(e) => Err(e),
-            None => Ok(Vec::new()),
+            None => anyhow::bail!("no available accounts"),
         }
     }
 

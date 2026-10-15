@@ -15,6 +15,26 @@
 | Providers & models | Gateway providers from the config file and their key state; set a key; the catalog with each model's endpoints | `GET /admin/providers`, `GET /admin/catalog/routes`, `POST /admin/catalog/refresh` |
 | Usage | Request log grouped by client, account, provider or model. Selecting a row narrows the view to it and groups by the first of model, account, client and provider that is neither shown nor narrowed yet; filters show as removable chips and live in the hash route (`/#/usage?group=model&client=…`). Link to `telemetry.dashboard_url` | `GET /admin/usage?group_by=…&since_secs=…&client=…&account=…&provider=…&model=…` (an empty filter value matches rows without that key, such as the admin token) |
 
+## Model discovery
+
+Model lists and counts include a shared **Refresh models** control, the age of the
+catalog, and each provider's model count or discovery error. The policy preview
+uses its selected providers. Account views use their provider pools: discovery
+is shared across accounts of a provider, not performed for one account. A failed
+discovery keeps cached and configured static models visible and labels the error.
+A successful empty response is shown as **Provider returned no models**.
+
+`GET /admin/catalog/status` returns each provider's `refreshed_at` (Unix seconds
+of the last attempt, or null), `models` (including cached and static entries), and
+`error` (or null). `POST /admin/catalog/refresh?providers=provider-a,provider-b`
+refreshes those providers; omit the query to refresh all providers. Its response
+remains the provider-to-model-list map used by the CLI.
+
+Account imports, completed logins, reset, enable/disable, removal, and provider key
+changes trigger discovery. The UI checks discovery status every 30 seconds and
+updates model lists after background discovery completes. Manual refresh updates
+all open model queries immediately after completion.
+
 ## Sign-in
 
 - **OpenID Connect.** The UI signs in through an OpenID Connect provider (built against Pocket ID). Xolotl is a confidential client and uses the authorization code flow with PKCE, all on the server; the browser never holds a provider token. `[ui.oidc]` in the config file names the issuer, client ID, redirect URL and admin group. The client secret is the vault secret `oidc` (field `client_secret`). Without `[ui.oidc]`, nobody can sign in to the UI.
