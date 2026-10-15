@@ -413,7 +413,7 @@ mod tests {
         assert_eq!(tap.usage, TokenUsage { input: Some(3), output: Some(4), cached: None });
         drop(tap);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let s = db.usage_summary("client", 0).await.unwrap();
+        let s = db.usage_summary("client", 0, &Default::default()).await.unwrap();
         assert_eq!(s[0].output_tokens, 4);
     }
 

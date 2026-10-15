@@ -113,6 +113,18 @@ pub enum Command {
         /// Look-back window, e.g. 1h, 24h, 7d.
         #[arg(long, default_value = "24h")]
         since: String,
+        /// Only this client ("" for the admin token).
+        #[arg(long)]
+        client: Option<String>,
+        /// Only this account ("" for gateway requests).
+        #[arg(long)]
+        account: Option<String>,
+        /// Only this provider.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Only this model ("" for requests without one).
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Reload keys and accounts from the vault.
     Reload {
@@ -312,10 +324,17 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Mcp { remote, cmd } => mcp(Client::new(&remote)?, cmd).await,
-        Command::Usage { remote, group_by, since } => {
+        Command::Usage { remote, group_by, since, client, account, provider, model } => {
             let c = Client::new(&remote)?;
             let secs = parse_duration(&since)?;
-            let v = c.get(&format!("/admin/usage?group_by={group_by}&since_secs={secs}")).await?;
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            query.append_pair("group_by", &group_by).append_pair("since_secs", &secs.to_string());
+            for (name, value) in [("client", client), ("account", account), ("provider", provider), ("model", model)] {
+                if let Some(value) = value {
+                    query.append_pair(name, &value);
+                }
+            }
+            let v = c.get(&format!("/admin/usage?{}", query.finish())).await?;
             if c.json {
                 return c.print(v);
             }

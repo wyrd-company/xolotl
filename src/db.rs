@@ -85,6 +85,39 @@ pub struct UsageSummary {
     pub cached_tokens: i64,
 }
 
+/// Narrows a usage summary to one client, account, provider and/or model.
+/// `Some("")` matches the rows where that column is NULL.
+#[derive(Debug, Clone, Default)]
+pub struct UsageFilter {
+    pub client: Option<String>,
+    pub account: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+impl UsageFilter {
+    /// Each filter value with its `request_log` column.
+    fn columns(&self) -> [(&'static str, Option<&str>); 4] {
+        [
+            ("client_id", self.client.as_deref()),
+            ("account_id", self.account.as_deref()),
+            ("provider", self.provider.as_deref()),
+            ("model", self.model.as_deref()),
+        ]
+    }
+}
+
+/// The `request_log` column to group usage by.
+fn usage_column(dimension: &str) -> Result<&'static str> {
+    Ok(match dimension {
+        "client" => "client_id",
+        "account" => "account_id",
+        "provider" => "provider",
+        "model" => "model",
+        other => anyhow::bail!("cannot group usage by {other:?}"),
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct McpCallRecord {
     pub client_id: Option<String>,
@@ -334,25 +367,36 @@ impl Db {
         .await?)
     }
 
-    /// Aggregate the request log since `since` grouped by `client`, `account`, `provider` or `model`.
-    pub async fn usage_summary(&self, group_by: &str, since: i64) -> Result<Vec<UsageSummary>> {
-        let column = match group_by {
-            "client" => "client_id",
-            "account" => "account_id",
-            "provider" => "provider",
-            "model" => "model",
-            other => anyhow::bail!("cannot group usage by {other:?}"),
-        };
+    /// Aggregate the request log since `since` grouped by `client`, `account`, `provider` or `model`,
+    /// narrowed to the rows that match every filter in `filter`.
+    pub async fn usage_summary(&self, group_by: &str, since: i64, filter: &UsageFilter) -> Result<Vec<UsageSummary>> {
+        let column = usage_column(group_by)?;
+        let mut conditions = String::new();
+        let mut values = Vec::new();
+        for (col, value) in filter.columns() {
+            let Some(value) = value else { continue };
+            // An empty value selects the rows where the column is NULL (the admin token, no account, no model).
+            if value.is_empty() {
+                conditions.push_str(&format!(" AND {col} IS NULL"));
+            } else {
+                conditions.push_str(&format!(" AND {col} = ?"));
+                values.push(value);
+            }
+        }
         let sql = format!(
             "SELECT {column} AS key, COUNT(*) AS requests,
                SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors,
                COALESCE(SUM(input_tokens), 0) AS input_tokens,
                COALESCE(SUM(output_tokens), 0) AS output_tokens,
                COALESCE(SUM(cached_tokens), 0) AS cached_tokens
-             FROM request_log WHERE ts >= ? GROUP BY {column} ORDER BY requests DESC"
+             FROM request_log WHERE ts >= ?{conditions} GROUP BY {column} ORDER BY requests DESC"
         );
-        // `column` comes from the fixed whitelist above.
-        Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql)).bind(since).fetch_all(&self.pool).await?)
+        // Column names are fixed (`usage_column`, `UsageFilter::columns`); filter values are bound.
+        let mut query = sqlx::query_as(sqlx::AssertSqlSafe(sql)).bind(since);
+        for value in values {
+            query = query.bind(value);
+        }
+        Ok(query.fetch_all(&self.pool).await?)
     }
 
     pub async fn prune(&self, retention_days: u32) -> Result<u64> {
@@ -481,13 +525,64 @@ mod tests {
             .await
             .unwrap();
         }
-        let s = db.usage_summary("client", 0).await.unwrap();
+        let s = db.usage_summary("client", 0, &UsageFilter::default()).await.unwrap();
         assert_eq!(s[0].requests, 3);
         assert_eq!(s[0].errors, 1);
         assert_eq!(s[0].input_tokens, 30);
-        assert!(db.usage_summary("bogus", 0).await.is_err());
+        assert!(db.usage_summary("bogus", 0, &UsageFilter::default()).await.is_err());
         let errors = db.recent_errors(10).await.unwrap();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].status, 500);
+    }
+
+    #[tokio::test]
+    async fn usage_summary_filters() {
+        let db = Db::in_memory().await.unwrap();
+        let rows = [
+            (Some("c1"), "codex", Some("a1"), Some("m1")),
+            (Some("c1"), "codex", Some("a2"), Some("m2")),
+            (Some("c1"), "claude", Some("a3"), Some("m1")),
+            (Some("c2"), "codex", Some("a1"), Some("m1")),
+            (None, "codex", None, None),
+        ];
+        for (client, provider, account, model) in rows {
+            db.log_request(&RequestRecord {
+                client_id: client.map(Into::into),
+                provider: provider.into(),
+                account_id: account.map(Into::into),
+                model: model.map(Into::into),
+                endpoint: "/v1/responses".into(),
+                status: 200,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let keys = |s: Vec<UsageSummary>| s.into_iter().map(|r| (r.key, r.requests)).collect::<Vec<_>>();
+        let some = |v: &str| Some(v.to_string());
+
+        let c1 = UsageFilter { client: some("c1"), ..Default::default() };
+        assert_eq!(keys(db.usage_summary("model", 0, &c1).await.unwrap()), [(some("m1"), 2), (some("m2"), 1)]);
+
+        let c1_codex = UsageFilter { provider: some("codex"), ..c1.clone() };
+        let mut accounts = keys(db.usage_summary("account", 0, &c1_codex).await.unwrap());
+        accounts.sort();
+        assert_eq!(accounts, [(some("a1"), 1), (some("a2"), 1)]);
+
+        let m1_a1 = UsageFilter { model: some("m1"), account: some("a1"), ..Default::default() };
+        let mut clients = keys(db.usage_summary("client", 0, &m1_a1).await.unwrap());
+        clients.sort();
+        assert_eq!(clients, [(some("c1"), 1), (some("c2"), 1)]);
+
+        // An empty value selects NULL, so the admin token's requests can be narrowed to.
+        let admin = UsageFilter { client: some(""), ..Default::default() };
+        assert_eq!(keys(db.usage_summary("model", 0, &admin).await.unwrap()), [(None, 1)]);
+
+        // A value is bound, not spliced into the SQL.
+        let injected = UsageFilter { client: some("c1' OR '1'='1"), ..Default::default() };
+        assert!(db.usage_summary("client", 0, &injected).await.unwrap().is_empty());
+
+        let nobody = UsageFilter { client: some("c3"), ..Default::default() };
+        assert!(db.usage_summary("model", 0, &nobody).await.unwrap().is_empty());
     }
 }
