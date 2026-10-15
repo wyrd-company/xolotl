@@ -14,8 +14,22 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: wyrd-company/wyrd.foo/.github/actions/publish-docs@v1
+      # Without the publisher key the docs are skipped with a warning, so a
+      # release still succeeds. Run this workflow by hand once it is granted.
+      - id: secret
+        env:
+          PRIVATE_KEY: ${{ secrets.WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY }}
+        run: |
+          if [ -n "$PRIVATE_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning title=publish-docs::Docs were not published to wyrd.foo: the secret WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY is not available to this repository."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.secret.outputs.present == 'true'
+        uses: actions/checkout@v4
+      - if: steps.secret.outputs.present == 'true'
+        uses: wyrd-company/wyrd.foo/.github/actions/publish-docs@v1
         with:
           app-id: ${{ secrets.WYRD_TOOLS_DOCS_PUBLISHER_APP_ID }}
           private-key: ${{ secrets.WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY }}
