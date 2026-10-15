@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import { Emblem } from "@/components/emblem";
 import { Button } from "@/components/ui/button";
 
 // Reasons the callback sends back in `?signin=`; the details are in the server log.
@@ -27,7 +28,10 @@ export function LoginPage({ configured, error }: { configured: boolean; error?: 
     <div className="bg-sidebar flex min-h-screen items-center justify-center p-4">
       <div className="bg-card flex w-full max-w-sm flex-col gap-5 rounded-xl p-8 shadow-lg">
         <div className="flex flex-col gap-1.5">
-          <div className="font-mono text-xl font-medium">xolotl</div>
+          <div className="flex items-center gap-3">
+            <Emblem className="h-12 w-auto" />
+            <span className="font-mono text-xl font-medium">xolotl</span>
+          </div>
           <h1 className="text-xl font-semibold">Sign in</h1>
           <p className="text-muted-foreground text-sm leading-relaxed">
             Sign in with your identity provider. Only members of the admin group get in.

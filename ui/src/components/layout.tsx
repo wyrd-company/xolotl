@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { NavLink, Outlet } from "react-router";
 import { toast } from "sonner";
 
+import { Emblem } from "@/components/emblem";
 import { del, get, setCsrfToken, type Session, type Status } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -37,7 +38,10 @@ export function Layout() {
   return (
     <div className="flex min-h-screen flex-col md:flex-row">
       <nav aria-label="Main" className="bg-sidebar text-sidebar-foreground flex shrink-0 flex-col gap-1 p-4 md:w-60 md:py-6">
-        <div className="px-3 pb-3 font-mono text-lg font-medium text-white md:pb-5">xolotl</div>
+        <div className="flex items-center gap-2.5 px-3 pb-3 text-white md:pb-5">
+          <Emblem className="h-8 w-auto" />
+          <span className="font-mono text-lg font-medium">xolotl</span>
+        </div>
         <div className="flex flex-wrap gap-1 md:flex-col">
           {NAV.map((n) => (
             <NavLink

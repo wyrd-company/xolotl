@@ -1,3 +1,5 @@
+<p align="center"><img src="brand/xolotl-emblem.png" alt="xolotl" height="240"></p>
+
 # Xolotl Proxy Gateway
 
 ## Why

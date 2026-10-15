@@ -6,30 +6,30 @@
 @import "@fontsource/ibm-plex-mono/latin-400.css";
 @import "@fontsource/ibm-plex-mono/latin-500.css";
 
-/* Palette from the admin UI mockups: graphite ink, cool greys, one rust accent. */
+/* Palette: the emblem's ink and rust (see brand/README.md), cool greys between them. */
 :root {
   --radius: 0.5rem;
   --background: #f4f5f7;
-  --foreground: #16181d;
+  --foreground: #192029;
   --card: #ffffff;
-  --card-foreground: #16181d;
+  --card-foreground: #192029;
   --popover: #ffffff;
-  --popover-foreground: #16181d;
-  --primary: #b83e0b;
+  --popover-foreground: #192029;
+  --primary: #b2411a;
   --primary-foreground: #ffffff;
   --secondary: #e6e8ec;
-  --secondary-foreground: #16181d;
+  --secondary-foreground: #192029;
   --muted: #f9fafb;
   --muted-foreground: #555b66;
   --accent: #eef0f3;
-  --accent-foreground: #16181d;
+  --accent-foreground: #192029;
   --destructive: #b91c1c;
   --border: #dde0e5;
   --input: #b9bec7;
-  --ring: #b83e0b;
-  --sidebar: #16181d;
+  --ring: #b2411a;
+  --sidebar: #192029;
   --sidebar-foreground: #c9cdd4;
-  --sidebar-accent: #2a2d35;
+  --sidebar-accent: #2b323d;
   --sidebar-accent-foreground: #ffffff;
   --success: #166534;
   --success-muted: #e3f4e8;
