@@ -2196,12 +2196,23 @@ async fn account_recovery_refreshes_models_and_reports_discovery_errors() {
     h.state.db.set_cooldown(id, now() + 100, "rate limited").await.unwrap();
     h.state.catalog.refresh_provider(&h.state.subs, SubProvider::OpencodeGo).await.unwrap();
     assert!(h.state.catalog.models()["opencode-go"].is_empty());
+    h.codex_account().await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/codex/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[{"slug":"another-model"}]})))
+        .mount(&h.upstream)
+        .await;
+    h.state.catalog.refresh_provider(&h.state.subs, SubProvider::Codex).await.unwrap();
     let other_models = h.state.catalog.models()["codex"].clone();
+    assert!(other_models.contains("another-model"));
     let (status, reset) = h.call("POST", &format!("/admin/accounts/{id}/reset"), Some(&h.admin), None).await;
     assert_eq!(status, 200);
     assert_eq!(reset["catalog_refresh"]["models"], 1);
     assert!(h.state.catalog.models()["opencode-go"].contains("sample-model"));
     assert_eq!(h.state.catalog.models()["codex"], other_models);
+    let (_, replaced) =
+        h.call("POST", &format!("/admin/accounts/{id}/key"), Some(&h.admin), Some(json!({"api_key":"replacement-key"}))).await;
+    assert_eq!(replaced["catalog_refresh"]["models"], 1);
     h.upstream.reset().await;
     let (status, result) = h.call("POST", &format!("/admin/accounts/{id}/models"), Some(&h.admin), None).await;
     assert_eq!(status, 200);
