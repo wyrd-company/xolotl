@@ -103,7 +103,7 @@ async fn codex_fails_over_on_usage_limit_and_cools_down() {
 
     // Request log records the serving account and token usage.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let s = subs.db.usage_summary("account", 0).await.unwrap();
+    let s = subs.db.usage_summary("account", 0, &Default::default()).await.unwrap();
     let row = s.iter().find(|r| r.key.as_deref() == Some(b.id.as_str())).unwrap();
     assert_eq!(row.input_tokens, 5);
 }
@@ -595,7 +595,7 @@ async fn codex_headerless_stream_is_accounted() {
     assert!(String::from_utf8_lossy(&body).contains("response.completed"));
     // The request log is written in the background.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let s = subs.db.usage_summary("account", 0).await.unwrap();
+    let s = subs.db.usage_summary("account", 0, &Default::default()).await.unwrap();
     let row = s.iter().find(|r| r.key.as_deref() == Some(a.id.as_str())).unwrap();
     assert_eq!((row.input_tokens, row.output_tokens), (5, 1));
 }
@@ -760,7 +760,7 @@ async fn grok_streams_with_identity_headers_and_rewrites_keepalives() {
 
     // Keepalives don't disturb usage accounting.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let s = subs.db.usage_summary("account", 0).await.unwrap();
+    let s = subs.db.usage_summary("account", 0, &Default::default()).await.unwrap();
     let row = s.iter().find(|r| r.key.as_deref() == Some(a.id.as_str())).unwrap();
     assert_eq!((row.input_tokens, row.output_tokens), (7, 2));
 }

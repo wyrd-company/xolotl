@@ -270,7 +270,7 @@ async fn messages_client_reaches_codex_through_translation() {
 
     // Usage is recorded from the upstream response, against the upstream endpoint.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let rows = h.state.db.usage_summary("model", 0).await.unwrap();
+    let rows = h.state.db.usage_summary("model", 0, &Default::default()).await.unwrap();
     let row = rows.iter().find(|r| r.key.as_deref() == Some("gpt-6-codex")).unwrap_or_else(|| panic!("{rows:?}"));
     assert_eq!((row.input_tokens, row.output_tokens), (11, 5));
 }
@@ -664,6 +664,27 @@ async fn admin_policies_keys_and_accounts() {
     assert_eq!(status, 200);
     assert!(catalog["codex"].as_array().unwrap().iter().any(|m| m == "gpt-6-codex"));
     assert_eq!(h.call("GET", "/admin/usage?group_by=model", Some(&h.admin), None).await.0, 200);
+
+    // Usage narrowed by filters; values may be URL-encoded and an empty one selects NULL.
+    for (client, model) in [(Some("usage a"), "m1"), (Some("usage a"), "m2"), (Some("usage b"), "m1"), (None, "m3")] {
+        let record = crate::db::RequestRecord {
+            client_id: client.map(Into::into),
+            provider: "usage-test".into(),
+            model: Some(model.into()),
+            endpoint: "/v1/responses".into(),
+            status: 200,
+            ..Default::default()
+        };
+        h.state.db.log_request(&record).await.unwrap();
+    }
+    let (status, rows) =
+        h.call("GET", "/admin/usage?group_by=model&since_secs=3600&provider=usage-test&client=usage%20a", Some(&h.admin), None).await;
+    assert_eq!(status, 200, "{rows}");
+    let mut models: Vec<_> = rows.as_array().unwrap().iter().map(|r| r["key"].as_str().unwrap()).collect();
+    models.sort();
+    assert_eq!(models, ["m1", "m2"]);
+    let (_, rows) = h.call("GET", "/admin/usage?group_by=model&provider=usage-test&client=", Some(&h.admin), None).await;
+    assert_eq!(rows, json!([{"key": "m3", "requests": 1, "errors": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}]));
 }
 
 /// A mock OpenID provider at `<upstream>/oidc` for the web UI sign-in.

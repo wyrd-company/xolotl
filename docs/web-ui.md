@@ -13,7 +13,7 @@
 | Client keys | Issue, rotate with grace, enable/disable, revoke. Shows the vault path and the `bao` command and Vault policy the client needs, never the key | `/admin/keys/...` |
 | MCP servers | Upstream MCP servers from the config file and OpenBao: add, edit and remove the latter; header secrets; OAuth sign-in; tools; recent tool calls | `/admin/mcp/...` |
 | Providers & models | Gateway providers from the config file and their key state; set a key; the catalog with each model's endpoints | `GET /admin/providers`, `GET /admin/catalog/routes`, `POST /admin/catalog/refresh` |
-| Usage | Request log grouped by client, account, provider or model; link to `telemetry.dashboard_url` | `GET /admin/usage` |
+| Usage | Request log grouped by client, account, provider or model. Selecting a row narrows the view to it and groups by the first of model, account, client and provider that is neither shown nor narrowed yet; filters show as removable chips and live in the hash route (`/#/usage?group=model&client=…`). Link to `telemetry.dashboard_url` | `GET /admin/usage?group_by=…&since_secs=…&client=…&account=…&provider=…&model=…` (an empty filter value matches rows without that key, such as the admin token) |
 
 ## Sign-in
 

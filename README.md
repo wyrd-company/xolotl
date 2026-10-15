@@ -154,6 +154,7 @@ xolotl keys rotate devcontainer/laptop --grace 1h
 xolotl keys revoke devcontainer/laptop
 
 xolotl usage --group-by client --since 7d
+xolotl usage --group-by model --client devcontainer/laptop   # narrow to one client (also --account, --provider, --model)
 
 # MCP gateway
 xolotl mcp servers                 # source, connection, tools, secret fields

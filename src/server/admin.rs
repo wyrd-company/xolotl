@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{AppState, authorize, json_error};
-use crate::db::now;
+use crate::db::{UsageFilter, now};
 use crate::keys::{IssueRequest, Scope};
 use crate::policy::Policy;
 use crate::secrets::SecretStore;
@@ -424,6 +424,10 @@ struct UsageQuery {
     /// Seconds back from now (default 24h).
     #[serde(default = "default_since")]
     since_secs: i64,
+    client: Option<String>,
+    account: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
 }
 
 fn default_group() -> String {
@@ -435,7 +439,9 @@ fn default_since() -> i64 {
 
 async fn usage(State(s): State<AppState>, h: HeaderMap, Query(q): Query<UsageQuery>) -> Res {
     admin(&s, &h).await?;
-    let mut rows = s.db.usage_summary(&q.group_by, now() - q.since_secs).await.map_err(bad)?;
+    // Not `#[serde(flatten)]`: URL-encoded queries can't flatten into the integer `since_secs`.
+    let filter = UsageFilter { client: q.client, account: q.account, provider: q.provider, model: q.model };
+    let mut rows = s.db.usage_summary(&q.group_by, now() - q.since_secs, &filter).await.map_err(bad)?;
     let _ = &mut rows;
     ok(rows)
 }
