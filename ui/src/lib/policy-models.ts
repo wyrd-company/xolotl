@@ -1,6 +1,5 @@
 // The policy editor's model list: allow/deny toggles written as exact
-// `provider/model` entries, sorting, more names, and provider health. No imports, so
-// `node --test` runs it without a bundler.
+// `provider/model` entries, sorting, more names, and provider health.
 
 /** A catalog model of an allowed provider (`Policy::candidates`). */
 export interface Candidate {
