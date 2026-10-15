@@ -10,7 +10,7 @@ import { Confirm } from "@/components/confirm";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -142,9 +142,6 @@ function AccountRow({ account: a, open, onOpenChange }: { account: Account; open
           <Button size="sm" variant="outline" disabled={toggle.isPending} onClick={() => toggle.mutate(undefined)}>
             {a.enabled ? "Disable" : "Enable"}
           </Button>
-          <Button size="sm" variant="ghost" aria-label={`Details for ${accountName(a)}`} onClick={() => onOpenChange(true)}>
-            Details
-          </Button>
           <AccountDetails account={a} open={open} onOpenChange={onOpenChange} />
         </div>
       </TableCell>
@@ -189,6 +186,11 @@ function AccountDetails({
         if (o) setPriority(String(a.priority));
       }}
     >
+      <DialogTrigger asChild>
+        <Button size="sm" variant="ghost" aria-label={`Details for ${accountName(a)}`}>
+          Details
+        </Button>
+      </DialogTrigger>
       <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{accountName(a)}</DialogTitle>
