@@ -871,3 +871,52 @@ async fn grok_discovers_models_from_the_proxy() {
         .await;
     assert_eq!(subs.fetch_models(SubProvider::Grok, "unused").await.unwrap(), vec!["grok-build", "grok-4.7"]);
 }
+
+#[tokio::test]
+async fn opencode_errors_preserve_reason_without_disabling_on_403() {
+    for status in [400, 401, 403, 429, 503] {
+        let server = MockServer::start().await;
+        let (subs, _) = setup(&server, Strategy::FillFirst).await;
+        let a = subs
+            .save_account(Credential { provider: SubProvider::OpencodeGo, api_key: Some("test-upstream-key".into()), ..Default::default() })
+            .await
+            .unwrap();
+        if status == 403 {
+            subs.db.set_account_priority(&a.id, 10).await.unwrap();
+            subs.save_account(Credential {
+                provider: SubProvider::OpencodeGo,
+                api_key: Some("second-test-key".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let error = json!({"error": {"code": "RequestRejected", "message": "request refused for test-upstream-key"}});
+        Mock::given(path("/zen/go/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(&error))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (actual, body) = run(&subs, SubProvider::OpencodeGo, "/v1/chat/completions", HeaderMap::new(), Bytes::from_static(b"{}")).await;
+        assert_eq!(actual, status);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "request failure must not try another account");
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), error);
+        let row = subs.db.get_account(&a.id).await.unwrap().unwrap();
+        assert_eq!(row.auth_failed, status == 401);
+        let reason = row.last_error.unwrap();
+        assert!(reason.contains(&format!("upstream status {status}: RequestRejected")), "{reason}");
+        assert!(reason.contains("[redacted]"));
+        assert!(!reason.contains("test-upstream-key"));
+        if status == 403 {
+            assert!(row.cooldown_until.is_none());
+            server.reset().await;
+            Mock::given(path("/zen/go/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_eq!(run(&subs, SubProvider::OpencodeGo, "/v1/chat/completions", HeaderMap::new(), Bytes::new()).await.0, 200);
+            assert!(subs.db.get_account(&a.id).await.unwrap().unwrap().last_error.is_none());
+        }
+    }
+}

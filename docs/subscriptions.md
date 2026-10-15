@@ -75,6 +75,10 @@ Codex can report a quota error as the first events of a `200` SSE stream. Xolotl
   - The model roster comes from the proxy's `/v1/models`; `catalog.static_models.grok` fills in when that fails. The Grok CLI's `/v1/models` lists only names some target can serve on Responses, so Claude subscription models are left out.
   - Device-code polling never goes faster than the issuer's `interval`, and each `slow_down` adds five seconds (RFC 8628 3.5). No usage endpoint is known, so Grok accounts have no usage windows; only 429 cooldowns apply.
 - **OpenCode Go:** the API key is sent as Bearer (plus `x-api-key` on Messages). Any path is accepted, which is what the `/opencode-go/<path>` passthrough relies on.
+  - Every proxied request sends `x-opencode-session`: the first nonempty `x-opencode-session`, `x-claude-code-session-id`, or `session_id` header. Without one, xolotl uses a stable SHA-256 of the authenticated client id. Clients that share a key share this fallback; send a session header to distinguish conversations. The same id selects account affinity, including on translated requests and passthroughs.
+  - The upstream user agent is `xolotl/<version> (<client user agent>)`, or `xolotl/<version>` when the client sends none, following the [OpenCode Go client guidance](https://opencode.ai/docs/go/#where-can-i-use-it).
+  - Only 401 marks an API-key account as needing credentials. A 403 is returned to the client without failover or cooldown; the account can serve the next request.
+  - Upstream failures include a diagnostic reason in logs and the account's last error. JSON diagnostics use only error type, code, name and message; non-JSON responses use their text. Active account credentials are redacted before the detail is limited to 512 characters, and control characters become spaces. A successful request clears the last error.
 
 ## Usage
 
