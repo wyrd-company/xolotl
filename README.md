@@ -68,7 +68,7 @@ User documentation is on [wyrd.foo](https://wyrd.foo/docs/xolotl/). Its source i
 | [Installation](docs/install.md) | Container image, release binary, building from source, OpenBao setup, running |
 | [Configuration](docs/configuration.md) | The config file, environment variables, OpenBao paths |
 | [Subscription accounts](docs/accounts.md) | Codex, Claude, Grok and OpenCode Go accounts: login, import, states, failover |
-| [Policies and client keys](docs/policies-and-keys.md) | Policies, model names, aliases, issuing and rotating keys |
+| [Policies and client keys](docs/policies-and-keys.md) | Policies, model names, renames and aliases, rate limits, issuing and rotating keys, usage |
 | [Clients](docs/clients.md) | Claude Code, Codex CLI, Grok CLI, SDKs, MCP clients, T3 Code; endpoints and translation |
 | [MCP gateway](docs/mcp-gateway.md) | Upstream MCP servers, OAuth logins, code mode, MCP policies |
 | [Web UI](docs/web-ui.md) | OpenID Connect sign-in and the screens |

@@ -43,11 +43,13 @@ The OpenBao values win over `[telemetry.otlp_headers]`.
 | `xolotl.account.usage_percent` | account, provider, window | Usage of each account window |
 | `xolotl.account.available` | account, provider | 1 when the account can take requests |
 | `xolotl.upstream.errors` | provider, status or kind | Upstream errors of subscription accounts |
-| `xolotl.oauth.refreshes` | provider, result | OAuth token refreshes |
+| `xolotl.oauth.refreshes` | provider, result | OAuth token refreshes. `result=uncertain`: the provider may have used the refresh token, but no usable answer came back |
 | `xolotl.vault.unsaved_credentials` | | Refreshed tokens not yet written to OpenBao. Alert when this stays above 0 |
 | `xolotl.mcp.tool_calls` | server, tool, status | MCP tool calls |
 | `xolotl.mcp.tool_call.duration` | server, tool | MCP tool call duration |
 | `xolotl.mcp.executions` | status | `execute` calls |
+| `xolotl.limit.consumption` | client, unit (`requests`, `tokens`), window (`minute`, `day`) | Rate limit consumption of each key |
+| `xolotl.limit.rejections` | policy, client, limit | Requests refused by a rate limit |
 
 ## Request log
 

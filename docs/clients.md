@@ -80,9 +80,13 @@ See [MCP gateway](mcp-gateway).
 
 Add a CLIProxyAPI usage source with URL `http://xolotl:8317` and a key whose
 policy has the `management` scope. T3 Code then shows the usage of your Codex
-and Claude accounts. When T3 Code resets an account's quota, xolotl clears that
-account's cooldown and last error and polls its usage again. It sends no
-request to the provider to reset the quota.
+and Claude accounts, and the Codex reset credits.
+
+T3 Code redeems a Codex reset credit itself: it sends the redemption request to
+Codex through xolotl's `api-call` endpoint, which adds the account's token and
+only reaches the account's own provider. Then it calls `reset-quota`, and xolotl
+clears that account's cooldown and last error and polls its usage again.
+`reset-quota` alone sends nothing to the provider.
 
 ## Endpoints
 
@@ -158,4 +162,4 @@ Errors have the shape of the endpoint you called: Anthropic-style on
 | 403 | The key lacks the scope, or a passthrough's provider or model is not allowed |
 | 404 | The policy exposes no such model name |
 | 400 | The model is not served on this endpoint |
-| 429 | Every account is cooling down. `Retry-After` gives the earliest reset |
+| 429 | Every account is cooling down, or the key is over a [rate limit](policies-and-keys#rate-limits). `Retry-After` gives the seconds to wait |

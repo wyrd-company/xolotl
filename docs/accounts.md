@@ -59,6 +59,14 @@ echo "$OPENCODE_GO_KEY" | xolotl accounts add-key --label personal
 
 If you leave out the pipe, the CLI asks for the key without echo.
 
+Every request to OpenCode Go carries a session ID in `x-opencode-session`.
+Xolotl takes it from the client's `x-opencode-session`, `x-claude-code-session-id`
+or `session_id` header. Without one, it uses a fixed ID derived from the client
+key, so all clients that share a key share one session. Send a session header
+to keep conversations apart. The same ID keeps the session on one account.
+
+The upstream user agent is `xolotl/<version> (<client user agent>)`.
+
 ### Import a CLI login
 
 ```sh
@@ -133,15 +141,37 @@ Xolotl tries up to `max_attempts` (3) accounts for one request.
 | 401 or revoked login | Refreshes the token once and retries. If that fails, marks the account `re-login` and tries the next one |
 | 5xx, overloaded, short 429 | Tries the next account |
 | 400, context length exceeded | Returns the error to the client, because another account fails the same way |
+| OpenCode Go 403 | Returns the error to the client. The account stays available, because a 403 refuses the request, not the key |
 
 When every account is cooling down, the client gets a 429 with `Retry-After`
 set to the earliest reset.
+
+The account's last error shows why the upstream refused, with credentials
+removed. A successful request clears it.
 
 ## Token refresh
 
 Xolotl refreshes OAuth tokens before they expire (`refresh_margin_secs`) and
 once after a 401. The usage poll, every 5 minutes, also keeps idle accounts
 fresh. Refreshed tokens are written back to OpenBao at once.
+
+When a refresh fails:
+
+- **The provider refuses the refresh token** (for example `invalid_grant` or
+  `refresh_token_reused`): the account goes to `re-login`. Log in again. A
+  `refresh_token_reused` error usually means that another client, such as a
+  local CLI with the same login, used the token first.
+- **Other failures**: the account keeps its current access token while it
+  works, and xolotl tries again later. The wait doubles after each failure,
+  from 5 seconds to at most 5 minutes. A successful refresh or a new login
+  ends the wait.
+- **Unknown outcome**: the request was sent but no usable answer came back, so
+  the provider may have used the refresh token. Xolotl logs an error, sets the
+  account's last error, and counts `xolotl.oauth.refreshes` with
+  `result=uncertain`. If the provider then refuses the refresh token, log in
+  again.
+
+A Claude import with a refresh token but no `expiresAt` refreshes on first use.
 
 Run only one xolotl instance against the same accounts. Refreshes are
 serialized inside one process only.
@@ -153,8 +183,31 @@ every `usage_poll_secs`. It uses them for the soft limit and `least-used`, and
 shows them in `xolotl accounts list`, the web UI and the
 `xolotl.account.usage_percent` metric. Grok accounts have no usage windows.
 
+### Codex reset credits
+
+Each Codex usage poll also counts the account's available reset credits. The
+web UI's overview shows the total for the Codex pool, and each account's
+details show its own count. When some counts are unknown, the overview marks
+the total as partial. The counts are from the last poll, so a credit can expire
+or be used elsewhere in the meantime.
+
+Xolotl does not redeem credits itself. T3 Code can redeem one (see
+[T3 Code hubs](#t3-code-hubs)).
+
+## Models
+
+After you add, import, reset, enable, disable or remove an account, xolotl asks
+the provider for its model list again. `xolotl models --refresh` and the web
+UI's **Refresh models** control do it at once. See
+[Providers and models](web-ui#models).
+
 ## T3 Code hubs
 
 T3 Code can show your accounts' usage. Add a CLIProxyAPI usage source with the
 URL of xolotl and a client key whose policy has the `management` scope. T3 Code
-shows the Codex and Claude accounts. See [Clients](clients#t3-code).
+shows the Codex and Claude accounts, and the Codex reset credits.
+
+To redeem a Codex reset credit, T3 Code sends the redemption request to Codex
+through xolotl, which adds the account's token. Then T3 Code asks xolotl to
+reset the account's quota: xolotl clears the account's cooldown and polls its
+usage again. See [Clients](clients#t3-code).

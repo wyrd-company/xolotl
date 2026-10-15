@@ -52,7 +52,7 @@ See [Subscription accounts](accounts).
 | Command | Does |
 |---|---|
 | `xolotl providers set-key <name>` | Store a gateway provider's API key in OpenBao |
-| `xolotl models [--refresh]` | The models each provider serves. `--refresh` discovers them again first |
+| `xolotl models [--refresh]` | The models each provider serves. `--refresh` discovers them again from every provider first |
 
 ## Policies and keys
 
@@ -64,7 +64,7 @@ See [Subscription accounts](accounts).
 | `xolotl policies view <name>` | The names a key sees, where they route, their endpoints, and the MCP tools |
 | `xolotl policies delete <name>` | Delete a policy that no key uses |
 | `xolotl keys issue --policy <p> --name <n> [--ttl <d>] [--description <s>]` | Issue a key into OpenBao at `keys/<p>/<n>` |
-| `xolotl keys list` | Keys with policy, state, rotation and expiry |
+| `xolotl keys list` | Keys with policy, state, rotation, expiry and rate limit consumption |
 | `xolotl keys rotate <p>/<n> [--grace <d>]` | Write a new key. The old key works for the grace period |
 | `xolotl keys enable\|disable <p>/<n>` | Turn a key on or off |
 | `xolotl keys revoke <p>/<n>` | Revoke the key and destroy its earlier versions |
@@ -92,4 +92,4 @@ See [MCP gateway](mcp-gateway).
 
 | Command | Does |
 |---|---|
-| `xolotl usage [--group-by client\|account\|provider\|model] [--since 24h]` | Requests, errors and tokens from the request log |
+| `xolotl usage [--group-by client\|account\|provider\|model] [--since 24h] [--client <c>] [--account <a>] [--provider <p>] [--model <m>]` | Requests, errors and tokens from the request log. The filters narrow the rows; `""` matches rows without a value |

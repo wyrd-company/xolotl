@@ -48,13 +48,55 @@ server log has the details.
 
 | Screen | What you can do |
 |---|---|
-| Overview | OpenBao and SQLite health, account pools and usage windows, totals for the last 24 hours, gateway providers, recent failed requests |
-| Accounts | Accounts by provider: refresh usage, enable or disable, set priority, clear a cooldown, remove, see details |
+| Overview | OpenBao and SQLite health, account pools and usage windows, the Codex reset credit total, totals for the last 24 hours, gateway providers, recent failed requests |
+| Accounts | Accounts by provider: refresh usage, enable or disable, set priority, clear a cooldown, remove, see details (including Codex reset credits) |
 | Add account | Codex device or browser login, Claude login, OpenCode Go key, import of a CLI credential file |
-| Policies | Edit providers, scopes, model globs, precedence, winners and aliases, with a live preview of the names a key sees |
-| Client keys | Issue, rotate with a grace period, enable or disable, revoke. Shows the OpenBao path, the `bao` command and the OpenBao policy the client needs. Never shows the key |
+| Policies | Providers with the state of their accounts or keys, scopes, precedence, MCP access, rate limits and the policy's consumption, and the model list (below) |
+| Client keys | Issue, rotate with a grace period, enable or disable, revoke. Consumption against the policy's rate limits. Shows the OpenBao path, the `bao` command and the OpenBao policy the client needs. Never shows the key |
 | MCP servers | Upstream servers: add, edit and remove runtime servers, set header secrets, OAuth sign-in, tools, recent tool calls |
 | Providers & models | Gateway providers and their key state, set a key, the model catalog with each model's endpoints |
 | Usage | The request log grouped by client, account, provider or model, and a link to `telemetry.dashboard_url` |
 
 Every member of the admin group has full access.
+
+### Policy model list
+
+The **Policies** screen lists every model of the allowed providers. For each
+model you can:
+
+- allow or deny it, one at a time or all filtered rows at once;
+- rename it inline;
+- give it more names, with fallbacks;
+- see which provider wins a name that several providers serve, and the state
+  of the provider's accounts.
+
+Filter by provider and sort the list. The toggles write exact `provider/model`
+entries to `allow_models` and `deny_models`. Edit the globs under
+**Model patterns**. See [Policies and client keys](policies-and-keys).
+
+### Usage
+
+Select a row to narrow the view to it. The view then groups by the first of
+model, account, client and provider that is not shown or narrowed yet. Each
+filter shows as a chip; remove a chip to widen the view again. The URL keeps
+the filters (`/#/usage?group=model&client=...`), so you can bookmark a view.
+
+## Models
+
+Every screen that lists models has a **Refresh models** control. It shows how
+old the catalog is, and each provider's model count or discovery error.
+
+- The policy model list refreshes its selected providers, or the provider in
+  the filter. Account views refresh their provider.
+- When discovery fails, the cached and static models stay visible with the
+  error. A provider that answers with an empty list shows
+  **Provider returned no models**.
+- Xolotl also discovers models after account changes, provider key changes and
+  `xolotl reload`. The UI checks every 30 seconds and updates its lists when
+  that discovery completes.
+
+## Theme
+
+The UI has a light and a dark theme. By default it follows the browser's color
+scheme. The three buttons above **Sign out** in the sidebar pick the system, light or
+dark theme. The browser keeps the choice.

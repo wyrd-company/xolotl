@@ -26,8 +26,8 @@ credentials stay in OpenBao, not in the agents' containers.
   (`search` and `execute`) to the upstream MCP servers their policy allows.
   Upstream credentials and OAuth logins stay in OpenBao.
 - **Client keys and policies.** Each client gets its own key. Its policy sets
-  the providers, models, model names and MCP tools it can use. Keys are issued
-  into OpenBao and never printed.
+  the providers, models, model names and MCP tools it can use, and its request
+  and token limits. Keys are issued into OpenBao and never printed.
 - **Usage and telemetry.** A request log, per-account usage windows, and
   OpenTelemetry traces, logs and metrics.
 - **Web UI and CLI.** Administer everything from a browser (OpenID Connect
