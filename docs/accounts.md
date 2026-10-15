@@ -91,13 +91,15 @@ xolotl accounts list --provider codex
 The list shows each account's ID, provider, label, plan, priority, state and
 usage windows (for example `5h 12%, 7d 40%`).
 
-| State | Meaning | What to do |
-|---|---|---|
-| `ok` | Available | Nothing |
-| `cool→<time>` | Cooling down until that time, usually because the quota is used up | Wait, or `xolotl accounts reset <id>` |
-| `re-login` | The provider refused the refresh token. The account is out of rotation | Log in to the account again |
-| `UNSAVED` | A refreshed token could not be written to OpenBao. Xolotl serves from memory and retries every 15 seconds | Fix OpenBao. Do not restart xolotl until the state clears, or the token is lost |
-| `disabled` | You disabled it | `xolotl accounts enable <id>` |
+| CLI state | Web UI state | Meaning | What to do |
+|---|---|---|---|
+| `ok` | Available | The account can take requests | Nothing |
+| `cool→<time>` | Cooling down | Cooling down until that time, usually because the quota is used up. The reason shows beside the state | Wait, or **Retry** (`xolotl accounts reset <id>`) |
+| `re-login` | Re-login needed | An OAuth account whose refresh token the provider refused. It is out of rotation | Log in to the account again |
+| `re-login` | Key rejected | An API-key account whose key the provider refused with a 401. It is out of rotation | Replace the key |
+| `re-login` | Refused | An API-key account whose last recorded error is another 4xx | Read the last error. Replace the key, or **Retry** |
+| `UNSAVED` | | A refreshed token could not be written to OpenBao. Xolotl serves from memory and retries every 15 seconds | Fix OpenBao. Do not restart xolotl until the state clears, or the token is lost |
+| `disabled` | Disabled | You disabled it | `xolotl accounts enable <id>` |
 
 `xolotl accounts usage <id>` fetches the usage windows from the provider now.
 
@@ -110,6 +112,30 @@ xolotl accounts enable <id>
 xolotl accounts reset <id>         # clear the cooldown and the re-login state
 xolotl accounts remove <id>
 ```
+
+## Recover an account
+
+The web UI's overview lists accounts that need attention. Each entry has a
+**Review account** link that opens the account's details. There:
+
+- **OAuth accounts** (Codex, Claude, Grok) in **Re-login needed** have an
+  inline login. Log in again to the same account; xolotl updates it in place.
+- **API-key accounts** (OpenCode Go) show the last error and a
+  **Replace key** form. The account keeps its ID, label, priority, enabled
+  state and usage history.
+- **Retry** clears the cooldown and the re-login state, so xolotl tries the
+  account again with the same credential. It does not change the credential
+  and does not reset the provider's quota. A disabled account stays disabled.
+  `xolotl accounts reset <id>` does the same.
+
+Adding an OpenCode Go key that another account already has updates that
+account instead of adding a second one. A replacement key that another account
+already has is refused.
+
+Adding a key, replacing a key and **Retry** also refresh the provider's model
+list. **Refresh models**, next to **Refresh usage**, does it on demand and
+shows the model count or the discovery error. A discovery error keeps the
+previous model list, and does not undo the saved key or the retry.
 
 ## How xolotl picks an account
 

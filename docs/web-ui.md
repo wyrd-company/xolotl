@@ -48,8 +48,8 @@ server log has the details.
 
 | Screen | What you can do |
 |---|---|
-| Overview | OpenBao and SQLite health, account pools and usage windows, the Codex reset credit total, totals for the last 24 hours, gateway providers, recent failed requests |
-| Accounts | Accounts by provider: refresh usage, enable or disable, set priority, clear a cooldown, remove, see details (including Codex reset credits) |
+| Overview | OpenBao and SQLite health, accounts that need attention (each with a **Review account** link), account pools and usage windows, the Codex reset credit total, totals for the last 24 hours, gateway providers, recent failed requests |
+| Accounts | Accounts by provider with their state and cooldown reason: refresh usage, refresh models, enable or disable. Details: set priority, **Retry**, log in again (OAuth accounts) or replace the key (API-key accounts), remove, last error, Codex reset credits |
 | Add account | Codex device or browser login, Claude login, OpenCode Go key, import of a CLI credential file |
 | Policies | Providers with the state of their accounts or keys, scopes, precedence, MCP access, rate limits and the policy's consumption, and the model list (below) |
 | Client keys | Issue, rotate with a grace period, enable or disable, revoke. Consumption against the policy's rate limits. Shows the OpenBao path, the `bao` command and the OpenBao policy the client needs. Never shows the key |
@@ -58,6 +58,22 @@ server log has the details.
 | Usage | The request log grouped by client, account, provider or model, and a link to `telemetry.dashboard_url` |
 
 Every member of the admin group has full access.
+
+### Account states
+
+| State | Meaning |
+|---|---|
+| Available | The account can take requests |
+| Cooling down | Waiting for a reset time; the reason and the time left show below the state |
+| Re-login needed | An OAuth account whose login the provider refused. Log in again from its details |
+| Key rejected | An API-key account whose key the provider refused with a 401. Replace the key from its details |
+| Refused | An API-key account whose last recorded error is another 4xx |
+| Disabled | You disabled it |
+| Unavailable | Not available for another reason, for example its credential is not loaded |
+
+**Retry** clears the cooldown and the re-login state. It does not change the
+credential or reset the provider's quota. See
+[Recover an account](accounts#recover-an-account).
 
 ### Policy model list
 
