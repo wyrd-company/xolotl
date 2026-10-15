@@ -469,9 +469,11 @@ mod tests {
         l.seed(&db, now).await.unwrap();
         let c = l.consumption("p/a", now);
         assert_eq!((c.requests_per_day, c.tokens_per_day), (2, 14));
+        // Requests of the bootstrap admin token (no client) are not counted.
+        assert_eq!(l.clients.lock().keys().collect::<Vec<_>>(), vec!["p/a"]);
         // Rows older than a day are not read.
         let later = Limiter::default();
-        later.seed(&db, now + DAY + MINUTE).await.unwrap();
+        assert_eq!(later.seed(&db, now + DAY + MINUTE).await.unwrap(), 0);
         assert_eq!(later.consumption("p/a", now + DAY + MINUTE), Consumption::default());
     }
 }
