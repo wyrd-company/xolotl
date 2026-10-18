@@ -1466,3 +1466,43 @@ async fn an_account_filled_since_its_check_is_passed_over() {
     assert!(e.is_on(Meter::Total), "{e:?}");
     assert_eq!(limiter.policy_consumption("p", Meter::Account(&b.id), now()).requests_per_minute, 1, "b not counted again");
 }
+
+#[tokio::test]
+async fn a_restart_counts_pool_requests_as_admission_did() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let live = Arc::new(crate::limits::Limiter::default());
+    let subs = Arc::try_unwrap(subs).ok().unwrap().with_limiter(live.clone());
+    let mut cred = codex_cred("acct-a", "old");
+    cred.expires_at = Some(now() - 10);
+    subs.save_account(cred).await.unwrap();
+    Mock::given(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "refresh_token_reused"})))
+        .mount(&server)
+        .await;
+    let key = principal(any_policy());
+    let mut charge = Charge::new(&[Meter::Total]);
+    // Admitted, then the account's credential fails: counted.
+    let resp = subs
+        .execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), Some(&key), None, &mut charge)
+        .await;
+    assert_eq!(resp.status(), 503);
+    assert!(charge.is_settled());
+    // The account now needs a login: refused before any account, not counted.
+    let mut charge = Charge::new(&[Meter::Total]);
+    let resp = subs
+        .execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), Some(&key), None, &mut charge)
+        .await;
+    assert_eq!(resp.status(), 503);
+    assert!(!charge.is_settled());
+    for _ in 0..50 {
+        if subs.db.request_counts_since(0).await.unwrap().iter().map(|r| r.requests).sum::<i64>() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let replayed = crate::limits::Limiter::default();
+    replayed.seed(&subs.db, now()).await.unwrap();
+    assert_eq!(live.consumption("p/client", now()).requests_per_day, 1);
+    assert_eq!(replayed.consumption("p/client", now()).requests_per_day, 1);
+}

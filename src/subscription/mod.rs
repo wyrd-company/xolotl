@@ -840,9 +840,6 @@ impl Subscriptions {
         let mut tried = HashSet::new();
         // Last failed upstream response, returned if every attempt fails.
         let mut last: Option<(u16, reqwest::header::HeaderMap, Bytes, String)> = None;
-        // The last account that admitted the request. The log row names it, so
-        // replaying the log counts the request as admission did.
-        let mut admitted: Option<String> = None;
 
         'accounts: for _ in 0..self.cfg.max_attempts {
             let account = match self.select(provider, principal, session.as_deref(), &tried, charge).await {
@@ -881,7 +878,9 @@ impl Subscriptions {
                 }
             };
             tried.insert(account.id.clone());
-            admitted = Some(account.id.clone());
+            // The account admitted the request: the log row names it, so
+            // replaying the log counts the request as admission did.
+            accounting.record.account_id = Some(account.id.clone());
             let mut force: Option<String> = None;
             loop {
                 let cred = match self.credential(&account.id, force.as_deref()).await {
@@ -1017,7 +1016,6 @@ impl Subscriptions {
                 proxy::relay_buffered(status, &headers, bytes, Some(accounting))
             }
             None => {
-                accounting.record.account_id = admitted;
                 accounting.finish(503, Default::default());
                 self.error_for(provider, path, StatusCode::SERVICE_UNAVAILABLE, "api_error", "no account could serve the request")
             }
