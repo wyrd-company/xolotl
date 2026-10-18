@@ -191,6 +191,11 @@ impl RefreshError {
     }
 }
 
+/// Whether a policy's `accounts` takes `*` or names an account of the pool.
+fn uses_any(policy: &crate::policy::Policy, provider: &str, rows: &[AccountRow]) -> bool {
+    policy.accounts.get(provider).is_some_and(|ids| ids.iter().any(|id| id == "*" || rows.iter().any(|r| &r.id == id)))
+}
+
 /// An account meter followed by the meters a request still has to count on.
 fn with_account<'m>(id: &'m str, pending: &[Meter<'m>]) -> Vec<Meter<'m>> {
     let mut m = vec![Meter::Account(id)];
@@ -637,14 +642,7 @@ impl Subscriptions {
         charge: &mut Charge<'_>,
     ) -> Result<AccountRow, SelectError> {
         let rows = self.db.list_accounts(Some(provider.as_str())).await.unwrap_or_default();
-        // A policy whose `accounts` names no account of the pool, `*` aside, uses none.
-        if let Some(p) = principal
-            && !p
-                .policy
-                .accounts
-                .get(provider.as_str())
-                .is_some_and(|ids| ids.iter().any(|id| id == "*" || rows.iter().any(|r| &r.id == id)))
-        {
+        if principal.is_some_and(|p| !uses_any(&p.policy, provider.as_str(), &rows)) {
             return Err(SelectError::NotAllowed);
         }
         let limiter = principal.and_then(|p| Some((p.client_id()?, &p.policy)));

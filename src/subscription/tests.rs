@@ -1394,18 +1394,29 @@ async fn an_empty_pool_tells_a_missing_grant_from_missing_accounts() {
     assert_eq!(status, 403, "only accounts that do not exist");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_requests_past_an_account_limit_get_429() {
     let server = MockServer::start().await;
     let (subs, _) = setup(&server, Strategy::FillFirst).await;
     let limiter = Arc::new(crate::limits::Limiter::default());
-    let subs = Arc::try_unwrap(subs).ok().unwrap().with_limiter(limiter.clone());
+    let subs = Arc::new(Arc::try_unwrap(subs).ok().unwrap().with_limiter(limiter.clone()));
     let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
     mock_codex_ok(&server, &["tok-a"]).await;
     let mut p = any_policy();
     p.limits.accounts.insert(a.id.clone(), crate::limits::Allowance { requests_per_minute: Some(1), ..Default::default() });
-    let key = principal(p);
-    let results = futures::future::join_all((0..16).map(|_| served_by(&subs, &key))).await;
+    let key = Arc::new(principal(p));
+    // Released together, so several pass the limit check before one is admitted.
+    let start = Arc::new(tokio::sync::Barrier::new(16));
+    let tasks: Vec<_> = (0..16)
+        .map(|_| {
+            let (subs, key, start) = (subs.clone(), key.clone(), start.clone());
+            tokio::spawn(async move {
+                start.wait().await;
+                served_by(&subs, &key).await
+            })
+        })
+        .collect();
+    let results: Vec<_> = futures::future::join_all(tasks).await.into_iter().map(Result::unwrap).collect();
     let ok = results.iter().filter(|r| r.0 == 200).count();
     let limited: Vec<_> = results.iter().filter(|r| r.0 == 429).collect();
     assert_eq!((ok, limited.len()), (1, 15), "{results:?}");
