@@ -79,7 +79,7 @@ async fn run_as(
     headers: HeaderMap,
     body: Bytes,
 ) -> (Option<String>, (u16, String)) {
-    let resp = subs.execute(provider, Method::POST, path, headers, body, Some(principal), Some("m")).await;
+    let resp = subs.execute(provider, Method::POST, path, headers, body, Some(principal), Some("m"), &mut Charge::default()).await;
     let status = resp.status().as_u16();
     let retry = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_string);
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -210,7 +210,9 @@ async fn all_accounts_cooling_returns_429_with_retry_after() {
     let (subs, _) = setup(&server, Strategy::RoundRobin).await;
     let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
     subs.db.set_cooldown(&a.id, now() + 300, "test").await.unwrap();
-    let resp = subs.execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), None, None).await;
+    let resp = subs
+        .execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), None, None, &mut Charge::default())
+        .await;
     assert_eq!(resp.status(), 429);
     let ra: i64 = resp.headers()["retry-after"].to_str().unwrap().parse().unwrap();
     assert!((295..=300).contains(&ra));
@@ -617,7 +619,9 @@ async fn codex_headerless_stream_is_accounted() {
         .respond_with(ResponseTemplate::new(200).set_body_bytes(SSE_OK.as_bytes()))
         .mount(&server)
         .await;
-    let resp = subs.execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), None, None).await;
+    let resp = subs
+        .execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), None, None, &mut Charge::default())
+        .await;
     assert_eq!(resp.headers()["content-type"], "text/event-stream");
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     assert!(String::from_utf8_lossy(&body).contains("response.completed"));
@@ -1305,8 +1309,18 @@ async fn mock_codex_ok(server: &MockServer, tokens: &[&str]) {
 }
 
 async fn served_by(subs: &Subscriptions, principal: &Principal) -> (u16, Option<String>, Option<String>) {
-    let resp =
-        subs.execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), Some(principal), None).await;
+    let resp = subs
+        .execute(
+            SubProvider::Codex,
+            Method::POST,
+            "/v1/responses",
+            HeaderMap::new(),
+            responses_body(),
+            Some(principal),
+            None,
+            &mut Charge::default(),
+        )
+        .await;
     let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
     (resp.status().as_u16(), header("x-served-by"), header("retry-after"))
 }
@@ -1363,4 +1377,37 @@ async fn account_limits_move_requests_to_other_accounts() {
     let (status, by, retry) = served_by(&subs, &key).await;
     assert_eq!((status, by), (429, None), "every account is at its limit");
     assert!(retry.is_some_and(|r| r.parse::<i64>().unwrap() > 0));
+}
+
+#[tokio::test]
+async fn an_empty_pool_tells_a_missing_grant_from_missing_accounts() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let mut p = any_policy();
+    let (status, ..) = served_by(&subs, &principal(p.clone())).await;
+    assert_eq!(status, 503, "* with no accounts yet: log in");
+    p.accounts.remove("codex");
+    let (status, ..) = served_by(&subs, &principal(p.clone())).await;
+    assert_eq!(status, 403, "no entry: no account, also in an empty pool");
+    p.accounts.insert("codex".into(), vec!["codex-gone".into()]);
+    let (status, ..) = served_by(&subs, &principal(p)).await;
+    assert_eq!(status, 403, "only accounts that do not exist");
+}
+
+#[tokio::test]
+async fn concurrent_requests_past_an_account_limit_get_429() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let limiter = Arc::new(crate::limits::Limiter::default());
+    let subs = Arc::try_unwrap(subs).ok().unwrap().with_limiter(limiter.clone());
+    let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
+    mock_codex_ok(&server, &["tok-a"]).await;
+    let mut p = any_policy();
+    p.limits.accounts.insert(a.id.clone(), crate::limits::Allowance { requests_per_minute: Some(1), ..Default::default() });
+    let key = principal(p);
+    let results = futures::future::join_all((0..16).map(|_| served_by(&subs, &key))).await;
+    let ok = results.iter().filter(|r| r.0 == 200).count();
+    let limited: Vec<_> = results.iter().filter(|r| r.0 == 429).collect();
+    assert_eq!((ok, limited.len()), (1, 15), "{results:?}");
+    assert!(limited.iter().all(|r| r.2.is_some()), "every refusal says when to retry");
 }

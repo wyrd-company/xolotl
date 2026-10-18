@@ -12,7 +12,7 @@ use super::*;
 use crate::config::{CatalogConfig, Endpoints, GatewayConfig, ProviderConfig, ProviderKind};
 use crate::db::now;
 use crate::keys::IssueRequest;
-use crate::limits::Limits;
+use crate::limits::{Limits, Meter};
 use crate::policy::{AliasTargets, Policy};
 use crate::secrets::MemoryStore;
 use crate::subscription::{Credential, auth_index};
@@ -671,8 +671,9 @@ async fn provider_limits_skip_to_the_next_alias_target() {
     let (status, body) = h.call("POST", "/v1/chat/completions", Some(&key), Some(chat("llama/qwen3"))).await;
     assert_eq!(status, 429, "{body}");
     assert!(body["error"]["message"].as_str().unwrap().contains("on provider \"llama\""), "{body}");
-    // Every request counts once in total; the refused one does not count.
-    assert_eq!(h.state.limiter.consumption("prov/client", now()).requests_per_minute, 2);
+    // A request counts once in total; one that reaches no account and the
+    // refused one do not count.
+    assert_eq!(h.state.limiter.consumption("prov/client", now()).requests_per_minute, 1);
 
     let (_, view) = h.call("GET", "/admin/policies/prov/view", Some(&h.admin), None).await;
     assert_eq!(view["provider_usage"]["llama"]["requests_per_minute"], 1, "{view}");
@@ -2414,4 +2415,39 @@ async fn api_key_import_waits_for_replacement_before_deduplicating() {
     };
     assert_eq!(imported.id, id);
     assert_eq!(h.state.secrets.list("accounts/opencode-go").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_request_no_account_admits_counts_nowhere() {
+    let h = harness().await;
+    let id = h.codex_account().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("data: {\"type\":\"response.completed\"}\n\n", "text/event-stream"))
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/llama/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"choices": []})))
+        .mount(&h.upstream)
+        .await;
+    let one = crate::limits::Allowance { requests_per_minute: Some(1), ..Default::default() };
+    let mut limits = Limits { requests_per_day: Some(3), ..Default::default() };
+    limits.accounts.insert(id.clone(), one);
+    let key = h.key(Policy { limits, ..policy("acct") }).await;
+    let responses = json!({"model": "gpt-6-codex", "input": []});
+    assert_eq!(h.call("POST", "/v1/responses", Some(&key), Some(responses.clone())).await.0, 200);
+    let (status, body) = h.call("POST", "/v1/responses", Some(&key), Some(responses.clone())).await;
+    assert_eq!(status, 429, "the only account is at its limit: {body}");
+    // The opencode-go passthrough reaches no account either.
+    assert_eq!(h.call("GET", "/opencode-go/v1/models", Some(&key), None).await.0, 503);
+    let c = h.state.limiter.consumption("acct/client", now());
+    assert_eq!(c.requests_per_day, 1, "refused in the pool: not counted in total");
+    let p = h.state.limiter.policy_consumption("acct", Meter::Provider("codex"), now());
+    assert_eq!(p.requests_per_day, 1, "nor on the provider");
+    // So another provider still has the rest of the daily allowance.
+    let chat = json!({"model": "llama/qwen3", "messages": []});
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat.clone())).await.0, 200);
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat.clone())).await.0, 200);
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat)).await.0, 429);
 }

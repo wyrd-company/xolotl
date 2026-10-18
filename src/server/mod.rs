@@ -26,7 +26,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::gateway::Gateway;
 use crate::keys::{KeyManager, Principal, Scope};
-use crate::limits::{Exceeded, Limiter, Meter};
+use crate::limits::{Charge, Exceeded, Limiter, Meter};
 use crate::mcp::McpHub;
 use crate::policy::{Target, View};
 use crate::proxy::{self, forward_request_headers};
@@ -374,38 +374,48 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
     let last = usable.len() - 1;
     // The request counts once in total, on the first target admitted; each
     // target counts on its provider. A target over its provider's limit is
-    // skipped like one that answered 429.
+    // skipped like one that answered 429. A pool counts the request with the
+    // account that serves it, so one no account admits counts on nothing.
     let mut counted = false;
     for (i, target) in usable.iter().enumerate() {
         let provider = Meter::Provider(&target.provider);
         let meters: &[Meter] = if counted { &[provider] } else { &[Meter::Total, provider] };
-        if let Some(client) = principal.client_id()
-            && let Err(e) = state.limiter.admit(client, &principal.policy, meters, crate::db::now())
-        {
-            if i < last && e.on.is_some() {
-                tracing::info!(target = %target.qualified(), limit = e.limit, "provider limit reached; trying the next alias target");
-                continue;
+        let pooled = pool(&target.provider).is_some();
+        if let Some(client) = principal.client_id() {
+            let now = crate::db::now();
+            let admitted = if pooled {
+                state.limiter.check(client, &principal.policy, meters, now)
+            } else {
+                state.limiter.admit(client, &principal.policy, meters, now)
+            };
+            if let Err(e) = admitted {
+                if i < last && e.on.is_some() {
+                    tracing::info!(target = %target.qualified(), limit = e.limit, "provider limit reached; trying the next alias target");
+                    continue;
+                }
+                return limited(&principal, &e, anthropic);
             }
-            return limited(&principal, &e, anthropic);
         }
-        counted = true;
+        let mut charge = Charge::new(if pooled { meters } else { &[] });
         let (resp, translation) = match (wire, route(target)) {
             (Some(client), Some(Route::Translated(upstream))) => {
                 let (body, t) = match translate::request(client, upstream, &json, &target.model) {
                     Ok(x) => x,
                     Err(msg) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", msg),
                 };
-                let resp = send(state, target, upstream.path(), translated_headers(&fwd, upstream), body, &principal, &model).await;
+                let resp =
+                    send(state, target, upstream.path(), translated_headers(&fwd, upstream), body, &principal, &model, &mut charge).await;
                 (resp, Some(t))
             }
             _ => {
-                let resp = send(state, target, path, fwd.clone(), json.clone(), &principal, &model).await;
+                let resp = send(state, target, path, fwd.clone(), json.clone(), &principal, &model, &mut charge).await;
                 let streams = json.get("stream").and_then(Value::as_bool).unwrap_or(false);
                 let grok = pool(&target.provider) == Some(SubProvider::Grok);
                 let resp = if grok && wire == Some(Wire::Responses) && !streams { collect_grok(resp).await } else { resp };
                 (resp, None)
             }
         };
+        counted |= !pooled || charge.is_settled();
         let status = resp.status().as_u16();
         if i < last && (status == 429 || status >= 500) {
             tracing::info!(target = %target.qualified(), status, "falling back to next alias target");
@@ -443,6 +453,7 @@ async fn collect_grok(resp: Response) -> Response {
 }
 
 /// Send a JSON request to one target: a subscription pool or a gateway provider.
+#[allow(clippy::too_many_arguments)]
 async fn send(
     state: &AppState,
     target: &Target,
@@ -451,6 +462,7 @@ async fn send(
     mut body: Value,
     principal: &Principal,
     model: &str,
+    charge: &mut Charge<'_>,
 ) -> Response {
     let client_id = principal.client_id();
     // Mistral and Grok drop `stream_options`; they report usage anyway.
@@ -459,7 +471,7 @@ async fn send(
         Some(p) => {
             body["model"] = Value::String(target.model.clone());
             let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
-            state.subs.execute(p, Method::POST, path, headers, bytes, Some(principal), Some(model)).await
+            state.subs.execute(p, Method::POST, path, headers, bytes, Some(principal), Some(model), charge).await
         }
         None => state.gateway.execute(target, Method::POST, path, headers, body, client_id, model).await,
     }
@@ -651,9 +663,6 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
         Ok(x) => x,
         Err(r) => return r,
     };
-    if let Err(resp) = admit(&state, &principal, &[Meter::Total, Meter::Provider(provider)], rest.starts_with("v1/messages")) {
-        return resp;
-    }
     // Failover may resend the body, so it is always buffered here.
     let bytes = match (bytes, stream) {
         (Some(b), _) => b,
@@ -666,7 +675,15 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
     let path = path_and_query(&rest, &parts.uri);
     let fwd = forward_request_headers(&parts.headers);
     let label = model.map(|m| format!("{provider}/{m}"));
-    state.subs.execute(SubProvider::OpencodeGo, parts.method, &path, fwd, bytes, Some(&principal), label.as_deref()).await
+    // The pool counts the request with the account that serves it.
+    let meters = [Meter::Total, Meter::Provider(provider)];
+    if let Some(client) = principal.client_id()
+        && let Err(e) = state.limiter.check(client, &principal.policy, &meters, crate::db::now())
+    {
+        return limited(&principal, &e, rest.starts_with("v1/messages"));
+    }
+    let mut charge = Charge::new(&meters);
+    state.subs.execute(SubProvider::OpencodeGo, parts.method, &path, fwd, bytes, Some(&principal), label.as_deref(), &mut charge).await
 }
 
 #[cfg(test)]

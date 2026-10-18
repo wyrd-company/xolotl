@@ -155,6 +155,35 @@ pub enum Meter<'a> {
     Account(&'a str),
 }
 
+/// The meters a request still has to count on. A pool counts them together
+/// with the account that serves the request, so a request no account
+/// admits counts on none of them.
+#[derive(Debug, Default)]
+pub struct Charge<'a> {
+    meters: Vec<Meter<'a>>,
+    settled: bool,
+}
+
+impl<'a> Charge<'a> {
+    pub fn new(meters: &[Meter<'a>]) -> Self {
+        Charge { meters: meters.to_vec(), settled: false }
+    }
+
+    /// The meters to count with the first account the request reaches.
+    pub fn pending(&self) -> &[Meter<'a>] {
+        if self.settled { &[] } else { &self.meters }
+    }
+
+    /// The request was counted on the meters.
+    pub fn settle(&mut self) {
+        self.settled = true;
+    }
+
+    pub fn is_settled(&self) -> bool {
+        self.settled
+    }
+}
+
 impl Meter<'_> {
     fn describe(&self) -> Option<String> {
         match self {
@@ -365,9 +394,10 @@ impl Limiter {
         Ok(())
     }
 
-    /// Whether a request on `meter` would be admitted, without counting it.
-    pub fn check(&self, client_id: &str, policy: &Policy, meter: Meter, now: i64) -> Result<(), Exceeded> {
-        check(&mut self.clients.lock(), client_id, policy, &meter, now)
+    /// Whether a request on every meter would be admitted, without counting it.
+    pub fn check(&self, client_id: &str, policy: &Policy, meters: &[Meter], now: i64) -> Result<(), Exceeded> {
+        let mut clients = self.clients.lock();
+        meters.iter().try_for_each(|meter| check(&mut clients, client_id, policy, meter, now))
     }
 
     /// Count the tokens of a finished request, on its provider and account.
@@ -562,8 +592,8 @@ mod tests {
         // Tokens count on the provider and the account that served them.
         l.admit("p/a", &p, &[Meter::Account("codex-a1")], T0).unwrap();
         l.record_tokens("p/a", "codex", Some("codex-a1"), 10, T0);
-        assert!(l.check("p/b", &p, Meter::Account("codex-a1"), T0).is_err());
-        assert!(l.check("p/b", &p, Meter::Account("codex-b2"), T0).is_ok());
+        assert!(l.check("p/b", &p, &[Meter::Account("codex-a1")], T0).is_err());
+        assert!(l.check("p/b", &p, &[Meter::Account("codex-b2")], T0).is_ok());
         assert_eq!(l.policy_consumption("p", Meter::Provider("codex"), T0).tokens_per_day, 10);
         assert_eq!(l.policy_consumption("p", Meter::Account("codex-a1"), T0).requests_per_day, 1);
         assert_eq!(l.policy_consumption("p", Meter::Total, T0).tokens_per_day, 10);
