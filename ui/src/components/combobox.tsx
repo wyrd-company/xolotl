@@ -1,6 +1,7 @@
 import { useId, useState } from "react";
 
 import { Input } from "@/components/ui/input";
+import { highlighted, suggestions } from "@/lib/suggest";
 import { cn } from "@/lib/utils";
 
 /**
@@ -27,10 +28,12 @@ export function Combobox({
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const id = useId();
-  const q = value.trim().toLowerCase();
-  const shown = options.filter((o) => o !== value && (!q || o.toLowerCase().includes(q))).slice(0, 8);
+  const shown = suggestions(options, value);
+  // The list changes under a kept index: after a pick, or new options.
+  const at = highlighted(active, shown);
   const pick = (o: string) => {
     onChange(o);
+    setActive(0);
     setOpen(false);
   };
 
@@ -46,7 +49,10 @@ export function Combobox({
         className="h-8 w-full font-mono text-xs"
         placeholder={placeholder}
         value={value}
-        onFocus={() => setOpen(true)}
+        onFocus={() => {
+          setActive(0);
+          setOpen(true);
+        }}
         // Let a click on an option land before the list closes.
         onBlur={() => setTimeout(() => setOpen(false), 120)}
         onChange={(e) => {
@@ -56,9 +62,9 @@ export function Combobox({
         }}
         onKeyDown={(e) => {
           if (!open || shown.length === 0) return;
-          if (e.key === "ArrowDown") setActive((a) => Math.min(a + 1, shown.length - 1));
-          else if (e.key === "ArrowUp") setActive((a) => Math.max(a - 1, 0));
-          else if (e.key === "Enter") pick(shown[active]);
+          if (e.key === "ArrowDown") setActive(Math.min(at + 1, shown.length - 1));
+          else if (e.key === "ArrowUp") setActive(Math.max(at - 1, 0));
+          else if (e.key === "Enter") pick(shown[at]);
           else if (e.key === "Escape") setOpen(false);
           else return;
           e.preventDefault();
@@ -70,8 +76,8 @@ export function Combobox({
             <li
               key={o}
               role="option"
-              aria-selected={i === active}
-              className={cn("cursor-pointer px-2 py-1 font-mono text-xs", i === active && "bg-accent")}
+              aria-selected={i === at}
+              className={cn("cursor-pointer px-2 py-1 font-mono text-xs", i === at && "bg-accent")}
               onMouseEnter={() => setActive(i)}
               onMouseDown={(e) => {
                 e.preventDefault();
