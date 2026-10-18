@@ -1455,4 +1455,14 @@ async fn an_account_filled_since_its_check_is_passed_over() {
     assert!(chosen.is_none() && limited.is_some_and(|e| e.retry_after > 0), "the refusal says when to retry");
     assert!(!charge.is_settled());
     assert_eq!(limiter.consumption("p/client", now()).requests_per_day, 1, "nothing counted");
+
+    // A limit of a pending meter holds on every account: refused at once.
+    for _ in 0..4 {
+        limiter.admit("p/client", &key.policy, &[Meter::Total], now()).unwrap();
+    }
+    let mut charge = Charge::new(&[Meter::Total]);
+    let mut limited = None;
+    let e = subs.admit_one(SubProvider::Codex, None, Some(&key), candidates(), &mut charge, &mut limited).unwrap_err();
+    assert!(e.is_on(Meter::Total), "{e:?}");
+    assert_eq!(limiter.policy_consumption("p", Meter::Account(&b.id), now()).requests_per_minute, 1, "b not counted again");
 }
