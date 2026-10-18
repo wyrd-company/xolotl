@@ -82,6 +82,8 @@ pub struct RequestRecord {
 #[derive(Debug, Clone, FromRow)]
 pub struct RequestCount {
     pub client_id: String,
+    pub provider: String,
+    pub account_id: Option<String>,
     pub ts: i64,
     pub requests: i64,
     pub tokens: i64,
@@ -417,13 +419,13 @@ impl Db {
     /// without an admission time count the request at completion.
     pub async fn request_counts_since(&self, since: i64) -> Result<Vec<RequestCount>> {
         Ok(sqlx::query_as(
-            "SELECT client_id, COALESCE(started_at, ts) AS ts, COUNT(*) AS requests, 0 AS tokens
+            "SELECT client_id, provider, account_id, COALESCE(started_at, ts) AS ts, COUNT(*) AS requests, 0 AS tokens
              FROM request_log WHERE COALESCE(started_at, ts) > ? AND client_id IS NOT NULL
-             GROUP BY client_id, COALESCE(started_at, ts)
+             GROUP BY client_id, provider, account_id, COALESCE(started_at, ts)
              UNION ALL
-             SELECT client_id, ts, 0 AS requests,
+             SELECT client_id, provider, account_id, ts, 0 AS requests,
                COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0) AS tokens
-             FROM request_log WHERE ts > ? AND client_id IS NOT NULL GROUP BY client_id, ts",
+             FROM request_log WHERE ts > ? AND client_id IS NOT NULL GROUP BY client_id, provider, account_id, ts",
         )
         .bind(since)
         .bind(since)

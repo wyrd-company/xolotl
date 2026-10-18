@@ -28,7 +28,8 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{Strategy, SubscriptionConfig};
 use crate::db::{AccountRow, AccountUsage, Db, UsageWindow, now};
-use crate::limits::Limiter;
+use crate::keys::Principal;
+use crate::limits::{Charge, Exceeded, Limiter, Meter};
 use crate::proxy::{self, Accounting};
 use crate::secrets::{Secrets, get_typed, put_typed};
 use crate::telemetry::metrics;
@@ -190,9 +191,35 @@ impl RefreshError {
     }
 }
 
+/// Whether a policy's `accounts` takes `*` or names an account of the pool.
+fn uses_any(policy: &crate::policy::Policy, provider: &str, rows: &[AccountRow]) -> bool {
+    policy.accounts.get(provider).is_some_and(|ids| ids.iter().any(|id| id == "*" || rows.iter().any(|r| &r.id == id)))
+}
+
+/// Keep the refusal that admits a request soonest.
+fn keep_soonest(limited: &mut Option<Exceeded>, e: Exceeded) {
+    if limited.as_ref().is_none_or(|l| e.retry_after < l.retry_after) {
+        *limited = Some(e);
+    }
+}
+
+/// An account meter followed by the meters a request still has to count on.
+fn with_account<'m>(id: &'m str, pending: &[Meter<'m>]) -> Vec<Meter<'m>> {
+    let mut m = vec![Meter::Account(id)];
+    m.extend_from_slice(pending);
+    m
+}
+
 enum SelectError {
     NoAccounts,
-    AllCooling { until: i64 },
+    /// The caller's policy uses none of the pool's accounts.
+    NotAllowed,
+    AllCooling {
+        until: i64,
+    },
+    /// Every usable account reached a limit of the caller's policy; the one
+    /// that admits a request soonest.
+    Limited(Exceeded),
 }
 
 /// Account view for the admin API / CLI.
@@ -609,19 +636,45 @@ impl Subscriptions {
 
     // ------------------------------------------------------------ selection
 
-    async fn select(&self, provider: SubProvider, session: Option<&str>, tried: &HashSet<String>) -> Result<AccountRow, SelectError> {
+    /// Choose an account for a request and count the request on it, with the
+    /// meters `charge` still has pending. An account at a limit of the
+    /// caller's policy is skipped, also when another request takes its last
+    /// slot in between.
+    async fn select(
+        &self,
+        provider: SubProvider,
+        principal: Option<&Principal>,
+        session: Option<&str>,
+        tried: &HashSet<String>,
+        charge: &mut Charge<'_>,
+    ) -> Result<AccountRow, SelectError> {
         let rows = self.db.list_accounts(Some(provider.as_str())).await.unwrap_or_default();
+        if principal.is_some_and(|p| !uses_any(&p.policy, provider.as_str(), &rows)) {
+            return Err(SelectError::NotAllowed);
+        }
+        let limiter = principal.and_then(|p| Some((p.client_id()?, &p.policy)));
+        let pending = charge.pending().to_vec();
         let t = now();
         let loaded: HashSet<String> = self.creds.read().keys().cloned().collect();
         let mut earliest: Option<i64> = None;
+        let mut limited: Option<Exceeded> = None;
         let mut candidates = Vec::new();
         for r in rows {
+            if principal.is_some_and(|p| !p.policy.allows_account(provider.as_str(), &r.id)) {
+                continue;
+            }
             if !r.enabled || r.auth_failed || !loaded.contains(&r.id) || tried.contains(&r.id) {
                 continue;
             }
             if r.cooling_down(t) {
                 let u = r.cooldown_until.unwrap_or(t);
                 earliest = Some(earliest.map_or(u, |e| e.min(u)));
+                continue;
+            }
+            if let Some((client, policy)) = limiter
+                && let Err(e) = self.limiter.check(client, policy, &with_account(&r.id, &pending), t)
+            {
+                keep_soonest(&mut limited, e);
                 continue;
             }
             let max_used = self
@@ -634,23 +687,64 @@ impl Subscriptions {
                 .unwrap_or(0.0);
             candidates.push((r, max_used));
         }
-        if candidates.is_empty() {
-            return Err(match earliest {
-                Some(until) => SelectError::AllCooling { until },
-                None => SelectError::NoAccounts,
-            });
+        match self.admit_one(provider, session, principal, candidates, charge, &mut limited) {
+            Ok(Some(chosen)) => Ok(chosen),
+            Ok(None) => Err(match (limited, earliest) {
+                (Some(e), Some(until)) if until - t < e.retry_after => SelectError::AllCooling { until },
+                (Some(e), _) => SelectError::Limited(e),
+                (None, Some(until)) => SelectError::AllCooling { until },
+                (None, None) => SelectError::NoAccounts,
+            }),
+            Err(e) => Err(SelectError::Limited(e)),
         }
+    }
 
+    /// Choose one of `candidates` and count the request on it, with the
+    /// meters `charge` has pending. A candidate whose last slot another
+    /// request took since it was checked is passed over, its refusal kept in
+    /// `limited`; `None` when every candidate was. A limit of a pending meter
+    /// refuses the request on every account.
+    fn admit_one(
+        &self,
+        provider: SubProvider,
+        session: Option<&str>,
+        principal: Option<&Principal>,
+        mut candidates: Vec<(AccountRow, f64)>,
+        charge: &mut Charge<'_>,
+        limited: &mut Option<Exceeded>,
+    ) -> Result<Option<AccountRow>, Exceeded> {
+        let pending = charge.pending().to_vec();
+        while !candidates.is_empty() {
+            let chosen = candidates.remove(self.choose(provider, session, &candidates)).0;
+            if let Some(p) = principal
+                && let Some(client) = p.client_id()
+            {
+                match self.limiter.admit(client, &p.policy, &with_account(&chosen.id, &pending), now()) {
+                    Ok(()) => {}
+                    Err(e) if e.is_on(Meter::Account(&chosen.id)) => {
+                        keep_soonest(limited, e);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            charge.settle();
+            return Ok(Some(chosen));
+        }
+        Ok(None)
+    }
+
+    /// The index of the candidate to serve the next request.
+    fn choose(&self, provider: SubProvider, session: Option<&str>, candidates: &[(AccountRow, f64)]) -> usize {
         // Session affinity keeps prompt caches warm and avoids replaying
         // encrypted reasoning to a different account.
         if let Some(s) = session.filter(|_| self.cfg.session_affinity_secs > 0) {
             let ttl = Duration::from_secs(self.cfg.session_affinity_secs);
             let pinned = self.affinity.lock().get(s).filter(|(_, at)| at.elapsed() < ttl).map(|(id, _)| id.clone());
             if let Some(id) = pinned
-                && let Some((r, used)) = candidates.iter().find(|(r, _)| r.id == id)
-                && *used < self.cfg.soft_limit_percent
+                && let Some(i) = candidates.iter().position(|(r, used)| r.id == id && *used < self.cfg.soft_limit_percent)
             {
-                return Ok(r.clone());
+                return i;
             }
         }
 
@@ -658,22 +752,21 @@ impl Subscriptions {
         let soft = self.cfg.soft_limit_percent;
         let tier = |(r, used): &(AccountRow, f64)| (*used >= soft, -r.priority);
         let best = candidates.iter().map(tier).min().expect("non-empty");
-        let mut group: Vec<(AccountRow, f64)> = candidates.into_iter().filter(|c| tier(c) == best).collect();
-        let chosen = match self.cfg.strategy {
-            Strategy::FillFirst => group.swap_remove(0).0,
+        let group: Vec<usize> = (0..candidates.len()).filter(|&i| tier(&candidates[i]) == best).collect();
+        match self.cfg.strategy {
+            Strategy::FillFirst => group[0],
+            // The first of the least used.
             Strategy::LeastUsed => {
-                group.sort_by(|a, b| a.1.total_cmp(&b.1));
-                group.swap_remove(0).0
+                group.into_iter().reduce(|a, b| if candidates[b].1 < candidates[a].1 { b } else { a }).expect("non-empty")
             }
             Strategy::RoundRobin => {
                 let mut rr = self.rr.lock();
                 let n = rr.entry(provider).or_insert(0);
                 let idx = *n % group.len();
                 *n = n.wrapping_add(1);
-                group.swap_remove(idx).0
+                group[idx]
             }
-        };
-        Ok(chosen)
+        }
     }
 
     fn pin_session(&self, session: Option<&str>, account: &str) {
@@ -710,7 +803,9 @@ impl Subscriptions {
     }
 
     /// Proxy one request through the provider's account pool, failing over
-    /// between accounts on quota, auth and transient errors.
+    /// between accounts on quota, auth and transient errors. The request
+    /// counts on the meters `charge` has pending together with the first
+    /// account that admits it.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
@@ -719,9 +814,11 @@ impl Subscriptions {
         path: &str,
         headers: HeaderMap,
         body: Bytes,
-        client_id: Option<&str>,
+        principal: Option<&Principal>,
         model: Option<&str>,
+        charge: &mut Charge<'_>,
     ) -> Response {
+        let client_id = principal.and_then(Principal::client_id);
         let ep = &self.cfg.endpoints;
         let url = match provider {
             SubProvider::Codex => codex::upstream_url(ep, path),
@@ -745,9 +842,26 @@ impl Subscriptions {
         let mut last: Option<(u16, reqwest::header::HeaderMap, Bytes, String)> = None;
 
         'accounts: for _ in 0..self.cfg.max_attempts {
-            let account = match self.select(provider, session.as_deref(), &tried).await {
+            let account = match self.select(provider, principal, session.as_deref(), &tried, charge).await {
                 Ok(a) => a,
                 Err(_) if last.is_some() => break,
+                Err(SelectError::NotAllowed) => {
+                    accounting.finish(403, Default::default());
+                    return self.error_for(
+                        provider,
+                        path,
+                        StatusCode::FORBIDDEN,
+                        "permission_error",
+                        &format!("this key's policy uses no {provider} account"),
+                    );
+                }
+                Err(SelectError::Limited(e)) => {
+                    accounting.finish(429, Default::default());
+                    let policy = principal.map(|p| p.policy.name.as_str()).unwrap_or_default();
+                    let mut resp = self.error_for(provider, path, StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &e.message(policy));
+                    resp.headers_mut().insert(axum::http::header::RETRY_AFTER, e.retry_after.into());
+                    return resp;
+                }
                 Err(SelectError::NoAccounts) => {
                     accounting.finish(503, Default::default());
                     return self.error_for(
@@ -764,6 +878,9 @@ impl Subscriptions {
                 }
             };
             tried.insert(account.id.clone());
+            // The account admitted the request: the log row names it, so
+            // replaying the log counts the request as admission did.
+            accounting.record.account_id = Some(account.id.clone());
             let mut force: Option<String> = None;
             loop {
                 let cred = match self.credential(&account.id, force.as_deref()).await {

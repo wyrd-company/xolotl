@@ -2,13 +2,18 @@ import assert from "node:assert/strict";
 import { test } from "vitest";
 
 import {
+  accountProvider,
   aliasesReaching,
+  allowsAccount,
   globMatch,
   providerHealth,
-  rulesAllow,
-  setAllowed,
-  withoutTarget,
+  decide,
+  isOverride,
+  matching,
+  move,
+  setToggles,
   sortRows,
+  switchOf,
   usable,
   type Candidate,
 } from "../src/lib/policy-models.ts";
@@ -30,48 +35,37 @@ test("globMatch follows the server's globs", () => {
   assert.ok(!globMatch("kimi", "kimi-k3"));
 });
 
-test("rulesAllow: deny wins, an empty allow list allows all", () => {
+test("decide: the first matching rule, then the switch, then the default", () => {
   const m = { provider: "opencode-go", model: "kimi-k3" };
-  assert.ok(rulesAllow({ allow: [], deny: [] }, m));
-  assert.ok(!rulesAllow({ allow: ["kimi-*"], deny: ["opencode-go/*"] }, m));
-  assert.ok(rulesAllow({ allow: ["opencode-go/*"], deny: [] }, m));
-  assert.ok(!rulesAllow({ allow: ["claude-*"], deny: [] }, m));
+  const allow = (pattern: string) => ({ pattern, allow: true });
+  const deny = (pattern: string) => ({ pattern, allow: false });
+  const rules = (list: { pattern: string; allow: boolean }[], models: Record<string, boolean> = {}, denyOther = false) => ({ rules: list, models, denyOther });
+  assert.deepEqual(decide(rules([]), m), { allowed: true });
+  assert.deepEqual(decide(rules([allow("claude-*")], {}, true), m), { allowed: false }, "every other model: off");
+  assert.deepEqual(decide(rules([allow("claude-*")]), m), { allowed: true }, "an allow rule doesn't turn other models off");
+  assert.deepEqual(decide(rules([], { "opencode-go/kimi-k3": true }, true), m), { allowed: true }, "switched on");
+  assert.deepEqual(decide(rules([], { "opencode-go/kimi-k3": false }), m), { allowed: false }, "switched off");
+  assert.deepEqual(decide(rules([allow("kimi-*")], { "opencode-go/kimi-k3": false }), m), {
+    allowed: true,
+    rule: { index: 0, allow: true, pattern: "kimi-*" },
+  });
+  assert.deepEqual(decide(rules([deny(" "), allow("kimi-*"), deny("opencode-go/*")]), m).rule, { index: 1, allow: true, pattern: "kimi-*" }, "first wins");
+  assert.deepEqual(decide(rules([deny("opencode-go/*"), allow("kimi-*")]), m).rule, { index: 0, allow: false, pattern: "opencode-go/*" });
+  assert.equal(switchOf(rules([deny("*")], { "opencode-go/kimi-k3": true }), m), true, "a masked switch keeps its value");
+  assert.ok(isOverride(" opencode-go/kimi-k3 ", m));
+  assert.ok(!isOverride("kimi-k3", m), "a bare model name is not an override: it matches every provider");
+  assert.deepEqual(move(["a", "b", "c"], 2, -1), ["a", "c", "b"]);
+  assert.deepEqual(move(["a", "b"], 0, -1), ["a", "b"]);
 });
 
-test("turning a model off denies it and never empties the allow list", () => {
-  const off = setAllowed({ allow: [], deny: [] }, [row("codex", "gpt-6")], false);
-  assert.deepEqual(off, { allow: [], deny: ["codex/gpt-6"] });
-
-  // The only allow entry stays, so the list doesn't become "allow all".
-  const only = setAllowed({ allow: ["codex/gpt-6"], deny: [] }, [row("codex", "gpt-6")], false);
-  assert.deepEqual(only, { allow: ["codex/gpt-6"], deny: ["codex/gpt-6"] });
-
-  // One of several exact entries is just removed.
-  const many = setAllowed({ allow: ["codex/gpt-6", "claude-*"], deny: [] }, [row("codex", "gpt-6")], false);
-  assert.deepEqual(many, { allow: ["claude-*"], deny: [] });
-
-  // Still matched by an allow glob: deny it.
-  const glob = setAllowed({ allow: ["codex/*", "codex/gpt-6"], deny: [] }, [row("codex", "gpt-6")], false);
-  assert.deepEqual(glob, { allow: ["codex/*"], deny: ["codex/gpt-6"] });
-});
-
-test("turning a model on removes its deny entry and adds it to a non-empty allow list", () => {
-  const denied = row("codex", "gpt-6", false);
-  assert.deepEqual(setAllowed({ allow: [], deny: ["codex/gpt-6", "*-preview"] }, [denied], true), { allow: [], deny: ["*-preview"] });
-  assert.deepEqual(setAllowed({ allow: ["claude-*"], deny: [] }, [denied], true), { allow: ["claude-*", "codex/gpt-6"], deny: [] });
-  assert.deepEqual(setAllowed({ allow: ["codex/*"], deny: ["codex/gpt-6"] }, [denied], true), { allow: ["codex/*"], deny: [] });
-});
-
-test("rows already in the wanted state are left alone", () => {
-  const rules = { allow: ["claude-*"], deny: ["x"] };
-  assert.deepEqual(setAllowed(rules, [row("codex", "gpt-6"), row("claude", "claude-opus-5")], true), rules);
-  assert.deepEqual(setAllowed(rules, [row("codex", "gpt-6", false)], false), rules);
-});
-
-test("bulk changes apply to every row", () => {
-  const rows = [row("codex", "a"), row("codex", "b"), row("claude", "c", false)];
-  assert.deepEqual(setAllowed({ allow: [], deny: ["claude/c"] }, rows, false), { allow: [], deny: ["claude/c", "codex/a", "codex/b"] });
-  assert.deepEqual(setAllowed({ allow: [], deny: ["claude/c"] }, rows, true), { allow: [], deny: [] });
+test("setToggles writes toggles only", () => {
+  const rows = [row("codex", "a"), row("codex", "b")];
+  assert.deepEqual(setToggles({ "claude/c": true }, rows, false), { "claude/c": true, "codex/a": false, "codex/b": false });
+  assert.deepEqual(
+    matching("codex/*", [...rows, row("claude", "c")]).map((c) => c.model),
+    ["a", "b"],
+  );
+  assert.deepEqual(matching("", rows), []);
 });
 
 test("default sort puts allowed models first, then by name", () => {
@@ -85,9 +79,9 @@ test("default sort puts allowed models first, then by name", () => {
 test("provider health counts available accounts and gateway keys", () => {
   const pools = ["codex", "opencode-go"];
   const accounts = [
-    { provider: "codex", available: true },
-    { provider: "codex", available: false },
-    { provider: "opencode-go", available: false },
+    { id: "codex-a1", provider: "codex", available: true },
+    { id: "codex-b2", provider: "codex", available: false },
+    { id: "opencode-go-c3", provider: "opencode-go", available: false },
   ];
   const gateway = [
     { name: "vercel", has_key: false, no_auth: false },
@@ -103,18 +97,30 @@ test("provider health counts available accounts and gateway keys", () => {
     ["codex", "opencode-go", "vercel", "llama"].map((p) => usable(h(p))),
     [true, false, false, true],
   );
+  // Only the accounts the policy uses count.
+  assert.deepEqual(providerHealth("codex", pools, accounts, gateway, { codex: ["codex-b2"] }), { kind: "pool", total: 1, available: 0 });
+  assert.deepEqual(providerHealth("codex", pools, accounts, gateway, { codex: ["*"] }), { kind: "pool", total: 2, available: 1 });
+});
+
+test("policy accounts: entries, * and account ids", () => {
+  assert.equal(allowsAccount({}, "codex", "codex-a1"), false, "no entry: no account");
+  assert.equal(allowsAccount({ codex: ["codex-a1"] }, "codex", "codex-b2"), false);
+  assert.equal(allowsAccount({ codex: ["*"] }, "codex", "codex-new"), true);
+  const pools = ["codex", "opencode-go"];
+  assert.equal(accountProvider("opencode-go-c3", pools), "opencode-go");
+  assert.equal(accountProvider("codex-", pools), undefined);
+  assert.equal(accountProvider("llama-a1", pools), undefined);
 });
 
 test("aliasesReaching finds first targets and fallbacks", () => {
   const aliases = [
-    { name: "short", targets: "codex/a" },
-    { name: "fast", targets: "codex/b, codex/a" },
-    { name: "other", targets: "codex/b" },
-    { name: "near", targets: "codex/aa" },
+    { name: "short", targets: ["codex/a"] },
+    { name: "fast", targets: ["codex/b", "codex/a"] },
+    { name: "other", targets: ["codex/b"] },
+    { name: "near", targets: ["codex/aa"] },
   ];
   assert.deepEqual(aliasesReaching(aliases, "codex/a"), [
     { index: 0, name: "short", fallback: false },
     { index: 1, name: "fast", fallback: true },
   ]);
-  assert.equal(withoutTarget("codex/b, codex/a ,codex/c", "codex/a"), "codex/b, codex/c");
 });

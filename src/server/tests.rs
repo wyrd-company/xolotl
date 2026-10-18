@@ -12,7 +12,7 @@ use super::*;
 use crate::config::{CatalogConfig, Endpoints, GatewayConfig, ProviderConfig, ProviderKind};
 use crate::db::now;
 use crate::keys::IssueRequest;
-use crate::limits::Limits;
+use crate::limits::{Limits, Meter};
 use crate::policy::{AliasTargets, Policy};
 use crate::secrets::MemoryStore;
 use crate::subscription::{Credential, auth_index};
@@ -84,7 +84,12 @@ async fn harness_with_secrets(tweak: impl FnOnce(&mut Config), secrets: Secrets)
 }
 
 fn policy(name: &str) -> Policy {
-    Policy { name: name.into(), providers: vec!["*".into()], ..Default::default() }
+    Policy { name: name.into(), providers: vec!["*".into()], accounts: every_account(), ..Default::default() }
+}
+
+/// Every account of every pool.
+fn every_account() -> BTreeMap<String, Vec<String>> {
+    SubProvider::ALL.iter().map(|p| (p.as_str().to_string(), vec!["*".to_string()])).collect()
 }
 
 impl Harness {
@@ -441,7 +446,14 @@ async fn responses_route_to_codex_pool_and_websocket_gets_426() {
         .respond_with(ResponseTemplate::new(200).set_body_raw("data: {\"type\":\"response.completed\"}\n\n", "text/event-stream"))
         .mount(&h.upstream)
         .await;
-    let key = h.key(Policy { name: "codex".into(), providers: vec!["codex".into()], ..Default::default() }).await;
+    let key = h
+        .key(Policy {
+            name: "codex".into(),
+            providers: vec!["codex".into()],
+            accounts: BTreeMap::from([("codex".into(), vec!["*".into()])]),
+            ..Default::default()
+        })
+        .await;
     let (status, body) = h.call("POST", "/v1/responses", Some(&key), Some(json!({"model": "gpt-6-codex", "input": []}))).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(h.call("GET", "/v1/responses", Some(&key), None).await.0, 426);
@@ -636,6 +648,50 @@ async fn policy_limits_answer_429_in_the_endpoint_shape() {
 }
 
 #[tokio::test]
+async fn provider_limits_skip_to_the_next_alias_target() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path("/llama/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 1}})),
+        )
+        .expect(1)
+        .mount(&h.upstream)
+        .await;
+    let mut limits = Limits::default();
+    limits.providers.insert("llama".into(), crate::limits::Allowance { requests_per_minute: Some(1), ..Default::default() });
+    let mut p = Policy { limits, ..policy("prov") };
+    p.aliases.insert("fast".into(), crate::policy::AliasTargets::Many(vec!["llama/qwen3".into(), "codex/gpt-6-codex".into()]));
+    let key = h.key(p).await;
+    let chat = |model: &str| json!({"model": model, "messages": []});
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat("fast"))).await.0, 200);
+    // llama is at its limit: the alias goes on to codex, which has no accounts here.
+    let (status, body) = h.call("POST", "/v1/chat/completions", Some(&key), Some(chat("fast"))).await;
+    assert_eq!(status, 503, "{body}");
+    let (status, body) = h.call("POST", "/v1/chat/completions", Some(&key), Some(chat("llama/qwen3"))).await;
+    assert_eq!(status, 429, "{body}");
+    assert!(body["error"]["message"].as_str().unwrap().contains("on provider \"llama\""), "{body}");
+    // A request counts once in total; one that reaches no account and the
+    // refused one do not count.
+    assert_eq!(h.state.limiter.consumption("prov/client", now()).requests_per_minute, 1);
+
+    let (_, view) = h.call("GET", "/admin/policies/prov/view", Some(&h.admin), None).await;
+    assert_eq!(view["provider_usage"]["llama"]["requests_per_minute"], 1, "{view}");
+
+    // Limits name providers and accounts the policy uses.
+    for (limits, why) in [
+        (json!({"providers": {"nope": {"requests_per_day": 1}}}), "unknown provider"),
+        (json!({"accounts": {"codex-x1": {"requests_per_day": 1}}}), "does not use account"),
+        (json!({"accounts": {"x1": {"requests_per_day": 1}}}), "not an account id"),
+    ] {
+        let p = json!({"name": "bad", "providers": ["llama", "codex"], "accounts": {"codex": ["codex-y2"]}, "limits": limits});
+        let (status, body) = h.call("PUT", "/admin/policies/bad", Some(&h.admin), Some(p)).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body["error"]["message"].as_str().unwrap().contains(why), "{why}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn chat_streams_report_usage_for_token_limits() {
     let h = harness().await;
     // A conforming upstream sends usage only when asked to.
@@ -725,7 +781,7 @@ async fn admin_policies_keys_and_accounts() {
 
     // The preview lists denied models too, with the name each one is served under.
     let draft = json!({
-        "name": "dev", "providers": ["claude", "opencode-go"], "deny_models": ["opencode-go/kimi-k3"],
+        "name": "dev", "providers": ["claude", "opencode-go"], "rules": [{"deny": "opencode-go/kimi-k3"}],
         "renames": {"claude/claude-opus-5": "opus"},
     });
     let (status, view) = h.call("POST", "/admin/policy-preview", Some(&h.admin), Some(draft)).await;
@@ -2359,4 +2415,45 @@ async fn api_key_import_waits_for_replacement_before_deduplicating() {
     };
     assert_eq!(imported.id, id);
     assert_eq!(h.state.secrets.list("accounts/opencode-go").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_request_no_account_admits_counts_nowhere() {
+    let h = harness().await;
+    let id = h.codex_account().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("data: {\"type\":\"response.completed\"}\n\n", "text/event-stream"))
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/llama/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"choices": []})))
+        .mount(&h.upstream)
+        .await;
+    let one = crate::limits::Allowance { requests_per_minute: Some(1), ..Default::default() };
+    let mut limits = Limits { requests_per_day: Some(3), ..Default::default() };
+    limits.accounts.insert(id.clone(), one);
+    let key = h.key(Policy { limits, ..policy("acct") }).await;
+    let responses = json!({"model": "gpt-6-codex", "input": []});
+    assert_eq!(h.call("POST", "/v1/responses", Some(&key), Some(responses.clone())).await.0, 200);
+    let (status, body) = h.call("POST", "/v1/responses", Some(&key), Some(responses.clone())).await;
+    assert_eq!(status, 429, "the only account is at its limit: {body}");
+    // The opencode-go passthrough reaches no account either.
+    assert_eq!(h.call("GET", "/opencode-go/v1/models", Some(&key), None).await.0, 503);
+    let c = h.state.limiter.consumption("acct/client", now());
+    assert_eq!(c.requests_per_day, 1, "refused in the pool: not counted in total");
+    let p = h.state.limiter.policy_consumption("acct", Meter::Provider("codex"), now());
+    assert_eq!(p.requests_per_day, 1, "nor on the provider");
+    // A restart replays the log as admission counted it.
+    let replayed = crate::limits::Limiter::default();
+    replayed.seed(&h.state.db, now()).await.unwrap();
+    let c = replayed.consumption("acct/client", now());
+    let p = replayed.policy_consumption("acct", Meter::Provider("codex"), now());
+    assert_eq!((c.requests_per_day, p.requests_per_day), (1, 1), "replayed");
+    // So another provider still has the rest of the daily allowance.
+    let chat = json!({"model": "llama/qwen3", "messages": []});
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat.clone())).await.0, 200);
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat.clone())).await.0, 200);
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat)).await.0, 429);
 }
