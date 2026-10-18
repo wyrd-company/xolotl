@@ -358,10 +358,13 @@ fn in_policy(client_id: &str, policy: &str) -> bool {
 impl Limiter {
     /// Rebuild the counters from the request log of the last day. Each
     /// logged request counts on the provider and the account that answered it.
+    /// A pool request without an account was refused before any account
+    /// admitted it, so it counts nowhere, as it did live.
     pub async fn seed(&self, db: &Db, now: i64) -> anyhow::Result<usize> {
         let rows = db.request_counts_since(now - DAY).await?;
         let mut clients = self.clients.lock();
-        for RequestCount { client_id, provider, account_id, ts, requests, tokens } in &rows {
+        let refused = |r: &RequestCount| r.account_id.is_none() && r.provider.parse::<crate::subscription::SubProvider>().is_ok();
+        for RequestCount { client_id, provider, account_id, ts, requests, tokens } in rows.iter().filter(|r| !refused(r)) {
             clients.entry(client_id.clone()).or_default().add(
                 provider,
                 account_id.as_deref(),
@@ -677,6 +680,7 @@ mod tests {
             db.log_request(&crate::db::RequestRecord {
                 client_id: client.map(str::to_string),
                 provider: "codex".into(),
+                account_id: Some("codex-a1".into()),
                 endpoint: "/v1/responses".into(),
                 status: 200,
                 input_tokens: input,
@@ -710,6 +714,7 @@ mod tests {
         // Accounting starts with the request, so it records the admission time.
         assert!(acc.record.started_at.is_some_and(|t| (now..=now + 1).contains(&t)));
         acc.record.started_at = Some(now - 61);
+        acc.record.account_id = Some("codex-a1".into());
         acc.finish(200, crate::proxy::TokenUsage { input: Some(5), output: Some(3), cached: None });
         for _ in 0..50 {
             if !db.request_counts_since(0).await.unwrap().is_empty() {

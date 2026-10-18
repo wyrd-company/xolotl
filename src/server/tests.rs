@@ -2445,6 +2445,12 @@ async fn a_request_no_account_admits_counts_nowhere() {
     assert_eq!(c.requests_per_day, 1, "refused in the pool: not counted in total");
     let p = h.state.limiter.policy_consumption("acct", Meter::Provider("codex"), now());
     assert_eq!(p.requests_per_day, 1, "nor on the provider");
+    // A restart replays the log as admission counted it.
+    let replayed = crate::limits::Limiter::default();
+    replayed.seed(&h.state.db, now()).await.unwrap();
+    let c = replayed.consumption("acct/client", now());
+    let p = replayed.policy_consumption("acct", Meter::Provider("codex"), now());
+    assert_eq!((c.requests_per_day, p.requests_per_day), (1, 1), "replayed");
     // So another provider still has the rest of the daily allowance.
     let chat = json!({"model": "llama/qwen3", "messages": []});
     assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat.clone())).await.0, 200);
