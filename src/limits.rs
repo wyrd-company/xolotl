@@ -223,6 +223,11 @@ pub struct Exceeded {
 }
 
 impl Exceeded {
+    /// Whether the limit reached is one of `meter`.
+    pub fn is_on(&self, meter: Meter) -> bool {
+        self.on == meter.describe()
+    }
+
     pub fn message(&self, policy: &str) -> String {
         let whose = match self.per {
             Counting::Key => "this key".to_string(),

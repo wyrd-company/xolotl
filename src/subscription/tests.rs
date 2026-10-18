@@ -1405,7 +1405,7 @@ async fn concurrent_requests_past_an_account_limit_get_429() {
     let mut p = any_policy();
     p.limits.accounts.insert(a.id.clone(), crate::limits::Allowance { requests_per_minute: Some(1), ..Default::default() });
     let key = Arc::new(principal(p));
-    // Released together, so several pass the limit check before one is admitted.
+    // Released together.
     let start = Arc::new(tokio::sync::Barrier::new(16));
     let tasks: Vec<_> = (0..16)
         .map(|_| {
@@ -1421,4 +1421,38 @@ async fn concurrent_requests_past_an_account_limit_get_429() {
     let limited: Vec<_> = results.iter().filter(|r| r.0 == 429).collect();
     assert_eq!((ok, limited.len()), (1, 15), "{results:?}");
     assert!(limited.iter().all(|r| r.2.is_some()), "every refusal says when to retry");
+}
+
+#[tokio::test]
+async fn an_account_filled_since_its_check_is_passed_over() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let limiter = Arc::new(crate::limits::Limiter::default());
+    let subs = Arc::try_unwrap(subs).ok().unwrap().with_limiter(limiter.clone());
+    let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
+    let b = subs.save_account(codex_cred("acct-b", "tok-b")).await.unwrap();
+    subs.db.set_account_priority(&a.id, 10).await.unwrap();
+    let mut p = any_policy();
+    p.limits.requests_per_day = Some(5);
+    p.limits.accounts.insert(a.id.clone(), crate::limits::Allowance { requests_per_minute: Some(1), ..Default::default() });
+    let key = principal(p);
+    let rows = subs.db.list_accounts(Some("codex")).await.unwrap();
+    let candidates = || rows.iter().map(|r| (r.clone(), 0.0)).collect::<Vec<_>>();
+    // Another request takes a's last slot after a passed its check.
+    limiter.admit("p/client", &key.policy, &[Meter::Account(&a.id)], now()).unwrap();
+
+    let mut charge = Charge::new(&[Meter::Total]);
+    let mut limited = None;
+    let chosen = subs.admit_one(SubProvider::Codex, None, Some(&key), candidates(), &mut charge, &mut limited).unwrap();
+    assert_eq!(chosen.map(|r| r.id), Some(b.id.clone()), "a is passed over");
+    assert!(charge.is_settled() && limited.as_ref().is_some_and(|e| e.is_on(Meter::Account(&a.id))));
+    assert_eq!(limiter.consumption("p/client", now()).requests_per_day, 1, "counted in total with b");
+
+    let only_a: Vec<_> = candidates().into_iter().filter(|(r, _)| r.id == a.id).collect();
+    let mut charge = Charge::new(&[Meter::Total]);
+    let mut limited = None;
+    let chosen = subs.admit_one(SubProvider::Codex, None, Some(&key), only_a, &mut charge, &mut limited).unwrap();
+    assert!(chosen.is_none() && limited.is_some_and(|e| e.retry_after > 0), "the refusal says when to retry");
+    assert!(!charge.is_settled());
+    assert_eq!(limiter.consumption("p/client", now()).requests_per_day, 1, "nothing counted");
 }

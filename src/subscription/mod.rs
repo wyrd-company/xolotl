@@ -196,6 +196,13 @@ fn uses_any(policy: &crate::policy::Policy, provider: &str, rows: &[AccountRow])
     policy.accounts.get(provider).is_some_and(|ids| ids.iter().any(|id| id == "*" || rows.iter().any(|r| &r.id == id)))
 }
 
+/// Keep the refusal that admits a request soonest.
+fn keep_soonest(limited: &mut Option<Exceeded>, e: Exceeded) {
+    if limited.as_ref().is_none_or(|l| e.retry_after < l.retry_after) {
+        *limited = Some(e);
+    }
+}
+
 /// An account meter followed by the meters a request still has to count on.
 fn with_account<'m>(id: &'m str, pending: &[Meter<'m>]) -> Vec<Meter<'m>> {
     let mut m = vec![Meter::Account(id)];
@@ -651,11 +658,6 @@ impl Subscriptions {
         let loaded: HashSet<String> = self.creds.read().keys().cloned().collect();
         let mut earliest: Option<i64> = None;
         let mut limited: Option<Exceeded> = None;
-        let note = |e: Exceeded, limited: &mut Option<Exceeded>| {
-            if limited.as_ref().is_none_or(|l| e.retry_after < l.retry_after) {
-                *limited = Some(e);
-            }
-        };
         let mut candidates = Vec::new();
         for r in rows {
             if principal.is_some_and(|p| !p.policy.allows_account(provider.as_str(), &r.id)) {
@@ -672,7 +674,7 @@ impl Subscriptions {
             if let Some((client, policy)) = limiter
                 && let Err(e) = self.limiter.check(client, policy, &with_account(&r.id, &pending), t)
             {
-                note(e, &mut limited);
+                keep_soonest(&mut limited, e);
                 continue;
             }
             let max_used = self
@@ -685,30 +687,51 @@ impl Subscriptions {
                 .unwrap_or(0.0);
             candidates.push((r, max_used));
         }
-        let refused = |limited: Option<Exceeded>, earliest: Option<i64>| match (limited, earliest) {
-            (Some(e), Some(until)) if until - t < e.retry_after => SelectError::AllCooling { until },
-            (Some(e), _) => SelectError::Limited(e),
-            (None, Some(until)) => SelectError::AllCooling { until },
-            (None, None) => SelectError::NoAccounts,
-        };
+        match self.admit_one(provider, session, principal, candidates, charge, &mut limited) {
+            Ok(Some(chosen)) => Ok(chosen),
+            Ok(None) => Err(match (limited, earliest) {
+                (Some(e), Some(until)) if until - t < e.retry_after => SelectError::AllCooling { until },
+                (Some(e), _) => SelectError::Limited(e),
+                (None, Some(until)) => SelectError::AllCooling { until },
+                (None, None) => SelectError::NoAccounts,
+            }),
+            Err(e) => Err(SelectError::Limited(e)),
+        }
+    }
+
+    /// Choose one of `candidates` and count the request on it, with the
+    /// meters `charge` has pending. A candidate whose last slot another
+    /// request took since it was checked is passed over, its refusal kept in
+    /// `limited`; `None` when every candidate was. A limit of a pending meter
+    /// refuses the request on every account.
+    fn admit_one(
+        &self,
+        provider: SubProvider,
+        session: Option<&str>,
+        principal: Option<&Principal>,
+        mut candidates: Vec<(AccountRow, f64)>,
+        charge: &mut Charge<'_>,
+        limited: &mut Option<Exceeded>,
+    ) -> Result<Option<AccountRow>, Exceeded> {
+        let pending = charge.pending().to_vec();
         while !candidates.is_empty() {
             let chosen = candidates.remove(self.choose(provider, session, &candidates)).0;
-            let Some((client, policy)) = limiter else {
-                charge.settle();
-                return Ok(chosen);
-            };
-            match self.limiter.admit(client, policy, &with_account(&chosen.id, &pending), now()) {
-                Ok(()) => {
-                    charge.settle();
-                    return Ok(chosen);
+            if let Some(p) = principal
+                && let Some(client) = p.client_id()
+            {
+                match self.limiter.admit(client, &p.policy, &with_account(&chosen.id, &pending), now()) {
+                    Ok(()) => {}
+                    Err(e) if e.is_on(Meter::Account(&chosen.id)) => {
+                        keep_soonest(limited, e);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
-                // Another request took the account's last slot: try the next one.
-                Err(e) if e.on.as_deref() == Some(chosen.id.as_str()) => note(e, &mut limited),
-                // A limit of every account the request could reach.
-                Err(e) => return Err(SelectError::Limited(e)),
             }
+            charge.settle();
+            return Ok(Some(chosen));
         }
-        Err(refused(limited, earliest))
+        Ok(None)
     }
 
     /// The index of the candidate to serve the next request.
