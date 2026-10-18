@@ -625,6 +625,7 @@ impl Subscriptions {
         tried: &HashSet<String>,
     ) -> Result<AccountRow, SelectError> {
         let rows = self.db.list_accounts(Some(provider.as_str())).await.unwrap_or_default();
+        let pooled = !rows.is_empty();
         let t = now();
         let loaded: HashSet<String> = self.creds.read().keys().cloned().collect();
         let mut earliest: Option<i64> = None;
@@ -668,9 +669,7 @@ impl Subscriptions {
                 (Some(e), Some(until)) if until - t < e.retry_after => SelectError::AllCooling { until },
                 (Some(e), _) => SelectError::Limited(e),
                 (None, Some(until)) => SelectError::AllCooling { until },
-                (None, None) if !allowed_any && principal.is_some_and(|p| p.policy.accounts.contains_key(provider.as_str())) => {
-                    SelectError::NotAllowed
-                }
+                (None, None) if !allowed_any && pooled => SelectError::NotAllowed,
                 (None, None) => SelectError::NoAccounts,
             });
         }
@@ -790,7 +789,7 @@ impl Subscriptions {
                         path,
                         StatusCode::FORBIDDEN,
                         "permission_error",
-                        &format!("this key may use no {provider} account that exists"),
+                        &format!("this key's policy uses no {provider} account"),
                     );
                 }
                 Err(SelectError::Limited(e)) => {

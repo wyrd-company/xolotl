@@ -37,4 +37,4 @@ All writes use KV v2 check-and-set against the version that was read, so an inst
 | disable / enable | Flag in the record |
 | revoke | Writes a revocation marker (no key) as the newest version, then **destroys** the data of every earlier version, so the key can't be recovered from history. Requires `update` on `secret/destroy/xolotl/*`. |
 
-A policy can't be deleted while keys still reference it. Policy writes are validated: known providers, winners and alias targets allowed by the policy, valid names, `accounts` entries of allowed subscription providers that list that provider's account IDs (or `*`), and provider and account limits on what the policy uses.
+A policy can't be deleted while keys still reference it. Policy writes are validated: known providers, winners and alias targets allowed by the policy, valid names, `accounts` entries of allowed subscription providers that list that provider's account IDs (or `*`; no entry means no accounts), `models` keys of the form `provider/model`, and provider and account limits on what the policy uses.

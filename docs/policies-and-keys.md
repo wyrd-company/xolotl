@@ -22,6 +22,11 @@ precedence = ["claude", "codex", "grok", "opencode-go", "vercel"]
 [accounts]
 codex = ["codex-1a2b3c4d5e"]
 claude = ["*"]
+grok = ["*"]
+opencode-go = ["*"]
+
+[models]
+"codex/gpt-6-codex-mini" = false
 
 [winners]
 "kimi-k3" = "vercel"
@@ -45,12 +50,11 @@ xolotl policies delete devcontainer   # refused while keys use it
 ```
 
 The web UI's policy editor has the same fields. It lists the providers with
-the accounts of each subscription provider. Its model list shows every model
-of the allowed providers, with allow and deny toggles, inline renames, extra
-names with fallbacks, the winner of each shared name, the precedence, and the
-state of the accounts the policy uses. The toggles write exact `provider/model`
-entries to `allow_models` and `deny_models`. Globs in the policy file still
-apply; the model list names them.
+the accounts of each subscription provider. Its model list shows the
+patterns, the aliases and every model of the allowed providers, with a switch
+per model, inline renames, the winner of each shared name, the precedence, and
+the state of the accounts the policy uses. A model's switch writes `models`;
+patterns and aliases are rows of their own.
 
 | Field | Meaning |
 |---|---|
@@ -58,8 +62,9 @@ apply; the model list names them.
 | `description` | Free text |
 | `providers` | Providers the key can use: `claude`, `codex`, `grok`, `opencode-go`, gateway provider names, or `*` for all |
 | `accounts` | Per subscription provider, the accounts that serve the keys, or `["*"]` for every account, also accounts added later. See [Accounts](#accounts) |
-| `allow_models` | Globs on `model` or `provider/model`. Empty allows every model of the allowed providers |
-| `deny_models` | Globs that remove models. Deny wins over allow |
+| `allow_models` | Allow patterns: globs on `model` or `provider/model`. See [Model names](#model-names) |
+| `deny_models` | Deny patterns. Deny wins over allow |
+| `models` | `provider/model` → `true` or `false`, for models no pattern matches |
 | `precedence` | Provider order for a model name that several providers serve |
 | `winners` | Per-model provider choice, before `precedence` |
 | `renames` | `provider/model` → the name keys see instead of its plain name |
@@ -91,9 +96,8 @@ codex = ["codex-1a2b3c4d5e", "codex-f6a7b8c9d0"]   # only these two
 claude = ["*"]                                    # every account, also new ones
 ```
 
-- A provider without an entry uses every account. The web UI always writes
-  the entry: a provider you turn on starts with the accounts it has now.
-- The list can't be empty. To block a provider, remove it from `providers`.
+- A provider without an entry has no accounts: its requests get a 403. In
+  the web UI, a provider you turn on starts with the accounts it has now.
 - `xolotl accounts list` shows the account IDs.
 - When none of the listed accounts exists, a request gets a 403. When the
   listed accounts are disabled, cooling down or at a limit, the pool answers
@@ -105,7 +109,9 @@ A client sends a model name. The policy turns it into one or more targets
 (`provider/model`):
 
 1. Xolotl keeps each model in the catalog whose provider is allowed and that
-   passes `allow_models` and `deny_models`.
+   the policy allows: a matching deny pattern denies it, else a matching
+   allow pattern allows it, else its `models` entry decides. A model none of
+   these decide is allowed when there are no allow patterns.
 2. When several providers serve the same name, one provider wins the plain
    name: the one in `winners`, else the first in `precedence`, else the first
    in the default order `claude`, `codex`, `grok`, `opencode-go`, else

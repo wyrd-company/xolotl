@@ -77,19 +77,21 @@ credential or reset the provider's quota. See
 
 ### Policy model list
 
-The **Policies** screen lists every model of the allowed providers. For each
-model you can:
+The **Policies** screen lists the policy's patterns, its aliases, and every
+model of the allowed providers.
 
-- allow or deny it, one at a time or all filtered rows at once;
-- rename it inline;
-- give it more names, with fallbacks;
-- see which provider wins a name that several providers serve, and the state
-  of the accounts the policy uses;
-- set the precedence of the providers.
+- **Models:** turn each model on or off, or every shown model at once, and
+  rename it inline. A model a pattern decides shows its switch greyed out.
+  The row shows which provider wins a name that several providers serve, and
+  the state of the accounts the policy uses.
+- **Patterns:** **Allow pattern** and **Deny pattern** add a row at the top.
+  Its switch makes it an allow or a deny pattern. Patterns win over the
+  models' switches.
+- **Aliases:** **Alias** adds a row with a name and a target you search for,
+  and fallbacks tried in order.
+- **Precedence:** set the order of the providers for shared names.
 
-Filter by provider, sort, and show or hide denied models. The toggles write
-exact `provider/model` entries to `allow_models` and `deny_models`. Globs from
-the policy file are listed above the table; edit them in the file. See
+Filter by provider, sort, and show or hide denied models. See
 [Policies and client keys](policies-and-keys).
 
 ### Usage

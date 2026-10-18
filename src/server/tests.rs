@@ -84,7 +84,12 @@ async fn harness_with_secrets(tweak: impl FnOnce(&mut Config), secrets: Secrets)
 }
 
 fn policy(name: &str) -> Policy {
-    Policy { name: name.into(), providers: vec!["*".into()], ..Default::default() }
+    Policy { name: name.into(), providers: vec!["*".into()], accounts: every_account(), ..Default::default() }
+}
+
+/// Every account of every pool.
+fn every_account() -> BTreeMap<String, Vec<String>> {
+    SubProvider::ALL.iter().map(|p| (p.as_str().to_string(), vec!["*".to_string()])).collect()
 }
 
 impl Harness {
@@ -441,7 +446,14 @@ async fn responses_route_to_codex_pool_and_websocket_gets_426() {
         .respond_with(ResponseTemplate::new(200).set_body_raw("data: {\"type\":\"response.completed\"}\n\n", "text/event-stream"))
         .mount(&h.upstream)
         .await;
-    let key = h.key(Policy { name: "codex".into(), providers: vec!["codex".into()], ..Default::default() }).await;
+    let key = h
+        .key(Policy {
+            name: "codex".into(),
+            providers: vec!["codex".into()],
+            accounts: BTreeMap::from([("codex".into(), vec!["*".into()])]),
+            ..Default::default()
+        })
+        .await;
     let (status, body) = h.call("POST", "/v1/responses", Some(&key), Some(json!({"model": "gpt-6-codex", "input": []}))).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(h.call("GET", "/v1/responses", Some(&key), None).await.0, 426);

@@ -35,8 +35,8 @@ export function ProviderAccess({
   const all = draft.providers.includes("*");
   const allowed = (p: string) => all || draft.providers.includes(p);
   const pool = (p: string) => accounts.filter((a) => a.provider === p);
-  /** A new entry: the pool's accounts now, or `*` for an empty pool (an empty list blocks nothing and is refused). */
-  const fresh = (p: string) => (pool(p).length ? pool(p).map((a) => a.id) : ["*"]);
+  /** A new entry: the pool's accounts now. */
+  const fresh = (p: string) => pool(p).map((a) => a.id);
 
   function setAccounts(next: Record<string, string[]>) {
     set("accounts", next);
@@ -45,23 +45,27 @@ export function ProviderAccess({
     set("providers", on ? [...draft.providers, p] : draft.providers.filter((x) => x !== p));
     if (!isPool(p)) return;
     const next = { ...draft.accounts };
-    if (on) next[p] = fresh(p);
+    if (on && fresh(p).length) next[p] = fresh(p);
     else delete next[p];
     setAccounts(next);
   }
   function toggleAll(on: boolean) {
     set("providers", on ? ["*"] : []);
     const next: Record<string, string[]> = {};
-    if (on) for (const p of known.filter(isPool)) next[p] = draft.accounts[p] ?? ["*"];
+    if (on) for (const p of known.filter(isPool)) if (draft.accounts[p] ?? fresh(p).length) next[p] = draft.accounts[p] ?? fresh(p);
     setAccounts(next);
   }
   function toggleAccount(p: string, id: string, on: boolean) {
-    const ids = draft.accounts[p] ?? ["*"];
+    const ids = draft.accounts[p] ?? [];
     const explicit = ids.includes("*") ? pool(p).map((a) => a.id) : ids;
-    setAccounts({ ...draft.accounts, [p]: on ? [...explicit, id] : explicit.filter((x) => x !== id) });
+    const next = { ...draft.accounts, [p]: on ? [...explicit, id] : explicit.filter((x) => x !== id) };
+    if (next[p].length === 0) delete next[p];
+    setAccounts(next);
   }
   function toggleEvery(p: string, on: boolean) {
-    setAccounts({ ...draft.accounts, [p]: on ? ["*"] : fresh(p) });
+    const next = { ...draft.accounts, [p]: on ? ["*"] : fresh(p) };
+    if (next[p].length === 0) delete next[p];
+    setAccounts(next);
   }
 
   const count = all ? "all providers" : `${draft.providers.length} provider${draft.providers.length === 1 ? "" : "s"}`;
@@ -73,8 +77,8 @@ export function ProviderAccess({
       summary={count}
       description={
         <>
-          The providers keys under this policy may use. A subscription provider serves them only from the accounts checked here;{" "}
-          <Mono>*</Mono> also takes accounts added later.
+          The providers keys under this policy may use. A subscription provider serves them only from the accounts checked here; with none
+          checked it serves nothing. <Mono>*</Mono> also takes accounts added later.
         </>
       }
     >
@@ -86,13 +90,11 @@ export function ProviderAccess({
         <ul className="flex flex-col divide-y rounded-md border">
           {known.map((p) => {
             const on = allowed(p);
-            const ids = draft.accounts[p] ?? ["*"];
+            const ids = draft.accounts[p] ?? [];
             const every = ids.includes("*");
             const mine = pool(p);
             const missing = every ? [] : ids.filter((id) => !mine.some((a) => a.id === id));
             const checked = (id: string) => every || ids.includes(id);
-            // The last account can't be unchecked: uncheck the provider to block it.
-            const last = !every && ids.length === 1;
             return (
               <li key={p} className="flex flex-col gap-2 px-3 py-2.5">
                 <label className={cn("flex items-center gap-2 text-sm", ready && !usable(health(p)) && on && "text-muted-foreground")}>
@@ -109,7 +111,7 @@ export function ProviderAccess({
                         <label key={a.id} className={cn("flex items-center gap-2 text-sm", !checked(a.id) && "text-muted-foreground")}>
                           <Checkbox
                             checked={checked(a.id)}
-                            disabled={every || (last && checked(a.id))}
+                            disabled={every}
                             aria-label={`Use ${accountName(a)}`}
                             onCheckedChange={(c) => toggleAccount(p, a.id, c === true)}
                           />
@@ -121,7 +123,7 @@ export function ProviderAccess({
                     })}
                     {missing.map((id) => (
                       <label key={id} className="text-muted-foreground flex items-center gap-2 text-sm">
-                        <Checkbox checked disabled={last} aria-label={`Use ${id}`} onCheckedChange={() => toggleAccount(p, id, false)} />
+                        <Checkbox checked aria-label={`Use ${id}`} onCheckedChange={() => toggleAccount(p, id, false)} />
                         <span className="font-mono text-xs">{id}</span>
                         <Badge variant="warning">no such account</Badge>
                       </label>

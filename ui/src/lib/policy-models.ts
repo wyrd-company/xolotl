@@ -14,28 +14,16 @@ export interface Candidate {
   taken_by?: { kind: "alias" } | { kind: "rename"; target: string };
 }
 
-export const splitTargets = (s: string) =>
-  s
-    .split(",")
-    .map((t) => t.trim())
-    .filter(Boolean);
-
 /**
  * Every alias with `target` among its targets. Aliases are explicit grants:
- * they reach the target even when the model globs deny it.
+ * they reach the target even when the policy denies it.
  */
-export function aliasesReaching(aliases: { name: string; targets: string }[], target: string) {
+export function aliasesReaching(aliases: { name: string; targets: string[] }[], target: string) {
   return aliases.flatMap((a, index) => {
-    const at = splitTargets(a.targets).indexOf(target);
+    const at = a.targets.indexOf(target);
     return at < 0 ? [] : [{ index, name: a.name, fallback: at > 0 }];
   });
 }
-
-/** `targets` without `target`. */
-export const withoutTarget = (targets: string, target: string) =>
-  splitTargets(targets)
-    .filter((t) => t !== target)
-    .join(", ");
 
 export const qualified = (c: { provider: string; model: string }) => `${c.provider}/${c.model}`;
 
@@ -55,40 +43,44 @@ export function globMatch(pattern: string, text: string): boolean {
   return true;
 }
 
-const matches = (patterns: string[], c: { provider: string; model: string }) =>
-  patterns.some((p) => globMatch(p, c.model) || globMatch(p, qualified(c)));
+const matches = (pattern: string, c: { provider: string; model: string }) => globMatch(pattern, c.model) || globMatch(pattern, qualified(c));
 
+/** How a policy decides models: patterns, then per-model toggles. */
 export interface ModelRules {
   allow: string[];
   deny: string[];
+  /** `provider/model` -> on or off. */
+  models: Record<string, boolean>;
 }
 
-/** Whether the globs allow a model of an allowed provider (`Policy::allows_model`). */
-export const rulesAllow = (rules: ModelRules, c: { provider: string; model: string }) => {
-  return !matches(rules.deny, c) && (rules.allow.length === 0 || matches(rules.allow, c));
-};
+export interface Decision {
+  allowed: boolean;
+  /** The pattern that decided; the toggle doesn't count then. */
+  pattern?: { kind: "allow" | "deny"; pattern: string };
+}
 
 /**
- * Allow or deny each row. Turning a model off adds its `provider/model` to
- * `deny` (deny wins) rather than emptying `allow`, which would allow every
- * model. Turning it on removes that entry, and adds one to a non-empty
- * `allow` that doesn't match it yet. A deny glob other than the exact entry
- * still wins; the row shows it.
+ * Whether a model of an allowed provider is allowed (`Policy::model_rule`):
+ * a deny pattern, else an allow pattern, else its toggle, else on when there
+ * are no allow patterns.
  */
-export function setAllowed(rules: ModelRules, rows: Candidate[], on: boolean): ModelRules {
-  let { allow, deny } = rules;
-  for (const c of rows) {
-    if (c.allowed === on) continue;
-    const q = qualified(c);
-    if (on) {
-      deny = deny.filter((p) => p !== q);
-      if (allow.length > 0 && !matches(allow, c)) allow = [...allow, q];
-    } else {
-      if (allow.length > 1 && allow.includes(q)) allow = allow.filter((p) => p !== q);
-      if ((allow.length === 0 || matches(allow, c)) && !deny.includes(q)) deny = [...deny, q];
-    }
-  }
-  return { allow, deny };
+export function decide(rules: ModelRules, c: { provider: string; model: string }): Decision {
+  const deny = rules.deny.find((p) => matches(p, c));
+  if (deny) return { allowed: false, pattern: { kind: "deny", pattern: deny } };
+  const allow = rules.allow.find((p) => matches(p, c));
+  if (allow) return { allowed: true, pattern: { kind: "allow", pattern: allow } };
+  return { allowed: rules.models[qualified(c)] ?? rules.allow.length === 0 };
+}
+
+/** The models a pattern matches. */
+export const matching = (pattern: string, rows: { provider: string; model: string }[]) =>
+  pattern ? rows.filter((c) => matches(pattern, c)) : [];
+
+/** Turn each row's toggle on or off. Patterns are left alone. */
+export function setToggles(models: Record<string, boolean>, rows: { provider: string; model: string }[], on: boolean) {
+  const next = { ...models };
+  for (const c of rows) next[qualified(c)] = on;
+  return next;
 }
 
 export type SortBy = "allowed" | "name" | "provider";
@@ -111,10 +103,10 @@ export function accountProvider(id: string, pools: readonly string[]): string | 
   return pools.find((p) => id.startsWith(`${p}-`) && id.length > p.length + 1);
 }
 
-/** Whether a policy's `accounts` lets keys use an account of an allowed provider (`Policy::allows_account`). */
+/** Whether a policy's `accounts` lets keys use an account of an allowed provider (`Policy::allows_account`). No entry: none. */
 export function allowsAccount(accounts: Record<string, string[]>, provider: string, id: string): boolean {
-  const ids = accounts[provider];
-  return !ids || ids.includes("*") || ids.includes(id);
+  const ids = accounts[provider] ?? [];
+  return ids.includes("*") || ids.includes(id);
 }
 
 /** Accounts of a subscription pool the policy uses, or the key state of a gateway provider. */
@@ -123,10 +115,11 @@ export function providerHealth(
   pools: readonly string[],
   accounts: { id: string; provider: string; available: boolean }[],
   gateway: { name: string; has_key: boolean; no_auth: boolean }[],
-  policyAccounts: Record<string, string[]> = {},
+  /** The policy's `accounts`; without it, every account counts. */
+  policyAccounts?: Record<string, string[]>,
 ): Health {
   if (pools.includes(provider)) {
-    const mine = accounts.filter((a) => a.provider === provider && allowsAccount(policyAccounts, provider, a.id));
+    const mine = accounts.filter((a) => a.provider === provider && (!policyAccounts || allowsAccount(policyAccounts, provider, a.id)));
     return { kind: "pool", total: mine.length, available: mine.filter((a) => a.available).length };
   }
   const g = gateway.find((p) => p.name === provider);

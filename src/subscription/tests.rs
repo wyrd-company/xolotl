@@ -58,7 +58,12 @@ fn principal(policy: crate::policy::Policy) -> Principal {
 }
 
 fn any_policy() -> crate::policy::Policy {
-    crate::policy::Policy { name: "p".into(), providers: vec!["*".into()], ..Default::default() }
+    crate::policy::Policy {
+        name: "p".into(),
+        providers: vec!["*".into()],
+        accounts: SubProvider::ALL.iter().map(|p| (p.as_str().to_string(), vec!["*".to_string()])).collect(),
+        ..Default::default()
+    }
 }
 
 async fn run(subs: &Subscriptions, provider: SubProvider, path: &str, headers: HeaderMap, body: Bytes) -> (u16, String) {
@@ -1316,7 +1321,7 @@ async fn policy_accounts_choose_the_pool_accounts() {
     mock_codex_ok(&server, &["tok-a", "tok-b"]).await;
 
     let (status, by, _) = served_by(&subs, &principal(any_policy())).await;
-    assert_eq!((status, by.as_deref()), (200, Some("tok-a")), "without an entry, every account serves");
+    assert_eq!((status, by.as_deref()), (200, Some("tok-a")), "* takes every account");
 
     let mut p = any_policy();
     p.accounts.insert("codex".into(), vec![b.id.clone()]);
@@ -1327,6 +1332,10 @@ async fn policy_accounts_choose_the_pool_accounts() {
     p.accounts.insert("codex".into(), vec!["codex-gone".into()]);
     let (status, ..) = served_by(&subs, &principal(p)).await;
     assert_eq!(status, 403, "the policy uses no account that exists");
+    let mut p = any_policy();
+    p.accounts.remove("codex");
+    let (status, ..) = served_by(&subs, &principal(p)).await;
+    assert_eq!(status, 403, "no entry: no account");
 }
 
 #[tokio::test]

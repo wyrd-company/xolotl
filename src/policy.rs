@@ -12,8 +12,11 @@
 //! other providers.
 //!
 //! For a subscription provider, `accounts` names the accounts of its pool
-//! that serve the policy's keys. A provider without an entry uses all of
-//! them.
+//! that serve the policy's keys. A provider without an entry has none.
+//!
+//! Whether a model is allowed: a matching `deny_models` pattern denies it,
+//! else a matching `allow_models` pattern allows it, else its `models`
+//! toggle decides, else it is allowed when there are no allow patterns.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -37,15 +40,19 @@ pub struct Policy {
     pub providers: Vec<String>,
     /// Subscription provider -> the account ids of its pool keys may use; `*`
     /// allows all, also accounts added later. A provider without an entry
-    /// uses all its accounts.
+    /// has no accounts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub accounts: BTreeMap<String, Vec<String>>,
-    /// Globs matched against `model` or `provider/model`. Empty allows all.
+    /// Allow patterns: globs matched against `model` or `provider/model`.
+    /// They win over `models`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_models: Vec<String>,
-    /// Globs that remove models; deny wins over allow.
+    /// Deny patterns; they win over allow patterns and `models`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_models: Vec<String>,
+    /// `provider/model` -> on or off, for a model no pattern matches.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, bool>,
     /// Provider order for model names served by several providers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub precedence: Vec<String>,
@@ -130,8 +137,8 @@ pub struct Candidate {
     pub provider: String,
     pub model: String,
     pub allowed: bool,
-    /// The `allow_models` / `deny_models` glob that decided; `None` when no
-    /// glob matched (allowed by an empty allow list, or missing from it).
+    /// The `allow_models` / `deny_models` pattern that decided; `None` when
+    /// none matched (the model's toggle or the default decided).
     pub rule: Option<String>,
     /// The name keys see this model under: its rename, or its plain name if
     /// it won it. `None` if it is denied, lost its plain name, or its name
@@ -190,6 +197,7 @@ impl Policy {
         Policy {
             name: "_admin".into(),
             providers: vec!["*".into()],
+            accounts: crate::subscription::SubProvider::ALL.iter().map(|p| (p.as_str().to_string(), vec!["*".into()])).collect(),
             scopes: vec![Scope::Admin],
             mcp_servers: vec!["*".into()],
             ..Default::default()
@@ -218,7 +226,9 @@ impl Policy {
                 });
                 (p.trim().to_ascii_lowercase(), ids)
             })
+            .filter(|(_, ids)| !ids.is_empty())
             .collect();
+        self.models = std::mem::take(&mut self.models).into_iter().map(|(t, on)| (t.trim().to_string(), on)).collect();
         lower(&mut self.mcp_servers);
         for v in [&mut self.allow_models, &mut self.deny_models, &mut self.allow_tools, &mut self.deny_tools] {
             v.retain_mut(|s| {
@@ -255,13 +265,15 @@ impl Policy {
         for (provider, ids) in &self.accounts {
             anyhow::ensure!(is_pool(provider), "accounts.{provider}: {provider:?} is not a subscription provider");
             anyhow::ensure!(self.allows_provider(provider), "accounts.{provider}: the policy does not allow provider {provider:?}");
-            anyhow::ensure!(!ids.is_empty(), "accounts.{provider} lists no accounts (remove the provider to block it)");
             for id in ids {
                 anyhow::ensure!(
                     id == "*" || account_provider(id) == Some(provider.as_str()),
                     "accounts.{provider}: {id:?} is not a {provider} account"
                 );
             }
+        }
+        for target in self.models.keys() {
+            anyhow::ensure!(Target::parse(target).is_some(), "models: {target:?} must be provider/model");
         }
         for p in self.limits.providers.keys() {
             anyhow::ensure!(known.contains(p), "limits.providers: unknown provider {p:?}");
@@ -309,25 +321,27 @@ impl Policy {
 
     /// Whether keys may use a subscription account of `provider`.
     pub fn allows_account(&self, provider: &str, id: &str) -> bool {
-        self.allows_provider(provider) && self.accounts.get(provider).is_none_or(|ids| ids.iter().any(|a| a == "*" || a == id))
+        self.allows_provider(provider) && self.accounts.get(provider).is_some_and(|ids| ids.iter().any(|a| a == "*" || a == id))
     }
 
     pub fn allows_model(&self, provider: &str, model: &str) -> bool {
         self.allows_provider(provider) && self.model_rule(provider, model).0
     }
 
-    /// Whether the model globs allow `provider/model`, and the glob that
-    /// decided: the first matching deny glob, else the first matching allow glob.
+    /// Whether the policy allows `provider/model`, and the pattern that
+    /// decided: the first matching deny pattern, else the first matching
+    /// allow pattern. Without one, the model's toggle decides, else the
+    /// absence of allow patterns.
     fn model_rule<'a>(&'a self, provider: &str, model: &str) -> (bool, Option<&'a str>) {
         let qualified = format!("{provider}/{model}");
         let hit = |patterns: &'a [String]| patterns.iter().find(|p| glob_match(p, model) || glob_match(p, &qualified)).map(String::as_str);
         if let Some(p) = hit(&self.deny_models) {
             return (false, Some(p));
         }
-        match hit(&self.allow_models) {
-            Some(p) => (true, Some(p)),
-            None => (self.allow_models.is_empty(), None),
+        if let Some(p) = hit(&self.allow_models) {
+            return (true, Some(p));
         }
+        (self.models.get(&qualified).copied().unwrap_or(self.allow_models.is_empty()), None)
     }
 
     /// The name a rename gives `provider/model`.
@@ -680,10 +694,12 @@ mod tests {
         let k = known();
         let mut p = policy();
         p.providers = vec!["codex".into(), "claude".into(), "vercel".into()];
-        assert!(p.allows_account("codex", "codex-a1"), "no entry: every account");
+        assert!(!p.allows_account("codex", "codex-a1"), "no entry: no account");
         p.accounts.insert(" Codex ".into(), vec![" codex-a1 ".into(), "codex-a1".into()]);
         p.accounts.insert("claude".into(), vec!["*".into()]);
+        p.accounts.insert("grok".into(), vec![" ".into()]);
         p.normalize();
+        assert!(!p.accounts.contains_key("grok"), "an empty list is no entry");
         p.validate(&k, &BTreeSet::new()).unwrap();
         assert_eq!(p.accounts["codex"], ["codex-a1"]);
         assert!(p.allows_account("codex", "codex-a1"));
@@ -696,7 +712,6 @@ mod tests {
         for (provider, ids, why) in [
             ("vercel", vec!["vercel-a1"], "not a subscription provider"),
             ("grok", vec!["grok-a1"], "does not allow"),
-            ("codex", vec![], "lists no accounts"),
             ("codex", vec!["claude-a1"], "not a codex account"),
         ] {
             let mut bad = p.clone();
@@ -704,6 +719,28 @@ mod tests {
             let err = bad.validate(&k, &BTreeSet::new()).unwrap_err().to_string();
             assert!(err.contains(why), "{provider}: {err}");
         }
+    }
+
+    #[test]
+    fn patterns_win_over_model_toggles() {
+        let mut p = policy();
+        p.models.insert("claude/claude-opus-5".into(), false);
+        p.models.insert("codex/gpt-6-codex".into(), true);
+        assert!(!p.allows_model("claude", "claude-opus-5"), "toggled off");
+        assert!(p.allows_model("claude", "claude-haiku-5-5"), "no allow patterns: on by default");
+        p.allow_models = vec!["claude-*".into()];
+        assert!(p.allows_model("claude", "claude-opus-5"), "the allow pattern wins over the toggle");
+        assert!(p.allows_model("codex", "gpt-6-codex"), "toggled on, no pattern");
+        assert!(!p.allows_model("opencode-go", "kimi-k3"), "allow patterns: off by default");
+        p.deny_models = vec!["*-opus-*".into()];
+        assert!(!p.allows_model("claude", "claude-opus-5"), "deny wins");
+        let c = p.candidates(&catalog());
+        let opus = c.iter().find(|x| x.provider == "claude" && x.model == "claude-opus-5").unwrap();
+        assert_eq!((opus.allowed, opus.rule.as_deref()), (false, Some("*-opus-*")));
+        let codex = c.iter().find(|x| x.model == "gpt-6-codex").unwrap();
+        assert_eq!((codex.allowed, codex.rule.as_deref()), (true, None));
+        p.models.insert("nope".into(), true);
+        assert!(p.validate(&known(), &BTreeSet::new()).unwrap_err().to_string().contains("provider/model"));
     }
 
     #[test]

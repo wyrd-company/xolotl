@@ -103,14 +103,16 @@ export interface Draft {
   name: string;
   description: string;
   providers: string[];
-  /** Every allowed subscription provider has an entry (`*` for none in the policy). */
+  /** Subscription provider -> account ids or `*`; no entry: no accounts. */
   accounts: Record<string, string[]>;
   scopes: Scope[];
-  allow: string;
-  deny: string;
+  /** Allow and deny patterns, as rows of the model list. `id` keeps a row's identity while editing. */
+  patterns: { id: string; pattern: string; allow: boolean }[];
+  /** `provider/model` -> on or off. */
+  models: Record<string, boolean>;
   precedence: string[];
   winners: Record<string, string>;
-  aliases: { name: string; targets: string }[];
+  aliases: { id: string; name: string; targets: string[] }[];
   renames: Record<string, string>;
   mcpServers: string[];
   allowTools: string;
@@ -120,22 +122,23 @@ export interface Draft {
 
 export type SetDraft = <K extends keyof Draft>(k: K, v: Draft[K]) => void;
 
+export const rowId = () => Math.random().toString(36).slice(2);
+
 function toDraft(p: Policy | null): Draft {
-  const providers = p?.providers ?? [];
-  const accounts = { ...p?.accounts };
-  // A provider without an entry uses every account: show it as `*`.
-  for (const sub of SUB_PROVIDERS) if ((providers.includes("*") || providers.includes(sub)) && !accounts[sub]) accounts[sub] = ["*"];
   return {
     name: p?.name ?? "",
     description: p?.description ?? "",
-    providers,
-    accounts,
+    providers: p?.providers ?? [],
+    accounts: { ...p?.accounts },
     scopes: p?.scopes ?? ["proxy"],
-    allow: (p?.allow_models ?? []).join("\n"),
-    deny: (p?.deny_models ?? []).join("\n"),
+    patterns: [
+      ...(p?.allow_models ?? []).map((pattern) => ({ id: rowId(), pattern, allow: true })),
+      ...(p?.deny_models ?? []).map((pattern) => ({ id: rowId(), pattern, allow: false })),
+    ],
+    models: p?.models ?? {},
     precedence: p?.precedence ?? [],
     winners: p?.winners ?? {},
-    aliases: Object.entries(p?.aliases ?? {}).map(([name, t]) => ({ name, targets: (Array.isArray(t) ? t : [t]).join(", ") })),
+    aliases: Object.entries(p?.aliases ?? {}).map(([name, t]) => ({ id: rowId(), name, targets: Array.isArray(t) ? t : [t] })),
     renames: p?.renames ?? {},
     mcpServers: p?.mcp_servers ?? [],
     allowTools: (p?.allow_tools ?? []).join("\n"),
@@ -147,12 +150,10 @@ function toDraft(p: Policy | null): Draft {
 function toPolicy(d: Draft): Policy {
   const aliases: Record<string, string | string[]> = {};
   for (const a of d.aliases) {
-    const targets = a.targets
-      .split(",")
-      .map((t) => t.trim())
-      .filter(Boolean);
+    const targets = a.targets.map((t) => t.trim()).filter(Boolean);
     if (a.name.trim()) aliases[a.name.trim()] = targets.length === 1 ? targets[0] : targets;
   }
+  const patterns = (allow: boolean) => d.patterns.filter((p) => p.allow === allow && p.pattern.trim()).map((p) => p.pattern.trim());
   // A blank name, or the plain name itself, is no rename.
   const renames = Object.fromEntries(
     Object.entries(d.renames)
@@ -181,8 +182,9 @@ function toPolicy(d: Draft): Policy {
     providers: d.providers,
     accounts: Object.fromEntries(Object.entries(d.accounts).filter(([p]) => allows(p))),
     scopes: d.scopes,
-    allow_models: lines(d.allow),
-    deny_models: lines(d.deny),
+    allow_models: patterns(true),
+    deny_models: patterns(false),
+    models: d.models,
     precedence: d.precedence,
     winners: d.winners,
     aliases,
