@@ -8,9 +8,12 @@ import {
   globMatch,
   providerHealth,
   decide,
+  isOverride,
   matching,
+  move,
   setToggles,
   sortRows,
+  switchOf,
   usable,
   type Candidate,
 } from "../src/lib/policy-models.ts";
@@ -32,18 +35,27 @@ test("globMatch follows the server's globs", () => {
   assert.ok(!globMatch("kimi", "kimi-k3"));
 });
 
-test("decide: deny patterns, then allow patterns, then toggles, then the default", () => {
+test("decide: the first matching rule, then the switch, then the default", () => {
   const m = { provider: "opencode-go", model: "kimi-k3" };
-  const rules = (allow: string[], deny: string[], models: Record<string, boolean> = {}) => ({ allow, deny, models });
-  assert.deepEqual(decide(rules([], []), m), { allowed: true });
-  assert.deepEqual(decide(rules(["claude-*"], []), m), { allowed: false }, "allow patterns: off by default");
-  assert.deepEqual(decide(rules(["claude-*"], [], { "opencode-go/kimi-k3": true }), m), { allowed: true }, "toggled on");
-  assert.deepEqual(decide(rules([], [], { "opencode-go/kimi-k3": false }), m), { allowed: false }, "toggled off");
-  assert.deepEqual(decide(rules(["kimi-*"], [], { "opencode-go/kimi-k3": false }), m), {
+  const allow = (pattern: string) => ({ pattern, allow: true });
+  const deny = (pattern: string) => ({ pattern, allow: false });
+  const rules = (list: { pattern: string; allow: boolean }[], models: Record<string, boolean> = {}, denyOther = false) => ({ rules: list, models, denyOther });
+  assert.deepEqual(decide(rules([]), m), { allowed: true });
+  assert.deepEqual(decide(rules([allow("claude-*")], {}, true), m), { allowed: false }, "every other model: off");
+  assert.deepEqual(decide(rules([allow("claude-*")]), m), { allowed: true }, "an allow rule doesn't turn other models off");
+  assert.deepEqual(decide(rules([], { "opencode-go/kimi-k3": true }, true), m), { allowed: true }, "switched on");
+  assert.deepEqual(decide(rules([], { "opencode-go/kimi-k3": false }), m), { allowed: false }, "switched off");
+  assert.deepEqual(decide(rules([allow("kimi-*")], { "opencode-go/kimi-k3": false }), m), {
     allowed: true,
-    pattern: { kind: "allow", pattern: "kimi-*" },
+    rule: { index: 0, allow: true, pattern: "kimi-*" },
   });
-  assert.deepEqual(decide(rules(["kimi-*"], ["opencode-go/*"]), m), { allowed: false, pattern: { kind: "deny", pattern: "opencode-go/*" } });
+  assert.deepEqual(decide(rules([deny(" "), allow("kimi-*"), deny("opencode-go/*")]), m).rule, { index: 1, allow: true, pattern: "kimi-*" }, "first wins");
+  assert.deepEqual(decide(rules([deny("opencode-go/*"), allow("kimi-*")]), m).rule, { index: 0, allow: false, pattern: "opencode-go/*" });
+  assert.equal(switchOf(rules([deny("*")], { "opencode-go/kimi-k3": true }), m), true, "a masked switch keeps its value");
+  assert.ok(isOverride(" opencode-go/kimi-k3 ", m));
+  assert.ok(!isOverride("kimi-k3", m), "a bare model name is not an override: it matches every provider");
+  assert.deepEqual(move(["a", "b", "c"], 2, -1), ["a", "c", "b"]);
+  assert.deepEqual(move(["a", "b"], 0, -1), ["a", "b"]);
 });
 
 test("setToggles writes toggles only", () => {

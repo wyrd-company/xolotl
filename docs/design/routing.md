@@ -64,7 +64,7 @@ A policy (`src/policy.rs`) is stored in OpenBao at `policies/<name>`, and every 
 
 `Policy::resolve` builds the policy's **view**: client-visible name → list of targets.
 
-1. For every catalog model, keep it if the provider is allowed and the model passes `allow_models` / `deny_models`. The globs match either `model` or `provider/model`, and deny wins.
+1. For every catalog model, keep it if the provider is allowed and the policy allows the model: the first entry of `rules` whose glob matches `model` or `provider/model` decides, else the `models` switch, else `deny_other_models`.
 2. Group the remaining models that are not renamed by plain name. When several providers serve the same name, one wins it:
    1. the provider in `winners[model]`, if it serves the model;
    2. otherwise, the earliest provider in `precedence`;

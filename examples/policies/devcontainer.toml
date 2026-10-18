@@ -5,10 +5,15 @@ description = "Coding agents in devcontainers"
 # Providers this policy may use ("*" for all).
 providers = ["claude", "codex", "grok", "opencode-go", "vercel"]
 
-# Optional patterns matched against `model` or `provider/model`. Deny
-# patterns win over allow patterns, and both win over [models].
-# allow_models = ["claude-*", "gpt-*", "opencode-go/*"]
-deny_models = ["*-preview"]
+# Model rules: globs matched against `model` or `provider/model`, in order.
+# The first rule that matches decides; rules win over [models].
+rules = [
+  { deny = "*-preview" },
+  # { allow = "claude-*" },
+]
+
+# Deny every model that no rule matches and [models] does not switch on.
+# deny_other_models = true
 
 # MCP gateway (/mcp): add "mcp" to scopes and list the servers. Tool globs
 # match `tool` or `server/tool`; deny wins.
@@ -34,8 +39,7 @@ codex = ["*"]
 grok = ["*"]
 opencode-go = ["*"]
 
-# Models turned on or off, for models no pattern matches. Without allow
-# patterns, a model not listed here is on.
+# Models switched on or off, for models no rule matches.
 [models]
 # "codex/gpt-6-codex-mini" = false
 

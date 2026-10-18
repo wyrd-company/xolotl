@@ -153,12 +153,12 @@ export interface Policy {
   providers: string[];
   /** Subscription provider -> the account ids of its pool keys may use; `*` takes every account. No entry: no accounts. */
   accounts?: Record<string, string[]>;
-  /** Allow patterns; they win over `models`. */
-  allow_models?: string[];
-  /** Deny patterns; they win over allow patterns and `models`. */
-  deny_models?: string[];
-  /** `provider/model` -> on or off, for models no pattern matches. */
+  /** Allow and deny globs, in order; the first that matches decides. They win over `models`. */
+  rules?: ({ allow: string } | { deny: string })[];
+  /** `provider/model` -> on or off, for models no rule matches. */
   models?: Record<string, boolean>;
+  /** Deny models that no rule matches and that have no switch. */
+  deny_other_models?: boolean;
   precedence?: string[];
   winners?: Record<string, string>;
   aliases?: Record<string, string | string[]>;

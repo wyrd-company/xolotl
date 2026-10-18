@@ -77,21 +77,23 @@ credential or reset the provider's quota. See
 
 ### Policy model list
 
-The **Policies** screen lists the policy's patterns, its aliases, and every
-model of the allowed providers.
+The **Policies** screen shows the models of a policy in two modes.
 
-- **Models:** turn each model on or off, or every shown model at once, and
-  rename it inline. A model a pattern decides shows its switch greyed out.
+- **Rules:** the rules in the order they apply. **Allow rule** and **Deny
+  rule** add a row at the top; its switch makes it an allow or a deny rule,
+  and the arrows move it. The first rule that matches a model decides. Below
+  the rules, **Every other model** sets what happens to a model no rule
+  matches and no switch sets. **Alias** adds an alias with a name, a target
+  you search for, and fallbacks tried in order.
+- **Effective models:** every model of the allowed providers as the policy
+  decides it. Turn each model on or off, or every shown model at once, and
+  rename it inline. A model a rule decides is greyed out, keeps its own
+  switch, and names the rule; **Allow anyway** or **Deny anyway** adds an
+  override, a rule for that model at the top, with a switch in its own colour.
   The row shows which provider wins a name that several providers serve, and
-  the state of the accounts the policy uses.
-- **Patterns:** **Allow pattern** and **Deny pattern** add a row at the top.
-  Its switch makes it an allow or a deny pattern. Patterns win over the
-  models' switches.
-- **Aliases:** **Alias** adds a row with a name and a target you search for,
-  and fallbacks tried in order.
-- **Precedence:** set the order of the providers for shared names.
-
-Filter by provider, sort, and show or hide denied models. See
+  the state of the accounts the policy uses. Filter by provider, sort, and
+  show or hide denied models.
+- **Precedence:** set the order of the providers for shared names. See
 [Policies and client keys](policies-and-keys).
 
 ### Usage

@@ -106,10 +106,12 @@ export interface Draft {
   /** Subscription provider -> account ids or `*`; no entry: no accounts. */
   accounts: Record<string, string[]>;
   scopes: Scope[];
-  /** Allow and deny patterns, as rows of the model list. `id` keeps a row's identity while editing. */
-  patterns: { id: string; pattern: string; allow: boolean }[];
+  /** Allow and deny rules in order. `id` keeps a row's identity while editing. */
+  rules: { id: string; pattern: string; allow: boolean }[];
   /** `provider/model` -> on or off. */
   models: Record<string, boolean>;
+  /** Deny models that no rule matches and that have no switch. */
+  denyOther: boolean;
   precedence: string[];
   winners: Record<string, string>;
   aliases: { id: string; name: string; targets: string[] }[];
@@ -131,11 +133,9 @@ function toDraft(p: Policy | null): Draft {
     providers: p?.providers ?? [],
     accounts: { ...p?.accounts },
     scopes: p?.scopes ?? ["proxy"],
-    patterns: [
-      ...(p?.allow_models ?? []).map((pattern) => ({ id: rowId(), pattern, allow: true })),
-      ...(p?.deny_models ?? []).map((pattern) => ({ id: rowId(), pattern, allow: false })),
-    ],
+    rules: (p?.rules ?? []).map((r) => ("allow" in r ? { id: rowId(), pattern: r.allow, allow: true } : { id: rowId(), pattern: r.deny, allow: false })),
     models: p?.models ?? {},
+    denyOther: p?.deny_other_models ?? false,
     precedence: p?.precedence ?? [],
     winners: p?.winners ?? {},
     aliases: Object.entries(p?.aliases ?? {}).map(([name, t]) => ({ id: rowId(), name, targets: Array.isArray(t) ? t : [t] })),
@@ -153,7 +153,6 @@ function toPolicy(d: Draft): Policy {
     const targets = a.targets.map((t) => t.trim()).filter(Boolean);
     if (a.name.trim()) aliases[a.name.trim()] = targets.length === 1 ? targets[0] : targets;
   }
-  const patterns = (allow: boolean) => d.patterns.filter((p) => p.allow === allow && p.pattern.trim()).map((p) => p.pattern.trim());
   // A blank name, or the plain name itself, is no rename.
   const renames = Object.fromEntries(
     Object.entries(d.renames)
@@ -182,9 +181,9 @@ function toPolicy(d: Draft): Policy {
     providers: d.providers,
     accounts: Object.fromEntries(Object.entries(d.accounts).filter(([p]) => allows(p))),
     scopes: d.scopes,
-    allow_models: patterns(true),
-    deny_models: patterns(false),
+    rules: d.rules.filter((r) => r.pattern.trim()).map((r) => (r.allow ? { allow: r.pattern.trim() } : { deny: r.pattern.trim() })),
     models: d.models,
+    deny_other_models: d.denyOther || undefined,
     precedence: d.precedence,
     winners: d.winners,
     aliases,

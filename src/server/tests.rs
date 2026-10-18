@@ -780,7 +780,7 @@ async fn admin_policies_keys_and_accounts() {
 
     // The preview lists denied models too, with the name each one is served under.
     let draft = json!({
-        "name": "dev", "providers": ["claude", "opencode-go"], "deny_models": ["opencode-go/kimi-k3"],
+        "name": "dev", "providers": ["claude", "opencode-go"], "rules": [{"deny": "opencode-go/kimi-k3"}],
         "renames": {"claude/claude-opus-5": "opus"},
     });
     let (status, view) = h.call("POST", "/admin/policy-preview", Some(&h.admin), Some(draft)).await;

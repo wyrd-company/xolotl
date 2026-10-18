@@ -1,5 +1,5 @@
-// The policy editor's model list: allow/deny toggles written as exact
-// `provider/model` entries, sorting, more names, and provider health.
+// The policy editor's model list: ordered rules, per-model switches,
+// sorting, aliases, and provider health.
 
 /** A catalog model of an allowed provider (`Policy::candidates`). */
 export interface Candidate {
@@ -45,41 +45,63 @@ export function globMatch(pattern: string, text: string): boolean {
 
 const matches = (pattern: string, c: { provider: string; model: string }) => globMatch(pattern, c.model) || globMatch(pattern, qualified(c));
 
-/** How a policy decides models: patterns, then per-model toggles. */
+/** A model rule: an allow or deny glob. */
+export interface ModelRule {
+  pattern: string;
+  allow: boolean;
+}
+
+/** How a policy decides models: rules in order, then switches, then the default. */
 export interface ModelRules {
-  allow: string[];
-  deny: string[];
+  rules: ModelRule[];
   /** `provider/model` -> on or off. */
   models: Record<string, boolean>;
+  /** Deny models that no rule matches and that have no switch. */
+  denyOther: boolean;
 }
 
 export interface Decision {
   allowed: boolean;
-  /** The pattern that decided; the toggle doesn't count then. */
-  pattern?: { kind: "allow" | "deny"; pattern: string };
+  /** The first rule that matched; the switch doesn't count then. `index` is its place in `rules`. */
+  rule?: { index: number; allow: boolean; pattern: string };
 }
 
 /**
  * Whether a model of an allowed provider is allowed (`Policy::model_rule`):
- * a deny pattern, else an allow pattern, else its toggle, else on when there
- * are no allow patterns.
+ * the first rule that matches, else its switch, else the default.
  */
 export function decide(rules: ModelRules, c: { provider: string; model: string }): Decision {
-  const deny = rules.deny.find((p) => matches(p, c));
-  if (deny) return { allowed: false, pattern: { kind: "deny", pattern: deny } };
-  const allow = rules.allow.find((p) => matches(p, c));
-  if (allow) return { allowed: true, pattern: { kind: "allow", pattern: allow } };
-  return { allowed: rules.models[qualified(c)] ?? rules.allow.length === 0 };
+  const index = rules.rules.findIndex((r) => r.pattern.trim() && matches(r.pattern.trim(), c));
+  if (index >= 0) {
+    const r = rules.rules[index];
+    return { allowed: r.allow, rule: { index, allow: r.allow, pattern: r.pattern.trim() } };
+  }
+  return { allowed: switchOf(rules, c) };
 }
+
+/** The model's own switch: its `models` entry, else the default. */
+export const switchOf = (rules: ModelRules, c: { provider: string; model: string }) => rules.models[qualified(c)] ?? !rules.denyOther;
+
+/** An override: a rule for exactly this model. */
+export const isOverride = (pattern: string, c: { provider: string; model: string }) => pattern.trim() === qualified(c);
 
 /** The models a pattern matches. */
 export const matching = (pattern: string, rows: { provider: string; model: string }[]) =>
   pattern ? rows.filter((c) => matches(pattern, c)) : [];
 
-/** Turn each row's toggle on or off. Patterns are left alone. */
+/** Turn each row's switch on or off. Rules are left alone. */
 export function setToggles(models: Record<string, boolean>, rows: { provider: string; model: string }[], on: boolean) {
   const next = { ...models };
   for (const c of rows) next[qualified(c)] = on;
+  return next;
+}
+
+/** Move the item at `index` by `by` places. */
+export function move<T>(items: T[], index: number, by: number): T[] {
+  const to = index + by;
+  if (to < 0 || to >= items.length) return items;
+  const next = [...items];
+  [next[index], next[to]] = [next[to], next[index]];
   return next;
 }
 
