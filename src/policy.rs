@@ -10,6 +10,10 @@
 //! a losing provider's model under any name. A renamed model is offered under
 //! its new name instead of its plain name, and leaves the plain name to the
 //! other providers.
+//!
+//! For a subscription provider, `accounts` names the accounts of its pool
+//! that serve the policy's keys. A provider without an entry uses all of
+//! them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,6 +35,11 @@ pub struct Policy {
     /// Provider names (`claude`, `codex`, `grok`, `opencode-go`, gateway provider names); `*` allows all.
     #[serde(default)]
     pub providers: Vec<String>,
+    /// Subscription provider -> the account ids of its pool keys may use; `*`
+    /// allows all, also accounts added later. A provider without an entry
+    /// uses all its accounts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub accounts: BTreeMap<String, Vec<String>>,
     /// Globs matched against `model` or `provider/model`. Empty allows all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_models: Vec<String>,
@@ -150,6 +159,18 @@ pub struct View {
     pub names: BTreeMap<String, Vec<Target>>,
 }
 
+fn is_pool(provider: &str) -> bool {
+    provider.parse::<crate::subscription::SubProvider>().is_ok()
+}
+
+/// The subscription provider of an account id: ids are `<provider>-<suffix>`.
+pub fn account_provider(id: &str) -> Option<&'static str> {
+    crate::subscription::SubProvider::ALL
+        .into_iter()
+        .map(|p| p.as_str())
+        .find(|p| id.strip_prefix(p).is_some_and(|rest| rest.len() > 1 && rest.starts_with('-')))
+}
+
 /// A client-visible name: an alias or a rename.
 fn valid_model_name(name: &str) -> bool {
     !name.is_empty() && !name.chars().any(char::is_whitespace)
@@ -187,6 +208,17 @@ impl Policy {
         };
         lower(&mut self.providers);
         lower(&mut self.precedence);
+        self.accounts = std::mem::take(&mut self.accounts)
+            .into_iter()
+            .map(|(p, mut ids)| {
+                let mut seen = BTreeSet::new();
+                ids.retain_mut(|s| {
+                    *s = s.trim().to_string();
+                    !s.is_empty() && seen.insert(s.clone())
+                });
+                (p.trim().to_ascii_lowercase(), ids)
+            })
+            .collect();
         lower(&mut self.mcp_servers);
         for v in [&mut self.allow_models, &mut self.deny_models, &mut self.allow_tools, &mut self.deny_tools] {
             v.retain_mut(|s| {
@@ -219,6 +251,25 @@ impl Policy {
         self.limits.validate()?;
         for p in self.providers.iter().chain(&self.precedence).chain(self.winners.values()) {
             anyhow::ensure!(p == "*" || known.contains(p), "unknown provider {p:?}");
+        }
+        for (provider, ids) in &self.accounts {
+            anyhow::ensure!(is_pool(provider), "accounts.{provider}: {provider:?} is not a subscription provider");
+            anyhow::ensure!(self.allows_provider(provider), "accounts.{provider}: the policy does not allow provider {provider:?}");
+            anyhow::ensure!(!ids.is_empty(), "accounts.{provider} lists no accounts (remove the provider to block it)");
+            for id in ids {
+                anyhow::ensure!(
+                    id == "*" || account_provider(id) == Some(provider.as_str()),
+                    "accounts.{provider}: {id:?} is not a {provider} account"
+                );
+            }
+        }
+        for p in self.limits.providers.keys() {
+            anyhow::ensure!(known.contains(p), "limits.providers: unknown provider {p:?}");
+            anyhow::ensure!(self.allows_provider(p), "limits.providers: the policy does not allow provider {p:?}");
+        }
+        for id in self.limits.accounts.keys() {
+            let provider = account_provider(id).ok_or_else(|| anyhow::anyhow!("limits.accounts: {id:?} is not an account id"))?;
+            anyhow::ensure!(self.allows_account(provider, id), "limits.accounts: the policy does not use account {id:?}");
         }
         for (model, p) in &self.winners {
             anyhow::ensure!(self.allows_provider(p), "winner for {model:?} is {p:?}, which the policy does not allow");
@@ -254,6 +305,11 @@ impl Policy {
 
     pub fn allows_provider(&self, provider: &str) -> bool {
         self.providers.iter().any(|p| p == "*" || p == provider)
+    }
+
+    /// Whether keys may use a subscription account of `provider`.
+    pub fn allows_account(&self, provider: &str, id: &str) -> bool {
+        self.allows_provider(provider) && self.accounts.get(provider).is_none_or(|ids| ids.iter().any(|a| a == "*" || a == id))
     }
 
     pub fn allows_model(&self, provider: &str, model: &str) -> bool {
@@ -617,6 +673,37 @@ mod tests {
         let mut p = rename(" claude/claude-opus-5 ", "  ");
         p.normalize();
         assert!(p.renames.is_empty(), "a blank name removes the rename");
+    }
+
+    #[test]
+    fn accounts_narrow_the_pools() {
+        let k = known();
+        let mut p = policy();
+        p.providers = vec!["codex".into(), "claude".into(), "vercel".into()];
+        assert!(p.allows_account("codex", "codex-a1"), "no entry: every account");
+        p.accounts.insert(" Codex ".into(), vec![" codex-a1 ".into(), "codex-a1".into()]);
+        p.accounts.insert("claude".into(), vec!["*".into()]);
+        p.normalize();
+        p.validate(&k, &BTreeSet::new()).unwrap();
+        assert_eq!(p.accounts["codex"], ["codex-a1"]);
+        assert!(p.allows_account("codex", "codex-a1"));
+        assert!(!p.allows_account("codex", "codex-b2"));
+        assert!(p.allows_account("claude", "claude-new"), "* takes accounts added later");
+        assert!(!p.allows_account("grok", "grok-a1"), "provider not allowed");
+        assert_eq!(account_provider("opencode-go-a1"), Some("opencode-go"));
+        assert_eq!(account_provider("codex-"), None);
+
+        for (provider, ids, why) in [
+            ("vercel", vec!["vercel-a1"], "not a subscription provider"),
+            ("grok", vec!["grok-a1"], "does not allow"),
+            ("codex", vec![], "lists no accounts"),
+            ("codex", vec!["claude-a1"], "not a codex account"),
+        ] {
+            let mut bad = p.clone();
+            bad.accounts.insert(provider.into(), ids.into_iter().map(str::to_string).collect());
+            let err = bad.validate(&k, &BTreeSet::new()).unwrap_err().to_string();
+            assert!(err.contains(why), "{provider}: {err}");
+        }
     }
 
     #[test]

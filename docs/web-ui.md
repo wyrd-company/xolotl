@@ -51,7 +51,7 @@ server log has the details.
 | Overview | OpenBao and SQLite health, accounts that need attention (each with a **Review account** link), account pools and usage windows, the Codex reset credit total, totals for the last 24 hours, gateway providers, recent failed requests |
 | Accounts | Accounts by provider with their state and cooldown reason: refresh usage, refresh models, enable or disable. Details: set priority, **Retry**, log in again (OAuth accounts) or replace the key (API-key accounts), remove, last error, Codex reset credits |
 | Add account | Codex device or browser login, Claude login, OpenCode Go key, import of a CLI credential file |
-| Policies | Providers with the state of their accounts or keys, scopes, precedence, MCP access, rate limits and the policy's consumption, and the model list (below) |
+| Policies | Providers and the accounts of each subscription provider, scopes, MCP access, rate limits (in total, per provider and per account) with the policy's consumption, and the model list (below). Each section folds away |
 | Client keys | Issue, rotate with a grace period, enable or disable, revoke. Consumption against the policy's rate limits. Shows the OpenBao path, the `bao` command and the OpenBao policy the client needs. Never shows the key |
 | MCP servers | Upstream servers: add, edit and remove runtime servers, set header secrets, OAuth sign-in, tools, recent tool calls |
 | Providers & models | Gateway providers and their key state, set a key, the model catalog with each model's endpoints |
@@ -84,11 +84,13 @@ model you can:
 - rename it inline;
 - give it more names, with fallbacks;
 - see which provider wins a name that several providers serve, and the state
-  of the provider's accounts.
+  of the accounts the policy uses;
+- set the precedence of the providers.
 
-Filter by provider and sort the list. The toggles write exact `provider/model`
-entries to `allow_models` and `deny_models`. Edit the globs under
-**Model patterns**. See [Policies and client keys](policies-and-keys).
+Filter by provider, sort, and show or hide denied models. The toggles write
+exact `provider/model` entries to `allow_models` and `deny_models`. Globs from
+the policy file are listed above the table; edit them in the file. See
+[Policies and client keys](policies-and-keys).
 
 ### Usage
 

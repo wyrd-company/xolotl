@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "vitest";
 
 import {
+  accountProvider,
   aliasesReaching,
+  allowsAccount,
   globMatch,
   providerHealth,
   rulesAllow,
@@ -85,9 +87,9 @@ test("default sort puts allowed models first, then by name", () => {
 test("provider health counts available accounts and gateway keys", () => {
   const pools = ["codex", "opencode-go"];
   const accounts = [
-    { provider: "codex", available: true },
-    { provider: "codex", available: false },
-    { provider: "opencode-go", available: false },
+    { id: "codex-a1", provider: "codex", available: true },
+    { id: "codex-b2", provider: "codex", available: false },
+    { id: "opencode-go-c3", provider: "opencode-go", available: false },
   ];
   const gateway = [
     { name: "vercel", has_key: false, no_auth: false },
@@ -103,6 +105,19 @@ test("provider health counts available accounts and gateway keys", () => {
     ["codex", "opencode-go", "vercel", "llama"].map((p) => usable(h(p))),
     [true, false, false, true],
   );
+  // Only the accounts the policy uses count.
+  assert.deepEqual(providerHealth("codex", pools, accounts, gateway, { codex: ["codex-b2"] }), { kind: "pool", total: 1, available: 0 });
+  assert.deepEqual(providerHealth("codex", pools, accounts, gateway, { codex: ["*"] }), { kind: "pool", total: 2, available: 1 });
+});
+
+test("policy accounts: entries, * and account ids", () => {
+  assert.equal(allowsAccount({}, "codex", "codex-a1"), true, "no entry: every account");
+  assert.equal(allowsAccount({ codex: ["codex-a1"] }, "codex", "codex-b2"), false);
+  assert.equal(allowsAccount({ codex: ["*"] }, "codex", "codex-new"), true);
+  const pools = ["codex", "opencode-go"];
+  assert.equal(accountProvider("opencode-go-c3", pools), "opencode-go");
+  assert.equal(accountProvider("codex-", pools), undefined);
+  assert.equal(accountProvider("llama-a1", pools), undefined);
 });
 
 test("aliasesReaching finds first targets and fallbacks", () => {

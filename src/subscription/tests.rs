@@ -53,11 +53,32 @@ fn responses_body() -> Bytes {
     Bytes::from(json!({"model": "gpt-5-codex", "input": [], "instructions": "x"}).to_string())
 }
 
+fn principal(policy: crate::policy::Policy) -> Principal {
+    Principal { client_id: Some(format!("{}/client", policy.name)), policy: Arc::new(policy) }
+}
+
+fn any_policy() -> crate::policy::Policy {
+    crate::policy::Policy { name: "p".into(), providers: vec!["*".into()], ..Default::default() }
+}
+
 async fn run(subs: &Subscriptions, provider: SubProvider, path: &str, headers: HeaderMap, body: Bytes) -> (u16, String) {
-    let resp = subs.execute(provider, Method::POST, path, headers, body, Some("client"), Some("m")).await;
+    run_as(subs, &principal(any_policy()), provider, path, headers, body).await.1
+}
+
+/// Status, `retry-after` and body of one request under a key of the policy.
+async fn run_as(
+    subs: &Subscriptions,
+    principal: &Principal,
+    provider: SubProvider,
+    path: &str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (Option<String>, (u16, String)) {
+    let resp = subs.execute(provider, Method::POST, path, headers, body, Some(principal), Some("m")).await;
     let status = resp.status().as_u16();
+    let retry = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_string);
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    (status, String::from_utf8_lossy(&bytes).to_string())
+    (retry, (status, String::from_utf8_lossy(&bytes).to_string()))
 }
 
 const SSE_OK: &str = "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n";
@@ -1264,4 +1285,73 @@ async fn codex_reset_credits_reject_non_object_usage_without_panicking() {
     Mock::given(path("/backend-api/wham/usage")).respond_with(ResponseTemplate::new(200).set_body_json(json!([]))).mount(&server).await;
     assert!(subs.poll_usage(&a.id).await.is_err());
     assert!(subs.db.get_usage(&a.id).await.unwrap().is_none());
+}
+
+/// One Codex mock per account token, each answering 200.
+async fn mock_codex_ok(server: &MockServer, tokens: &[&str]) {
+    for t in tokens {
+        Mock::given(method("POST"))
+            .and(path("/backend-api/codex/responses"))
+            .and(header("authorization", format!("Bearer {t}").as_str()))
+            .respond_with(ResponseTemplate::new(200).insert_header("x-served-by", *t).set_body_raw(SSE_OK, "text/event-stream"))
+            .mount(server)
+            .await;
+    }
+}
+
+async fn served_by(subs: &Subscriptions, principal: &Principal) -> (u16, Option<String>, Option<String>) {
+    let resp =
+        subs.execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), Some(principal), None).await;
+    let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+    (resp.status().as_u16(), header("x-served-by"), header("retry-after"))
+}
+
+#[tokio::test]
+async fn policy_accounts_choose_the_pool_accounts() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
+    let b = subs.save_account(codex_cred("acct-b", "tok-b")).await.unwrap();
+    subs.db.set_account_priority(&a.id, 10).await.unwrap();
+    mock_codex_ok(&server, &["tok-a", "tok-b"]).await;
+
+    let (status, by, _) = served_by(&subs, &principal(any_policy())).await;
+    assert_eq!((status, by.as_deref()), (200, Some("tok-a")), "without an entry, every account serves");
+
+    let mut p = any_policy();
+    p.accounts.insert("codex".into(), vec![b.id.clone()]);
+    let (status, by, _) = served_by(&subs, &principal(p)).await;
+    assert_eq!((status, by.as_deref()), (200, Some("tok-b")), "only the listed account serves");
+
+    let mut p = any_policy();
+    p.accounts.insert("codex".into(), vec!["codex-gone".into()]);
+    let (status, ..) = served_by(&subs, &principal(p)).await;
+    assert_eq!(status, 403, "the policy uses no account that exists");
+}
+
+#[tokio::test]
+async fn account_limits_move_requests_to_other_accounts() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let limiter = Arc::new(crate::limits::Limiter::default());
+    let subs = Arc::try_unwrap(subs).ok().unwrap().with_limiter(limiter.clone());
+    let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
+    let b = subs.save_account(codex_cred("acct-b", "tok-b")).await.unwrap();
+    subs.db.set_account_priority(&a.id, 10).await.unwrap();
+    mock_codex_ok(&server, &["tok-a", "tok-b"]).await;
+
+    let one = crate::limits::Allowance { requests_per_minute: Some(1), ..Default::default() };
+    let mut p = any_policy();
+    p.limits.accounts.insert(a.id.clone(), one.clone());
+    let key = principal(p.clone());
+    assert_eq!(served_by(&subs, &key).await.1.as_deref(), Some("tok-a"));
+    assert_eq!(served_by(&subs, &key).await.1.as_deref(), Some("tok-b"), "a is at its limit");
+    let c = limiter.policy_consumption("p", crate::limits::Meter::Account(&a.id), now());
+    assert_eq!(c.requests_per_minute, 1);
+
+    p.limits.accounts.insert(b.id.clone(), one);
+    let key = principal(p);
+    let (status, by, retry) = served_by(&subs, &key).await;
+    assert_eq!((status, by), (429, None), "every account is at its limit");
+    assert!(retry.is_some_and(|r| r.parse::<i64>().unwrap() > 0));
 }

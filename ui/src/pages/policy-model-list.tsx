@@ -1,11 +1,11 @@
 import { useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-react";
+import { ArrowLeft, ArrowRight, ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-react";
 
 import { CatalogRefresh } from "@/components/catalog-refresh";
 import { Empty, Mono } from "@/components/layout";
+import { Section, SectionContent } from "@/components/section";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -54,7 +54,17 @@ function fallbacks(targets: string): string {
   return i < 0 ? "" : targets.slice(i + 1).replace(/^ /, "");
 }
 
-/** The list of models keys under the policy may use: toggles, names, extra names. */
+/** The provider order for shared names, as shown, and how to change it. */
+export interface Precedence {
+  order: string[];
+  move: (index: number, by: number) => void;
+  /** Present when the policy sets its own order. */
+  reset?: () => void;
+}
+
+const SHOW_DENIED = "policy-models:show-denied";
+
+/** The list of models keys under the policy may use: toggles, names, extra names, precedence. */
 export function ModelList({
   allowedProviders,
   draft,
@@ -63,6 +73,7 @@ export function ModelList({
   fetching,
   error,
   health,
+  precedence,
 }: {
   allowedProviders: string[];
   draft: Draft;
@@ -71,11 +82,17 @@ export function ModelList({
   fetching: boolean;
   error: Error | null;
   health: (provider: string) => Health;
+  precedence: Precedence;
 }) {
   const [provider, setProvider] = useState(ALL);
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState<SortBy>("allowed");
   const [open, setOpen] = useState<Set<string>>(new Set());
+  const [showDenied, setShowDeniedState] = useState(() => localStorage.getItem(SHOW_DENIED) !== "0");
+  const setShowDenied = (on: boolean) => {
+    localStorage.setItem(SHOW_DENIED, on ? "1" : "0");
+    setShowDeniedState(on);
+  };
 
   const rules = { allow: lines(draft.allow), deny: lines(draft.deny) };
   // Allowed as edited, before the debounced preview catches up.
@@ -90,9 +107,12 @@ export function ModelList({
     .map((k) => byName.get(k))
     .filter((c): c is Candidate => !!c)
     .filter((c) => provider === ALL || c.provider === provider)
+    .filter((c) => showDenied || c.allowed)
     .filter((c) => !q || [qualified(c), draft.renames[qualified(c)] ?? ""].some((s) => s.toLowerCase().includes(q)));
   const providers = [...new Set(rows.map((c) => c.provider))];
   const allowedCount = rows.filter((c) => c.allowed).length;
+  // Globs from the policy file; the toggles write exact entries.
+  const patterns = [...rules.allow.map((p) => ["allow", p]), ...rules.deny.map((p) => ["deny", p])].filter(([, p]) => p.includes("*"));
 
   function toggle(cs: Candidate[], on: boolean) {
     const next = setAllowed(rules, cs, on);
@@ -126,15 +146,20 @@ export function ModelList({
   const other = draft.aliases.map((a, i) => ({ a, i })).filter(({ a }) => !byName.has(splitTargets(a.targets)[0] ?? ""));
 
   return (
-    <Card className="pb-0">
-      <CardHeader>
-        <CardTitle className="text-base">Models</CardTitle>
-        <CardDescription>
+    <Section
+      id="policy-models"
+      className="pb-0"
+      title="Models"
+      summary={view ? `${allowedCount} of ${rows.length} allowed` : undefined}
+      description={
+        <>
           What keys under this policy see{view ? ` (${allowedCount} of ${rows.length} allowed)` : ""}. Turn models on or off and rename them;{" "}
           <Mono>provider/model</Mono> always reaches an allowed model.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-3">
+        </>
+      }
+    >
+      <SectionContent className="flex flex-col gap-3">
+        <PrecedenceRow precedence={precedence} />
         <CatalogRefresh providers={provider === ALL ? allowedProviders : allowedProviders.filter((p) => p === provider)} />
         <div className="flex flex-wrap items-center gap-2">
           <Input aria-label="Filter models" placeholder="Filter" className="h-9 w-56" value={query} onChange={(e) => setQuery(e.target.value)} />
@@ -163,6 +188,10 @@ export function ModelList({
               ))}
             </SelectContent>
           </Select>
+          <label className="flex items-center gap-2 px-1 text-sm">
+            <Checkbox checked={showDenied} onCheckedChange={(c) => setShowDenied(c === true)} />
+            Show denied
+          </label>
           <div className="grow" />
           <Button type="button" variant="outline" size="sm" disabled={!shown.length} onClick={() => toggle(shown, true)}>
             Allow all{shown.length < rows.length ? ` ${shown.length} shown` : ""}
@@ -171,8 +200,14 @@ export function ModelList({
             Deny all{shown.length < rows.length ? ` ${shown.length} shown` : ""}
           </Button>
         </div>
+        {patterns.length > 0 && (
+          <p className="text-muted-foreground text-xs">
+            Patterns from the policy file also apply:{" "}
+            {patterns.map(([kind, p], i) => [i > 0 && ", ", <span key={`${kind}-${p}`}>{kind} <Mono>{p}</Mono></span>])}.
+          </p>
+        )}
         {error && <p className="bg-danger-muted text-destructive rounded-md px-3 py-2 text-sm">{error.message}</p>}
-      </CardContent>
+      </SectionContent>
       <Table className="min-w-[720px]">
         <TableHeader>
           <TableRow>
@@ -301,8 +336,8 @@ export function ModelList({
       </Table>
       {draft.providers.length === 0 && <Empty>No providers: keys under this policy see no models.</Empty>}
       {view && rows.length === 0 && draft.providers.length > 0 && <Empty>The allowed providers have no models in the catalog.</Empty>}
-      {rows.length > 0 && shown.length === 0 && <Empty>No models match the filter.</Empty>}
-      <CardContent className="flex flex-col gap-2 border-t pt-4 pb-6">
+      {rows.length > 0 && shown.length === 0 && <Empty>{showDenied ? "No models match the filter." : "No allowed models match the filter."}</Empty>}
+      <SectionContent className="flex flex-col gap-2 border-t pt-4 pb-6">
         <h3 className="text-sm font-semibold">Other names</h3>
         <p className="text-muted-foreground text-sm">
           Names for targets not in the list above: comma-separated provider/model targets, tried in order.
@@ -321,8 +356,50 @@ export function ModelList({
         <Button type="button" variant="outline" size="sm" className="self-start" onClick={() => addAlias("")}>
           <Plus /> Add a name
         </Button>
-      </CardContent>
-    </Card>
+      </SectionContent>
+    </Section>
+  );
+}
+
+/** Who serves a model name that several providers offer, unless a row picks one. */
+function PrecedenceRow({ precedence: { order, move, reset } }: { precedence: Precedence }) {
+  if (order.length < 2) return null;
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex flex-wrap items-center gap-x-2 text-sm">
+        <span className="font-medium">Precedence</span>
+        <span className="text-muted-foreground text-xs">
+          who serves a name several providers offer, unless its row picks one{reset ? "" : " (default order)"}
+        </span>
+        {reset && (
+          <Button type="button" variant="link" size="sm" className="h-auto p-0 text-xs" onClick={reset}>
+            Reset to the default order
+          </Button>
+        )}
+      </div>
+      <ol className="flex flex-wrap items-center gap-1.5" aria-label="Precedence">
+        {order.map((p, i) => (
+          <li key={p} className="flex items-center gap-0.5 rounded-md border py-0.5 pr-0.5 pl-2">
+            <span className="text-muted-foreground font-mono text-xs">{i + 1}</span>
+            <span className="px-1 font-mono text-xs">{p}</span>
+            <Button type="button" size="icon" variant="ghost" className="size-6" aria-label={`Move ${p} up`} disabled={i === 0} onClick={() => move(i, -1)}>
+              <ArrowLeft />
+            </Button>
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="size-6"
+              aria-label={`Move ${p} down`}
+              disabled={i === order.length - 1}
+              onClick={() => move(i, 1)}
+            >
+              <ArrowRight />
+            </Button>
+          </li>
+        ))}
+      </ol>
+    </div>
   );
 }
 
@@ -345,7 +422,7 @@ function RowNote({
   if (!c.allowed) {
     return c.rule && c.rule !== target ? (
       <span>
-        denied by <Mono>{c.rule}</Mono> (model patterns)
+        denied by the pattern <Mono>{c.rule}</Mono>
       </span>
     ) : null;
   }

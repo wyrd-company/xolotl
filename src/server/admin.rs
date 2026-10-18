@@ -1,5 +1,7 @@
 //! Admin API used by the `xolotl` CLI: client keys, accounts, logins, usage.
 
+use std::collections::BTreeMap;
+
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -11,6 +13,7 @@ use serde_json::{Value, json};
 use super::{AppState, authorize, json_error};
 use crate::db::{UsageFilter, now};
 use crate::keys::{IssueRequest, Scope};
+use crate::limits::Meter;
 use crate::policy::Policy;
 use crate::secrets::SecretStore;
 use crate::subscription::SubProvider;
@@ -160,7 +163,13 @@ fn view_json(s: &AppState, policy: &Policy) -> Value {
         "shared": policy.shared_names(&catalog),
         "mcp_servers": s.mcp.allowed_servers(policy).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
         "tools": mcp_view_tools(s, policy),
-        "usage": s.limiter.policy_consumption(&policy.name, now()),
+        "usage": s.limiter.policy_consumption(&policy.name, Meter::Total, now()),
+        "provider_usage": policy.limits.providers.keys()
+            .map(|p| (p.clone(), s.limiter.policy_consumption(&policy.name, Meter::Provider(p), now())))
+            .collect::<BTreeMap<_, _>>(),
+        "account_usage": policy.limits.accounts.keys()
+            .map(|id| (id.clone(), s.limiter.policy_consumption(&policy.name, Meter::Account(id), now())))
+            .collect::<BTreeMap<_, _>>(),
     })
 }
 

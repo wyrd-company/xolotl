@@ -179,7 +179,7 @@ impl Accounting {
         let r = &self.record;
         if let (Some(limiter), Some(client)) = (&self.limiter, &r.client_id) {
             let tokens = usage.input.unwrap_or(0).max(0) + usage.output.unwrap_or(0).max(0);
-            limiter.record_tokens(client, tokens as u64, crate::db::now());
+            limiter.record_tokens(client, &r.provider, r.account_id.as_deref(), tokens as u64, crate::db::now());
         }
         let attrs = [
             KeyValue::new("provider", r.provider.clone()),

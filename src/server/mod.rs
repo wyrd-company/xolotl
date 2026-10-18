@@ -26,7 +26,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::gateway::Gateway;
 use crate::keys::{KeyManager, Principal, Scope};
-use crate::limits::Limiter;
+use crate::limits::{Exceeded, Limiter, Meter};
 use crate::mcp::McpHub;
 use crate::policy::{Target, View};
 use crate::proxy::{self, forward_request_headers};
@@ -278,20 +278,23 @@ pub fn json_error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(json!({"error": {"type": status_kind(status), "message": msg}}))).into_response()
 }
 
-/// Count a request against its policy's limits. A reached limit answers 429
-/// with `retry-after`, in the Anthropic error shape for Messages clients.
-fn admit(state: &AppState, principal: &Principal, anthropic: bool) -> Result<(), Response> {
+/// Count a request against its policy's limits on every meter. A reached
+/// limit answers 429 with `retry-after`, in the Anthropic error shape for
+/// Messages clients.
+fn admit(state: &AppState, principal: &Principal, meters: &[Meter], anthropic: bool) -> Result<(), Response> {
     let Some(client) = principal.client_id() else { return Ok(()) };
-    state.limiter.admit(client, &principal.policy, crate::db::now()).map_err(|e| {
-        let msg = e.message(&principal.policy.name);
-        let mut resp = if anthropic {
-            proxy::anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
-        } else {
-            proxy::error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
-        };
-        resp.headers_mut().insert(header::RETRY_AFTER, e.retry_after.into());
-        resp
-    })
+    state.limiter.admit(client, &principal.policy, meters, crate::db::now()).map_err(|e| limited(principal, &e, anthropic))
+}
+
+fn limited(principal: &Principal, e: &Exceeded, anthropic: bool) -> Response {
+    let msg = e.message(&principal.policy.name);
+    let mut resp = if anthropic {
+        proxy::anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+    } else {
+        proxy::error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+    };
+    resp.headers_mut().insert(header::RETRY_AFTER, e.retry_after.into());
+    resp
 }
 
 fn status_kind(s: StatusCode) -> &'static str {
@@ -367,26 +370,36 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             .unwrap_or_default();
         return err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("model {model:?} is not available on {path}{hint}"));
     }
-    if let Err(resp) = admit(state, &principal, anthropic) {
-        return resp;
-    }
-
     let fwd = forward_request_headers(&headers);
-    let client_id = principal.client_id().map(str::to_string);
     let last = usable.len() - 1;
+    // The request counts once in total, on the first target admitted; each
+    // target counts on its provider. A target over its provider's limit is
+    // skipped like one that answered 429.
+    let mut counted = false;
     for (i, target) in usable.iter().enumerate() {
+        let provider = Meter::Provider(&target.provider);
+        let meters: &[Meter] = if counted { &[provider] } else { &[Meter::Total, provider] };
+        if let Some(client) = principal.client_id()
+            && let Err(e) = state.limiter.admit(client, &principal.policy, meters, crate::db::now())
+        {
+            if i < last && e.on.is_some() {
+                tracing::info!(target = %target.qualified(), limit = e.limit, "provider limit reached; trying the next alias target");
+                continue;
+            }
+            return limited(&principal, &e, anthropic);
+        }
+        counted = true;
         let (resp, translation) = match (wire, route(target)) {
             (Some(client), Some(Route::Translated(upstream))) => {
                 let (body, t) = match translate::request(client, upstream, &json, &target.model) {
                     Ok(x) => x,
                     Err(msg) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", msg),
                 };
-                let resp =
-                    send(state, target, upstream.path(), translated_headers(&fwd, upstream), body, client_id.as_deref(), &model).await;
+                let resp = send(state, target, upstream.path(), translated_headers(&fwd, upstream), body, &principal, &model).await;
                 (resp, Some(t))
             }
             _ => {
-                let resp = send(state, target, path, fwd.clone(), json.clone(), client_id.as_deref(), &model).await;
+                let resp = send(state, target, path, fwd.clone(), json.clone(), &principal, &model).await;
                 let streams = json.get("stream").and_then(Value::as_bool).unwrap_or(false);
                 let grok = pool(&target.provider) == Some(SubProvider::Grok);
                 let resp = if grok && wire == Some(Wire::Responses) && !streams { collect_grok(resp).await } else { resp };
@@ -436,16 +449,17 @@ async fn send(
     path: &str,
     headers: HeaderMap,
     mut body: Value,
-    client_id: Option<&str>,
+    principal: &Principal,
     model: &str,
 ) -> Response {
+    let client_id = principal.client_id();
     // Mistral and Grok drop `stream_options`; they report usage anyway.
     proxy::request_stream_usage(path, &mut body);
     match pool(&target.provider) {
         Some(p) => {
             body["model"] = Value::String(target.model.clone());
             let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
-            state.subs.execute(p, Method::POST, path, headers, bytes, client_id, Some(model)).await
+            state.subs.execute(p, Method::POST, path, headers, bytes, Some(principal), Some(model)).await
         }
         None => state.gateway.execute(target, Method::POST, path, headers, body, client_id, model).await,
     }
@@ -610,7 +624,7 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
         Ok(x) => x,
         Err(r) => return r,
     };
-    if let Err(resp) = admit(&state, &principal, rest.starts_with("v1/messages")) {
+    if let Err(resp) = admit(&state, &principal, &[Meter::Total, Meter::Provider(&provider)], rest.starts_with("v1/messages")) {
         return resp;
     }
     let path = path_and_query(&rest, &parts.uri);
@@ -637,7 +651,7 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
         Ok(x) => x,
         Err(r) => return r,
     };
-    if let Err(resp) = admit(&state, &principal, rest.starts_with("v1/messages")) {
+    if let Err(resp) = admit(&state, &principal, &[Meter::Total, Meter::Provider(provider)], rest.starts_with("v1/messages")) {
         return resp;
     }
     // Failover may resend the body, so it is always buffered here.
@@ -652,7 +666,7 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
     let path = path_and_query(&rest, &parts.uri);
     let fwd = forward_request_headers(&parts.headers);
     let label = model.map(|m| format!("{provider}/{m}"));
-    state.subs.execute(SubProvider::OpencodeGo, parts.method, &path, fwd, bytes, principal.client_id(), label.as_deref()).await
+    state.subs.execute(SubProvider::OpencodeGo, parts.method, &path, fwd, bytes, Some(&principal), label.as_deref()).await
 }
 
 #[cfg(test)]

@@ -19,6 +19,10 @@ providers = ["claude", "codex", "grok", "opencode-go", "vercel"]
 deny_models = ["*-preview"]
 precedence = ["claude", "codex", "grok", "opencode-go", "vercel"]
 
+[accounts]
+codex = ["codex-1a2b3c4d5e"]
+claude = ["*"]
+
 [winners]
 "kimi-k3" = "vercel"
 
@@ -40,18 +44,20 @@ xolotl policies get devcontainer
 xolotl policies delete devcontainer   # refused while keys use it
 ```
 
-The web UI's policy editor has the same fields. Its model list shows every
-model of the allowed providers, with allow and deny toggles, inline renames,
-extra names with fallbacks, the winner of each shared name, and the state of
-each provider's accounts. The toggles write exact `provider/model` entries to
-`allow_models` and `deny_models`. The globs stay editable under
-**Model patterns**.
+The web UI's policy editor has the same fields. It lists the providers with
+the accounts of each subscription provider. Its model list shows every model
+of the allowed providers, with allow and deny toggles, inline renames, extra
+names with fallbacks, the winner of each shared name, the precedence, and the
+state of the accounts the policy uses. The toggles write exact `provider/model`
+entries to `allow_models` and `deny_models`. Globs in the policy file still
+apply; the model list names them.
 
 | Field | Meaning |
 |---|---|
 | `name` | Lowercase letters, digits, `-` and `_`, at most 63 characters |
 | `description` | Free text |
 | `providers` | Providers the key can use: `claude`, `codex`, `grok`, `opencode-go`, gateway provider names, or `*` for all |
+| `accounts` | Per subscription provider, the accounts that serve the keys, or `["*"]` for every account, also accounts added later. See [Accounts](#accounts) |
 | `allow_models` | Globs on `model` or `provider/model`. Empty allows every model of the allowed providers |
 | `deny_models` | Globs that remove models. Deny wins over allow |
 | `precedence` | Provider order for a model name that several providers serve |
@@ -61,7 +67,7 @@ each provider's accounts. The toggles write exact `provider/model` entries to
 | `scopes` | What the key can do. Default `["proxy"]` |
 | `mcp_servers` | MCP servers the key can use through `/mcp`, or `*` |
 | `allow_tools`, `deny_tools` | Globs on `tool` or `server/tool`. Deny wins. See [MCP gateway](mcp-gateway#policies) |
-| `limits` | Request and token limits on the LLM endpoints. See [Rate limits](#rate-limits) |
+| `limits` | Request and token limits on the LLM endpoints, also per provider and per account. See [Rate limits](#rate-limits) |
 
 ### Scopes
 
@@ -73,6 +79,25 @@ each provider's accounts. The toggles write exact `provider/model` entries to
 | `admin` | The admin API, the same as the bootstrap admin token |
 
 A policy that allows MCP servers needs no `providers`.
+
+### Accounts
+
+A subscription provider serves a policy's keys from the accounts listed under
+`accounts`:
+
+```toml
+[accounts]
+codex = ["codex-1a2b3c4d5e", "codex-f6a7b8c9d0"]   # only these two
+claude = ["*"]                                    # every account, also new ones
+```
+
+- A provider without an entry uses every account. The web UI always writes
+  the entry: a provider you turn on starts with the accounts it has now.
+- The list can't be empty. To block a provider, remove it from `providers`.
+- `xolotl accounts list` shows the account IDs.
+- When none of the listed accounts exists, a request gets a 403. When the
+  listed accounts are disabled, cooling down or at a limit, the pool answers
+  as it does for a pool with no usable accounts.
 
 ## Model names
 
@@ -118,7 +143,8 @@ key can call. A client gets the same names from `GET /v1/models`.
 
 ## Rate limits
 
-A policy can limit how much its keys use the LLM endpoints:
+A policy can limit how much its keys use the LLM endpoints, in total and per
+provider or account:
 
 ```toml
 [limits]
@@ -127,6 +153,12 @@ requests_per_minute = 60
 requests_per_day = 5000
 tokens_per_minute = 200000
 tokens_per_day = 5000000
+
+[limits.providers.vercel]    # requests sent to one provider
+tokens_per_day = 1000000
+
+[limits.accounts.codex-1a2b3c4d5e]   # requests sent to one account
+requests_per_day = 500
 ```
 
 Every field is optional. A missing limit is no limit. A limit must be at least
@@ -139,7 +171,16 @@ Every field is optional. A missing limit is no limit. A limit must be at least
 
 - **Windows** slide: a minute is the last 60 seconds, a day the last 24 hours.
 - **Per key or per policy.** With `per = "key"` (default) each key has its own
-  allowance. With `per = "policy"` all keys of the policy share one.
+  allowance. With `per = "policy"` all keys of the policy share one. `per`
+  applies to the provider and account limits too.
+- **Provider limits** count the requests sent to the provider. When a
+  provider is at its limit, an alias tries its next target; the last target
+  answers 429. A provider limit names a provider the policy allows.
+- **Account limits** count the requests sent to the account, also one that
+  fails over to another account. An account at its limit is skipped and the
+  pool serves from its other accounts. When every account is at a limit, the
+  request gets a 429. An account limit names an account the policy uses.
+  After a restart, each logged request counts on the account that answered it.
 - **Tokens are counted when the response finishes.** A token limit is checked
   before each request, so the request that goes over the limit still
   completes. The next one is refused.
@@ -161,7 +202,8 @@ Counters are kept in memory and rebuilt from the request log of the last
 24 hours when xolotl starts. Each instance counts only its own requests.
 
 `xolotl keys list` shows each key's consumption per window, and the web UI
-shows it on the **Policies** and **Client keys** screens. The metrics are
+shows it on the **Policies** and **Client keys** screens. The **Policies**
+screen also shows the consumption of each provider and account limit. The metrics are
 `xolotl.limit.consumption` and `xolotl.limit.rejections` (see
 [Telemetry](telemetry)).
 

@@ -151,6 +151,8 @@ export interface Policy {
   name: string;
   description?: string;
   providers: string[];
+  /** Subscription provider -> the account ids of its pool keys may use; `*` takes every account. No entry: every account. */
+  accounts?: Record<string, string[]>;
   allow_models?: string[];
   deny_models?: string[];
   precedence?: string[];
@@ -165,18 +167,26 @@ export interface Policy {
   limits?: Limits;
 }
 
-/** A policy's rate limits and token budgets; a missing field is unlimited. */
-export interface Limits {
-  /** Whose consumption counts: each key on its own (default) or all keys of the policy together. */
-  per?: "key" | "policy";
+/** Request and token limits over the sliding minute and day; a missing field is unlimited. */
+export interface Allowance {
   requests_per_minute?: number;
   requests_per_day?: number;
   tokens_per_minute?: number;
   tokens_per_day?: number;
 }
 
+/** A policy's rate limits and token budgets: of every request, and per provider and account. */
+export interface Limits extends Allowance {
+  /** Whose consumption counts: each key on its own (default) or all keys of the policy together. */
+  per?: "key" | "policy";
+  /** Provider name -> limits of the requests sent to it. */
+  providers?: Record<string, Allowance>;
+  /** Account id -> limits of the requests sent to it. */
+  accounts?: Record<string, Allowance>;
+}
+
 /** Consumption in the sliding minute and day windows. */
-export type Consumption = Required<Omit<Limits, "per">>;
+export type Consumption = Required<Allowance>;
 
 export interface PolicyView {
   policy: string;
@@ -189,6 +199,9 @@ export interface PolicyView {
   tools: string[];
   /** Consumption of all keys of the policy together. */
   usage: Consumption;
+  /** The same, per limited provider and per limited account. */
+  provider_usage?: Record<string, Consumption>;
+  account_usage?: Record<string, Consumption>;
 }
 
 export interface KeyInfo {

@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, Plus } from "lucide-react";
+import { Plus } from "lucide-react";
 import { Link, Navigate, useNavigate, useParams } from "react-router";
 
 import { Confirm } from "@/components/confirm";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
 import { PolicyLimits } from "@/components/policy-limits";
+import { Section, SectionContent } from "@/components/section";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -29,10 +29,11 @@ import {
   type Scope,
 } from "@/lib/api";
 import { useAction } from "@/lib/hooks";
-import { providerHealth, usable } from "@/lib/policy-models";
+import { accountProvider, allowsAccount, providerHealth } from "@/lib/policy-models";
 import { cn } from "@/lib/utils";
 
-import { HealthBadge, lines, ModelList } from "./policy-model-list";
+import { lines, ModelList } from "./policy-model-list";
+import { ProviderAccess } from "./policy-providers";
 
 /** Route segment for an unsaved policy; `+` can't appear in policy names. */
 const NEW = "+new";
@@ -102,6 +103,8 @@ export interface Draft {
   name: string;
   description: string;
   providers: string[];
+  /** Every allowed subscription provider has an entry (`*` for none in the policy). */
+  accounts: Record<string, string[]>;
   scopes: Scope[];
   allow: string;
   deny: string;
@@ -118,10 +121,15 @@ export interface Draft {
 export type SetDraft = <K extends keyof Draft>(k: K, v: Draft[K]) => void;
 
 function toDraft(p: Policy | null): Draft {
+  const providers = p?.providers ?? [];
+  const accounts = { ...p?.accounts };
+  // A provider without an entry uses every account: show it as `*`.
+  for (const sub of SUB_PROVIDERS) if ((providers.includes("*") || providers.includes(sub)) && !accounts[sub]) accounts[sub] = ["*"];
   return {
     name: p?.name ?? "",
     description: p?.description ?? "",
-    providers: p?.providers ?? [],
+    providers,
+    accounts,
     scopes: p?.scopes ?? ["proxy"],
     allow: (p?.allow_models ?? []).join("\n"),
     deny: (p?.deny_models ?? []).join("\n"),
@@ -151,10 +159,27 @@ function toPolicy(d: Draft): Policy {
       .map(([t, n]) => [t, n.trim()])
       .filter(([t, n]) => n && n !== t.slice(t.indexOf("/") + 1)),
   );
+  const all = d.providers.includes("*");
+  const allows = (p: string) => all || d.providers.includes(p);
+  // Limits of providers and accounts the policy no longer uses go with them.
+  const usesAccount = (id: string) => {
+    const p = accountProvider(id, SUB_PROVIDERS);
+    return !!p && allows(p) && allowsAccount(d.accounts, p, id);
+  };
+  const limits: Limits = { ...d.limits };
+  const keep = <T,>(m: Record<string, T> | undefined, ok: (k: string) => boolean) => {
+    const kept = Object.fromEntries(Object.entries(m ?? {}).filter(([k]) => ok(k)));
+    return Object.keys(kept).length ? kept : undefined;
+  };
+  limits.providers = keep(d.limits.providers, allows);
+  limits.accounts = keep(d.limits.accounts, usesAccount);
+  if (!limits.providers) delete limits.providers;
+  if (!limits.accounts) delete limits.accounts;
   return {
     name: d.name.trim(),
     description: d.description.trim() || undefined,
     providers: d.providers,
+    accounts: Object.fromEntries(Object.entries(d.accounts).filter(([p]) => allows(p))),
     scopes: d.scopes,
     allow_models: lines(d.allow),
     deny_models: lines(d.deny),
@@ -165,7 +190,7 @@ function toPolicy(d: Draft): Policy {
     mcp_servers: d.mcpServers,
     allow_tools: lines(d.allowTools),
     deny_tools: lines(d.denyTools),
-    limits: d.limits,
+    limits,
   };
 }
 
@@ -193,7 +218,7 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
   const gateway = useQuery({ queryKey: ["providers"], queryFn: () => get<GatewayProvider[]>("/admin/providers") });
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: () => get<Account[]>("/admin/accounts"), refetchInterval: 30_000 });
   const known = [...SUB_PROVIDERS, ...(gateway.data ?? []).filter((p) => p.enabled).map((p) => p.name)];
-  const health = (p: string) => providerHealth(p, SUB_PROVIDERS, accounts.data ?? [], gateway.data ?? []);
+  const health = (p: string) => providerHealth(p, SUB_PROVIDERS, accounts.data ?? [], gateway.data ?? [], draft.accounts);
   const all = draft.providers.includes("*");
   const allowed = all ? known : known.filter((p) => draft.providers.includes(p));
   // Precedence as shown: the saved order first, then the rest in default order.
@@ -221,9 +246,6 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
     onSuccess: () => navigate("/policies"),
   });
 
-  function toggleProvider(p: string, on: boolean) {
-    set("providers", on ? [...draft.providers, p] : draft.providers.filter((x) => x !== p));
-  }
   function move(i: number, by: number) {
     const next = [...order];
     [next[i], next[i + by]] = [next[i + by], next[i]];
@@ -238,8 +260,8 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
         save.mutate(undefined);
       }}
     >
-      <Card>
-        <CardContent className="flex flex-col gap-5">
+      <Section id="policy-general" title="Policy" summary={draft.description || draft.scopes.join(", ")}>
+        <SectionContent className="flex flex-col gap-5">
           <div className="grid gap-4 md:grid-cols-[minmax(0,16rem)_1fr]">
             <div className="flex flex-col gap-2">
               <Label htmlFor="p-name">Name</Label>
@@ -258,22 +280,6 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
             </div>
           </div>
           <fieldset className="flex flex-col gap-3">
-            <legend className="pb-3 text-sm font-medium">Providers</legend>
-            <div className="flex flex-wrap gap-x-6 gap-y-3">
-              {known.map((p) => (
-                <label key={p} className={cn("flex items-center gap-2 text-sm", accounts.isSuccess && !usable(health(p)) && "text-muted-foreground")}>
-                  <Checkbox checked={all || draft.providers.includes(p)} disabled={all} onCheckedChange={(c) => toggleProvider(p, c === true)} />
-                  <span className="font-mono">{p}</span>
-                  {accounts.isSuccess && <HealthBadge health={health(p)} />}
-                </label>
-              ))}
-              <label className="flex items-center gap-2 text-sm">
-                <Checkbox checked={all} onCheckedChange={(c) => set("providers", c === true ? ["*"] : [])} />
-                all (<span className="font-mono">*</span>)
-              </label>
-            </div>
-          </fieldset>
-          <fieldset className="flex flex-col gap-3">
             <legend className="pb-3 text-sm font-medium">Scopes</legend>
             <div className="flex flex-wrap gap-x-6 gap-y-3">
               {SCOPES.map(([s, label]) => (
@@ -287,74 +293,31 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
               ))}
             </div>
           </fieldset>
-        </CardContent>
-      </Card>
+        </SectionContent>
+      </Section>
 
-      <ModelList allowedProviders={allowed} draft={draft} set={set} view={preview.data} fetching={preview.isFetching} error={preview.error} health={health} />
+      <ProviderAccess draft={draft} set={set} known={known} accounts={accounts.data ?? []} health={health} ready={accounts.isSuccess} />
 
-      <Card>
-        <CardContent>
-          <details>
-            <summary className="cursor-pointer text-sm font-medium">Model patterns</summary>
-            <p className="text-muted-foreground pt-2 text-sm">
-              The toggles above write exact <Mono>provider/model</Mono> entries here. Globs match <Mono>model</Mono> or <Mono>provider/model</Mono>.
-            </p>
-            <div className="grid gap-4 pt-4 md:grid-cols-2">
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="p-allow">Allow models (one per line; empty allows all)</Label>
-                <Textarea id="p-allow" className="font-mono" rows={3} value={draft.allow} onChange={(e) => set("allow", e.target.value)} />
-              </div>
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="p-deny">Deny models (deny wins)</Label>
-                <Textarea id="p-deny" className="font-mono" rows={3} value={draft.deny} onChange={(e) => set("deny", e.target.value)} />
-              </div>
-            </div>
-          </details>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Precedence</CardTitle>
-          <CardDescription>
-            Who serves a model name that several providers offer, unless the model list picks one. The others drop the plain name;{" "}
-            <Mono>provider/model</Mono> still reaches them.
-            {draft.precedence.length === 0 ? " Using the default order." : null}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-4">
-          <ol className="flex flex-col gap-1">
-            {order.map((p, i) => (
-              <li key={p} className="flex max-w-sm items-center gap-2 rounded-md border px-3 py-1.5">
-                <span className="text-muted-foreground w-5 font-mono text-xs">{i + 1}</span>
-                <span className="flex-1 font-mono text-sm">{p}</span>
-                <Button type="button" size="icon" variant="ghost" aria-label={`Move ${p} up`} disabled={i === 0} onClick={() => move(i, -1)}>
-                  <ArrowUp />
-                </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  aria-label={`Move ${p} down`}
-                  disabled={i === order.length - 1}
-                  onClick={() => move(i, 1)}
-                >
-                  <ArrowDown />
-                </Button>
-              </li>
-            ))}
-          </ol>
-          {draft.precedence.length > 0 && (
-            <Button type="button" variant="ghost" size="sm" className="self-start" onClick={() => set("precedence", [])}>
-              Reset to the default order
-            </Button>
-          )}
-        </CardContent>
-      </Card>
+      <ModelList
+        allowedProviders={allowed}
+        draft={draft}
+        set={set}
+        view={preview.data}
+        fetching={preview.isFetching}
+        error={preview.error}
+        health={health}
+        precedence={{ order, move, reset: draft.precedence.length > 0 ? () => set("precedence", []) : undefined }}
+      />
 
       <McpAccess draft={draft} set={set} tools={preview.data?.tools ?? []} />
 
-      <PolicyLimits limits={draft.limits} onChange={(l) => set("limits", l)} usage={isNew ? undefined : preview.data?.usage} />
+      <PolicyLimits
+        limits={draft.limits}
+        onChange={(l) => set("limits", l)}
+        view={isNew ? undefined : preview.data}
+        providers={allowed}
+        accounts={(accounts.data ?? []).filter((a) => allowed.includes(a.provider) && allowsAccount(draft.accounts, a.provider, a.id))}
+      />
 
       <div className="flex flex-wrap items-center gap-3">
         <Button type="submit" disabled={!dirty || !policy.name || !!preview.error || save.isPending}>
@@ -402,14 +365,17 @@ function McpAccess({
   const toggle = (name: string, on: boolean) => set("mcpServers", on ? [...draft.mcpServers, name] : draft.mcpServers.filter((x) => x !== name));
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">MCP servers</CardTitle>
-        <CardDescription>
+    <Section
+      id="policy-mcp"
+      title="MCP servers"
+      summary={all ? "all servers" : `${draft.mcpServers.length} server${draft.mcpServers.length === 1 ? "" : "s"}`}
+      description={
+        <>
           The upstream servers and tools keys may use through <Mono>/mcp</Mono>. Needs the <Mono>mcp</Mono> scope.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-5">
+        </>
+      }
+    >
+      <SectionContent className="flex flex-col gap-5">
         <div className="flex flex-wrap gap-x-6 gap-y-3">
           {names.map((n) => (
             <label key={n} className="flex items-center gap-2 text-sm">
@@ -467,7 +433,7 @@ function McpAccess({
             )}
           </div>
         )}
-      </CardContent>
-    </Card>
+      </SectionContent>
+    </Section>
   );
 }

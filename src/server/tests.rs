@@ -636,6 +636,49 @@ async fn policy_limits_answer_429_in_the_endpoint_shape() {
 }
 
 #[tokio::test]
+async fn provider_limits_skip_to_the_next_alias_target() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path("/llama/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 1}})),
+        )
+        .expect(1)
+        .mount(&h.upstream)
+        .await;
+    let mut limits = Limits::default();
+    limits.providers.insert("llama".into(), crate::limits::Allowance { requests_per_minute: Some(1), ..Default::default() });
+    let mut p = Policy { limits, ..policy("prov") };
+    p.aliases.insert("fast".into(), crate::policy::AliasTargets::Many(vec!["llama/qwen3".into(), "codex/gpt-6-codex".into()]));
+    let key = h.key(p).await;
+    let chat = |model: &str| json!({"model": model, "messages": []});
+    assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat("fast"))).await.0, 200);
+    // llama is at its limit: the alias goes on to codex, which has no accounts here.
+    let (status, body) = h.call("POST", "/v1/chat/completions", Some(&key), Some(chat("fast"))).await;
+    assert_eq!(status, 503, "{body}");
+    let (status, body) = h.call("POST", "/v1/chat/completions", Some(&key), Some(chat("llama/qwen3"))).await;
+    assert_eq!(status, 429, "{body}");
+    assert!(body["error"]["message"].as_str().unwrap().contains("on provider \"llama\""), "{body}");
+    // Every request counts once in total; the refused one does not count.
+    assert_eq!(h.state.limiter.consumption("prov/client", now()).requests_per_minute, 2);
+
+    let (_, view) = h.call("GET", "/admin/policies/prov/view", Some(&h.admin), None).await;
+    assert_eq!(view["provider_usage"]["llama"]["requests_per_minute"], 1, "{view}");
+
+    // Limits name providers and accounts the policy uses.
+    for (limits, why) in [
+        (json!({"providers": {"nope": {"requests_per_day": 1}}}), "unknown provider"),
+        (json!({"accounts": {"codex-x1": {"requests_per_day": 1}}}), "does not use account"),
+        (json!({"accounts": {"x1": {"requests_per_day": 1}}}), "not an account id"),
+    ] {
+        let p = json!({"name": "bad", "providers": ["llama", "codex"], "accounts": {"codex": ["codex-y2"]}, "limits": limits});
+        let (status, body) = h.call("PUT", "/admin/policies/bad", Some(&h.admin), Some(p)).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body["error"]["message"].as_str().unwrap().contains(why), "{why}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn chat_streams_report_usage_for_token_limits() {
     let h = harness().await;
     // A conforming upstream sends usage only when asked to.

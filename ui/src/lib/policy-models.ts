@@ -106,15 +106,27 @@ export function sortRows(rows: Candidate[], by: SortBy): Candidate[] {
 
 export type Health = { kind: "pool"; total: number; available: number } | { kind: "gateway"; ready: boolean } | { kind: "unknown" };
 
-/** Accounts of a subscription pool, or the key state of a gateway provider. */
+/** The subscription provider of an account id: ids are `<provider>-<suffix>` (`policy::account_provider`). */
+export function accountProvider(id: string, pools: readonly string[]): string | undefined {
+  return pools.find((p) => id.startsWith(`${p}-`) && id.length > p.length + 1);
+}
+
+/** Whether a policy's `accounts` lets keys use an account of an allowed provider (`Policy::allows_account`). */
+export function allowsAccount(accounts: Record<string, string[]>, provider: string, id: string): boolean {
+  const ids = accounts[provider];
+  return !ids || ids.includes("*") || ids.includes(id);
+}
+
+/** Accounts of a subscription pool the policy uses, or the key state of a gateway provider. */
 export function providerHealth(
   provider: string,
   pools: readonly string[],
-  accounts: { provider: string; available: boolean }[],
+  accounts: { id: string; provider: string; available: boolean }[],
   gateway: { name: string; has_key: boolean; no_auth: boolean }[],
+  policyAccounts: Record<string, string[]> = {},
 ): Health {
   if (pools.includes(provider)) {
-    const mine = accounts.filter((a) => a.provider === provider);
+    const mine = accounts.filter((a) => a.provider === provider && allowsAccount(policyAccounts, provider, a.id));
     return { kind: "pool", total: mine.length, available: mine.filter((a) => a.available).length };
   }
   const g = gateway.find((p) => p.name === provider);

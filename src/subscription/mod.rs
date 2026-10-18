@@ -28,7 +28,8 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{Strategy, SubscriptionConfig};
 use crate::db::{AccountRow, AccountUsage, Db, UsageWindow, now};
-use crate::limits::Limiter;
+use crate::keys::Principal;
+use crate::limits::{Exceeded, Limiter, Meter};
 use crate::proxy::{self, Accounting};
 use crate::secrets::{Secrets, get_typed, put_typed};
 use crate::telemetry::metrics;
@@ -192,7 +193,14 @@ impl RefreshError {
 
 enum SelectError {
     NoAccounts,
-    AllCooling { until: i64 },
+    /// The pool has accounts, but the caller's policy uses none of them.
+    NotAllowed,
+    AllCooling {
+        until: i64,
+    },
+    /// Every usable account reached a limit of the caller's policy; the one
+    /// that admits a request soonest.
+    Limited(Exceeded),
 }
 
 /// Account view for the admin API / CLI.
@@ -609,19 +617,40 @@ impl Subscriptions {
 
     // ------------------------------------------------------------ selection
 
-    async fn select(&self, provider: SubProvider, session: Option<&str>, tried: &HashSet<String>) -> Result<AccountRow, SelectError> {
+    async fn select(
+        &self,
+        provider: SubProvider,
+        principal: Option<&Principal>,
+        session: Option<&str>,
+        tried: &HashSet<String>,
+    ) -> Result<AccountRow, SelectError> {
         let rows = self.db.list_accounts(Some(provider.as_str())).await.unwrap_or_default();
         let t = now();
         let loaded: HashSet<String> = self.creds.read().keys().cloned().collect();
         let mut earliest: Option<i64> = None;
+        let mut limited: Option<Exceeded> = None;
+        let mut allowed_any = false;
         let mut candidates = Vec::new();
         for r in rows {
+            if principal.is_some_and(|p| !p.policy.allows_account(provider.as_str(), &r.id)) {
+                continue;
+            }
+            allowed_any = true;
             if !r.enabled || r.auth_failed || !loaded.contains(&r.id) || tried.contains(&r.id) {
                 continue;
             }
             if r.cooling_down(t) {
                 let u = r.cooldown_until.unwrap_or(t);
                 earliest = Some(earliest.map_or(u, |e| e.min(u)));
+                continue;
+            }
+            if let Some(p) = principal
+                && let Some(client) = p.client_id()
+                && let Err(e) = self.limiter.check(client, &p.policy, Meter::Account(&r.id), t)
+            {
+                if limited.as_ref().is_none_or(|l| e.retry_after < l.retry_after) {
+                    limited = Some(e);
+                }
                 continue;
             }
             let max_used = self
@@ -635,9 +664,14 @@ impl Subscriptions {
             candidates.push((r, max_used));
         }
         if candidates.is_empty() {
-            return Err(match earliest {
-                Some(until) => SelectError::AllCooling { until },
-                None => SelectError::NoAccounts,
+            return Err(match (limited, earliest) {
+                (Some(e), Some(until)) if until - t < e.retry_after => SelectError::AllCooling { until },
+                (Some(e), _) => SelectError::Limited(e),
+                (None, Some(until)) => SelectError::AllCooling { until },
+                (None, None) if !allowed_any && principal.is_some_and(|p| p.policy.accounts.contains_key(provider.as_str())) => {
+                    SelectError::NotAllowed
+                }
+                (None, None) => SelectError::NoAccounts,
             });
         }
 
@@ -719,9 +753,10 @@ impl Subscriptions {
         path: &str,
         headers: HeaderMap,
         body: Bytes,
-        client_id: Option<&str>,
+        principal: Option<&Principal>,
         model: Option<&str>,
     ) -> Response {
+        let client_id = principal.and_then(Principal::client_id);
         let ep = &self.cfg.endpoints;
         let url = match provider {
             SubProvider::Codex => codex::upstream_url(ep, path),
@@ -745,9 +780,26 @@ impl Subscriptions {
         let mut last: Option<(u16, reqwest::header::HeaderMap, Bytes, String)> = None;
 
         'accounts: for _ in 0..self.cfg.max_attempts {
-            let account = match self.select(provider, session.as_deref(), &tried).await {
+            let account = match self.select(provider, principal, session.as_deref(), &tried).await {
                 Ok(a) => a,
                 Err(_) if last.is_some() => break,
+                Err(SelectError::NotAllowed) => {
+                    accounting.finish(403, Default::default());
+                    return self.error_for(
+                        provider,
+                        path,
+                        StatusCode::FORBIDDEN,
+                        "permission_error",
+                        &format!("this key may use no {provider} account that exists"),
+                    );
+                }
+                Err(SelectError::Limited(e)) => {
+                    accounting.finish(429, Default::default());
+                    let policy = principal.map(|p| p.policy.name.as_str()).unwrap_or_default();
+                    let mut resp = self.error_for(provider, path, StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &e.message(policy));
+                    resp.headers_mut().insert(axum::http::header::RETRY_AFTER, e.retry_after.into());
+                    return resp;
+                }
                 Err(SelectError::NoAccounts) => {
                     accounting.finish(503, Default::default());
                     return self.error_for(
@@ -764,6 +816,14 @@ impl Subscriptions {
                 }
             };
             tried.insert(account.id.clone());
+            // Count the request on the account; another request may have
+            // reached its limit since `select` checked it.
+            if let Some(p) = principal
+                && let Some(client) = p.client_id()
+                && self.limiter.admit(client, &p.policy, &[Meter::Account(&account.id)], now()).is_err()
+            {
+                continue 'accounts;
+            }
             let mut force: Option<String> = None;
             loop {
                 let cred = match self.credential(&account.id, force.as_deref()).await {
