@@ -1,3 +1,7 @@
+// ---
+// relationships:
+//   implements: web-ui
+// ---
 import type { ComponentProps, ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { NavLink, Outlet } from "react-router";
@@ -60,6 +64,15 @@ export function Layout() {
             </NavLink>
           ))}
         </div>
+        <a
+          href="https://github.com/wyrd-company/xolotl"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="rounded-md px-3 py-2.5 text-sm no-underline transition-colors hover:bg-sidebar-accent hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+        >
+          Repository / report issues
+          <span className="sr-only"> (opens in a new tab)</span>
+        </a>
         <div className="hidden min-h-6 grow md:block" />
         <div className="px-3 pt-3 text-xs text-[#a3a9b3]">
           OpenBao:{" "}
