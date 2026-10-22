@@ -16,6 +16,7 @@ import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { del, get, post, PROVIDER_NAMES, SUB_PROVIDERS, type Account, type Status } from "@/lib/api";
+import { publicUsageWindows } from "@/lib/usage-windows";
 import { resetCreditsSummary } from "@/lib/reset-credits";
 import { dateTime, relative } from "@/lib/format";
 import { useAction } from "@/lib/hooks";
@@ -164,6 +165,7 @@ function AccountDetails({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  const windows = publicUsageWindows(a.usage?.windows);
   const [priority, setPriority] = useState(String(a.priority));
   const inv = {
     invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"]],
@@ -257,10 +259,10 @@ function AccountDetails({
             <Mono>{a.auth_index}</Mono>
           </dd>
         </dl>
-        {a.usage?.windows.length ? (
+        {a.usage && windows.length ? (
           <div className="flex flex-col gap-2">
             <div className="text-sm font-medium">Usage · fetched {relative(a.usage.fetched_at)}</div>
-            <WindowBars windows={a.usage.windows} />
+            <WindowBars windows={windows} />
           </div>
         ) : null}
         <form

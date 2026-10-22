@@ -358,13 +358,17 @@ pub fn parse_usage(body: &Value) -> Vec<UsageWindow> {
 }
 
 /// Available Claude resets from the usage endpoint's opt-in `cedar_ember`
-/// block. Missing offer data is unknown. Unusable or malformed grants do not count.
+/// block. Missing or ineligible offers are unknown. Unusable or malformed grants do not count.
 pub fn parse_reset_credits(body: &Value, at: i64) -> Option<u64> {
     let block = body.get("cedar_ember")?.as_object()?;
     if !block.get("eligible")?.as_bool()? {
         return None;
     }
-    let grants = block.get("grants")?.as_array()?;
+    let grants = match block.get("grants") {
+        None => &[][..],
+        Some(Value::Array(grants)) => grants.as_slice(),
+        Some(_) => return None,
+    };
     let next = block.get("next_grant_id").and_then(Value::as_str);
     let mut has_next = false;
     let mut count = 0u64;
@@ -579,6 +583,8 @@ mod tests {
         assert_eq!(parse_reset_credits(&json!({"cedar_ember": block.clone()}), at), Some(5));
         block["next_grant_id"] = json!("missing");
         assert_eq!(parse_reset_credits(&json!({"cedar_ember": block.clone()}), at), Some(0));
+        assert_eq!(parse_reset_credits(&json!({"cedar_ember": {"eligible": true, "next_grant_id": "first"}}), at), Some(0));
+        assert_eq!(parse_reset_credits(&json!({"cedar_ember": {"eligible": true}}), at), Some(0));
         block["eligible"] = json!(false);
         assert_eq!(parse_reset_credits(&json!({"cedar_ember": block}), at), None);
         for body in [json!({}), json!({"cedar_ember": null}), json!({"cedar_ember": {"eligible": true, "grants": "bad"}})] {
