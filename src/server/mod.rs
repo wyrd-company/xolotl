@@ -564,8 +564,14 @@ async fn codex_models(State(state): State<AppState>, headers: HeaderMap) -> Resp
     let entries: Vec<Value> = view
         .names
         .iter()
-        .filter(|(_, ts)| ts.iter().all(|t| state.catalog.route(&t.provider, &t.model, Wire::Responses, Wire::Responses.path()).is_some()))
-        .map(|(name, ts)| state.catalog.codex_entry(name, ts))
+        .filter_map(|(name, ts)| {
+            let usable: Vec<_> = ts
+                .iter()
+                .filter(|t| state.catalog.route(&t.provider, &t.model, Wire::Responses, Wire::Responses.path()).is_some())
+                .cloned()
+                .collect();
+            (!usable.is_empty()).then(|| state.catalog.codex_entry(name, &usable))
+        })
         .collect();
     let mut response = Json(json!({"models": entries})).into_response();
     response.headers_mut().insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());

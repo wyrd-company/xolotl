@@ -259,8 +259,12 @@ impl ModelCatalog {
             entry.as_object_mut().unwrap().extend(native.clone());
         }
         entry["slug"] = json!(name);
-        entry["display_name"] = json!(name);
-        entry["description"] = json!(metadata.description(&first.provider));
+        if entry.get("display_name").is_none() || name != first.model {
+            entry["display_name"] = json!(name);
+        }
+        if entry.get("description").is_none() || entry["description"].is_null() {
+            entry["description"] = json!(metadata.description(&first.provider));
+        }
         // An alias's context must be safe for every fallback target. Unknown is unknown.
         let limits: Option<Vec<u64>> = targets
             .iter()
@@ -274,7 +278,13 @@ impl ModelCatalog {
                 configured.or(native).or(self.metadata(&t.provider, &t.model).values.max_input_tokens)
             })
             .collect();
-        if let Some(window) = limits.and_then(|xs| xs.into_iter().min()) {
+        let preserve_native_window = targets.len() == 1
+            && first.provider == "codex"
+            && entry["context_window"].as_u64().is_some()
+            && override_.and_then(|o| o.values.max_input_tokens).is_none();
+        if preserve_native_window {
+            // Native maximum/auto-compaction fields can describe a distinct supported window.
+        } else if let Some(window) = limits.and_then(|xs| xs.into_iter().min()) {
             entry["context_window"] = json!(window);
             entry["max_context_window"] = json!(window);
         } else {

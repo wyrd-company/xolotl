@@ -2659,7 +2659,7 @@ async fn codex_catalog_auth_policy_aliases_and_native_fields() {
     })
     .await;
     h.codex_account().await;
-    Mock::given(method("GET")).and(path("/backend-api/codex/models")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[{"slug":"gpt-6-codex","supported_in_api":true,"visibility":"list","context_window":400000,"base_instructions":"native instructions","supported_reasoning_levels":[{"effort":"high","description":"Native high"}]}]}))).mount(&h.upstream).await;
+    Mock::given(method("GET")).and(path("/backend-api/codex/models")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[{"slug":"gpt-6-codex","supported_in_api":true,"visibility":"list","context_window":400000,"max_context_window":1000000,"display_name":"Native label","description":"Native description","base_instructions":"native instructions","supported_reasoning_levels":[{"effort":"high","description":"Native high"}]}]}))).mount(&h.upstream).await;
     h.state.catalog.refresh_providers(&h.state.subs, &h.state.gateway, &["codex".to_string()].into_iter().collect()).await;
     let mut p = policy("sample");
     p.providers = vec!["llama".into(), "codex".into()];
@@ -2679,6 +2679,9 @@ async fn codex_catalog_auth_policy_aliases_and_native_fields() {
     let native = rows.iter().find(|m| m["slug"] == "gpt-6-codex").unwrap();
     assert_eq!(native["base_instructions"], "native instructions");
     assert_eq!(native["context_window"], 400000);
+    assert_eq!(native["max_context_window"], 1000000);
+    assert_eq!(native["display_name"], "Native label");
+    assert_eq!(native["description"], "Native description");
     assert_eq!(native["supported_reasoning_levels"][0]["description"], "Native high");
     assert!(!rows.iter().any(|m| m["slug"].as_str().unwrap().contains("claude")));
     let mut denied = policy("denied");
@@ -2712,4 +2715,27 @@ async fn translated_and_native_context_errors_use_anthropic_compaction_message()
         assert_eq!(error["error"]["type"], "invalid_request_error");
         assert_eq!(error["error"]["message"], "prompt is too long");
     }
+}
+
+#[tokio::test]
+async fn codex_catalog_uses_reachable_alias_targets() {
+    let h = harness_with(|c| {
+        c.catalog.metadata.insert(
+            "llama/qwen3".into(),
+            crate::metadata::Override {
+                values: crate::metadata::Metadata { max_input_tokens: Some(128000), ..Default::default() },
+                tools: Some(true),
+                ..Default::default()
+            },
+        );
+    })
+    .await;
+    let mut p = policy("sample");
+    p.aliases.insert("sample-fallback".into(), AliasTargets::Many(vec!["claude/claude-opus-5".into(), "llama/qwen3".into()]));
+    let key = h.key(p).await;
+    let (status, list) = h.call("GET", "/backend-api/codex/models", Some(&key), None).await;
+    assert_eq!(status, 200);
+    let alias = list["models"].as_array().unwrap().iter().find(|m| m["slug"] == "sample-fallback").unwrap();
+    assert_eq!(alias["context_window"], 128000);
+    assert_eq!(alias["shell_type"], "unified_exec");
 }
