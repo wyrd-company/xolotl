@@ -1,6 +1,16 @@
+---
+relationships:
+  implemented-by: layout
+---
 # Web UI
 
 `xolotl serve` serves an admin web UI at `/`. It is a client of the same `/admin` API the CLI uses, plus a few endpoints added for it.
+
+The shared sidebar includes a visible **Repository / report issues** anchor to
+`https://github.com/wyrd-company/xolotl`. It opens a new tab with `noopener
+noreferrer`, names that behavior for screen readers, and has a visible keyboard
+focus outline. The link remains available on narrow screens and every signed-in
+route.
 
 ## Screens
 

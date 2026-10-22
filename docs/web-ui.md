@@ -61,6 +61,11 @@ server log has the details.
 
 Every member of the admin group has full access.
 
+Use **Repository / report issues** in the sidebar to open the
+[Xolotl repository](https://github.com/wyrd-company/xolotl) in a new tab.
+Select **Issues** there to report a problem. The link is available on every
+screen after sign-in and can be reached with Tab and opened with Enter.
+
 ### Overview
 
 **Needs action** lists enabled accounts whose credentials were refused, plus
