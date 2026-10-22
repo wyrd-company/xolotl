@@ -108,6 +108,7 @@ pub struct TokenUsage {
     pub input: Option<i64>,
     pub output: Option<i64>,
     pub cached: Option<i64>,
+    pub cache_write: Option<i64>,
 }
 
 impl TokenUsage {
@@ -124,6 +125,9 @@ impl TokenUsage {
                 let cache_read = int("/cache_read_input_tokens").unwrap_or(0);
                 let cache_write = int("/cache_creation_input_tokens").unwrap_or(0);
                 self.input = Some(n + cache_read + cache_write);
+            }
+            if let Some(n) = int("/cache_creation_input_tokens") {
+                self.cache_write = Some(n);
             }
             if let Some(n) = int("/completion_tokens").or_else(|| int("/output_tokens")) {
                 self.output = Some(n);
@@ -145,6 +149,7 @@ pub struct Accounting {
     pub record: RequestRecord,
     pub started: Instant,
     limiter: Option<Arc<Limiter>>,
+    prices: Option<crate::metadata::Metadata>,
 }
 
 impl Accounting {
@@ -162,7 +167,13 @@ impl Accounting {
             },
             started: Instant::now(),
             limiter: None,
+            prices: None,
         }
+    }
+
+    pub fn with_prices(mut self, prices: Option<crate::metadata::Metadata>) -> Self {
+        self.prices = prices;
+        self
     }
 
     pub fn with_limiter(mut self, limiter: &Arc<Limiter>) -> Self {
@@ -171,6 +182,7 @@ impl Accounting {
     }
 
     pub fn finish(mut self, status: u16, usage: TokenUsage) {
+        self.record.api_equivalent_cost = self.prices.and_then(|p| p.cost(usage));
         self.record.status = status;
         self.record.input_tokens = usage.input;
         self.record.output_tokens = usage.output;
@@ -417,14 +429,14 @@ mod tests {
     fn usage_openai_chat() {
         let mut u = TokenUsage::default();
         u.observe(&json!({"usage": {"prompt_tokens": 10, "completion_tokens": 3, "prompt_tokens_details": {"cached_tokens": 4}}}));
-        assert_eq!(u, TokenUsage { input: Some(10), output: Some(3), cached: Some(4) });
+        assert_eq!(u, TokenUsage { input: Some(10), output: Some(3), cached: Some(4), cache_write: None });
     }
 
     #[test]
     fn usage_responses_completed_event() {
         let mut u = TokenUsage::default();
         u.observe(&json!({"type": "response.completed", "response": {"usage": {"input_tokens": 7, "output_tokens": 2, "input_tokens_details": {"cached_tokens": 1}}}}));
-        assert_eq!(u, TokenUsage { input: Some(7), output: Some(2), cached: Some(1) });
+        assert_eq!(u, TokenUsage { input: Some(7), output: Some(2), cached: Some(1), cache_write: None });
     }
 
     #[test]
@@ -432,7 +444,7 @@ mod tests {
         let mut u = TokenUsage::default();
         u.observe(&json!({"type": "message_start", "message": {"usage": {"input_tokens": 5, "cache_read_input_tokens": 100, "output_tokens": 1}}}));
         u.observe(&json!({"type": "message_delta", "usage": {"output_tokens": 42}}));
-        assert_eq!(u, TokenUsage { input: Some(105), output: Some(42), cached: Some(100) });
+        assert_eq!(u, TokenUsage { input: Some(105), output: Some(42), cached: Some(100), cache_write: None });
     }
 
     #[tokio::test]
@@ -446,7 +458,7 @@ mod tests {
         let acc = Accounting::new(db.clone(), "codex", "/v1/responses", Some("c"), Some("m"));
         let mut tap = TapStream::new(futures::stream::iter(chunks), true, 200, Some(acc));
         while tap.next().await.is_some() {}
-        assert_eq!(tap.usage, TokenUsage { input: Some(3), output: Some(4), cached: None });
+        assert_eq!(tap.usage, TokenUsage { input: Some(3), output: Some(4), cached: None, cache_write: None });
         drop(tap);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let s = db.usage_summary("client", 0, &Default::default()).await.unwrap();

@@ -8,6 +8,7 @@ pub mod gateway;
 pub mod keys;
 pub mod limits;
 pub mod mcp;
+pub mod metadata;
 pub mod policy;
 pub mod proxy;
 pub mod secrets;

@@ -75,6 +75,9 @@ pub enum Command {
         /// Re-discover before printing.
         #[arg(long)]
         refresh: bool,
+        /// Include metadata in JSON output (default JSON stays provider -> model names).
+        #[arg(long)]
+        metadata: bool,
     },
     /// Manage subscription accounts.
     Accounts {
@@ -298,17 +301,31 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Command::Keys { remote, cmd } => keys(Client::new(&remote)?, cmd).await,
         Command::Policies { remote, cmd } => policies(Client::new(&remote)?, cmd).await,
-        Command::Models { remote, refresh } => {
+        Command::Models { remote, refresh, metadata } => {
             let c = Client::new(&remote)?;
-            let v = if refresh { c.post("/admin/catalog/refresh", json!({})).await? } else { c.get("/admin/catalog").await? };
+            if refresh {
+                c.post("/admin/catalog/refresh", json!({})).await?;
+            }
+            if c.json && !metadata {
+                return c.print(c.get("/admin/catalog").await?);
+            }
+            let v = c.get("/admin/catalog/routes").await?;
             if c.json {
                 return c.print(v);
             }
-            for (provider, models) in v.as_object().into_iter().flatten() {
-                let list: Vec<&str> = models.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-                println!("{provider} ({}):", list.len());
-                for m in list {
-                    println!("  {m}");
+            for row in v.as_array().into_iter().flatten() {
+                let m: crate::metadata::Resolved = serde_json::from_value(row["metadata"].clone())?;
+                let provider = row["provider"].as_str().unwrap_or("?");
+                println!("{}/{} · {}", provider, row["model"].as_str().unwrap_or("?"), m.description(provider));
+                let age = m.age_secs.map(|s| format!("{s}s old")).unwrap_or_else(|| "config / no fetch".into());
+                println!("  source: {} · {age}", m.source.as_deref().unwrap_or("unknown"));
+                println!(
+                    "  cache read/write per Mtok: {:?} / {:?}",
+                    m.values.cache_read_input_token_cost.map(|p| p * 1e6),
+                    m.values.cache_creation_input_token_cost.map(|p| p * 1e6)
+                );
+                if let Some(e) = m.error {
+                    println!("  refresh failed (last good data retained): {e}");
                 }
             }
             Ok(())
@@ -386,15 +403,17 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
     let n = limiter.seed(&db, crate::db::now()).await.context("loading rate limit counters from the request log")?;
     tracing::debug!(rows = n, "loaded rate limit counters");
     limiter.register_metrics();
+    let gateway = Gateway::new(&cfg.gateway, secrets.clone(), http.clone(), db.clone()).with_limiter(limiter.clone());
+    let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()).with_db(db.clone()).await);
+    let gateway = Arc::new(gateway.with_catalog(catalog.clone()));
     let subs = Arc::new(
         Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone())
+            .with_catalog(catalog.clone())
             .with_grok_client_version(cfg.catalog.grok_client_version.clone())
             .with_limiter(limiter.clone()),
     );
     let n = subs.sync().await.context("loading accounts from the vault")?;
     tracing::info!(accounts = n, "loaded subscription accounts");
-    let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()).with_limiter(limiter.clone()));
-    let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
 
     let mcp = Arc::new(crate::mcp::McpHub::new(&cfg, secrets.clone(), db.clone()));
     let n = mcp.reload().await.context("loading MCP servers from the vault")?;

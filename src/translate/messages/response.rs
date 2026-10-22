@@ -105,6 +105,8 @@ pub fn encode_response(r: &Response, info: &ClientInfo) -> Value {
 }
 
 pub fn error_body(kind: &str, message: &str) -> Value {
+    let (kind, message) =
+        if crate::metadata::too_long(kind, message) { ("invalid_request_error", "prompt is too long") } else { (kind, message) };
     json!({"type": "error", "error": {"type": kind, "message": message}})
 }
 

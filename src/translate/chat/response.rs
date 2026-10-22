@@ -49,7 +49,13 @@ fn usage_json(u: &Usage) -> Value {
 /// An error body sent with a successful HTTP status.
 pub fn failure(v: &Value) -> Option<(String, String)> {
     let e = v.get("error").filter(|e| e.is_object())?;
-    let kind = e.get("type").or_else(|| e.get("code")).and_then(Value::as_str).unwrap_or("api_error");
+    let kind = e
+        .get("code")
+        .filter(|v| v.as_str().is_some_and(|s| crate::metadata::too_long(s, "")))
+        .or_else(|| e.get("type"))
+        .or_else(|| e.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("api_error");
     Some((kind.to_string(), e.get("message").and_then(Value::as_str).unwrap_or("upstream error").to_string()))
 }
 
@@ -163,7 +169,13 @@ impl Decoder for StreamDecoder {
         }
         let Some(v) = ev.json() else { return Vec::new() };
         if let Some(e) = v.get("error") {
-            let kind = e.get("type").or_else(|| e.get("code")).and_then(Value::as_str).unwrap_or("api_error");
+            let kind = e
+                .get("code")
+                .filter(|v| v.as_str().is_some_and(|s| crate::metadata::too_long(s, "")))
+                .or_else(|| e.get("type"))
+                .or_else(|| e.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or("api_error");
             self.em.error(kind, e.get("message").and_then(Value::as_str).unwrap_or("upstream error"));
             return self.em.take();
         }

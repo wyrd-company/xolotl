@@ -237,7 +237,21 @@ export interface GatewayProvider {
   has_key: boolean;
 }
 
+export interface ModelMetadata {
+  max_input_tokens: number | null;
+  max_output_tokens: number | null;
+  input_cost_per_token: number | null;
+  output_cost_per_token: number | null;
+  cache_read_input_token_cost: number | null;
+  cache_creation_input_token_cost: number | null;
+  source: string | null;
+  fetched_at: number | null;
+  age_secs: number | null;
+  error: string | null;
+}
+
 export interface CatalogRoute {
+  metadata?: ModelMetadata;
   provider: string;
   model: string;
   endpoints: string[];
@@ -253,6 +267,8 @@ export interface UsageRow {
   input_tokens: number;
   output_tokens: number;
   cached_tokens: number;
+  api_equivalent_cost?: number | null;
+  priced_requests?: number;
 }
 
 export interface McpServer {

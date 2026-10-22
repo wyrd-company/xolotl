@@ -30,12 +30,19 @@ pub struct Gateway {
     db: Db,
     keys: RwLock<HashMap<String, (Option<String>, Instant)>>,
     limiter: Arc<Limiter>,
+    catalog: Option<Arc<crate::catalog::ModelCatalog>>,
 }
 
 impl Gateway {
     pub fn new(cfg: &GatewayConfig, secrets: Secrets, http: reqwest::Client, db: Db) -> Self {
         let providers = cfg.providers.iter().filter(|(_, p)| p.is_enabled()).map(|(k, v)| (k.clone(), v.clone())).collect();
-        Self { providers, secrets, http, db, keys: RwLock::new(HashMap::new()), limiter: Default::default() }
+        Self { providers, secrets, http, db, keys: RwLock::new(HashMap::new()), catalog: None, limiter: Default::default() }
+    }
+
+    /// Snapshot model prices with each request.
+    pub fn with_catalog(mut self, catalog: Arc<crate::catalog::ModelCatalog>) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     /// Count response tokens against client rate limits.
@@ -140,8 +147,9 @@ impl Gateway {
                 normalize_mistral(path, obj);
             }
         }
-        let accounting =
-            Accounting::new(self.db.clone(), &target.provider, path, client_id, Some(requested_model)).with_limiter(&self.limiter);
+        let accounting = Accounting::new(self.db.clone(), &target.provider, path, client_id, Some(requested_model))
+            .with_prices(self.catalog.as_ref().map(|c| c.metadata(&target.provider, &target.model).values))
+            .with_limiter(&self.limiter);
         let bytes = serde_json::to_vec(&body).unwrap_or_default();
         match self.send(&target.provider, method, path, headers, reqwest::Body::from(bytes)).await {
             Ok(r) => proxy::relay(r, Some(accounting)),
@@ -166,7 +174,12 @@ impl Gateway {
         model: Option<&str>,
     ) -> Response {
         let endpoint = path_and_query.split('?').next().unwrap_or(path_and_query);
-        let accounting = Accounting::new(self.db.clone(), provider, endpoint, client_id, model).with_limiter(&self.limiter);
+        let prices = self.catalog.as_ref().and_then(|c| {
+            let model = model?.strip_prefix(&format!("{provider}/")).unwrap_or(model?);
+            Some(c.metadata(provider, model).values)
+        });
+        let accounting =
+            Accounting::new(self.db.clone(), provider, endpoint, client_id, model).with_limiter(&self.limiter).with_prices(prices);
         match self.send(provider, method, path_and_query, headers, body).await {
             Ok(r) => proxy::relay(r, Some(accounting)),
             Err(e) => {

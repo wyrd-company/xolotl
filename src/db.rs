@@ -84,6 +84,7 @@ pub struct RequestRecord {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cached_tokens: Option<i64>,
+    pub api_equivalent_cost: Option<f64>,
     pub latency_ms: i64,
     pub trace_id: Option<String>,
 }
@@ -108,6 +109,8 @@ pub struct UsageSummary {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cached_tokens: i64,
+    pub api_equivalent_cost: Option<f64>,
+    pub priced_requests: i64,
 }
 
 /// Narrows a usage summary to one client, account, provider and/or model.
@@ -355,13 +358,25 @@ impl Db {
         .transpose()
     }
 
+    pub async fn metadata_cache(&self) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT body FROM model_metadata_cache WHERE id = 1").fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn save_metadata_cache(&self, body: &str) -> Result<()> {
+        sqlx::query("INSERT INTO model_metadata_cache (id, body) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET body=excluded.body")
+            .bind(body)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // ---- request log ----
 
     pub async fn log_request(&self, r: &RequestRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO request_log (ts, started_at, client_id, provider, account_id, model, endpoint, status,
-               input_tokens, output_tokens, cached_tokens, latency_ms, trace_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               input_tokens, output_tokens, cached_tokens, latency_ms, trace_id, api_equivalent_cost)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(now())
         .bind(r.started_at)
@@ -376,6 +391,7 @@ impl Db {
         .bind(r.cached_tokens)
         .bind(r.latency_ms)
         .bind(&r.trace_id)
+        .bind(r.api_equivalent_cost)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -416,7 +432,9 @@ impl Db {
                SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors,
                COALESCE(SUM(input_tokens), 0) AS input_tokens,
                COALESCE(SUM(output_tokens), 0) AS output_tokens,
-               COALESCE(SUM(cached_tokens), 0) AS cached_tokens
+               COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+               SUM(api_equivalent_cost) AS api_equivalent_cost,
+               COUNT(api_equivalent_cost) AS priced_requests
              FROM request_log WHERE ts >= ?{conditions} GROUP BY {column} ORDER BY requests DESC"
         );
         // Column names are fixed (`usage_column`, `UsageFilter::columns`); filter values are bound.

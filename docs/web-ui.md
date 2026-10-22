@@ -160,3 +160,5 @@ old the catalog is, and each provider's model count or discovery error.
 The UI has a light and a dark theme. By default it follows the browser's color
 scheme. The three buttons above **Sign out** in the sidebar pick the system, light or
 dark theme. The browser keeps the choice.
+
+Model catalog rows show context, maximum output, input/output and cache prices per million tokens, with the LiteLLM key or override and last successful fetch age. Failed refreshes retain cached data. Usage and Traffic show API-equivalent USD with priced-request coverage; subscription value is not billed spend.
