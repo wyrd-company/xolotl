@@ -1,3 +1,7 @@
+// ---
+// relationships:
+//   implements: web-ui
+// ---
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, ExternalLink, LogIn, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -5,6 +9,7 @@ import { toast } from "sonner";
 
 import { Confirm } from "@/components/confirm";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
+import { SaveToolbar } from "@/components/save-toolbar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -265,6 +270,14 @@ function ServerForm({ initial, onDone }: { initial: { name: string; def: McpServ
             save.mutate(undefined);
           }}
         >
+          <SaveToolbar label="MCP server actions">
+            <Button type="submit" disabled={!name || !f.url.trim() || save.isPending}>
+              {isNew ? "Add server" : "Save"}
+            </Button>
+            <Button type="button" variant="ghost" onClick={onDone}>
+              Cancel
+            </Button>
+          </SaveToolbar>
           <div className="grid gap-4 md:grid-cols-[minmax(0,16rem)_1fr]">
             <div className="flex flex-col gap-2">
               <Label htmlFor={id("name")}>Name</Label>
@@ -369,14 +382,6 @@ function ServerForm({ initial, onDone }: { initial: { name: string; def: McpServ
               <Plus /> Add header
             </Button>
           </fieldset>
-          <div className="flex gap-2">
-            <Button type="submit" disabled={!name || !f.url.trim() || save.isPending}>
-              {isNew ? "Add server" : "Save"}
-            </Button>
-            <Button type="button" variant="ghost" onClick={onDone}>
-              Cancel
-            </Button>
-          </div>
         </form>
       </CardContent>
     </Card>
