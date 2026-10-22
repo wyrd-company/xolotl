@@ -15,6 +15,16 @@
 | Providers & models | Gateway providers from the config file and their key state; set a key; the catalog with each model's endpoints | `GET /admin/providers`, `GET /admin/catalog/routes`, `POST /admin/catalog/refresh` |
 | Usage | Request log grouped by client, account, provider or model. Selecting a row narrows the view to it and groups by the first of model, account, client and provider that is neither shown nor narrowed yet; filters show as removable chips and live in the hash route (`/#/usage?group=model&client=…`). Link to `telemetry.dashboard_url` | `GET /admin/usage?group_by=…&since_secs=…&client=…&account=…&provider=…&model=…` (an empty filter value matches rows without that key, such as the admin token) |
 
+## Editing
+
+Policy and MCP server editors keep their save and discard or cancel actions in a
+sticky bar at the top while the form scrolls. Policy deletion and its key-use
+restriction remain in the same bar. Actions wrap on narrow screens.
+
+Buttons use explicit theme text colors in their default and hover states. Disabled
+buttons use the existing secondary background and muted text colors, without
+fading the whole control.
+
 ## Model discovery
 
 Model lists and counts include a shared **Refresh models** control, the age of the

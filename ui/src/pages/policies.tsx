@@ -1,3 +1,7 @@
+// ---
+// relationships:
+//   implements: web-ui
+// ---
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Plus } from "lucide-react";
@@ -6,6 +10,7 @@ import { Link, Navigate, useNavigate, useParams } from "react-router";
 import { Confirm } from "@/components/confirm";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
 import { PolicyLimits } from "@/components/policy-limits";
+import { SaveToolbar } from "@/components/save-toolbar";
 import { Section, SectionContent } from "@/components/section";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -261,6 +266,33 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
         save.mutate(undefined);
       }}
     >
+      <SaveToolbar label="Policy actions">
+        <Button type="submit" disabled={!dirty || !policy.name || !!preview.error || save.isPending}>
+          {isNew ? "Create policy" : "Save policy"}
+        </Button>
+        {dirty && !isNew && (
+          <Button type="button" variant="ghost" onClick={() => setDraft(toDraft(initial))}>
+            Discard changes
+          </Button>
+        )}
+        {!isNew && (
+          <Confirm
+            title={`Delete policy ${initial.name}?`}
+            description="This removes it from OpenBao."
+            action="Delete"
+            onConfirm={() => remove.mutate(undefined)}
+          >
+            <Button type="button" variant="outline" className="text-destructive" disabled={keyCount > 0 || remove.isPending}>
+              Delete
+            </Button>
+          </Confirm>
+        )}
+        <span className="text-muted-foreground min-w-0 text-sm [overflow-wrap:anywhere]">
+          {!isNew && keyCount > 0 ? "A policy with keys can't be deleted. " : ""}
+          Saved to <Mono>policies/{policy.name || "…"}</Mono>.
+        </span>
+      </SaveToolbar>
+
       <Section id="policy-general" title="Policy" summary={draft.description || draft.scopes.join(", ")}>
         <SectionContent className="flex flex-col gap-5">
           <div className="grid gap-4 md:grid-cols-[minmax(0,16rem)_1fr]">
@@ -319,33 +351,6 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
         providers={allowed}
         accounts={(accounts.data ?? []).filter((a) => allowed.includes(a.provider) && allowsAccount(draft.accounts, a.provider, a.id))}
       />
-
-      <div className="flex flex-wrap items-center gap-3">
-        <Button type="submit" disabled={!dirty || !policy.name || !!preview.error || save.isPending}>
-          {isNew ? "Create policy" : "Save policy"}
-        </Button>
-        {dirty && !isNew && (
-          <Button type="button" variant="ghost" onClick={() => setDraft(toDraft(initial))}>
-            Discard changes
-          </Button>
-        )}
-        {!isNew && (
-          <Confirm
-            title={`Delete policy ${initial.name}?`}
-            description="This removes it from OpenBao."
-            action="Delete"
-            onConfirm={() => remove.mutate(undefined)}
-          >
-            <Button type="button" variant="outline" className="text-destructive" disabled={keyCount > 0 || remove.isPending}>
-              Delete
-            </Button>
-          </Confirm>
-        )}
-        <span className="text-muted-foreground text-sm">
-          {!isNew && keyCount > 0 ? "A policy with keys can't be deleted. " : ""}
-          Saved to <Mono>policies/{policy.name || "…"}</Mono>.
-        </span>
-      </div>
     </form>
   );
 }
