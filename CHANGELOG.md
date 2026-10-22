@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0
+
+### Features
+
+- Expose cached model context and price metadata with overrides, Claude Code context hints and token estimates, API-equivalent usage costs, and an authenticated Codex-native model catalog.
+
+### Fixes
+
+- Show Claude weekly model limits and available Claude and Codex resets; hide internal usage buckets.
+- Focus Overview on actionable failures, configured provider health and 24-hour traffic, with account fixes and errors-only Usage links.
+- Add a keyboard-accessible repository and issue-reporting link to the web UI sidebar.
+- Keep policy and MCP server save actions visible while scrolling, and keep button labels readable before hover and while disabled in both themes.
+
 ## 0.4.0
 
 ### Features
