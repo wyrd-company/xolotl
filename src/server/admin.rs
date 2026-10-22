@@ -212,7 +212,7 @@ async fn catalog_routes(State(s): State<AppState>, h: HeaderMap) -> Res {
         .flat_map(|(provider, models)| models.iter().map(move |m| (provider, m)))
         .map(|(provider, model)| {
             let (native, translated) = s.catalog.endpoints(provider, model);
-            json!({"provider": provider, "model": model, "endpoints": native, "translated_endpoints": translated})
+            json!({"provider": provider, "model": model, "metadata": s.catalog.metadata(provider, model), "endpoints": native, "translated_endpoints": translated})
         })
         .collect();
     ok(rows)

@@ -715,7 +715,7 @@ mod tests {
         assert!(acc.record.started_at.is_some_and(|t| (now..=now + 1).contains(&t)));
         acc.record.started_at = Some(now - 61);
         acc.record.account_id = Some("codex-a1".into());
-        acc.finish(200, crate::proxy::TokenUsage { input: Some(5), output: Some(3), cached: None });
+        acc.finish(200, crate::proxy::TokenUsage { input: Some(5), output: Some(3), cached: None, cache_write: None });
         for _ in 0..50 {
             if !db.request_counts_since(0).await.unwrap().is_empty() {
                 break;

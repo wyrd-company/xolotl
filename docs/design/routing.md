@@ -4,7 +4,7 @@ A client sends a model name. Xolotl turns it into one or more **targets** (`prov
 
 ## Model catalog
 
-`src/catalog.rs` keeps the list of models each provider serves.
+`src/catalog.rs` keeps the list of models each provider serves and the [model metadata](model-metadata) used for client context hints and list-price accounting.
 
 - **Discovery** runs at startup and every `catalog.refresh_secs` (default 600 s), on `POST /admin/catalog/refresh` (`xolotl models --refresh`), after account login/import, reset, enable/disable or removal, after provider key changes, and on admin reload.
   - The refresh endpoint accepts an optional comma-separated `providers` query to refresh selected providers; omit it to refresh the whole catalog. Eligible providers are the subscription pools and enabled gateway providers.

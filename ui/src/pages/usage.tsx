@@ -7,6 +7,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ExternalLink, X } from "lucide-react";
 import { Link, useSearchParams } from "react-router";
 
+import { ApiEquivalentCost } from "@/components/api-equivalent-cost";
 import { Empty, PageHeader, QueryError } from "@/components/layout";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -106,6 +107,7 @@ export function UsagePage() {
         </div>
       )}
       <QueryError error={usage.error} />
+      <p className="text-muted-foreground text-sm">API-equivalent costs use list prices recorded with each request. Subscription costs are estimates of API value, not spend. Unpriced requests are excluded.</p>
       <Card className="py-0">
         <Table className="min-w-[720px]">
           <TableHeader>
@@ -116,6 +118,7 @@ export function UsagePage() {
               <TableHead className="text-right">Input tokens</TableHead>
               <TableHead className="text-right">Output tokens</TableHead>
               <TableHead className="text-right">Cached</TableHead>
+              <TableHead className="text-right">API-equivalent USD</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody className="font-mono text-xs">
@@ -131,6 +134,7 @@ export function UsagePage() {
                 <TableCell className="text-right">{num(r.input_tokens)}</TableCell>
                 <TableCell className="text-right">{num(r.output_tokens)}</TableCell>
                 <TableCell className="text-right">{num(r.cached_tokens)}</TableCell>
+                <TableCell className="text-right"><ApiEquivalentCost rows={[r]} /></TableCell>
               </TableRow>
             ))}
           </TableBody>

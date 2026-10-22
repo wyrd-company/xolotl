@@ -71,16 +71,21 @@ async fn harness_with_secrets(tweak: impl FnOnce(&mut Config), secrets: Secrets)
         grok_api: format!("{uri}/grok/v1"),
         grok_auth: uri.clone(),
     };
+    cfg.catalog.metadata_url = format!("{uri}/metadata");
     tweak(&mut cfg);
     let db = Db::in_memory().await.unwrap();
     let http = crate::proxy::upstream_client(std::time::Duration::from_secs(30)).unwrap();
     let keys = Arc::new(KeyManager::new(secrets.clone()));
     keys.reload().await.unwrap();
     let limiter = Arc::new(Limiter::default());
-    let subs =
-        Arc::new(Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone()).with_limiter(limiter.clone()));
-    let gateway = Arc::new(Gateway::new(&cfg.gateway, secrets.clone(), http, db.clone()).with_limiter(limiter.clone()));
-    let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()));
+    let gateway = Gateway::new(&cfg.gateway, secrets.clone(), http.clone(), db.clone()).with_limiter(limiter.clone());
+    let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()).with_db(db.clone()).await);
+    let gateway = Arc::new(gateway.with_catalog(catalog.clone()));
+    let subs = Arc::new(
+        Subscriptions::new(cfg.subscription.clone(), db.clone(), secrets.clone(), http.clone())
+            .with_limiter(limiter.clone())
+            .with_catalog(catalog.clone()),
+    );
     let mcp = Arc::new(McpHub::new(&cfg, secrets.clone(), db.clone()));
     let state =
         AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: None, sessions: Default::default(), mcp, limiter };
@@ -238,12 +243,12 @@ async fn precedence_decides_plain_names_and_prefix_reaches_losers() {
 }
 
 #[tokio::test]
-async fn untranslatable_endpoint_explains_where_a_model_lives() {
+async fn malformed_translated_count_has_anthropic_error() {
     let h = harness().await;
     let key = h.key(policy("p")).await;
     let (status, body) = h.call("POST", "/v1/messages/count_tokens", Some(&key), Some(json!({"model": "gpt-6-codex"}))).await;
     assert_eq!(status, 400);
-    assert!(body.to_string().contains("/v1/responses"), "{body}");
+    assert!(body.to_string().contains("messages must be an array"), "{body}");
     assert_eq!(body["type"], "error", "Anthropic envelope on /v1/messages");
 }
 
@@ -860,7 +865,10 @@ async fn admin_policies_keys_and_accounts() {
     models.sort();
     assert_eq!(models, ["m1", "m2"]);
     let (_, rows) = h.call("GET", "/admin/usage?group_by=model&provider=usage-test&client=", Some(&h.admin), None).await;
-    assert_eq!(rows, json!([{"key": "m3", "requests": 1, "errors": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}]));
+    assert_eq!(
+        rows,
+        json!([{"key": "m3", "requests": 1, "errors": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0,"api_equivalent_cost":null,"priced_requests":0}])
+    );
 
     // The overview's errors link excludes successful requests even in a mixed group.
     for status in [399, 400, 401, 500] {
@@ -882,7 +890,10 @@ async fn admin_policies_keys_and_accounts() {
         .call("GET", "/admin/usage?group_by=model&since_secs=3600&provider=usage-test&client=usage%20a&errors=true", Some(&h.admin), None)
         .await;
     assert_eq!(status, 200, "{errors}");
-    assert_eq!(errors, json!([{"key": "m1", "requests": 3, "errors": 3, "input_tokens": 30, "output_tokens": 0, "cached_tokens": 0}]));
+    assert_eq!(
+        errors,
+        json!([{"key": "m1", "requests": 3, "errors": 3, "input_tokens": 30, "output_tokens": 0, "cached_tokens": 0,"api_equivalent_cost":null,"priced_requests":0}])
+    );
     let (_, all) = h.call("GET", "/admin/usage?group_by=model&provider=usage-test&model=m1&errors=false", Some(&h.admin), None).await;
     assert_eq!(all[0]["requests"], 6);
 }
@@ -2484,4 +2495,221 @@ async fn a_request_no_account_admits_counts_nowhere() {
     assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat.clone())).await.0, 200);
     assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat.clone())).await.0, 200);
     assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(chat)).await.0, 429);
+}
+
+#[tokio::test]
+async fn metadata_cache_retains_last_good_and_survives_restart() {
+    let h = harness().await;
+    let valid =
+        json!({"qwen3":{"litellm_provider":"sample","max_input_tokens":128000,"max_output_tokens":8000,"input_cost_per_token":0.000002}});
+    Mock::given(method("GET"))
+        .and(path("/metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(valid))
+        .mount(&h.upstream)
+        .await;
+    h.state.catalog.refresh_metadata(h.state.subs.http()).await;
+    let before = h.state.catalog.metadata("llama", "qwen3");
+    assert_eq!(before.values.max_input_tokens, Some(128000));
+    assert!(before.fetched_at.is_some());
+    h.upstream.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"qwen3":{"litellm_provider":"sample","max_input_tokens":-1}})))
+        .mount(&h.upstream)
+        .await;
+    h.state.catalog.refresh_metadata(h.state.subs.http()).await;
+    let after = h.state.catalog.metadata("llama", "qwen3");
+    assert_eq!(after.values.max_input_tokens, before.values.max_input_tokens);
+    assert_eq!(after.fetched_at, before.fetched_at);
+    assert!(after.error.is_some());
+    h.upstream.reset().await;
+    h.state.catalog.refresh_metadata(h.state.subs.http()).await;
+    assert_eq!(h.state.catalog.metadata("llama", "qwen3").values.max_input_tokens, Some(128000));
+    let reloaded = ModelCatalog::new(h.state.cfg.catalog.clone(), h.state.gateway.kinds()).with_db(h.state.db.clone()).await;
+    assert_eq!(reloaded.metadata("llama", "qwen3").fetched_at, before.fetched_at);
+    assert_eq!(reloaded.metadata("llama", "qwen3").values.max_input_tokens, Some(128000));
+}
+
+#[tokio::test]
+async fn metadata_discovery_hints_respect_all_alias_targets_and_policy() {
+    let h = harness_with(|c| {
+        for (name, limit) in [("llama/qwen3", 1000000), ("codex/gpt-6-codex", 999999), ("claude/claude-opus-5", 200000)] {
+            c.catalog.metadata.insert(
+                name.into(),
+                crate::metadata::Override {
+                    values: crate::metadata::Metadata {
+                        max_input_tokens: Some(limit),
+                        max_output_tokens: Some(8000),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+    })
+    .await;
+    let mut p = policy("sample");
+    p.aliases.insert("sample-mixed".into(), AliasTargets::Many(vec!["llama/qwen3".into(), "codex/gpt-6-codex".into()]));
+    let key = h.key(p).await;
+    let (_, list) =
+        h.call_with("GET", "/v1/models", &[("authorization", &format!("Bearer {key}")), ("anthropic-version", "2023-06-01")], None).await;
+    let data = list["data"].as_array().unwrap();
+    assert!(data.iter().any(|m| m["id"] == "qwen3[1m]"));
+    assert!(data.iter().any(|m| m["id"] == "gpt-6-codex"));
+    assert!(data.iter().any(|m| m["id"] == "sample-mixed"));
+    assert!(!data.iter().any(|m| m["id"] == "sample-mixed[1m]"));
+    assert!(data.iter().all(|m| m["description"].is_string()));
+    let (_, openai) = h.call("GET", "/v1/models", Some(&key), None).await;
+    assert!(openai["data"].as_array().unwrap().iter().all(|m| !m["id"].as_str().unwrap().ends_with("[1m]")));
+    let (_, rows) = h.call("GET", "/admin/catalog/routes", Some(&h.admin), None).await;
+    let r = rows.as_array().unwrap().iter().find(|r| r["model"] == "qwen3").unwrap();
+    assert_eq!(r["metadata"]["max_input_tokens"], 1000000);
+    assert_eq!(r["metadata"]["source"], "override:llama/qwen3");
+}
+
+#[tokio::test]
+async fn metadata_suffix_routes_and_counts_as_one_model_and_denials_hold() {
+    let h = harness_with(|c| {
+        c.catalog.metadata.insert(
+            "llama/qwen3".into(),
+            crate::metadata::Override {
+                values: crate::metadata::Metadata {
+                    input_cost_per_token: Some(0.1),
+                    output_cost_per_token: Some(0.2),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+    })
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/llama/v1/chat/completions"))
+        .and(body_partial_json(json!({"model":"qwen3"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}),
+        ))
+        .expect(2)
+        .mount(&h.upstream)
+        .await;
+    let key = h.key(policy("sample")).await;
+    for model in ["qwen3", "qwen3[1m]"] {
+        assert_eq!(
+            h.call(
+                "POST",
+                "/v1/messages",
+                Some(&key),
+                Some(json!({"model":model,"max_tokens":10,"messages":[{"role":"user","content":"hello"}]}))
+            )
+            .await
+            .0,
+            200
+        );
+    }
+    let mut denied = policy("denied");
+    denied.models.insert("llama/qwen3".into(), false);
+    let denied_key = h.key(denied).await;
+    assert_eq!(h.call("POST", "/v1/messages", Some(&denied_key), Some(json!({"model":"llama/qwen3[1m]","messages":[]}))).await.0, 404);
+    // Join the existing accounting producers through observable read-back (bounded test-only wait).
+    let rows = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = h.state.db.usage_summary("model", 0, &Default::default()).await.unwrap();
+            if rows.iter().map(|r| r.requests).sum::<i64>() == 2 {
+                break rows;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key.as_deref(), Some("qwen3"));
+    assert_eq!(rows[0].priced_requests, 2);
+    assert_eq!(rows[0].api_equivalent_cost, Some(2.8));
+}
+
+#[tokio::test]
+async fn translated_count_is_authenticated_estimated_and_has_no_upstream_charge() {
+    let h = harness().await;
+    let key = h.key(policy("sample")).await;
+    let body = json!({"model":"llama/qwen3[1m]","messages":[{"role":"user","content":"hello"}],"tools":[{"name":"sample","input_schema":{"type":"object"}}]});
+    assert_eq!(h.call("POST", "/v1/messages/count_tokens", None, Some(body.clone())).await.0, 401);
+    let (status, count) = h.call("POST", "/v1/messages/count_tokens", Some(&key), Some(body.clone())).await;
+    assert_eq!(status, 200);
+    assert_eq!(count["estimated"], true);
+    assert_eq!(count["input_tokens"], crate::metadata::estimate_tokens(&body));
+    assert!(h.upstream.received_requests().await.unwrap().is_empty());
+    assert!(h.state.db.usage_summary("model", 0, &Default::default()).await.unwrap().is_empty());
+    assert_eq!(h.call("POST", "/v1/messages/count_tokens", Some(&key), Some(json!({"model":"llama/qwen3","messages":"bad"}))).await.0, 400);
+}
+
+#[tokio::test]
+async fn codex_catalog_auth_policy_aliases_and_native_fields() {
+    let h = harness_with(|c| {
+        c.catalog.metadata.insert(
+            "llama/qwen3".into(),
+            crate::metadata::Override {
+                values: crate::metadata::Metadata { max_input_tokens: Some(128000), max_output_tokens: Some(8000), ..Default::default() },
+                tools: Some(true),
+                images: Some(true),
+                reasoning_levels: Some(vec!["low".into(), "high".into()]),
+                ..Default::default()
+            },
+        );
+    })
+    .await;
+    h.codex_account().await;
+    Mock::given(method("GET")).and(path("/backend-api/codex/models")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[{"slug":"gpt-6-codex","supported_in_api":true,"visibility":"list","context_window":400000,"base_instructions":"native instructions","supported_reasoning_levels":[{"effort":"high","description":"Native high"}]}]}))).mount(&h.upstream).await;
+    h.state.catalog.refresh_providers(&h.state.subs, &h.state.gateway, &["codex".to_string()].into_iter().collect()).await;
+    let mut p = policy("sample");
+    p.providers = vec!["llama".into(), "codex".into()];
+    p.accounts.retain(|provider, _| provider == "codex");
+    p.aliases.insert("sample-alias".into(), AliasTargets::One("llama/qwen3".into()));
+    let key = h.key(p).await;
+    assert_eq!(h.call("GET", "/backend-api/codex/models", None, None).await.0, 401);
+    let (status, list) = h.call("GET", "/backend-api/codex/models?client_version=0.0.0", Some(&key), None).await;
+    assert_eq!(status, 200);
+    let rows = list["models"].as_array().unwrap();
+    let alias = rows.iter().find(|m| m["slug"] == "sample-alias").unwrap();
+    assert_eq!(alias["context_window"], 128000);
+    assert_eq!(alias["max_output_tokens"], 8000);
+    assert_eq!(alias["shell_type"], "unified_exec");
+    assert_eq!(alias["input_modalities"], json!(["text", "image"]));
+    assert_eq!(alias["supported_reasoning_levels"][1]["effort"], "high");
+    let native = rows.iter().find(|m| m["slug"] == "gpt-6-codex").unwrap();
+    assert_eq!(native["base_instructions"], "native instructions");
+    assert_eq!(native["context_window"], 400000);
+    assert_eq!(native["supported_reasoning_levels"][0]["description"], "Native high");
+    assert!(!rows.iter().any(|m| m["slug"].as_str().unwrap().contains("claude")));
+    let mut denied = policy("denied");
+    denied.deny_other_models = true;
+    let denied_key = h.key(denied).await;
+    assert_eq!(h.call("GET", "/backend-api/codex/models", Some(&denied_key), None).await.1["models"], json!([]));
+    assert_eq!(h.call_with("GET", "/backend-api/codex/models", &[("cookie", "session=sample")], None).await.0, 401);
+}
+
+#[tokio::test]
+async fn translated_and_native_context_errors_use_anthropic_compaction_message() {
+    for native in [false, true] {
+        let h = harness_with(|c| {
+            if native {
+                c.catalog.wires.insert("llama".into(), vec![Wire::Messages]);
+            }
+        })
+        .await;
+        let key = h.key(policy("sample")).await;
+        Mock::given(method("POST"))
+            .and(path(if native { "/llama/v1/messages" } else { "/llama/v1/chat/completions" }))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                json!({"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"request rejected"}}),
+            ))
+            .mount(&h.upstream)
+            .await;
+        let (status, error) =
+            h.call("POST", "/v1/messages", Some(&key), Some(json!({"model":"llama/qwen3","messages":[],"max_tokens":10}))).await;
+        assert_eq!(status, 400);
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert_eq!(error["error"]["message"], "prompt is too long");
+    }
 }

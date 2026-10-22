@@ -636,3 +636,17 @@ async fn failed_json_responses_become_client_errors() {
         run(t, upstream_response(200, "application/json", messages::error_body("overloaded_error", "busy").to_string())).await;
     assert_eq!(status, 502);
 }
+
+#[tokio::test]
+async fn context_errors_in_json_and_sse_trigger_messages_compaction() {
+    let req = json!({"model":"sample-model","messages":[],"max_tokens":10,"stream":true});
+    let (_, t) = request(Wire::Messages, Wire::Responses, &req, "sample-model").unwrap();
+    let failed = sse(&[json!({"type":"response.failed","response":{"error":{"code":"context_length_exceeded","message":"rejected"}}})]);
+    let (_, _, body) = run(t, upstream_response(200, "text/event-stream", failed)).await;
+    assert!(body.contains("prompt is too long"), "{body}");
+    assert!(body.contains("invalid_request_error"), "{body}");
+    let (_, t) = request(Wire::Messages, Wire::Chat, &req, "sample-model").unwrap();
+    let failed = json!({"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"rejected"}}).to_string();
+    let (_, _, body) = run(t, upstream_response(400, "application/json", failed)).await;
+    assert!(body.contains("prompt is too long"), "{body}");
+}

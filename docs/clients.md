@@ -19,7 +19,20 @@ export ANTHROPIC_BASE_URL=http://xolotl:8317
 export ANTHROPIC_AUTH_TOKEN=$XOLOTL_API_KEY      # or ANTHROPIC_API_KEY
 ```
 
-Claude Code's model list comes from `GET /v1/models`, in Anthropic's format.
+Claude Code's model list comes from `GET /v1/models`, in Anthropic's format,
+with model descriptions, context limits and API-equivalent list prices. Models
+with a known input limit of at least one million tokens receive a `[1m]` hint.
+Both the hinted and canonical names route and account as the same model. Alias
+hints require every fallback target to meet the limit. A 200K–999K window stays
+untagged so Claude Code can compact early. Unknown models receive no hint.
+Claude Code discovery filters for names containing `claude` or `anthropic`;
+select other names with `--model` or `/model <name>`.
+
+For an exact custom-model window, set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` in the
+client session. Xolotl cannot set this environment value through the API. See
+[Claude Code model configuration](https://code.claude.com/docs/en/model-config#correct-the-window-for-a-gateway-or-custom-model-id).
+Upstream context-limit errors become `prompt is too long` so Claude Code can
+compact and retry. Translated token counts are approximate and labeled as such.
 
 ## Codex CLI
 
@@ -33,7 +46,24 @@ name = "xolotl"
 base_url = "http://xolotl:8317/v1"
 env_key = "XOLOTL_API_KEY"
 wire_api = "responses"
+model_catalog_url = "http://xolotl:8317/backend-api/codex/models"
 ```
+
+The Codex-native catalog uses the same client key as inference. It is filtered
+to the key's policy and includes aliases as independent entries. Native Codex
+metadata passes through; other models use LiteLLM windows and configured
+capabilities. Configure unknown models with `[catalog.metadata]`.
+
+Instead of `env_key`, Codex can obtain the key from a helper:
+
+```toml
+[model_providers.xolotl.auth]
+command = "secrets-helper xolotl-key"
+```
+
+The helper prints the client key. Codex sends provider authentication when it
+fetches `model_catalog_url`; no public catalog is required. See the
+[official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 
 ## Grok CLI
 
@@ -93,6 +123,7 @@ clears that account's cooldown and last error and polls its usage again.
 | Request | Goes to |
 |---|---|
 | `POST /v1/messages`, `/v1/responses`, `/v1/chat/completions`, other `POST /v1/*` | The target the policy gives for `model` |
+| `GET /backend-api/codex/models` | Policy-filtered Codex-native metadata |
 | `GET /v1/models` | The policy's model names and their endpoints |
 | `/<provider>/<path>` | Passthrough to a gateway provider, with its key |
 | `/opencode-go/<path>` | Passthrough to OpenCode Go through the account pool |
@@ -142,8 +173,10 @@ Exceptions:
   model on every endpoint, alias it to a second provider:
   `["claude/claude-haiku-5-5", "opencode-go/claude-haiku-5-5"]`. Xolotl skips
   targets that can't serve the endpoint.
-- **`/v1/messages/count_tokens` and `/v1/responses/compact`** are not
-  translated.
+- **`/v1/messages/count_tokens`** calls native Messages providers or returns a
+  local UTF-8 byte estimate for translated models (`estimated: true` and
+  `x-xolotl-token-count` header). Tools and system prompts are included; image
+  and tokenizer costs are approximate. **`/v1/responses/compact`** is native only.
 - A model that can't serve the endpoint gets a 400 that names the endpoints it
   is served on.
 

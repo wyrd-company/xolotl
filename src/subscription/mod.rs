@@ -257,6 +257,7 @@ pub struct Subscriptions {
     /// Sent to Grok's chat proxy (`catalog.grok_client_version`).
     grok_client_version: String,
     limiter: Arc<Limiter>,
+    catalog: Option<Arc<crate::catalog::ModelCatalog>>,
 }
 
 struct RefreshRetry {
@@ -290,8 +291,15 @@ impl Subscriptions {
             refresh_retries: Mutex::new(HashMap::new()),
             flows: Flows::default(),
             grok_client_version: crate::config::CatalogConfig::default().grok_client_version,
+            catalog: None,
             limiter: Default::default(),
         }
+    }
+
+    /// Snapshot model prices with each request.
+    pub fn with_catalog(mut self, catalog: Arc<crate::catalog::ModelCatalog>) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     /// Count response tokens against client rate limits.
@@ -836,7 +844,10 @@ impl Subscriptions {
             SubProvider::OpencodeGo => Some(opencode_go::session_key(&headers, client_id)),
             SubProvider::Grok => grok::session_key(&headers, body_json.as_ref().unwrap_or(&Value::Null)),
         };
-        let mut accounting = Accounting::new(self.db.clone(), provider.as_str(), path, client_id, model).with_limiter(&self.limiter);
+        let prices =
+            self.catalog.as_ref().and_then(|c| Some(c.metadata(provider.as_str(), body_json.as_ref()?.get("model")?.as_str()?).values));
+        let mut accounting =
+            Accounting::new(self.db.clone(), provider.as_str(), path, client_id, model).with_limiter(&self.limiter).with_prices(prices);
         let mut tried = HashSet::new();
         // Last failed upstream response, returned if every attempt fails.
         let mut last: Option<(u16, reqwest::header::HeaderMap, Bytes, String)> = None;
@@ -1202,9 +1213,39 @@ impl Subscriptions {
 
     // --------------------------------------------------------------- models
 
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    pub async fn fetch_codex_catalog(&self, client_version: &str) -> Result<Value> {
+        let rows = self.db.list_accounts(Some("codex")).await?;
+        let mut last = None;
+        for row in rows.into_iter().filter(|r| r.enabled && !r.auth_failed) {
+            let result: Result<Value> = async {
+                let cred = self.credential(&row.id, None).await?;
+                let resp = codex::models_request(&self.http, &self.cfg.endpoints, &cred, client_version)
+                    .timeout(Duration::from_secs(15))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let body: Value = resp.json().await?;
+                anyhow::ensure!(body["models"].is_array(), "missing native models array");
+                Ok(body)
+            }
+            .await;
+            match result {
+                Ok(body) => return Ok(body),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("no available accounts")))
+    }
+
     /// The models the provider serves, asked with the first account that answers.
-    /// Empty when the pool has no usable accounts.
     pub async fn fetch_models(&self, provider: SubProvider, codex_client_version: &str) -> Result<Vec<String>> {
+        if provider == SubProvider::Codex {
+            return Ok(codex::parse_models(&self.fetch_codex_catalog(codex_client_version).await?));
+        }
         let rows = self.db.list_accounts(Some(provider.as_str())).await?;
         let ep = &self.cfg.endpoints;
         let mut last_err = None;

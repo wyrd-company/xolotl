@@ -93,3 +93,5 @@ See [MCP gateway](mcp-gateway).
 | Command | Does |
 |---|---|
 | `xolotl usage [--group-by client\|account\|provider\|model] [--since 24h] [--client <c>] [--account <a>] [--provider <p>] [--model <m>]` | Requests, errors and tokens from the request log. The filters narrow the rows; `""` matches rows without a value |
+
+`xolotl models` shows context, maximum output, input/output and cache prices, metadata source and age. `--refresh` refreshes metadata with model discovery; `--json --metadata` returns catalog route rows with a `metadata` object. `--json` keeps the provider-to-model-name map. Costs are API-equivalent USD list prices.

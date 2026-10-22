@@ -89,16 +89,68 @@ pub struct ModelCatalog {
     /// Gateway provider name -> kind.
     gateway_kinds: BTreeMap<String, ProviderKind>,
     snapshot: RwLock<Arc<Snapshot>>,
+    metadata: RwLock<crate::metadata::Registry>,
+    codex_entries: RwLock<BTreeMap<String, serde_json::Value>>,
+    db: Option<crate::db::Db>,
 }
 
 impl ModelCatalog {
     pub fn new(cfg: CatalogConfig, gateway_kinds: BTreeMap<String, ProviderKind>) -> Self {
-        let me =
-            Self { refresh_lock: tokio::sync::Mutex::new(()), cfg, gateway_kinds, snapshot: RwLock::new(Arc::new(Snapshot::default())) };
+        let me = Self {
+            refresh_lock: tokio::sync::Mutex::new(()),
+            cfg,
+            gateway_kinds,
+            metadata: Default::default(),
+            codex_entries: Default::default(),
+            db: None,
+            snapshot: RwLock::new(Arc::new(Snapshot::default())),
+        };
         // Start with the static entries so routing works before discovery.
         let models = me.with_static(Catalog::new());
         *me.snapshot.write() = Arc::new(Snapshot { models, ..Default::default() });
         me
+    }
+
+    pub async fn with_db(mut self, db: crate::db::Db) -> Self {
+        if let Ok(Some(body)) = db.metadata_cache().await
+            && let Ok(cached) = serde_json::from_str::<crate::metadata::Registry>(&body)
+            && cached.entries.values().all(|m| m.validate().is_ok())
+        {
+            *self.metadata.write() = cached;
+        }
+        self.db = Some(db);
+        self
+    }
+
+    pub fn metadata(&self, provider: &str, model: &str) -> crate::metadata::Resolved {
+        self.metadata.read().lookup(provider, model, self.cfg.metadata.get(&format!("{provider}/{model}")))
+    }
+
+    pub async fn refresh_metadata(&self, http: &reqwest::Client) {
+        let _guard = self.refresh_lock.lock().await;
+        self.refresh_metadata_unlocked(http).await;
+    }
+
+    async fn refresh_metadata_unlocked(&self, http: &reqwest::Client) {
+        if self.cfg.metadata_url.is_empty() {
+            return;
+        }
+        let result: anyhow::Result<crate::metadata::Registry> = async {
+            let resp = http.get(&self.cfg.metadata_url).send().await?.error_for_status()?;
+            crate::metadata::Registry::parse(resp.json().await?, crate::db::now())
+        }
+        .await;
+        match result {
+            Ok(registry) => {
+                if let Some(db) = &self.db
+                    && let Err(e) = db.save_metadata_cache(&serde_json::to_string(&registry).expect("valid registry")).await
+                {
+                    tracing::warn!(error = %e, "metadata cache persistence failed");
+                }
+                *self.metadata.write() = registry;
+            }
+            Err(e) => self.metadata.write().error = Some(format!("{e:#}")),
+        }
     }
 
     /// Every provider name: subscription pools and gateway providers.
@@ -146,10 +198,25 @@ impl ModelCatalog {
     /// Serialize refreshes so a scoped refresh cannot overwrite another provider's result.
     pub async fn refresh_providers(&self, subs: &Subscriptions, gateway: &Gateway, providers: &BTreeSet<String>) {
         let _guard = self.refresh_lock.lock().await;
+        self.refresh_metadata_unlocked(subs.http()).await;
         let mut fresh = self.models();
         let mut discovery = self.snapshot.read().discovery.clone();
         for name in providers {
             let result = match name.parse::<SubProvider>() {
+                Ok(SubProvider::Codex) => match subs.fetch_codex_catalog(&self.cfg.codex_client_version).await {
+                    Ok(body) => {
+                        let names = crate::subscription::codex::parse_models(&body);
+                        let entries = body["models"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|m| Some((m["slug"].as_str()?.to_string(), m.clone())))
+                            .collect();
+                        *self.codex_entries.write() = entries;
+                        Ok(names)
+                    }
+                    Err(e) => Err(e),
+                },
                 Ok(provider) => subs.fetch_models(provider, &self.cfg.codex_client_version).await,
                 Err(_) => gateway.fetch_models(name).await,
             };
@@ -169,6 +236,91 @@ impl ModelCatalog {
         let total: usize = models.values().map(BTreeSet::len).sum();
         tracing::info!(models = total, "model catalog refreshed");
         *self.snapshot.write() = Arc::new(Snapshot { models, discovery, refreshed: Some(Instant::now()) });
+    }
+
+    /// Native Codex fields are retained; only the policy-visible identity changes.
+    pub fn codex_entry(&self, name: &str, targets: &[crate::policy::Target]) -> serde_json::Value {
+        use serde_json::json;
+        let first = &targets[0];
+        let metadata = self.metadata(&first.provider, &first.model);
+        let override_ = self.cfg.metadata.get(&first.qualified());
+        let mut entry = json!({
+            "shell_type": "disabled", "visibility": "list", "supported_in_api": true, "priority": 0,
+            "supported_reasoning_levels": [], "support_verbosity": false, "default_verbosity": null,
+            "availability_nux": null, "upgrade": null, "apply_patch_tool_type": null,
+            "truncation_policy": {"mode": "bytes", "limit": 10000}, "experimental_supported_tools": [],
+            "input_modalities": ["text"], "supports_reasoning_summaries": false,
+            "supports_reasoning_summary_parameter": false, "parallel_tool_calls": false,
+            "base_instructions": "You are a coding assistant.", "effective_context_window_percent": 95
+        });
+        if first.provider == "codex"
+            && let Some(native) = self.codex_entries.read().get(&first.model).and_then(serde_json::Value::as_object)
+        {
+            entry.as_object_mut().unwrap().extend(native.clone());
+        }
+        entry["slug"] = json!(name);
+        entry["display_name"] = json!(name);
+        entry["description"] = json!(metadata.description(&first.provider));
+        // An alias's context must be safe for every fallback target. Unknown is unknown.
+        let limits: Option<Vec<u64>> = targets
+            .iter()
+            .map(|t| {
+                let configured = self.cfg.metadata.get(&t.qualified()).and_then(|o| o.values.max_input_tokens);
+                let native = if t.provider == "codex" {
+                    self.codex_entries.read().get(&t.model).and_then(|m| m["context_window"].as_u64())
+                } else {
+                    None
+                };
+                configured.or(native).or(self.metadata(&t.provider, &t.model).values.max_input_tokens)
+            })
+            .collect();
+        if let Some(window) = limits.and_then(|xs| xs.into_iter().min()) {
+            entry["context_window"] = json!(window);
+            entry["max_context_window"] = json!(window);
+        } else {
+            for key in ["context_window", "max_context_window", "auto_compact_token_limit"] {
+                entry.as_object_mut().unwrap().remove(key);
+            }
+        }
+        if let Some(max) = metadata.values.max_output_tokens {
+            entry["max_output_tokens"] = json!(max);
+        }
+        if let Some(o) = override_ {
+            if let Some(images) = o.images {
+                entry["input_modalities"] = if images { json!(["text", "image"]) } else { json!(["text"]) };
+            }
+            if let Some(tools) = o.tools {
+                entry["shell_type"] = json!(if tools { "unified_exec" } else { "disabled" });
+            }
+            if let Some(levels) = &o.reasoning_levels {
+                entry["supported_reasoning_levels"] =
+                    json!(levels.iter().map(|l| json!({"effort": l, "description": l})).collect::<Vec<_>>());
+                entry["default_reasoning_level"] = levels.first().map(|l| json!(l)).unwrap_or(serde_json::Value::Null);
+            }
+        }
+        if targets.len() > 1 {
+            let entries: Vec<_> = targets.iter().map(|t| self.codex_entry(name, std::slice::from_ref(t))).collect();
+            if entries.iter().any(|m| m["shell_type"] != "unified_exec") {
+                entry["shell_type"] = json!("disabled");
+            }
+            if entries.iter().any(|m| !m["input_modalities"].as_array().is_some_and(|xs| xs.contains(&json!("image")))) {
+                entry["input_modalities"] = json!(["text"]);
+            }
+            let common: Vec<_> = entries[0]["supported_reasoning_levels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|level| {
+                    entries.iter().all(|m| {
+                        m["supported_reasoning_levels"].as_array().is_some_and(|xs| xs.iter().any(|x| x["effort"] == level["effort"]))
+                    })
+                })
+                .cloned()
+                .collect();
+            entry["default_reasoning_level"] = common.first().map(|v| v["effort"].clone()).unwrap_or(serde_json::Value::Null);
+            entry["supported_reasoning_levels"] = json!(common);
+        }
+        entry
     }
 
     /// Wire formats that reach `provider/model`.

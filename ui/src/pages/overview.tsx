@@ -7,6 +7,7 @@ import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle } from "lucide-react";
 import { Link } from "react-router";
 
+import { ApiEquivalentCost } from "@/components/api-equivalent-cost";
 import { CatalogRefresh } from "@/components/catalog-refresh";
 import {
   accountName,
@@ -531,6 +532,7 @@ function Traffic({ rows }: { rows: UsageRow[] }) {
         </Stat>
         <Stat label="Input tokens" value={num(totals.input)} />
         <Stat label="Output tokens" value={num(totals.output)} />
+        <div className="col-span-2 text-sm"><span className="text-muted-foreground">API-equivalent USD: </span><ApiEquivalentCost rows={rows} /><p className="text-muted-foreground text-xs">List-price estimate; subscription value, not spend. Unpriced requests excluded.</p></div>
       </div>
       <div className="border-t pt-4">
         <h3 className="text-muted-foreground mb-3 text-sm">

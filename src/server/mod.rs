@@ -68,6 +68,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .route("/v1/models", get(models))
+        .route("/backend-api/codex/models", get(codex_models))
         .route("/v1/messages", post(|s, r| llm(s, r, "/v1/messages")))
         .route("/v1/messages/count_tokens", post(|s, r| llm(s, r, "/v1/messages/count_tokens")))
         .route("/v1/responses", post(|s, r| llm(s, r, "/v1/responses")).get(websocket_unsupported))
@@ -348,6 +349,7 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
     let Some(model) = json.get("model").and_then(Value::as_str).map(str::to_string) else {
         return err(StatusCode::BAD_REQUEST, "invalid_request_error", "missing `model`".into());
     };
+    let model = if anthropic { model.strip_suffix("[1m]").unwrap_or(&model).to_string() } else { model };
     let known = state.catalog.known_providers();
     let Some(targets) = state.view(&principal).lookup(&principal.policy, &known, &model) else {
         return err(StatusCode::NOT_FOUND, "not_found_error", format!("model {model:?} is not available to this key"));
@@ -355,6 +357,18 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
 
     let wire = Wire::for_path(path);
     let route = |t: &Target| wire.and_then(|w| state.catalog.route(&t.provider, &t.model, w, path));
+    // Counting a translated Messages request is local: no provider call or quota charge.
+    if path == "/v1/messages/count_tokens" {
+        let first = &targets[0];
+        if !state.catalog.wires(&first.provider, &first.model).contains(&Wire::Messages) && first.provider != "claude" {
+            if json.get("messages").and_then(Value::as_array).is_none() {
+                return err(StatusCode::BAD_REQUEST, "invalid_request_error", "messages must be an array".into());
+            }
+            let mut response = Json(json!({"input_tokens": crate::metadata::estimate_tokens(&json), "estimated": true})).into_response();
+            response.headers_mut().insert("x-xolotl-token-count", "estimate; method=json-utf8-bytes/3".parse().unwrap());
+            return response;
+        }
+    }
     let (usable, unusable): (Vec<Target>, Vec<Target>) = targets.into_iter().partition(|t| match wire {
         Some(_) => route(t).is_some(),
         // Pools only serve the LLM endpoints.
@@ -423,10 +437,30 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
         }
         return match translation {
             Some(t) => t.response(resp).await,
+            None if anthropic && !resp.status().is_success() => normalize_messages_error(resp).await,
             None => resp,
         };
     }
     unreachable!("loop returns on the last target")
+}
+
+async fn normalize_messages_error(resp: Response) -> Response {
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(e) => return proxy::anthropic_error(StatusCode::BAD_GATEWAY, "api_error", e.to_string()),
+    };
+    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+        let error = value.get("error").unwrap_or(&value);
+        let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+        if ["code", "type"].iter().any(|k| crate::metadata::too_long(error.get(*k).and_then(Value::as_str).unwrap_or(""), message)) {
+            parts.headers.remove(header::CONTENT_LENGTH);
+            parts.headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+            let body = json!({"type":"error", "error":{"type":"invalid_request_error", "message":"prompt is too long"}});
+            return Response::from_parts(parts, Body::from(body.to_string()));
+        }
+    }
+    Response::from_parts(parts, Body::from(bytes))
 }
 
 /// Grok's proxy only streams: answer a Responses client that didn't ask to
@@ -521,6 +555,23 @@ async fn llm_dynamic(state: AppState, req: Request, path: &str) -> Response {
 /// in Anthropic's shape when the request carries `anthropic-version` (Claude
 /// Code). Each entry names the endpoints its first target is served on
 /// natively and through translation.
+async fn codex_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match authorize(&state, &headers, Scope::Proxy).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let view = state.view(&principal);
+    let entries: Vec<Value> = view
+        .names
+        .iter()
+        .filter(|(_, ts)| ts.iter().all(|t| state.catalog.route(&t.provider, &t.model, Wire::Responses, Wire::Responses.path()).is_some()))
+        .map(|(name, ts)| state.catalog.codex_entry(name, ts))
+        .collect();
+    let mut response = Json(json!({"models": entries})).into_response();
+    response.headers_mut().insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
+    response
+}
+
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let principal = match authorize(&state, &headers, Scope::Proxy).await {
         Ok(p) => p,
@@ -551,8 +602,12 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
             .iter()
             .map(|(name, ts)| {
                 let (native, translated) = endpoints(ts);
+                let first = &ts[0];
+                let metadata = state.catalog.metadata(&first.provider, &first.model);
+                let large = ts.iter().all(|t| state.catalog.metadata(&t.provider, &t.model).values.max_input_tokens.is_some_and(|n| n >= 1_000_000));
+                let id = if large { format!("{name}[1m]") } else { name.clone() };
                 json!({
-                    "id": name, "type": "model", "display_name": name, "created_at": "1970-01-01T00:00:00Z",
+                    "id": id, "type": "model", "display_name": name, "description": metadata.description(&first.provider), "metadata": metadata, "created_at": "1970-01-01T00:00:00Z",
                     "endpoints": native, "translated_endpoints": translated,
                 })
             })
@@ -569,6 +624,8 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
             json!({
                 "id": name, "object": "model", "owned_by": ts.first().map(|t| t.provider.as_str()).unwrap_or(""),
                 "endpoints": native, "translated_endpoints": translated,
+                "display_name": name, "description": state.catalog.metadata(&ts[0].provider, &ts[0].model).description(&ts[0].provider),
+                "metadata": state.catalog.metadata(&ts[0].provider, &ts[0].model),
             })
         })
         .collect();

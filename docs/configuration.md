@@ -192,6 +192,35 @@ model list.
 `messages`, `responses` or `chat`. Xolotl translates other formats. You can't
 override `claude`. See [Clients](clients#wire-formats-and-translation).
 
+### Model metadata
+
+`catalog.metadata_url` defaults to LiteLLM's public model registry. Set it to an
+empty string to disable network refresh. Refresh uses `catalog.refresh_secs`
+and `xolotl models --refresh`. The last validated snapshot is cached in SQLite;
+failed fetches keep its values and age. Models need no metadata to route.
+
+Map or override an individual model with its full `provider/model` key:
+
+```toml
+[catalog.metadata."llamacpp/sample-model"]
+litellm_key = "openai/sample-model"  # optional explicit registry key
+max_input_tokens = 128000
+max_output_tokens = 8000
+input_cost_per_token = 0.000002
+output_cost_per_token = 0.000008
+cache_read_input_token_cost = 0.0000002
+cache_creation_input_token_cost = 0.0000025
+tools = true                       # Codex catalog shell tools
+images = false
+reasoning_levels = ["low", "high"]
+```
+
+Only supplied values replace registry values. Unmatched models show unknown
+limits and prices. Prices are USD per token, displayed per million tokens.
+Codex catalog synthesis defaults to text input, no shell tools, and no reasoning
+levels. Declare supported capabilities explicitly. Native Codex entries retain
+the upstream fields. See [Model metadata design](design/model-metadata).
+
 ## `[mcp]`
 
 ```toml

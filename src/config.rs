@@ -202,6 +202,9 @@ pub fn valid_mcp_server_name(name: &str) -> bool {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CatalogConfig {
+    /// LiteLLM registry source. Empty disables network refresh.
+    pub metadata_url: String,
+    pub metadata: BTreeMap<String, crate::metadata::Override>,
     /// How often to re-discover provider model lists.
     pub refresh_secs: u64,
     /// Codex filters its model roster by client version.
@@ -219,6 +222,8 @@ impl Default for CatalogConfig {
     fn default() -> Self {
         Self {
             refresh_secs: 600,
+            metadata_url: crate::metadata::REGISTRY_URL.into(),
+            metadata: BTreeMap::new(),
             codex_client_version: "0.160.0".into(),
             grok_client_version: "1.0.52".into(),
             static_models: BTreeMap::new(),
@@ -566,6 +571,19 @@ impl Config {
             );
             if p.kind == ProviderKind::OpenaiCompatible {
                 anyhow::ensure!(p.base_url.is_some(), "provider {name:?}: openai-compatible providers need base_url");
+            }
+        }
+        for (key, entry) in &self.catalog.metadata {
+            anyhow::ensure!(
+                key.split_once('/').is_some_and(|(p, m)| !p.is_empty() && !m.is_empty()),
+                "catalog.metadata key must be provider/model"
+            );
+            entry.values.validate()?;
+            if let Some(levels) = &entry.reasoning_levels {
+                anyhow::ensure!(
+                    levels.iter().all(|l| ["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&l.as_str())),
+                    "invalid catalog reasoning level"
+                );
             }
         }
         for key in self.catalog.wires.keys() {

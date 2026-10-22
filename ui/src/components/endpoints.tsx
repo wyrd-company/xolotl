@@ -29,8 +29,8 @@ export function EndpointsLegend() {
       <Badge variant="outline" className="text-muted-foreground border-dashed font-mono">
         translated
       </Badge>
-      xolotl translates requests and responses. <span className="font-mono">count_tokens</span> and{" "}
-      <span className="font-mono">responses/compact</span> are native only.
+      xolotl translates requests and responses. <span className="font-mono">count_tokens</span> is estimated for translated models;{" "}
+      <span className="font-mono">responses/compact</span> is native only.
     </p>
   );
 }

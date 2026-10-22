@@ -310,6 +310,11 @@ fn upstream_error(status: StatusCode, body: &[u8]) -> (String, String) {
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| default_kind(status).to_string());
+    let kind = if err.get("code").and_then(Value::as_str).is_some_and(|code| crate::metadata::too_long(code, "")) {
+        err["code"].as_str().unwrap().to_string()
+    } else {
+        kind
+    };
     (kind, message)
 }
 
