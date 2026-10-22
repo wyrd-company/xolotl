@@ -1,3 +1,7 @@
+// ---
+// relationships:
+//   implements: ../../docs/web-ui.md
+// ---
 //! Admin API used by the `xolotl` CLI: client keys, accounts, logins, usage.
 
 use std::collections::BTreeMap;
@@ -509,6 +513,8 @@ struct UsageQuery {
     account: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    errors: bool,
 }
 
 fn default_group() -> String {
@@ -521,7 +527,7 @@ fn default_since() -> i64 {
 async fn usage(State(s): State<AppState>, h: HeaderMap, Query(q): Query<UsageQuery>) -> Res {
     admin(&s, &h).await?;
     // Not `#[serde(flatten)]`: URL-encoded queries can't flatten into the integer `since_secs`.
-    let filter = UsageFilter { client: q.client, account: q.account, provider: q.provider, model: q.model };
+    let filter = UsageFilter { client: q.client, account: q.account, provider: q.provider, model: q.model, errors: q.errors };
     let mut rows = s.db.usage_summary(&q.group_by, now() - q.since_secs, &filter).await.map_err(bad)?;
     let _ = &mut rows;
     ok(rows)

@@ -1,3 +1,7 @@
+// ---
+// relationships:
+//   tests: admin
+// ---
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -857,6 +861,30 @@ async fn admin_policies_keys_and_accounts() {
     assert_eq!(models, ["m1", "m2"]);
     let (_, rows) = h.call("GET", "/admin/usage?group_by=model&provider=usage-test&client=", Some(&h.admin), None).await;
     assert_eq!(rows, json!([{"key": "m3", "requests": 1, "errors": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}]));
+
+    // The overview's errors link excludes successful requests even in a mixed group.
+    for status in [399, 400, 401, 500] {
+        h.state
+            .db
+            .log_request(&crate::db::RequestRecord {
+                client_id: Some("usage a".into()),
+                provider: "usage-test".into(),
+                model: Some("m1".into()),
+                endpoint: "/v1/responses".into(),
+                status,
+                input_tokens: Some(10),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let (status, errors) = h
+        .call("GET", "/admin/usage?group_by=model&since_secs=3600&provider=usage-test&client=usage%20a&errors=true", Some(&h.admin), None)
+        .await;
+    assert_eq!(status, 200, "{errors}");
+    assert_eq!(errors, json!([{"key": "m1", "requests": 3, "errors": 3, "input_tokens": 30, "output_tokens": 0, "cached_tokens": 0}]));
+    let (_, all) = h.call("GET", "/admin/usage?group_by=model&provider=usage-test&model=m1&errors=false", Some(&h.admin), None).await;
+    assert_eq!(all[0]["requests"], 6);
 }
 
 /// A mock OpenID provider at `<upstream>/oidc` for the web UI sign-in.
