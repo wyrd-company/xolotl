@@ -1161,6 +1161,10 @@ impl Subscriptions {
             };
             body["reset_credits"] = serde_json::to_value(credits)?;
         }
+        if provider == SubProvider::Claude {
+            anyhow::ensure!(body.is_object(), "Claude usage response is not an object");
+            body["reset_credits"] = serde_json::to_value(claude::parse_reset_credits(&body, t))?;
+        }
         self.record_usage(id, provider, windows, Some(body)).await;
         self.db.get_usage(id).await?.context("usage vanished")
     }

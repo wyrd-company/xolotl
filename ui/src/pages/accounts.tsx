@@ -16,6 +16,7 @@ import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { del, get, post, PROVIDER_NAMES, SUB_PROVIDERS, type Account, type Status } from "@/lib/api";
+import { resetCreditsSummary } from "@/lib/reset-credits";
 import { dateTime, relative } from "@/lib/format";
 import { useAction } from "@/lib/hooks";
 
@@ -129,7 +130,12 @@ function AccountRow({ account: a, open, onOpenChange }: { account: Account; open
         <AccountStateBadge account={a} />
       </TableCell>
       <TableCell>
-        <WindowsSummary windows={a.usage?.windows} />
+        <div className="flex flex-col gap-1">
+          <WindowsSummary windows={a.usage?.windows} />
+          {(a.provider === "codex" || a.provider === "claude") && (
+            <span className="text-muted-foreground text-xs">{resetCreditsSummary([a])}</span>
+          )}
+        </div>
       </TableCell>
       <TableCell className="font-mono">{a.priority}</TableCell>
       <TableCell className="whitespace-nowrap">{relative(a.last_used_at)}</TableCell>
@@ -214,7 +220,7 @@ function AccountDetails({
           )}
           <dt className="text-muted-foreground">Plan</dt>
           <dd>{a.plan ?? "-"}</dd>
-          {a.provider === "codex" && (
+          {(a.provider === "codex" || a.provider === "claude") && (
             <>
               <dt className="text-muted-foreground">Reset credits</dt>
               <dd>{a.usage?.raw?.reset_credits ?? "Unknown"}</dd>

@@ -1506,3 +1506,55 @@ async fn a_restart_counts_pool_requests_as_admission_did() {
     assert_eq!(live.consumption("p/client", now()).requests_per_day, 1);
     assert_eq!(replayed.consumption("p/client", now()).requests_per_day, 1);
 }
+
+#[tokio::test]
+async fn claude_usage_persists_scoped_windows_and_reset_counts() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let row = subs
+        .save_account(Credential {
+            provider: SubProvider::Claude,
+            access_token: "example-token".into(),
+            expires_at: Some(now() + 3600),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/api/oauth/usage"))
+        .and(wiremock::matchers::query_param("cedar_ember", "1"))
+        .and(header("authorization", "Bearer example-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "five_hour": {"utilization": 25},
+            "iguana_necktie": {"utilization": 100, "resets_at": "2099-01-01T00:00:00Z"},
+            "limits": [{"kind": "weekly_scoped", "percent": 100, "resets_at": "2099-01-01T00:00:00Z",
+                "scope": {"model": {"display_name": "Fable"}}}],
+            "cedar_ember": {"eligible": true, "next_grant_id": "first", "grants": [
+                {"id": "first", "resets_left": 2, "usable_now": true}
+            ]}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let usage = subs.poll_usage(&row.id).await.unwrap();
+    assert_eq!(usage.raw.unwrap()["reset_credits"], 2);
+    assert_eq!(usage.windows.iter().find(|w| w.name == "7d-fable").unwrap().used_percent, 100.0);
+    assert!(!usage.windows.iter().any(|w| w.name == "iguana_necktie"));
+    assert!(subs.db.get_account(&row.id).await.unwrap().unwrap().cooldown_until.is_none(), "scoped limits must not bench an account");
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("anthropic-ratelimit-unified-5h-utilization", "0.4".parse().unwrap());
+    subs.observe_headers(&row.id, SubProvider::Claude, &headers).await;
+    let accounts = subs.accounts(Some(SubProvider::Claude)).await.unwrap();
+    let serialized = serde_json::to_value(&accounts).unwrap();
+    assert_eq!(serialized[0]["usage"]["raw"]["reset_credits"], 2);
+    assert_eq!(accounts[0].usage.as_ref().unwrap().windows.iter().find(|w| w.name == "5h").unwrap().used_percent, 40.0);
+
+    server.reset().await;
+    Mock::given(path("/api/oauth/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"five_hour": {"utilization": 50}})))
+        .mount(&server)
+        .await;
+    let usage = subs.poll_usage(&row.id).await.unwrap();
+    assert_eq!(usage.raw.unwrap()["reset_credits"], Value::Null, "an absent block replaces a stale count with unknown");
+    assert_eq!(usage.windows[0].used_percent, 50.0);
+}

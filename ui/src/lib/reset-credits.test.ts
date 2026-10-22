@@ -21,3 +21,7 @@ test("distinguishes unknown counts from zero and labels partial totals", () => {
   expect(resetCreditsSummary([account(2), account(undefined)])).toBe("2 reset credits available · 1 account unknown");
   expect(resetCreditsSummary([account(2), account(undefined), { usage: null }])).toBe("2 reset credits available · 2 accounts unknown");
 });
+
+test("rejects malformed counts without hiding known zero", () => {
+  expect(resetCreditsSummary([account(NaN), account(-1), account(1.5), account(Infinity), account(0)])).toBe("0 reset credits available · 4 accounts unknown");
+});
