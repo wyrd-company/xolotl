@@ -1,3 +1,7 @@
+// ---
+// relationships:
+//   implements: ../docs/design/architecture.md
+// ---
 //! SQLite runtime state: account health/cooldowns, usage snapshots and the
 //! request log. Nothing secret is stored here.
 
@@ -114,6 +118,7 @@ pub struct UsageFilter {
     pub account: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub errors: bool,
 }
 
 impl UsageFilter {
@@ -392,6 +397,9 @@ impl Db {
     pub async fn usage_summary(&self, group_by: &str, since: i64, filter: &UsageFilter) -> Result<Vec<UsageSummary>> {
         let column = usage_column(group_by)?;
         let mut conditions = String::new();
+        if filter.errors {
+            conditions.push_str(" AND status >= 400");
+        }
         let mut values = Vec::new();
         for (col, value) in filter.columns() {
             let Some(value) = value else { continue };

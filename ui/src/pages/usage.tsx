@@ -1,3 +1,7 @@
+// ---
+// relationships:
+//   implements: ../../../docs/web-ui.md
+// ---
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ExternalLink, X } from "lucide-react";
@@ -19,10 +23,12 @@ const EMPTY_KEY: Record<GroupBy, string> = { client: "admin token", account: "no
 export function UsagePage() {
   const [params, setParams] = useSearchParams();
   const { group, period, filters } = readView(params);
+  const errorsOnly = params.get("errors") === "true";
   const api = new URLSearchParams({ group_by: group, since_secs: String(period), ...Object.fromEntries(filters) });
+  if (errorsOnly) api.set("errors", "true");
   const status = useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/admin/status") });
   const usage = useQuery({
-    queryKey: ["usage", group, period, filters],
+    queryKey: ["usage", group, period, filters, errorsOnly],
     queryFn: () => get<UsageRow[]>(`/admin/usage?${api}`),
   });
   const rows = usage.data ?? [];
@@ -71,8 +77,16 @@ export function UsagePage() {
           </Select>
         </div>
       </div>
-      {filters.length > 0 && (
+      {(filters.length > 0 || errorsOnly) && (
         <div className="flex flex-wrap items-center gap-2" aria-label="Filters">
+          {errorsOnly && (
+            <Badge variant="outline" className="py-1 pr-1 text-sm font-normal">
+              Errors only
+              <Link to={withParams(params, { errors: null })} aria-label="Remove errors filter" className="text-muted-foreground hover:text-foreground rounded-full p-0.5">
+                <X />
+              </Link>
+            </Badge>
+          )}
           {filters.map(([g, value]) => (
             <Badge key={g} variant="outline" className="py-1 pr-1 text-sm font-normal">
               <span className="text-muted-foreground">{GROUPS.find(([d]) => d === g)![1]}:</span>
@@ -86,7 +100,7 @@ export function UsagePage() {
               </Link>
             </Badge>
           ))}
-          <Link to={withParams(params, Object.fromEntries(GROUPS.map(([g]) => [g, null])))} className="text-primary text-sm">
+          <Link to={withParams(params, { ...Object.fromEntries(GROUPS.map(([g]) => [g, null])), errors: null })} className="text-primary text-sm">
             Clear all
           </Link>
         </div>
@@ -122,7 +136,7 @@ export function UsagePage() {
           </TableBody>
         </Table>
         {usage.isSuccess && rows.length === 0 && (
-          <Empty>{filters.length ? "No matching requests in this period." : "No requests in this period."}</Empty>
+          <Empty>{filters.length || errorsOnly ? "No matching requests in this period." : "No requests in this period."}</Empty>
         )}
       </Card>
     </>

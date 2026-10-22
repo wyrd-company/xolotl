@@ -1,3 +1,7 @@
+// ---
+// relationships:
+//   tests: usage-view
+// ---
 import { describe, expect, it } from "vitest";
 
 import { narrowTo, readView } from "@/lib/usage-view";
@@ -39,4 +43,9 @@ describe("narrowTo", () => {
   it("narrows to a row without a key with an empty value", () => {
     expect(readView(params(narrowTo(params("group=client"), null)!)).filters).toEqual([["client", ""]]);
   });
+});
+
+
+it("retains the errors-only filter when narrowing to a provider", () => {
+  expect(narrowTo(params("group=provider&errors=true"), "gateway-a")).toBe("?group=model&errors=true&provider=gateway-a");
 });
