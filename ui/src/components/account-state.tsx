@@ -1,6 +1,7 @@
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import type { Account, UsageWindow } from "@/lib/api";
+import { publicUsageWindows } from "@/lib/usage-windows";
 import { relative } from "@/lib/format";
 
 export { accountState, accountPath } from "@/lib/account-state";
@@ -26,18 +27,19 @@ export function accountName(a: Account): string {
 
 /** Highest usage across an account's windows (0 when unknown). */
 export function peakUsage(a: Account): number {
-  return Math.max(0, ...(a.usage?.windows.map((w) => w.used_percent) ?? []));
+  return Math.max(0, ...publicUsageWindows(a.usage?.windows).map((w) => w.used_percent));
 }
 
 export function WindowsSummary({ windows }: { windows: UsageWindow[] | undefined }) {
-  if (!windows?.length) return <span className="text-muted-foreground">-</span>;
-  return <span className="font-mono text-xs">{windows.map((w) => `${w.name} ${Math.round(w.used_percent)}%`).join(" · ")}</span>;
+  const shown = publicUsageWindows(windows);
+  if (!shown.length) return <span className="text-muted-foreground">-</span>;
+  return <span className="font-mono text-xs">{shown.map((w) => `${w.name} ${Math.round(w.used_percent)}%`).join(" · ")}</span>;
 }
 
 export function WindowBars({ windows, softLimit }: { windows: UsageWindow[]; softLimit?: number }) {
   return (
     <div className="flex flex-col gap-2">
-      {windows.map((w) => (
+      {publicUsageWindows(windows).map((w) => (
         <div key={w.name} className="flex flex-col gap-1">
           <div className="flex justify-between text-xs">
             <span>

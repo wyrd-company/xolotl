@@ -1078,7 +1078,8 @@ impl Subscriptions {
         self.record_usage(id, provider, merged, None).await;
     }
 
-    async fn record_usage(&self, id: &str, provider: SubProvider, windows: Vec<UsageWindow>, raw: Option<Value>) {
+    async fn record_usage(&self, id: &str, provider: SubProvider, mut windows: Vec<UsageWindow>, raw: Option<Value>) {
+        windows.retain(UsageWindow::is_public);
         let m = metrics();
         for w in &windows {
             m.account_usage.record(
@@ -1160,6 +1161,10 @@ impl Subscriptions {
                 }
             };
             body["reset_credits"] = serde_json::to_value(credits)?;
+        }
+        if provider == SubProvider::Claude {
+            anyhow::ensure!(body.is_object(), "Claude usage response is not an object");
+            body["reset_credits"] = serde_json::to_value(claude::parse_reset_credits(&body, t))?;
         }
         self.record_usage(id, provider, windows, Some(body)).await;
         self.db.get_usage(id).await?.context("usage vanished")

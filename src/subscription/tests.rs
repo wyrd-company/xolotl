@@ -1506,3 +1506,112 @@ async fn a_restart_counts_pool_requests_as_admission_did() {
     assert_eq!(live.consumption("p/client", now()).requests_per_day, 1);
     assert_eq!(replayed.consumption("p/client", now()).requests_per_day, 1);
 }
+
+#[tokio::test]
+async fn claude_usage_persists_scoped_windows_and_reset_counts() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let row = subs
+        .save_account(Credential {
+            provider: SubProvider::Claude,
+            access_token: "example-token".into(),
+            expires_at: Some(now() + 3600),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/api/oauth/usage"))
+        .and(wiremock::matchers::query_param("cedar_ember", "1"))
+        .and(header("authorization", "Bearer example-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "five_hour": {"utilization": 25},
+            "iguana_necktie": {"utilization": 100, "resets_at": "2099-01-01T00:00:00Z"},
+            "limits": [{"kind": "weekly_scoped", "percent": 100, "resets_at": "2099-01-01T00:00:00Z",
+                "scope": {"model": {"display_name": "Fable"}}}],
+            "cedar_ember": {"eligible": true, "next_grant_id": "first", "grants": [
+                {"id": "first", "resets_left": 2, "usable_now": true}
+            ]}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let usage = subs.poll_usage(&row.id).await.unwrap();
+    assert_eq!(usage.raw.unwrap()["reset_credits"], 2);
+    assert_eq!(usage.windows.iter().find(|w| w.name == "7d-fable").unwrap().used_percent, 100.0);
+    assert!(!usage.windows.iter().any(|w| w.name == "iguana_necktie"));
+    assert!(subs.db.get_account(&row.id).await.unwrap().unwrap().cooldown_until.is_none(), "scoped limits must not bench an account");
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("anthropic-ratelimit-unified-5h-utilization", "0.4".parse().unwrap());
+    subs.observe_headers(&row.id, SubProvider::Claude, &headers).await;
+    let accounts = subs.accounts(Some(SubProvider::Claude)).await.unwrap();
+    let serialized = serde_json::to_value(&accounts).unwrap();
+    assert_eq!(serialized[0]["usage"]["raw"]["reset_credits"], 2);
+    assert_eq!(accounts[0].usage.as_ref().unwrap().windows.iter().find(|w| w.name == "5h").unwrap().used_percent, 40.0);
+
+    server.reset().await;
+    Mock::given(path("/api/oauth/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"five_hour": {"utilization": 50}})))
+        .mount(&server)
+        .await;
+    let usage = subs.poll_usage(&row.id).await.unwrap();
+    assert_eq!(usage.raw.unwrap()["reset_credits"], Value::Null, "an absent block replaces a stale count with unknown");
+    assert_eq!(usage.windows[0].used_percent, 50.0);
+    server.reset().await;
+    Mock::given(path("/api/oauth/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"cedar_ember": {"eligible": true, "next_grant_id": "missing"}})))
+        .mount(&server)
+        .await;
+    assert_eq!(subs.poll_usage(&row.id).await.unwrap().raw.unwrap()["reset_credits"], 0);
+}
+
+#[tokio::test]
+async fn cached_internal_window_does_not_affect_selection_or_account_output() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let a = subs
+        .save_account(Credential { provider: SubProvider::Claude, access_token: "first-example-token".into(), ..Default::default() })
+        .await
+        .unwrap();
+    let b = subs
+        .save_account(Credential { provider: SubProvider::Claude, access_token: "second-example-token".into(), ..Default::default() })
+        .await
+        .unwrap();
+    subs.db.set_account_priority(&a.id, 10).await.unwrap();
+    let window = |name: &str, used_percent: f64| UsageWindow { name: name.into(), used_percent, resets_at: None, window_secs: None };
+    // Write the old persisted shape; do not poll before selection or display.
+    subs.db
+        .put_usage(&AccountUsage {
+            account_id: a.id.clone(),
+            fetched_at: now(),
+            windows: vec![window("5h", 10.0), window("iguana_necktie", 100.0)],
+            raw: None,
+        })
+        .await
+        .unwrap();
+    subs.db
+        .put_usage(&AccountUsage { account_id: b.id.clone(), fetched_at: now(), windows: vec![window("5h", 20.0)], raw: None })
+        .await
+        .unwrap();
+    let selected = subs
+        .select(SubProvider::Claude, None, None, &HashSet::new(), &mut Charge::default())
+        .await
+        .unwrap_or_else(|_| panic!("an account must be selected"));
+    assert_eq!(selected.id, a.id, "the cached internal bucket must not soft-limit the preferred account");
+    let view = serde_json::to_value(subs.accounts(Some(SubProvider::Claude)).await.unwrap()).unwrap();
+    assert!(!view.to_string().contains("iguana_necktie"), "the API source for CLI and UI must omit the internal window");
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("anthropic-ratelimit-unified-5h-utilization", "0.3".parse().unwrap());
+    subs.observe_headers(&a.id, SubProvider::Claude, &headers).await;
+    let usage = subs.db.get_usage(&a.id).await.unwrap().unwrap();
+    assert_eq!(
+        usage.windows,
+        vec![window("5h", 30.0)]
+            .into_iter()
+            .map(|mut w| {
+                w.window_secs = Some(18000);
+                w
+            })
+            .collect::<Vec<_>>()
+    );
+}

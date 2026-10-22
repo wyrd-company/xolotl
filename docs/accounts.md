@@ -209,15 +209,23 @@ every `usage_poll_secs`. It uses them for the soft limit and `least-used`, and
 shows them in `xolotl accounts list`, the web UI and the
 `xolotl.account.usage_percent` metric. Grok accounts have no usage windows.
 
-### Codex reset credits
+Claude's weekly model-family windows, including Fable, are shown separately
+from the account-wide limits. The internal `iguana_necktie` bucket is hidden.
+Exhausting a model-family window does not put the whole account on cooldown.
 
-Each Codex usage poll also counts the account's available reset credits. The
-web UI's overview shows the total for the Codex pool, and each account's
-details show its own count. When some counts are unknown, the overview marks
-the total as partial. The counts are from the last poll, so a credit can expire
-or be used elsewhere in the meantime.
+### Available resets
 
-Xolotl does not redeem credits itself. T3 Code can redeem one (see
+Each Codex usage poll also counts the account's available reset credits.
+Claude usage polls request the available reset grants and count those that
+are usable, unpaused and unexpired, when the provider identifies a next grant.
+
+The web UI's overview shows a total for each Claude and Codex pool. The accounts
+list and account details show each account's count. An unknown count is shown as
+unknown, not zero; pool totals are marked partial when some accounts are unknown.
+Counts come from the last poll, so a reset can expire or be used elsewhere in the
+meantime. Claude accounts without an eligible reset offer show an unknown count.
+
+Xolotl does not redeem credits itself. T3 Code can redeem a Codex credit (see
 [T3 Code hubs](#t3-code-hubs)).
 
 ## Models

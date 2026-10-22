@@ -52,6 +52,13 @@ pub struct UsageWindow {
     pub window_secs: Option<i64>,
 }
 
+impl UsageWindow {
+    /// Internal provider buckets must not affect selection, display or metrics.
+    pub(crate) fn is_public(&self) -> bool {
+        self.name != "iguana_necktie"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountUsage {
     pub account_id: String,
@@ -335,12 +342,10 @@ impl Db {
                 .fetch_optional(&self.pool)
                 .await?;
         row.map(|(account_id, fetched_at, windows, raw)| {
-            Ok(AccountUsage {
-                account_id,
-                fetched_at,
-                windows: serde_json::from_str(&windows)?,
-                raw: raw.and_then(|r| serde_json::from_str(&r).ok()),
-            })
+            // Filter old snapshots at the shared read boundary, also when polling is disabled.
+            let mut windows: Vec<UsageWindow> = serde_json::from_str(&windows)?;
+            windows.retain(UsageWindow::is_public);
+            Ok(AccountUsage { account_id, fetched_at, windows, raw: raw.and_then(|r| serde_json::from_str(&r).ok()) })
         })
         .transpose()
     }

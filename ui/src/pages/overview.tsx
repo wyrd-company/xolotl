@@ -21,6 +21,7 @@ import {
   type UsageRow,
 } from "@/lib/api";
 import { clock, num, relative } from "@/lib/format";
+import { publicUsageWindows } from "@/lib/usage-windows";
 import { resetCreditsSummary } from "@/lib/reset-credits";
 
 const DAY = 86_400;
@@ -119,6 +120,7 @@ export function OverviewPage() {
           const pool = accts.filter((a) => a.provider === p);
           const available = pool.filter((a) => a.available);
           const best = [...available].sort((a, b) => peakUsage(a) - peakUsage(b))[0];
+          const windows = publicUsageWindows(best?.usage?.windows);
           return (
             <Card key={p}>
               <CardHeader>
@@ -128,15 +130,15 @@ export function OverviewPage() {
                 </CardAction>
               </CardHeader>
               <CardContent className="flex flex-col gap-3">
-                {best?.usage?.windows.length ? (
+                {windows.length ? (
                   <>
                     <div className="text-muted-foreground text-xs">Least used available account</div>
-                    <WindowBars windows={best.usage.windows} softLimit={s?.subscription.soft_limit_percent} />
+                    <WindowBars windows={windows} softLimit={s?.subscription.soft_limit_percent} />
                   </>
                 ) : (
                   <div className="text-muted-foreground text-sm">{pool.length ? "No usage reported yet." : "No accounts."}</div>
                 )}
-                {p === "codex" && pool.length > 0 && (
+                {(p === "codex" || p === "claude") && pool.length > 0 && (
                   <div className="text-muted-foreground text-sm">{resetCreditsSummary(pool)}</div>
                 )}
                 <Link to="/accounts" className="text-primary text-sm">

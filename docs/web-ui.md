@@ -48,8 +48,8 @@ server log has the details.
 
 | Screen | What you can do |
 |---|---|
-| Overview | OpenBao and SQLite health, accounts that need attention (each with a **Review account** link), account pools and usage windows, the Codex reset credit total, totals for the last 24 hours, gateway providers, recent failed requests |
-| Accounts | Accounts by provider with their state and cooldown reason: refresh usage, refresh models, enable or disable. Details: set priority, **Retry**, log in again (OAuth accounts) or replace the key (API-key accounts), remove, last error, Codex reset credits |
+| Overview | OpenBao and SQLite health, accounts that need attention (each with a **Review account** link), account pools and usage windows, Claude and Codex reset credit totals, totals for the last 24 hours, gateway providers, recent failed requests |
+| Accounts | Accounts by provider with their state and cooldown reason: refresh usage, refresh models, enable or disable. Details: set priority, **Retry**, log in again (OAuth accounts) or replace the key (API-key accounts), remove, last error, Claude and Codex reset credits |
 | Add account | Codex device or browser login, Claude login, OpenCode Go key, import of a CLI credential file |
 | Policies | Providers and the accounts of each subscription provider, scopes, MCP access, rate limits (in total, per provider and per account) with the policy's consumption, and the model list (below). Each section folds away |
 | Client keys | Issue, rotate with a grace period, enable or disable, revoke. Consumption against the policy's rate limits. Shows the OpenBao path, the `bao` command and the OpenBao policy the client needs. Never shows the key |

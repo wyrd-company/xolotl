@@ -92,17 +92,23 @@ Codex can report a quota error as the first events of a `200` SSE stream. Xolotl
 
 Usage windows (percent used, reset time) come from two sources:
 - **Response headers:** Codex `x-codex-*`, Claude `anthropic-ratelimit-unified-*`.
-- **Polling** each account every `usage_poll_secs`: Codex `/wham/usage`, Claude `/api/oauth/usage`, OpenCode Go `/v1/usage`.
+- **Polling** each account every `usage_poll_secs`: Codex `/wham/usage`, Claude `/api/oauth/usage?cedar_ember=1`, OpenCode Go `/v1/usage`.
 
-They are stored per account in SQLite, shown by `xolotl accounts list` / `usage`, exported as `xolotl.account.usage_percent`, and used by selection (soft limit, least-used).
+Claude's model-family weekly limits come from `limits` entries with `kind: "weekly_scoped"`, `scope.model.display_name`, `percent` and `resets_at`. They become named windows such as `7d-fable`; they do not put the whole account on cooldown. Legacy `seven_day_<model>` windows remain supported, with a matching scoped entry taking precedence.
 
-### Codex reset credits
+The internal `iguana_necktie` bucket is excluded from parsing, stored-snapshot reads, recording and the web UI. Cached snapshots cannot use it for account selection, CLI output or header merges, even when polling is disabled.
+
+Windows are stored per account in SQLite, shown by `xolotl accounts list` / `usage`, exported as `xolotl.account.usage_percent`, and used by selection (soft limit, least-used).
+
+### Available resets
 
 Each Codex usage poll also reads `/wham/rate-limit-reset-credits` with the account's credentials. The count includes only credits with `status: "available"`, `reset_type: "codex_rate_limits"`, and either no expiry (`expires_at` absent or `null`) or a future `expires_at`. Credits with invalid expiry values are skipped.
 
-The count is stored as `raw.reset_credits` in the account's usage snapshot. Response-header updates preserve it. If the credit lookup fails or has an invalid response, the count is `null` (unknown); quota windows still update. The next successful poll replaces it, including with zero.
+Claude's usage response includes an opt-in `cedar_ember` block. Eligible offers count usable, unpaused grants with valid future expiries (or no expiry), provided `next_grant_id` identifies a usable grant. Omitted `grants` is an empty list and produces zero; an absent or ineligible offer and malformed offer data produce unknown.
 
-The overview shows the Codex pool total across all accounts, including disabled and cooling accounts. When some counts are unknown, it labels the total as partial. Account details show the per-account count. These are snapshots from the last poll; credits can expire or be redeemed elsewhere between polls. Credit redemption is available through T3Code hubs.
+Each provider's count is stored as `raw.reset_credits` in the account's usage snapshot. Response-header updates preserve it. If the credit lookup fails or has an invalid response, the count is `null` (unknown); quota windows still update. The next successful poll replaces it, including with zero.
+
+The overview shows a total for each Claude and Codex pool across all its accounts, including disabled and cooling accounts. When some counts are unknown, it labels the total as partial. The account list and details show per-account counts. These are snapshots from the last poll; credits can expire or be redeemed elsewhere between polls. Xolotl does not redeem credits; Codex redemption is available through T3Code hubs.
 
 ## T3Code hubs
 

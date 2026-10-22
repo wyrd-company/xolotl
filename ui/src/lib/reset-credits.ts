@@ -1,13 +1,13 @@
 // ---
 // relationships:
-//   references: ../../../docs/subscriptions.md
+//   references: ../../../docs/accounts.md
 // ---
 import type { Account } from "./api";
 
 /** A partial pool total must not imply unknown accounts have zero credits. */
 export function resetCreditsSummary(pool: Pick<Account, "usage">[]): string {
   const counts = pool.map((a) => a.usage?.raw?.reset_credits);
-  const known = counts.filter((count): count is number => count != null);
+  const known = counts.filter((count): count is number => typeof count === "number" && Number.isSafeInteger(count) && count >= 0);
   if (known.length === 0) return "Reset credits unknown";
   const total = known.reduce((sum, count) => sum + count, 0);
   const label = `${total} reset credit${total === 1 ? "" : "s"} available`;

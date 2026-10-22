@@ -282,7 +282,7 @@ pub fn models_request(http: &reqwest::Client, ep: &Endpoints, cred: &Credential)
 }
 
 pub fn usage_request(http: &reqwest::Client, ep: &Endpoints, cred: &Credential) -> reqwest::RequestBuilder {
-    http.get(format!("{}/api/oauth/usage", ep.claude_api.trim_end_matches('/')))
+    http.get(format!("{}/api/oauth/usage?cedar_ember=1", ep.claude_api.trim_end_matches('/')))
         .bearer_auth(&cred.access_token)
         .header("anthropic-beta", OAUTH_BETA)
         .header("user-agent", DEFAULT_UA)
@@ -315,6 +315,9 @@ pub fn parse_usage(body: &Value) -> Vec<UsageWindow> {
     let mut out = Vec::new();
     let Some(obj) = body.as_object() else { return out };
     for (key, w) in obj {
+        if key == "iguana_necktie" {
+            continue;
+        }
         let Some(used) = w.get("utilization").and_then(Value::as_f64).filter(|f| f.is_finite()) else { continue };
         let window_secs = match key.as_str() {
             "five_hour" => Some(5 * 3600),
@@ -328,8 +331,70 @@ pub fn parse_usage(body: &Value) -> Vec<UsageWindow> {
             window_secs,
         });
     }
+    // New usage responses put model-family windows in `limits`, rather than
+    // a `seven_day_<model>` field. Prefer that value if both shapes are present.
+    for limit in body.get("limits").and_then(Value::as_array).into_iter().flatten() {
+        if limit.get("kind").and_then(Value::as_str) != Some("weekly_scoped") {
+            continue;
+        }
+        let Some(model) = limit.pointer("/scope/model/display_name").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) else {
+            continue;
+        };
+        let Some(used) = limit.get("percent").and_then(Value::as_f64).filter(|f| f.is_finite()) else { continue };
+        let name = format!("7d-{}", model.trim().to_ascii_lowercase());
+        let window = UsageWindow {
+            name: name.clone(),
+            used_percent: used.clamp(0.0, 100.0),
+            resets_at: parse_time(limit.get("resets_at")),
+            window_secs: Some(7 * 86_400),
+        };
+        match out.iter_mut().find(|w| w.name == name) {
+            Some(old) => *old = window,
+            None => out.push(window),
+        }
+    }
     out.sort_by(|a, b| a.window_secs.cmp(&b.window_secs).then(a.name.cmp(&b.name)));
     out
+}
+
+/// Available Claude resets from the usage endpoint's opt-in `cedar_ember`
+/// block. Missing or ineligible offers are unknown. Unusable or malformed grants do not count.
+pub fn parse_reset_credits(body: &Value, at: i64) -> Option<u64> {
+    let block = body.get("cedar_ember")?.as_object()?;
+    if !block.get("eligible")?.as_bool()? {
+        return None;
+    }
+    let grants = match block.get("grants") {
+        None => &[][..],
+        Some(Value::Array(grants)) => grants.as_slice(),
+        Some(_) => return None,
+    };
+    let next = block.get("next_grant_id").and_then(Value::as_str);
+    let mut has_next = false;
+    let mut count = 0u64;
+    for grant in grants {
+        let Some(id) = grant.get("id").and_then(Value::as_str).filter(|id| {
+            !id.is_empty() && id.len() <= 40 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        }) else {
+            continue;
+        };
+        let Some(left) = grant.get("resets_left").and_then(Value::as_u64) else { continue };
+        if grant.get("usable_now").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        match grant.get("paused") {
+            None | Some(Value::Bool(false)) => {}
+            _ => continue,
+        }
+        match grant.get("ends_at") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) if chrono::DateTime::parse_from_rfc3339(s).ok().is_some_and(|t| t.timestamp() > at) => {}
+            _ => continue,
+        }
+        has_next |= Some(id) == next;
+        count = count.checked_add(left)?;
+    }
+    Some(if has_next { count } else { 0 })
 }
 
 fn header<'a>(h: &'a reqwest::header::HeaderMap, k: &str) -> Option<&'a str> {
@@ -472,6 +537,59 @@ mod tests {
         assert_eq!(w[0].name, "5h");
         assert!(w[0].resets_at.is_some());
         assert_eq!(w[1].name, "7d");
+    }
+
+    #[test]
+    fn usage_includes_scoped_weekly_limits_and_omits_internal_bucket() {
+        let windows = parse_usage(&json!({
+            "five_hour": {"utilization": 12},
+            "seven_day": {"utilization": 34},
+            "seven_day_fable": {"utilization": 5},
+            "iguana_necktie": {"utilization": 100},
+            "future_public_window": {"utilization": 15},
+            "limits": [
+                {"kind": "weekly_scoped", "percent": 73, "resets_at": "2099-01-01T00:00:00Z",
+                 "scope": {"model": {"display_name": "Fable"}}},
+                {"kind": "weekly_scoped", "percent": null, "scope": {"model": {"display_name": "Unknown"}}},
+                {"kind": "other", "percent": 88, "scope": {"model": {"display_name": "Other"}}}
+            ]
+        }));
+        assert!(!windows.iter().any(|w| w.name == "iguana_necktie"));
+        assert!(windows.iter().any(|w| w.name == "future_public_window"));
+        let scoped: Vec<_> = windows.iter().filter(|w| w.name == "7d-fable").collect();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].used_percent, 73.0);
+        assert_eq!(scoped[0].window_secs, Some(7 * 86_400));
+        assert_eq!(scoped[0].resets_at, Some(4_070_908_800));
+        assert!(!is_account_window(&scoped[0].name));
+        assert!(!windows.iter().any(|w| w.name == "7d-unknown" || w.name == "7d-other"));
+    }
+
+    #[test]
+    fn reset_credits_count_live_usable_grants_only() {
+        let at = 1_800_000_000;
+        let grant = |id: &str| json!({"id": id, "resets_left": 2, "usable_now": true});
+        let mut block = json!({"eligible": true, "next_grant_id": "first", "grants": [
+            grant("first"),
+            {"id": "second", "resets_left": 3, "usable_now": true, "ends_at": "2099-01-01T00:00:00Z"},
+            {"id": "old", "resets_left": 8, "usable_now": true, "ends_at": "2000-01-01T00:00:00Z"},
+            {"id": "paused", "resets_left": 8, "usable_now": true, "paused": true},
+            {"id": "future", "resets_left": 8, "usable_now": false},
+            {"id": "bad", "resets_left": -1, "usable_now": true},
+            {"id": "bad_expiry", "resets_left": 8, "usable_now": true, "ends_at": "2099-01-01"},
+            {"id": "bad_pause", "resets_left": 8, "usable_now": true, "paused": "false"},
+            {"id": "Not Valid", "resets_left": 8, "usable_now": true}
+        ]});
+        assert_eq!(parse_reset_credits(&json!({"cedar_ember": block.clone()}), at), Some(5));
+        block["next_grant_id"] = json!("missing");
+        assert_eq!(parse_reset_credits(&json!({"cedar_ember": block.clone()}), at), Some(0));
+        assert_eq!(parse_reset_credits(&json!({"cedar_ember": {"eligible": true, "next_grant_id": "first"}}), at), Some(0));
+        assert_eq!(parse_reset_credits(&json!({"cedar_ember": {"eligible": true}}), at), Some(0));
+        block["eligible"] = json!(false);
+        assert_eq!(parse_reset_credits(&json!({"cedar_ember": block}), at), None);
+        for body in [json!({}), json!({"cedar_ember": null}), json!({"cedar_ember": {"eligible": true, "grants": "bad"}})] {
+            assert_eq!(parse_reset_credits(&body, at), None);
+        }
     }
 
     #[test]
