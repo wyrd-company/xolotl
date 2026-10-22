@@ -1,6 +1,16 @@
+---
+relationships:
+  implemented-by: layout
+---
 # Web UI
 
 `xolotl serve` serves an admin web UI at `/`. It is a client of the same `/admin` API the CLI uses, plus a few endpoints added for it.
+
+The shared sidebar includes a visible **Repository / report issues** anchor to
+`https://github.com/wyrd-company/xolotl`. It opens a new tab with `noopener
+noreferrer`, names that behavior for screen readers, and has a visible keyboard
+focus outline. The link remains available on narrow screens and every signed-in
+route.
 
 ## Screens
 
@@ -14,6 +24,16 @@
 | MCP servers | Upstream MCP servers from the config file and OpenBao: add, edit and remove the latter; header secrets; OAuth sign-in; tools; recent tool calls | `/admin/mcp/...` |
 | Providers & models | Gateway providers from the config file and their key state; set a key; the catalog with each model's endpoints | `GET /admin/providers`, `GET /admin/catalog/routes`, `POST /admin/catalog/refresh` |
 | Usage | Request log grouped by client, account, provider or model. Selecting a row narrows the view to it and groups by the first of model, account, client and provider that is neither shown nor narrowed yet; filters show as removable chips and live in the hash route (`/#/usage?group=model&client=…`). Link to `telemetry.dashboard_url` | `GET /admin/usage?group_by=…&since_secs=…&client=…&account=…&provider=…&model=…` (an empty filter value matches rows without that key, such as the admin token) |
+
+## Editing
+
+Policy and MCP server editors keep their save and discard or cancel actions in a
+sticky bar at the top while the form scrolls. Policy deletion and its key-use
+restriction remain in the same bar. Actions wrap on narrow screens.
+
+Buttons use explicit theme text colors in their default and hover states. Disabled
+buttons use the existing secondary background and muted text colors, without
+fading the whole control.
 
 ## Model discovery
 
