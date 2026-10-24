@@ -1,7 +1,7 @@
 ---
 title: Known limitations
 order: 11
-docs: true
+product: xolotl
 ---
 
 | Limitation | Tracked in |

@@ -1,6 +1,6 @@
 // ---
 // relationships:
-//   references: docs/web-ui.md
+//   references: docs/user/web-ui.md
 // ---
 import { useEffect } from "react";
 import {

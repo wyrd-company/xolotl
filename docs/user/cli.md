@@ -1,7 +1,7 @@
 ---
 title: CLI reference
 order: 9
-docs: true
+product: xolotl
 ---
 
 `xolotl serve` runs the server. Every other command calls a running server's

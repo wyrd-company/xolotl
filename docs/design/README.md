@@ -1,6 +1,6 @@
 # Xolotl design notes
 
-These pages describe how xolotl is built and why. For installing, configuring and running it, see the [user documentation](../overview.md).
+These pages describe how xolotl is built and why. For installing, configuring and running it, see the [user documentation](../user/overview.md).
 
 | Page | Covers |
 |---|---|
@@ -12,4 +12,4 @@ These pages describe how xolotl is built and why. For installing, configuring an
 | [Client keys](client-keys.md) | Key records in OpenBao, authentication, rotation and revocation |
 | [Rate limits](limits.md) | Request and token limits on policies: windows, per-key or per-policy counting, 429 responses, consumption |
 | [Releases](releases.md) | Intentional, CI, and the release workflow's tag guard |
-| [Known limitations](../limitations.md) | What isn't done yet, with the issues that track it |
+| [Known limitations](../user/limitations.md) | What isn't done yet, with the issues that track it |

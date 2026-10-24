@@ -1,7 +1,7 @@
 ---
 title: Configuration
 order: 3
-docs: true
+product: xolotl
 ---
 
 Xolotl reads one TOML file, given with `--config` or `XOLOTL_CONFIG`. Every

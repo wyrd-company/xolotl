@@ -1,10 +1,10 @@
-# Records docs/assets/demo.gif. From the repository root, after `cargo build`:
+# Records docs/user/assets/demo.gif. From the repository root, after `cargo build`:
 #
 #   vhs docs/demo.tape
 #
 # docs/demo-env.sh starts an OpenBao dev server in Docker and a debug xolotl.
 
-Output docs/assets/demo.gif
+Output docs/user/assets/demo.gif
 
 Require bash
 Require curl

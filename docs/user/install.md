@@ -2,7 +2,7 @@
 title: Installation
 order: 2
 install: true
-docs: true
+product: xolotl
 ---
 
 Xolotl is one executable, `xolotl`. `xolotl serve` runs the server. Every other

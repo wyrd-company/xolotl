@@ -1,6 +1,6 @@
 // ---
 // relationships:
-//   implements: ../../../docs/web-ui.md
+//   implements: ../../../docs/user/web-ui.md
 // ---
 import type { UsageRow } from "@/lib/api";
 

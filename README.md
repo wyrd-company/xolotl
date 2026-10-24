@@ -64,24 +64,24 @@ User documentation is on [wyrd.foo](https://wyrd.foo/docs/xolotl/). Its source i
 
 | Page | Covers |
 |---|---|
-| [Overview](docs/overview.md) | What xolotl does and how it fits together |
-| [Installation](docs/install.md) | Container image, release binary, building from source, OpenBao setup, running |
-| [Configuration](docs/configuration.md) | The config file, environment variables, OpenBao paths |
-| [Subscription accounts](docs/accounts.md) | Codex, Claude, Grok and OpenCode Go accounts: login, import, states, failover |
-| [Policies and client keys](docs/policies-and-keys.md) | Policies, model names, renames and aliases, rate limits, issuing and rotating keys, usage |
-| [Clients](docs/clients.md) | Claude Code, Codex CLI, Grok CLI, SDKs, MCP clients, T3 Code; endpoints and translation |
-| [MCP gateway](docs/mcp-gateway.md) | Upstream MCP servers, OAuth logins, code mode, MCP policies |
-| [Web UI](docs/web-ui.md) | OpenID Connect sign-in and the screens |
-| [CLI reference](docs/cli.md) | Every `xolotl` command |
-| [Telemetry](docs/telemetry.md) | OTLP export, logs, metrics |
-| [Known limitations](docs/limitations.md) | What isn't done yet |
+| [Overview](docs/user/overview.md) | What xolotl does and how it fits together |
+| [Installation](docs/user/install.md) | Container image, release binary, building from source, OpenBao setup, running |
+| [Configuration](docs/user/configuration.md) | The config file, environment variables, OpenBao paths |
+| [Subscription accounts](docs/user/accounts.md) | Codex, Claude, Grok and OpenCode Go accounts: login, import, states, failover |
+| [Policies and client keys](docs/user/policies-and-keys.md) | Policies, model names, renames and aliases, rate limits, issuing and rotating keys, usage |
+| [Clients](docs/user/clients.md) | Claude Code, Codex CLI, Grok CLI, SDKs, MCP clients, T3 Code; endpoints and translation |
+| [MCP gateway](docs/user/mcp-gateway.md) | Upstream MCP servers, OAuth logins, code mode, MCP policies |
+| [Web UI](docs/user/web-ui.md) | OpenID Connect sign-in and the screens |
+| [CLI reference](docs/user/cli.md) | Every `xolotl` command |
+| [Telemetry](docs/user/telemetry.md) | OTLP export, logs, metrics |
+| [Known limitations](docs/user/limitations.md) | What isn't done yet |
 
 Design notes (architecture, routing, accounts, keys, MCP, web UI, releases) are in [`docs/design/`](docs/design/README.md).
 
 ## Quick start
 
 ```sh
-# OpenBao: an AppRole for xolotl and the bootstrap admin token (see docs/install.md)
+# OpenBao: an AppRole for xolotl and the bootstrap admin token (see docs/user/install.md)
 bao kv put secret/xolotl/admin token="$(openssl rand -base64 32)"
 
 # Run
@@ -119,12 +119,12 @@ pnpm build   # ui/dist: embedded into release builds, read from disk by debug bu
 
 ### Documentation
 
-User pages are the `docs/*.md` files with `docs: true` in their front matter; `docs/docs.yml` is the catalog entry. Links between pages use the bare page name (`[Clients](clients)`), as wyrd.foo serves them. The release workflow publishes them to wyrd.foo through `.github/workflows/publish-docs.yml`, which can also be run by hand.
+User pages are the `docs/user/**/*.md` files, each with `product: xolotl` in its front matter; `docs/user/docs.yml` is the catalog entry and lists every asset the pages and the entry use. Everything under `docs/user/` is published, and nothing else in `docs/` is. Links between pages use the bare page name (`[Clients](clients)`), as wyrd.foo serves them. The release workflow publishes them to wyrd.foo through `.github/workflows/publish-docs.yml`, which can also be run by hand.
 
 Record the demo again after a change it shows (needs Docker, `jq` and [VHS](https://github.com/charmbracelet/vhs)):
 
 ```sh
-cargo build && vhs docs/demo.tape   # writes docs/assets/demo.gif
+cargo build && vhs docs/demo.tape   # writes docs/user/assets/demo.gif
 ```
 
 ### Releases

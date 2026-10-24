@@ -56,7 +56,7 @@ On graceful shutdown the server makes one last attempt to save unsaved credentia
 
 ## Telemetry
 
-`src/telemetry.rs` sets up OTLP/HTTP export of traces, logs and metrics when `telemetry.otlp_endpoint` is set; header values come from OpenBao at `telemetry`. Metrics are listed in [Telemetry](../telemetry.md).
+`src/telemetry.rs` sets up OTLP/HTTP export of traces, logs and metrics when `telemetry.otlp_endpoint` is set; header values come from OpenBao at `telemetry`. Metrics are listed in [Telemetry](../user/telemetry.md).
 
 ## Source layout
 

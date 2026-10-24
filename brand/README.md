@@ -10,7 +10,7 @@ The xolotl emblem is a canine in a portal: Xolotl, the dog-headed guide through 
 | `xolotl-emblem-dark.svg` | The same emblem with light ink, for dark backgrounds. |
 | `xolotl-icon.svg`, `xolotl-icon-dark.svg` | The emblem on a square canvas with breathing room, for icons. |
 | `xolotl-emblem.png`, `xolotl-social.png` | Rasters for the README and the repository's social preview. |
-| `build.sh` | Regenerates the rasters here and the icons in `ui/public` from the SVGs. Needs `agent-svgtools` and ImageMagick. |
+| `build.sh` | Regenerates the rasters here and the icons in `ui/public` from the SVGs, and copies the icons and `ui/public/favicon.svg` to `docs/user/assets` as the published logo, dark logo and favicon. Needs `agent-svgtools` and ImageMagick. |
 
 The web UI draws the emblem inline from `ui/src/components/emblem.tsx`, with the ink in `currentColor` and the portal in the UI's primary colour. Its geometry is a copy of the master; change both together.
 

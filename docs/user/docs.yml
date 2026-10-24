@@ -1,0 +1,58 @@
+# yaml-language-server: $schema=https://wyrd.foo/schemas/docs/v1.json
+schemaVersion: 1
+assets:
+  - assets/demo.gif
+  - assets/logo.svg
+  - assets/logo-dark.svg
+  - assets/favicon.svg
+products:
+  xolotl:
+    name: xolotl
+    version: 0.5.0
+    docs-version: 0.1.0
+    tagline: One proxy for your LLM subscriptions, AI gateways and MCP servers.
+    blurb: >-
+      A self-hosted Rust proxy that gives coding agents one URL and one client key
+      for Codex, Claude, Grok and OpenCode Go subscriptions, gateway providers and
+      MCP servers, with every real credential kept in OpenBao.
+    status: preview
+    category: Agent Infrastructure
+    order: 7
+    logo: assets/logo.svg
+    logo-dark: assets/logo-dark.svg
+    favicon: assets/favicon.svg
+    highlights:
+      - Give coding agents one URL and one client key for subscriptions, AI gateways and MCP servers.
+      - Keep every real credential in OpenBao, never in the agents' containers.
+      - Spread requests over several accounts per provider and move to the next when one reaches its quota.
+      - Translate between the Anthropic Messages, OpenAI Responses and Chat Completions formats, so a client can use a model from another provider.
+      - Serve one MCP server at /mcp with code-mode access to the upstream MCP servers a key's policy allows.
+      - Set providers, models, MCP tools and limits per client key, and administer from a web UI or the CLI.
+    media:
+      - src: assets/demo.gif
+        caption: An operator puts a policy, issues a client key into OpenBao, and the client lists the models its key can use.
+    kinds:
+      - kind: app
+        install:
+          - method: docker
+            default: true
+            command: docker pull ghcr.io/wyrd-company/xolotl:latest
+    nav:
+      - section: Get started
+        groups:
+          - group: Introduction
+            pages: [overview]
+          - group: Set up
+            pages: [install, configuration]
+      - section: Use xolotl
+        groups:
+          - group: Providers and keys
+            pages: [accounts, policies-and-keys]
+          - group: Clients and tools
+            pages: [clients, mcp-gateway]
+      - section: Operate
+        groups:
+          - group: Administer
+            pages: [web-ui, cli]
+          - group: Monitor and limits
+            pages: [telemetry, limitations]
