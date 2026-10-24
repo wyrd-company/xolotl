@@ -1,6 +1,6 @@
 // ---
 // relationships:
-//   references: ../../../docs/accounts.md
+//   references: ../../../docs/user/accounts.md
 // ---
 import type { Account } from "./api";
 

@@ -1,7 +1,7 @@
 ---
 title: Clients
 order: 6
-docs: true
+product: xolotl
 ---
 
 Clients use xolotl like a provider API. They send their client key and a model

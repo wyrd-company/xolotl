@@ -1,6 +1,6 @@
 // ---
 // relationships:
-//   implements: ../../../docs/web-ui.md
+//   implements: ../../../docs/user/web-ui.md
 // ---
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";

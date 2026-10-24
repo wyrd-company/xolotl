@@ -1,6 +1,6 @@
 // ---
 // relationships:
-//   implements: ../../../docs/web-ui.md
+//   implements: ../../../docs/user/web-ui.md
 // ---
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";

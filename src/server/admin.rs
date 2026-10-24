@@ -1,6 +1,6 @@
 // ---
 // relationships:
-//   implements: ../../docs/web-ui.md
+//   implements: ../../docs/user/web-ui.md
 // ---
 //! Admin API used by the `xolotl` CLI: client keys, accounts, logins, usage.
 

@@ -1,7 +1,7 @@
 ---
 relationships:
   extends: routing
-  implements: ../clients.md
+  implements: ../user/clients.md
 ---
 # Model metadata
 
