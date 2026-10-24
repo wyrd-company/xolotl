@@ -15,7 +15,24 @@ release-units:
     - adapter: cargo
       file: Cargo.toml
       mode: committed
+    - adapter: yaml
+      file: docs/user/docs.yml
+      mode: committed
+      pointer: /products/xolotl/version
     tags:
       primary:
         role: primary
         template: '{version}'
+  xolotl-docs:
+    path: docs/user
+    depends-on:
+    - xolotl
+    projections:
+    - adapter: yaml
+      file: docs.yml
+      mode: committed
+      pointer: /products/xolotl/docs-version
+    tags:
+      primary:
+        role: primary
+        template: '{id}@{version}'
