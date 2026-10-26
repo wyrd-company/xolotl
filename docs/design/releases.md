@@ -58,10 +58,12 @@ Only when the guard outputs `release=true` do the other jobs run:
 - tests;
 - a Linux x86_64 binary on a GitHub release, with notes from the CHANGELOG section;
 - the GHCR image `ghcr.io/wyrd-company/xolotl` for amd64 and arm64, tagged `X.Y.Z`, `X.Y` and `latest`;
-- after the binary and the image, the user documentation is published to wyrd.foo by `.github/workflows/publish-docs.yml`.
+- after the binary and the image, the code unit is published to wyrd.foo by calling the wyrd.foo v2 reusable workflow (`publish-docs.yml@v2`) with the tag as `ref`.
 
-The docs are published from this workflow, not from a `release` event: the GitHub release is created with `GITHUB_TOKEN`, and a release created that way starts no other workflows. It uses wyrd.foo's `publish-docs` action, which needs the org secrets `WYRD_TOOLS_DOCS_PUBLISHER_APP_ID` and `WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY`.
-
-When `WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY` is not available to the repository, `publish-docs.yml` skips the publish step and emits a warning naming the secret, so the release still succeeds. The docs on wyrd.foo then stay at their previous version. To publish them later, without a new release, run the workflow by hand on the latest release tag: **Actions → publish-docs → Run workflow** with that tag, or `gh workflow run publish-docs.yml --ref <X.Y.Z>`. It publishes `docs/` as it is on the chosen ref, so running it on `main` publishes docs for unreleased changes.
+The code unit publishes from this workflow, not from the tag push on its own: wyrd.foo reads the GitHub release of the tag, the release is created by the binary job, and a release created with `GITHUB_TOKEN` starts no other workflows. The reusable workflow needs the org secrets `WYRD_TOOLS_DOCS_PUBLISHER_APP_ID` and `WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY`; without them the `docs` job fails after the binary and the image are released.
 
 The guard script was tested locally against a baseline tag, a release tag, a hand-made annotated tag and a lightweight tag.
+
+## Docs publish workflow (`.github/workflows/publish-docs.yml`)
+
+Calls the same reusable workflow when a docs unit tag (`xolotl-docs@X.Y.Z`) is pushed, and on a manual run. The manual run takes the tag or commit as `ref`, and the optional `feature*` inputs. A push to `main` does not publish. To publish again without a new release, run it by hand: **Actions → Publish to wyrd.foo → Run workflow** with the tag, or `gh workflow run publish-docs.yml -f ref=<tag>`.

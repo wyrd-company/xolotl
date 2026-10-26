@@ -119,7 +119,7 @@ pnpm build   # ui/dist: embedded into release builds, read from disk by debug bu
 
 ### Documentation
 
-`docs/user/` is the wyrd.foo v2 docs tree. User pages are its `**/*.md` files, each with `product: xolotl` in its front matter; `docs/user/docs.yml` is the catalog entry and lists every asset the pages and the entry use. The v2 publisher publishes everything under `docs/user/` and nothing else in `docs/`. Links between pages use the bare page name (`[Clients](clients)`), as wyrd.foo serves them. `.github/workflows/publish-docs.yml` is the v1 publisher (`publish-docs@v1`): it reads `docs/` pages marked `docs: true` and does not publish `docs/user/`.
+`docs/user/` is the wyrd.foo v2 docs tree. User pages are its `**/*.md` files, each with `product: xolotl` in its front matter; `docs/user/docs.yml` is the catalog entry and lists every asset the pages and the entry use. The v2 publisher publishes everything under `docs/user/` and nothing else in `docs/`. Links between pages use the bare page name (`[Clients](clients)`), as wyrd.foo serves them. `.github/workflows/publish-docs.yml` publishes to wyrd.foo when a docs unit tag (`xolotl-docs@<version>`) is pushed, and on a manual run. A code unit release publishes from `release.yml`, after the binary and the image. A push to `main` does not publish. A docs-only fix is an `xolotl-docs` intent: it releases the docs unit on its own.
 
 Record the demo again after a change it shows (needs Docker, `jq` and [VHS](https://github.com/charmbracelet/vhs)):
 

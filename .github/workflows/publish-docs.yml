@@ -1,35 +1,43 @@
-name: publish-docs
+name: Publish to wyrd.foo
 
-# Publishes docs/ (docs.yml, pages marked `docs: true`, listed assets) to
-# wyrd.foo. The release workflow calls it after a release; it can also be run
-# by hand.
+# Publishes docs/user and the release data to wyrd.foo when a docs unit tag
+# (xolotl-docs@{version}) is pushed, and on a manual run. A plain push to main
+# does not publish. The code unit tag publishes from release.yml, after the
+# binary and the image: that is when the GitHub Release the publisher reads
+# exists.
 on:
-  workflow_call: {}
-  workflow_dispatch: {}
+  push:
+    tags:
+      - "xolotl-docs@*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag or commit to publish
+        required: true
+      feature:
+        description: Feature a product on the front page
+        type: boolean
+        default: false
+      feature-product:
+        description: The product key to feature; empty when the repo has one product
+        default: ""
+      feature-days:
+        description: How long the feature lasts, in days
+        default: "14"
+      feature-reason:
+        description: For example "New MCP server"; default "New release"
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
-    steps:
-      # Without the publisher key the docs are skipped with a warning, so a
-      # release still succeeds. Run this workflow by hand once it is granted.
-      - id: secret
-        env:
-          PRIVATE_KEY: ${{ secrets.WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY }}
-        run: |
-          if [ -n "$PRIVATE_KEY" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning title=publish-docs::Docs were not published to wyrd.foo: the secret WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY is not available to this repository."
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
-      - if: steps.secret.outputs.present == 'true'
-        uses: actions/checkout@v4
-      - if: steps.secret.outputs.present == 'true'
-        uses: wyrd-company/wyrd.foo/.github/actions/publish-docs@v1
-        with:
-          app-id: ${{ secrets.WYRD_TOOLS_DOCS_PUBLISHER_APP_ID }}
-          private-key: ${{ secrets.WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY }}
+    uses: wyrd-company/wyrd.foo/.github/workflows/publish-docs.yml@v2
+    with:
+      ref: ${{ inputs.ref || github.ref_name }}
+      feature: ${{ inputs.feature || false }}
+      feature-product: ${{ inputs.feature-product || '' }}
+      feature-days: ${{ inputs.feature-days || '14' }}
+      feature-reason: ${{ inputs.feature-reason || '' }}
+    secrets: inherit

@@ -141,10 +141,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # A release made with GITHUB_TOKEN starts no `release` workflows, so the
-  # docs are published from here.
+  # A release made with GITHUB_TOKEN starts no other workflows, and wyrd.foo
+  # reads the GitHub Release of the tag, so the code unit publishes from here,
+  # after the binary job created the Release.
   docs:
     needs: [guard, binary, image]
     if: needs.guard.outputs.release == 'true'
-    uses: ./.github/workflows/publish-docs.yml
+    uses: wyrd-company/wyrd.foo/.github/workflows/publish-docs.yml@v2
+    with:
+      ref: ${{ github.ref_name }}
     secrets: inherit
