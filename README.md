@@ -129,7 +129,7 @@ cargo build && vhs docs/demo.tape   # writes docs/user/assets/demo.gif
 
 ### Releases
 
-Versions are managed with [Intentional](https://github.com/wyrd-company/intentional) (`cargo install intentional-cli --version 0.4.0 --locked`). Tags are plain versions (`0.1.0`, no `v`); `0.0.0` is the baseline.
+Versions are managed with [Intentional](https://github.com/wyrd-company/intentional) (`cargo install intentional-cli --version 0.4.1 --locked`). Tags are plain versions (`0.1.0`, no `v`); `0.0.0` is the baseline.
 
 Each user-visible change ships with an intent:
 
