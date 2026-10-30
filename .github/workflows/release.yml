@@ -28,10 +28,10 @@ jobs:
           fetch-tags: true
       - name: Fetch the annotated tag object
         run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
-      - uses: wyrd-company/intentional@0.1.6
+      - uses: wyrd-company/intentional@0.4.1
         with:
           command: check
-          intentional-version: 0.1.6
+          intentional-version: 0.4.1
       - name: Require an Intentional release record
         id: verify
         shell: bash

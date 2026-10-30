@@ -4,15 +4,14 @@ Versions are managed with [Intentional](https://github.com/wyrd-company/intentio
 
 ## Configuration
 
-`.intentional/config.yml` defines one release unit, `xolotl`:
+`.intentional/config.yml` uses `contract-2` and defines two release units:
 
-- **Path and version:** the unit covers the whole repository (`.`). Its version is projected into `Cargo.toml`, and the projection is committed.
-- **Tags:** the template is `{version}`, giving plain tags like `0.1.0`, as the project README asks.
-- **Bump mapping:** `pre-1-0-bump-mapping: component`, so before 1.0 a `minor` intent bumps the minor version (`0.0.0` → `0.1.0`) and is listed under Features. With Intentional's default mapping, getting `0.1.0` would take a `major` intent listed under "Breaking".
+- **`xolotl`:** covers the repository root (`.`), with committed version projections into `Cargo.toml` and `docs/user/docs.yml` (`/products/xolotl/version`). Its tag template is `{version}`, giving plain tags like `0.5.0`.
+- **`xolotl-docs`:** covers `docs/user`, with a committed version projection into `docs.yml` (`/products/xolotl/docs-version`). Its tag template is `{id}@{version}`, giving tags like `xolotl-docs@0.1.0`. It depends on `xolotl`, with a `patch` internal dependency bump.
 
-The baseline is `0.0.0`, the version in `Cargo.toml`. `intentional tag --baseline` creates it; until the tag exists, `intentional check` (and so a release) fails with `missing-baseline`.
+Bumps describe change significance. Before 1.0, `major` increments the minor version, while `minor` and `patch` increment the patch version. Reaching 1.0.0 requires a `major` intent with `graduate: true`.
 
-The first release is one intent, `.intentional/intents/lucky-otter-1aef.md` (`xolotl: minor`).
+Existing release tags supply the current versions. Run `intentional status` and `intentional check` to verify version authority and committed projections before preparing a release.
 
 ## Release tags
 
