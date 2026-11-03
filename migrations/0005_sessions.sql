@@ -18,6 +18,8 @@ CREATE TABLE sessions (
     context_window    INTEGER,
     provider          TEXT,
     model             TEXT,
+    -- Counts formations, so that a stale request can't touch a later lock on the same target.
+    lock_generation   INTEGER NOT NULL DEFAULT 0,
     lock_name         TEXT,
     lock_provider     TEXT,
     lock_model        TEXT,

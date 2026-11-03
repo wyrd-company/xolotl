@@ -92,6 +92,8 @@ pub fn resolve(headers: &HeaderMap, body: &Value) -> Option<SessionId> {
 /// The account and target a session is pinned to. A gateway target has no account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lock {
+    /// Which formation of the session's lock this is. It changes each time a lock forms.
+    pub generation: i64,
     /// The model name the client asked for. Another name is not pinned to the target.
     pub name: String,
     pub provider: String,
@@ -275,7 +277,13 @@ impl SessionTrack {
             model: self.model.clone(),
             account: account.map(str::to_string),
         };
-        let lock = Lock { name: self.requested, provider: provider.to_string(), model: self.model, account: account.map(str::to_string) };
+        let lock = Lock {
+            generation: 0,
+            name: self.requested,
+            provider: provider.to_string(),
+            model: self.model,
+            account: account.map(str::to_string),
+        };
         match db.finish_turn(&turn, &lock, self.lock_tokens).await {
             Ok(true) => {
                 metrics().session_locks.add(1, &[KeyValue::new("event", "formed"), KeyValue::new("provider", lock.provider.clone())])

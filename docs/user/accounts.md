@@ -199,8 +199,9 @@ Xolotl breaks the lock, moves the request on and records why, when:
 **A locked session does not fail over on a short failure.** A 5xx, a transport
 error or a 429 without `Retry-After` from the locked account goes back to the
 client, which sees an error it would not see without the lock. A success ends the
-count. The third failure in a row breaks the lock and fails over in that same
-request. To keep failover on every request, turn the lock off with
+count. The third failure in a row (`max_attempts`) breaks the lock and fails over
+in that same request, which then still has its `max_attempts` tries of other
+accounts. To keep failover on every request, turn the lock off with
 `lock_tokens = 0` in [`[sessions]`](configuration#sessions).
 
 The lock belongs to the model name the client asked for. A request in the same

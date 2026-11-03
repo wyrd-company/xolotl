@@ -815,6 +815,12 @@ impl Subscriptions {
         }
     }
 
+    /// Whether the policy of `principal` can use any account of the pool.
+    pub async fn can_use(&self, provider: SubProvider, principal: &Principal) -> bool {
+        let rows = self.db.list_accounts(Some(provider.as_str())).await.unwrap_or_default();
+        uses_any(&principal.policy, provider.as_str(), &rows)
+    }
+
     /// Why a session's locked account can't serve a request now, if it is the
     /// account that can't: a limit on another meter refuses every account.
     async fn lock_unavailable(&self, provider: SubProvider, principal: Option<&Principal>, account: &str, t: i64) -> Option<&'static str> {
@@ -905,8 +911,13 @@ impl Subscriptions {
         // Last failed upstream response, returned if every attempt fails.
         let mut last: Option<(u16, reqwest::header::HeaderMap, Bytes, String)> = None;
 
-        'accounts: for _ in 0..self.cfg.max_attempts {
+        // An attempt on a held lock is outside the budget, so that breaking the
+        // lock can still fail over, whatever `max_attempts` is. It happens at
+        // most once: after it the request has returned or the lock is gone.
+        let mut attempts = 0;
+        'accounts: while attempts < self.cfg.max_attempts {
             let pin = tracked.and_then(|s| s.account_pin(provider.as_str(), &upstream_model));
+            attempts += usize::from(!pin.as_ref().is_some_and(|p| p.held));
             let selected =
                 self.select(provider, principal, session.as_deref(), pin.as_ref().map(|p| p.account.as_str()), &tried, charge).await;
             if let (Some(s), Some(p)) = (tracked, pin.as_ref().filter(|p| p.held))

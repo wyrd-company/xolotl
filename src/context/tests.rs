@@ -145,7 +145,11 @@ async fn a_side_request_leaves_the_context_figures_alone() {
 }
 
 fn lock(account: &str) -> Lock {
-    Lock { name: "n".into(), provider: "codex".into(), model: "m".into(), account: Some(account.into()) }
+    Lock { generation: 1, name: "n".into(), provider: "codex".into(), model: "m".into(), account: Some(account.into()) }
+}
+
+async fn current_lock(db: &Db) -> Lock {
+    db.session_lock("p/k", "s").await.unwrap().unwrap()
 }
 
 #[tokio::test]
@@ -154,16 +158,11 @@ async fn a_lock_has_one_owner() {
     db.record_turn(&turn(500, true)).await.unwrap();
     assert!(db.form_lock("p/k", "s", &lock("a")).await.unwrap());
     assert!(!db.form_lock("p/k", "s", &lock("b")).await.unwrap(), "the first holds it");
-    assert_eq!(db.session_lock("p/k", "s").await.unwrap(), Some(lock("a")));
+    assert_eq!(current_lock(&db).await.account.as_deref(), Some("a"));
     assert_eq!(db.session_lock("q/k", "s").await.unwrap(), None, "client keys don't share sessions");
 
-    // A stale attempt can neither release nor count on a lock it doesn't hold.
-    assert!(!db.break_lock("p/k", "s", &lock("b"), reason::COOLDOWN).await.unwrap());
-    assert_eq!(db.count_lock_failure("p/k", "s", &lock("b")).await.unwrap(), 0);
-    assert_eq!(db.session_lock("p/k", "s").await.unwrap(), Some(lock("a")));
-    assert_eq!(row(&db).await.lock_breaks, 0);
-
-    assert!(db.break_lock("p/k", "s", &lock("a"), reason::COOLDOWN).await.unwrap());
+    let a = current_lock(&db).await;
+    assert!(db.break_lock("p/k", "s", &a, reason::COOLDOWN).await.unwrap());
     let r = row(&db).await;
     assert_eq!((r.lock_breaks, r.last_break_reason.as_deref()), (1, Some("cooldown")));
     assert!(r.last_break_at.is_some());
@@ -172,12 +171,33 @@ async fn a_lock_has_one_owner() {
 }
 
 #[tokio::test]
+async fn a_stale_request_cannot_touch_a_later_lock_on_the_same_target() {
+    let db = Db::in_memory().await.unwrap();
+    db.record_turn(&turn(500, true)).await.unwrap();
+    db.form_lock("p/k", "s", &lock("a")).await.unwrap();
+    let stale = current_lock(&db).await;
+    assert!(db.break_lock("p/k", "s", &stale, reason::COOLDOWN).await.unwrap());
+
+    // The same account and model lock again, and the old request wakes up.
+    db.form_lock("p/k", "s", &lock("a")).await.unwrap();
+    let fresh = current_lock(&db).await;
+    assert_ne!(stale.generation, fresh.generation);
+    assert!(!db.break_lock("p/k", "s", &stale, reason::UPSTREAM_ERRORS).await.unwrap());
+    assert_eq!(db.count_lock_failure("p/k", "s", &stale).await.unwrap(), 0);
+    let r = row(&db).await;
+    assert_eq!((r.lock_breaks, r.lock_failures), (1, 0), "the new lock has no failures and no break");
+    assert_eq!(current_lock(&db).await, fresh);
+    assert_eq!(db.count_lock_failure("p/k", "s", &fresh).await.unwrap(), 1);
+}
+
+#[tokio::test]
 async fn a_success_on_the_lock_ends_a_run_of_failures() {
     let db = Db::in_memory().await.unwrap();
     db.record_turn(&turn(500, true)).await.unwrap();
     db.form_lock("p/k", "s", &lock("a")).await.unwrap();
-    assert_eq!(db.count_lock_failure("p/k", "s", &lock("a")).await.unwrap(), 1);
-    assert_eq!(db.count_lock_failure("p/k", "s", &lock("a")).await.unwrap(), 2);
+    let held = current_lock(&db).await;
+    assert_eq!(db.count_lock_failure("p/k", "s", &held).await.unwrap(), 1);
+    assert_eq!(db.count_lock_failure("p/k", "s", &held).await.unwrap(), 2);
     db.record_turn(&Turn { account: Some("b".into()), ..turn(500, true) }).await.unwrap();
     assert_eq!(row(&db).await.lock_failures, 2, "another account's success isn't the lock's");
     db.record_turn(&turn(500, true)).await.unwrap();

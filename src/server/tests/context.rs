@@ -112,7 +112,7 @@ async fn locked(h: &Harness, client: &str, session: &str, lock: &Lock) {
 }
 
 fn opus_on(account: &str) -> Lock {
-    Lock { name: OPUS.into(), provider: "claude".into(), model: "claude-opus-5".into(), account: Some(account.into()) }
+    Lock { generation: 1, name: OPUS.into(), provider: "claude".into(), model: "claude-opus-5".into(), account: Some(account.into()) }
 }
 
 #[tokio::test]
@@ -372,6 +372,49 @@ async fn a_policy_that_drops_the_account_breaks_the_lock() {
 }
 
 #[tokio::test]
+async fn an_alias_recovers_when_the_policy_drops_the_locked_pool() {
+    let (h, a, _) = pool(|_| {}).await;
+    let mut p = fast_policy("p", &["llama/qwen3", OPUS]);
+    p.accounts.remove("claude");
+    let key = h.key(p).await;
+    let lock = Lock { generation: 1, name: "fast".into(), provider: "claude".into(), model: "claude-opus-5".into(), account: Some(a) };
+    locked(&h, "p/client", "s", &lock).await;
+    h.upstream.reset().await;
+    chat_mock(&h, "qwen3", ResponseTemplate::new(200).set_body_json(json!({
+        "id": "c", "model": "qwen3", "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "x"}}],
+        "usage": {"prompt_tokens": 5000, "completion_tokens": 1}
+    })))
+    .await;
+    let (status, body) = send(&h, &key, "fast", "s").await;
+    assert_eq!(status, 200, "{body}");
+    let row = session_row(&h, "p/client", 2).await;
+    assert_eq!((row.last_break_reason.as_deref(), row.lock_provider.as_deref()), (Some("policy"), Some("llama")));
+}
+
+#[tokio::test]
+async fn one_attempt_still_fails_over_when_the_lock_breaks() {
+    let (h, a, b) = pool(|cfg| cfg.subscription.max_attempts = 1).await;
+    let key = h.key(policy("p")).await;
+    locked(&h, "p/client", "s", &opus_on(&a)).await;
+    let failing = ResponseTemplate::new(500).set_body_json(json!({"error": {"type": "api_error", "message": "boom"}}));
+    reset_to(&h, failing, answer(5000)).await;
+    assert_eq!(send(&h, &key, OPUS, "s").await.0, 200);
+    assert_eq!(tokens(&h).await, ["a", "b"]);
+    let row = session_row(&h, "p/client", 2).await;
+    assert_eq!((row.last_break_reason.as_deref(), row.lock_account.as_ref()), (Some("upstream_errors"), Some(&b)));
+}
+
+#[tokio::test]
+async fn a_request_outside_the_lock_keeps_its_attempt_budget() {
+    let (h, _, _) = pool(|cfg| cfg.subscription.max_attempts = 1).await;
+    let key = h.key(policy("p")).await;
+    let failing = || ResponseTemplate::new(500).set_body_json(json!({"error": {"type": "api_error", "message": "boom"}}));
+    reset_to(&h, failing(), failing()).await;
+    assert_eq!(send(&h, &key, OPUS, "s").await.0, 500);
+    assert_eq!(tokens(&h).await.len(), 1);
+}
+
+#[tokio::test]
 async fn an_account_at_its_policy_limit_breaks_the_lock() {
     let (h, a, _) = pool(|_| {}).await;
     let mut p = policy("p");
@@ -480,7 +523,7 @@ async fn an_alias_stays_on_its_locked_target_until_the_lock_breaks() {
 async fn a_target_the_name_no_longer_offers_breaks_the_lock() {
     let h = harness_with(|cfg| cfg.sessions.lock_tokens = 1000).await;
     let key = h.key(fast_policy("p", &["llama/qwen3"])).await;
-    let gone = Lock { name: "fast".into(), provider: "llama".into(), model: "busy".into(), account: None };
+    let gone = Lock { generation: 1, name: "fast".into(), provider: "llama".into(), model: "busy".into(), account: None };
     let id = crate::context::resolve(
         &{
             let mut m = HeaderMap::new();

@@ -113,7 +113,8 @@ async fn record_turn(db: impl SqliteExecutor<'_>, t: &Turn) -> Result<i64> {
 /// holds a lock. True when this call formed the lock.
 async fn form_lock(db: impl SqliteExecutor<'_>, client_id: &str, session_key: &str, lock: &Lock) -> Result<bool> {
     let r = sqlx::query(
-        "UPDATE sessions SET lock_name = ?, lock_provider = ?, lock_model = ?, lock_account = ?, locked_at = ?, lock_failures = 0
+        "UPDATE sessions SET lock_name = ?, lock_provider = ?, lock_model = ?, lock_account = ?, locked_at = ?, lock_failures = 0,
+           lock_generation = lock_generation + 1
          WHERE client_id = ? AND session_key = ? AND lock_provider IS NULL",
     )
     .bind(&lock.name)
@@ -128,19 +129,21 @@ async fn form_lock(db: impl SqliteExecutor<'_>, client_id: &str, session_key: &s
     Ok(r.rows_affected() == 1)
 }
 
-type LockColumns = (Option<String>, Option<String>, Option<String>, Option<String>);
+type LockColumns = (i64, Option<String>, Option<String>, Option<String>, Option<String>);
 
 impl Db {
     /// The session's lock, if it holds one.
     pub async fn session_lock(&self, client_id: &str, session_key: &str) -> Result<Option<Lock>> {
         let row: Option<LockColumns> = sqlx::query_as(
-            "SELECT lock_name, lock_provider, lock_model, lock_account FROM sessions WHERE client_id = ? AND session_key = ?",
+            "SELECT lock_generation, lock_name, lock_provider, lock_model, lock_account FROM sessions WHERE client_id = ? AND session_key = ?",
         )
         .bind(client_id)
         .bind(session_key)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.and_then(|(name, provider, model, account)| Some(Lock { name: name?, provider: provider?, model: model?, account })))
+        Ok(row.and_then(|(generation, name, provider, model, account)| {
+            Some(Lock { generation, name: name?, provider: provider?, model: model?, account })
+        }))
     }
 
     /// Record a successful request and, at `lock_tokens`, form `lock` on what
@@ -161,36 +164,30 @@ impl Db {
     pub async fn count_lock_failure(&self, client_id: &str, session_key: &str, lock: &Lock) -> Result<i64> {
         let row: Option<(i64,)> = sqlx::query_as(
             "UPDATE sessions SET lock_failures = lock_failures + 1
-             WHERE client_id = ? AND session_key = ? AND lock_name = ? AND lock_provider = ? AND lock_model = ? AND lock_account IS ?
+             WHERE client_id = ? AND session_key = ? AND lock_provider IS NOT NULL AND lock_generation = ?
              RETURNING lock_failures",
         )
         .bind(client_id)
         .bind(session_key)
-        .bind(&lock.name)
-        .bind(&lock.provider)
-        .bind(&lock.model)
-        .bind(&lock.account)
+        .bind(lock.generation)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map_or(0, |r| r.0))
     }
 
     /// Release `lock` and record why. A lock formed since `lock` was read is
-    /// left alone. True when this call released it.
+    /// left alone, even on the same target. True when this call released it.
     pub async fn break_lock(&self, client_id: &str, session_key: &str, lock: &Lock, reason: &str) -> Result<bool> {
         let r = sqlx::query(
             "UPDATE sessions SET lock_name = NULL, lock_provider = NULL, lock_model = NULL, lock_account = NULL, locked_at = NULL,
                lock_failures = 0, lock_breaks = lock_breaks + 1, last_break_reason = ?, last_break_at = ?
-             WHERE client_id = ? AND session_key = ? AND lock_name = ? AND lock_provider = ? AND lock_model = ? AND lock_account IS ?",
+             WHERE client_id = ? AND session_key = ? AND lock_provider IS NOT NULL AND lock_generation = ?",
         )
         .bind(reason)
         .bind(now())
         .bind(client_id)
         .bind(session_key)
-        .bind(&lock.name)
-        .bind(&lock.provider)
-        .bind(&lock.model)
-        .bind(&lock.account)
+        .bind(lock.generation)
         .execute(&self.pool)
         .await?;
         Ok(r.rows_affected() == 1)

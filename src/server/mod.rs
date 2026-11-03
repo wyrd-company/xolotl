@@ -391,7 +391,14 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
         && let Some(lock) = s.lock()
     {
         // The locked target goes first, and the others wait for the lock to break.
+        // A pool this policy can't use refuses with a 403, which no alias moves on
+        // from, so the request keeps the order it has without a lock.
+        let refused = match pool(&lock.provider) {
+            Some(p) => !state.subs.can_use(p, &principal).await,
+            None => false,
+        };
         match usable.iter().position(|t| t.provider == lock.provider && t.model == lock.model) {
+            _ if refused => s.break_lock(reason::POLICY).await,
             Some(i) => usable[..=i].rotate_right(1),
             None => s.break_lock(reason::TARGET_UNAVAILABLE).await,
         }

@@ -46,11 +46,11 @@ While the lock holds, a request for the locked name goes to the locked target an
 | `upstream_errors` | `subscription.max_attempts` consecutive failed requests on the lock |
 | `target_unavailable` | The requested name no longer offers the locked target |
 
-After a break the request routes normally, and a later success past the threshold locks the session where it landed. Releasing a lock names the lock it read, so a stale request can't release a newer one. Idle time and compaction release nothing: the lock goes with its session row at `retention_days`, and holding it costs only the account choice.
+After a break the request routes normally, and a later success past the threshold locks the session where it landed. A lock's generation changes each time one forms. Releasing a lock or counting a failure names the generation it read, so a stale request can't touch a newer lock, even on the same target. A policy that can use no account of the locked pool breaks the lock before routing, as that pool's 403 would stop an alias from moving on. Idle time and compaction release nothing: the lock goes with its session row at `retention_days`, and holding it costs only the account choice.
 
 ### A failure on the lock
 
-A 5xx, a transport error or a 429 without a cooldown (on a gateway target, any 429) goes back to the client and the lock stays, because failing over would throw away the cache for what may be a short failure. A success ends the run. The `max_attempts`-th failure in a row breaks the lock and fails over in the same request, so that an account that fails every request cannot hold a session.
+A 5xx, a transport error or a 429 without a cooldown (on a gateway target, any 429) goes back to the client and the lock stays, because failing over would throw away the cache for what may be a short failure. A success ends the run. The `max_attempts`-th failure in a row breaks the lock and fails over in the same request, so that an account that fails every request cannot hold a session. The attempt on the lock is outside that request's budget of `max_attempts` accounts, so that this holds at `max_attempts = 1`.
 
 This narrows failover for a session past the threshold: its client sees errors that it would not see otherwise. Options not chosen: holding with no limit, which strands a session on a broken account until an operator disables it; failing over as before, where one 529 costs the whole cache.
 
