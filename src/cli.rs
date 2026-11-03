@@ -549,6 +549,24 @@ fn unloaded_policy_lines(status: &Value) -> Vec<String> {
         .collect()
 }
 
+/// A line per warning in the answer to saving a policy.
+fn warning_lines(saved: &Value) -> Vec<String> {
+    saved["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|w| format!("warning: {w}")).collect()
+}
+
+/// A line per subscription provider in a policy view, with the accounts it can use.
+fn account_lines(view: &Value) -> Vec<String> {
+    view["accounts"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(provider, ids)| {
+            let ids: Vec<&str> = ids.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            format!("{provider:<14} {}", if ids.is_empty() { "no accounts".to_string() } else { ids.join(", ") })
+        })
+        .collect()
+}
+
 async fn policies(c: Client, cmd: PoliciesCmd) -> Result<()> {
     match cmd {
         PoliciesCmd::List => {
@@ -584,7 +602,9 @@ async fn policies(c: Client, cmd: PoliciesCmd) -> Result<()> {
                 serde_json::from_str(&raw)?
             };
             let name = policy["name"].as_str().context("policy needs a name")?.to_string();
-            c.print(c.put(&format!("/admin/policies/{name}"), policy).await?)
+            let saved = c.put(&format!("/admin/policies/{name}"), policy).await?;
+            warning_lines(&saved).iter().for_each(|line| eprintln!("{line}"));
+            c.print(saved)
         }
         PoliciesCmd::Delete { name } => c.print(c.delete(&format!("/admin/policies/{name}")).await?),
         PoliciesCmd::View { name } => {
@@ -603,6 +623,11 @@ async fn policies(c: Client, cmd: PoliciesCmd) -> Result<()> {
                     m["name"].as_str().unwrap_or("").to_string()
                 };
                 println!("{:<44} {:<56} {:<36} {}", name, list("targets"), list("endpoints"), list("translated_endpoints"));
+            }
+            let accounts = account_lines(&v);
+            if !accounts.is_empty() {
+                println!("\nACCOUNTS");
+                accounts.iter().for_each(|line| println!("  {line}"));
             }
             let tools: Vec<&str> = v["tools"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
             if v["mcp_servers"].as_array().is_some_and(|a| !a.is_empty()) {
@@ -986,6 +1011,20 @@ mod tests {
         );
         assert!(unloaded_policy_lines(&json!({"unloaded_policies": []})).is_empty());
         assert!(unloaded_policy_lines(&json!({"version": "older server"})).is_empty());
+    }
+
+    #[test]
+    fn saved_policy_warnings_become_lines() {
+        assert_eq!(warning_lines(&json!({"name": "dev", "warnings": ["one", "two"]})), vec!["warning: one", "warning: two"]);
+        assert!(warning_lines(&json!({"name": "dev"})).is_empty());
+    }
+
+    #[test]
+    fn view_accounts_say_where_there_are_none() {
+        let view = json!({"accounts": {"claude": [], "codex": ["codex-a1", "codex-b2"]}});
+        assert_eq!(account_lines(&view), vec!["claude         no accounts", "codex          codex-a1, codex-b2"]);
+        assert!(account_lines(&json!({"accounts": {}})).is_empty());
+        assert!(account_lines(&json!({"policy": "older server"})).is_empty());
     }
 
     #[test]

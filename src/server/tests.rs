@@ -19,7 +19,7 @@ use crate::keys::{IssueRequest, Scope};
 use crate::limits::{Limits, Meter};
 use crate::policy::{AliasTargets, Policy};
 use crate::secrets::MemoryStore;
-use crate::subscription::{Credential, auth_index};
+use crate::subscription::{Credential, SubProvider, auth_index};
 
 mod context;
 
@@ -1064,6 +1064,79 @@ async fn t3code_management_endpoints() {
     assert!(!h.state.db.get_account(&id).await.unwrap().unwrap().cooling_down(now()));
     let (status, _) = h.call("POST", "/v0/management/reset-quota", Some(&mgmt), Some(json!({"auth_index": "nope"}))).await;
     assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn a_saved_policy_warns_about_providers_with_no_accounts() {
+    let h = harness().await;
+    let put = |p: Value| {
+        let (name, h) = (p["name"].as_str().unwrap().to_string(), &h);
+        async move {
+            let (status, body) = h.call("PUT", &format!("/admin/policies/{name}"), Some(&h.admin), Some(p)).await;
+            assert_eq!(status, 200, "{body}");
+            body
+        }
+    };
+
+    // It saves, and says so only in the answer to the save.
+    let warned = put(json!({"name": "warned", "providers": ["claude", "codex"], "accounts": {"claude": [], "codex": ["*"]}})).await;
+    let warnings = warned["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{warned}");
+    assert!(warnings[0].as_str().unwrap().starts_with("claude has no accounts"), "{warned}");
+    let (status, stored) = h.call("GET", "/admin/policies/warned", Some(&h.admin), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(stored["providers"], json!(["claude", "codex"]));
+    assert!(stored.get("warnings").is_none(), "{stored}");
+
+    let wild = put(json!({"name": "wild", "providers": ["*"], "accounts": {"codex": ["*"]}})).await;
+    assert_eq!(wild["warnings"].as_array().unwrap().len(), SubProvider::ALL.len() - 1, "{wild}");
+
+    // Nothing to say: the answer is the policy, as it always was.
+    let quiet = put(json!({"name": "quiet", "providers": ["claude"], "accounts": {"claude": ["*"]}})).await;
+    let (_, stored) = h.call("GET", "/admin/policies/quiet", Some(&h.admin), None).await;
+    assert_eq!(quiet, stored);
+    assert!(quiet.get("warnings").is_none(), "{quiet}");
+
+    // Other answers about a warned policy don't change.
+    let (status, issued) = h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "warned", "name": "one"}))).await;
+    assert_eq!(status, 201, "{issued}");
+    assert!(issued.get("warnings").is_none(), "{issued}");
+}
+
+#[tokio::test]
+async fn a_policy_view_lists_the_accounts_each_provider_can_use() {
+    let h = harness().await;
+    let imported = json!({"provider": "opencode-go", "data": {"api_key": "ocg"}, "label": "go"});
+    let (status, row) = h.call("POST", "/admin/accounts/import", Some(&h.admin), Some(imported)).await;
+    assert_eq!(status, 200, "{row}");
+    let id = row["id"].as_str().unwrap().to_string();
+
+    let policy = |go: Value| json!({"name": "view", "providers": ["claude", "codex", "opencode-go"], "accounts": {"codex": ["codex-gone"], "opencode-go": go}});
+    for (go, expected) in [(json!(["*"]), json!([id])), (json!([id]), json!([id])), (json!(["opencode-go-other"]), json!([]))] {
+        let (status, body) = h.call("PUT", "/admin/policies/view", Some(&h.admin), Some(policy(go.clone()))).await;
+        assert_eq!(status, 200, "{body}");
+        let want = json!({"claude": [], "codex": [], "opencode-go": expected});
+        let (_, view) = h.call("GET", "/admin/policies/view/view", Some(&h.admin), None).await;
+        assert_eq!(view["accounts"], want, "{go}");
+        let (status, preview) = h.call("POST", "/admin/policy-preview", Some(&h.admin), Some(policy(go))).await;
+        assert_eq!(status, 200, "{preview}");
+        assert_eq!(preview["accounts"], want);
+    }
+
+    // `*` takes only the accounts of its own provider.
+    let star = json!({"name": "star", "providers": ["claude", "opencode-go"], "accounts": {"claude": ["*"], "opencode-go": ["*"]}});
+    let (_, preview) = h.call("POST", "/admin/policy-preview", Some(&h.admin), Some(star)).await;
+    assert_eq!(preview["accounts"], json!({"claude": [], "opencode-go": [id]}));
+
+    // The wildcard covers every subscription provider.
+    let wild = json!({"name": "wild", "providers": ["*"]});
+    let (_, preview) = h.call("POST", "/admin/policy-preview", Some(&h.admin), Some(wild)).await;
+    assert_eq!(preview["accounts"].as_object().unwrap().len(), SubProvider::ALL.len());
+    // A policy that allows no subscription provider has none to show.
+    let tools = json!({"name": "tools", "providers": [], "scopes": ["keys"], "key_policies": ["view"]});
+    let (status, preview) = h.call("POST", "/admin/policy-preview", Some(&h.admin), Some(tools)).await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(preview["accounts"], json!({}));
 }
 
 #[tokio::test]

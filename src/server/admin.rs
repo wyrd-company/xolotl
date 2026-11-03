@@ -125,7 +125,13 @@ async fn put_policy(State(s): State<AppState>, h: HeaderMap, Path(name): Path<St
     }
     let saved = s.keys.put_policy(policy, &s.catalog.known_providers(), &s.mcp.server_names()).await.map_err(bad)?;
     tracing::info!(policy = %saved.name, "saved policy");
-    ok(saved.as_ref().clone())
+    let warnings = saved.warnings();
+    if warnings.is_empty() {
+        return ok(saved.as_ref().clone());
+    }
+    let mut body = serde_json::to_value(saved.as_ref()).map_err(|e| internal(e.into()))?;
+    body["warnings"] = json!(warnings);
+    ok(body)
 }
 
 async fn delete_policy(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
@@ -138,7 +144,7 @@ async fn delete_policy(State(s): State<AppState>, h: HeaderMap, Path(name): Path
 async fn policy_view(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
     admin(&s, &h).await?;
     let policy = s.keys.policy(&name).ok_or_else(|| no_policy(&s, &name))?;
-    ok(view_json(&s, &policy))
+    ok(view_json(&s, &policy).await?)
 }
 
 /// The view of an unsaved policy, for editing. Invalid policies get a 400
@@ -150,10 +156,18 @@ async fn preview_policy(State(s): State<AppState>, h: HeaderMap, Json(mut policy
         policy.name = "preview".into();
     }
     policy.validate(&s.catalog.known_providers(), &s.mcp.server_names()).map_err(bad)?;
-    ok(view_json(&s, &policy))
+    ok(view_json(&s, &policy).await?)
 }
 
-fn view_json(s: &AppState, policy: &Policy) -> Value {
+async fn view_json(s: &AppState, policy: &Policy) -> Result<Value, Response> {
+    let rows = s.subs.db().list_accounts(None).await.map_err(internal)?;
+    // Every subscription provider the policy allows, with the accounts that exist now.
+    let accounts: BTreeMap<&str, Vec<&str>> = SubProvider::ALL
+        .iter()
+        .map(|p| p.as_str())
+        .filter(|p| policy.allows_provider(p))
+        .map(|p| (p, rows.iter().filter(|r| r.provider == p && policy.allows_account(p, &r.id)).map(|r| r.id.as_str()).collect()))
+        .collect();
     let catalog = s.catalog.models();
     let view = policy.resolve(&catalog);
     let models: Vec<Value> = view
@@ -171,9 +185,10 @@ fn view_json(s: &AppState, policy: &Policy) -> Value {
             })
         })
         .collect();
-    json!({
+    Ok(json!({
         "policy": policy.name,
         "models": models,
+        "accounts": accounts,
         "catalog": policy.candidates(&catalog),
         "shared": policy.shared_names(&catalog),
         "mcp_servers": s.mcp.allowed_servers(policy).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
@@ -185,7 +200,7 @@ fn view_json(s: &AppState, policy: &Policy) -> Value {
         "account_usage": policy.limits.accounts.keys()
             .map(|id| (id.clone(), s.limiter.policy_consumption(&policy.name, Meter::Account(id), now())))
             .collect::<BTreeMap<_, _>>(),
-    })
+    }))
 }
 
 /// The `server/tool` names a policy allows, from the cached tool lists.

@@ -102,3 +102,28 @@ test("saving a policy keeps its key policies", () => {
   expect(toPolicy(toDraft(issuer)).key_policies).toEqual(["first", "second"]);
   expect(toPolicy({ ...toDraft(issuer), keyPolicies: " first \n\n" }).key_policies).toEqual(["first"]);
 });
+
+const warning = (provider: string) => `No accounts checked, so keys under this policy cannot use ${provider}.`;
+
+test("warns about an allowed subscription provider with no accounts", () => {
+  const html = render("/policies/sample", false, [], { ...policy, providers: ["claude", "codex"], accounts: { codex: ["*"] } });
+  expect(html).toContain(warning("claude"));
+  expect(html).not.toContain(warning("codex"));
+  expect(html).not.toContain(warning("grok"));
+});
+
+test("warns for every subscription provider under the wildcard", () => {
+  const html = render("/policies/sample", false, [], { ...policy, providers: ["*"], accounts: { codex: ["*"] } });
+  expect(html).toContain(warning("claude"));
+  expect(html).not.toContain(warning("codex"));
+});
+
+test("warns under the admin scope, which also calls providers", () => {
+  const html = render("/policies/sample", false, [], { ...policy, providers: ["claude"], scopes: ["admin"] });
+  expect(html).toContain(warning("claude"));
+});
+
+test("does not warn when the policy's keys call no provider", () => {
+  const html = render("/policies/sample", false, [], { ...policy, providers: ["claude"], scopes: ["mcp"] });
+  expect(html).not.toContain(warning("claude"));
+});

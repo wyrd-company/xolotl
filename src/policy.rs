@@ -437,6 +437,21 @@ impl Policy {
         self.allows_provider(provider) && self.accounts.get(provider).is_some_and(|ids| ids.iter().any(|a| a == "*" || a == id))
     }
 
+    /// What a saved policy should tell its author: one line per subscription
+    /// provider it allows with no `accounts` entry, for a policy whose keys can
+    /// call a provider at all. `["*"]` allows every subscription provider.
+    pub fn warnings(&self) -> Vec<String> {
+        if !self.has_scope(Scope::Proxy) {
+            return Vec::new();
+        }
+        crate::subscription::SubProvider::ALL
+            .iter()
+            .map(|p| p.as_str())
+            .filter(|p| self.allows_provider(p) && !self.accounts.contains_key(*p))
+            .map(|p| format!("{p} has no accounts, so keys under this policy cannot use it. Add accounts.{p} with account IDs or \"*\", or stop allowing {p}."))
+            .collect()
+    }
+
     pub fn allows_model(&self, provider: &str, model: &str) -> bool {
         self.allows_provider(provider) && self.model_rule(provider, model).0
     }
@@ -915,6 +930,39 @@ mod tests {
             let err = format!("{:#}", from_stored(stored(record.clone())).unwrap_err());
             assert!(err.contains(why), "{record}: {err}");
         }
+    }
+
+    #[test]
+    fn warnings_name_each_allowed_subscription_provider_with_no_accounts() {
+        let warned = |record: serde_json::Value| {
+            let mut p: Policy = serde_json::from_value(record).unwrap();
+            p.normalize();
+            let warnings = p.warnings();
+            let named: Vec<&str> =
+                SubProvider::ALL.iter().map(|s| s.as_str()).filter(|s| warnings.iter().any(|w| w.starts_with(&format!("{s} ")))).collect();
+            assert_eq!(named.len(), warnings.len(), "one line per provider: {warnings:?}");
+            named.join(" ")
+        };
+        assert_eq!(warned(json!({"name": "a", "providers": ["claude", "codex"], "accounts": {"codex": ["*"]}})), "claude");
+        assert_eq!(warned(json!({"name": "a", "providers": ["claude"], "accounts": {"claude": []}})), "claude", "[] is no entry");
+        assert_eq!(
+            warned(json!({"name": "a", "providers": ["*"], "accounts": {"grok": ["grok-a1"]}})),
+            "codex claude opencode-go",
+            "* allows them all"
+        );
+        assert_eq!(warned(json!({"name": "a", "providers": ["llama"]})), "", "a gateway provider has no accounts to list");
+        assert_eq!(
+            warned(json!({"name": "a", "providers": ["claude"], "accounts": {"claude": ["claude-gone"]}})),
+            "",
+            "an entry is an entry"
+        );
+        assert_eq!(warned(json!({"name": "a", "providers": ["claude"], "scopes": ["admin"]})), "claude", "admin also calls providers");
+        assert_eq!(warned(json!({"name": "a", "providers": ["claude"], "scopes": ["mcp"]})), "", "these keys call no provider");
+        assert!(
+            Policy { name: "a".into(), providers: vec!["claude".into()], scopes: vec![Scope::Proxy], ..Default::default() }.warnings()[0]
+                .contains("accounts.claude"),
+            "says what to add"
+        );
     }
 
     #[test]

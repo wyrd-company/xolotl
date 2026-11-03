@@ -41,6 +41,8 @@ export function ProviderAccess({
   function setAccounts(next: Record<string, string[]>) {
     set("accounts", next);
   }
+  /** Keys under a policy without these scopes call no provider. */
+  const callsProviders = draft.scopes.includes("proxy") || draft.scopes.includes("admin");
   function toggleProvider(p: string, on: boolean) {
     set("providers", on ? [...draft.providers, p] : draft.providers.filter((x) => x !== p));
     if (!isPool(p)) return;
@@ -129,6 +131,9 @@ export function ProviderAccess({
                       </label>
                     ))}
                     {ready && mine.length === 0 && <span className="text-muted-foreground text-sm">No accounts yet.</span>}
+                    {callsProviders && ids.length === 0 && (
+                      <span className="text-warning text-sm">No accounts checked, so keys under this policy cannot use {p}.</span>
+                    )}
                     <label className="flex items-center gap-2 text-sm">
                       <Checkbox checked={every} onCheckedChange={(c) => toggleEvery(p, c === true)} />
                       every account, also new ones (<span className="font-mono">*</span>)
