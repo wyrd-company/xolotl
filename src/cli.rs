@@ -556,6 +556,9 @@ fn warning_lines(saved: &Value) -> Vec<String> {
 
 /// A line per subscription provider in a policy view, with the accounts it can use.
 fn account_lines(view: &Value) -> Vec<String> {
+    if view.get("accounts").is_some_and(Value::is_null) {
+        return vec!["could not read the accounts".to_string()];
+    }
     view["accounts"]
         .as_object()
         .into_iter()
@@ -1025,6 +1028,7 @@ mod tests {
         assert_eq!(account_lines(&view), vec!["claude         no accounts", "codex          codex-a1, codex-b2"]);
         assert!(account_lines(&json!({"accounts": {}})).is_empty());
         assert!(account_lines(&json!({"policy": "older server"})).is_empty());
+        assert_eq!(account_lines(&json!({"accounts": null})), vec!["could not read the accounts"]);
     }
 
     #[test]

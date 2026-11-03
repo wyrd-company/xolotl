@@ -1097,6 +1097,19 @@ async fn a_saved_policy_warns_about_providers_with_no_accounts() {
     assert_eq!(quiet, stored);
     assert!(quiet.get("warnings").is_none(), "{quiet}");
 
+    // A warned answer goes back in as a policy, and `warnings` isn't stored.
+    let (status, again) = h.call("PUT", "/admin/policies/warned", Some(&h.admin), Some(warned.clone())).await;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again, warned);
+    let (_, stored) = h.call("GET", "/admin/policies/warned", Some(&h.admin), None).await;
+    assert!(stored.get("warnings").is_none(), "{stored}");
+    // Any other unknown field is still refused.
+    let mut unknown = warned.clone();
+    unknown["warning"] = json!("typo");
+    let (status, body) = h.call("PUT", "/admin/policies/warned", Some(&h.admin), Some(unknown)).await;
+    assert_eq!(status, 422, "{body}");
+    assert!(body.to_string().contains("unknown field `warning`"), "{body}");
+
     // Other answers about a warned policy don't change.
     let (status, issued) = h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "warned", "name": "one"}))).await;
     assert_eq!(status, 201, "{issued}");
@@ -1135,6 +1148,28 @@ async fn a_policy_view_lists_the_accounts_each_provider_can_use() {
     // A policy that allows no subscription provider has none to show.
     let tools = json!({"name": "tools", "providers": [], "scopes": ["keys"], "key_policies": ["view"]});
     let (status, preview) = h.call("POST", "/admin/policy-preview", Some(&h.admin), Some(tools)).await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(preview["accounts"], json!({}));
+}
+
+#[tokio::test]
+async fn a_policy_view_answers_when_the_accounts_cannot_be_read() {
+    let h = harness().await;
+    sqlx::query("DROP TABLE accounts").execute(&h.state.subs.db().pool).await.unwrap();
+
+    let pool = json!({"name": "pool", "providers": ["claude"], "accounts": {"claude": ["*"]}});
+    let (status, preview) = h.call("POST", "/admin/policy-preview", Some(&h.admin), Some(pool.clone())).await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(preview["accounts"], Value::Null);
+    assert_eq!(preview["policy"], "pool");
+    assert_eq!(h.call("PUT", "/admin/policies/pool", Some(&h.admin), Some(pool)).await.0, 200);
+    let (status, view) = h.call("GET", "/admin/policies/pool/view", Some(&h.admin), None).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["accounts"], Value::Null);
+
+    // With no subscription provider to show, nothing is read and nothing is missing.
+    let none = json!({"name": "none", "providers": [], "scopes": ["keys"], "key_policies": ["pool"]});
+    let (status, preview) = h.call("POST", "/admin/policy-preview", Some(&h.admin), Some(none)).await;
     assert_eq!(status, 200, "{preview}");
     assert_eq!(preview["accounts"], json!({}));
 }

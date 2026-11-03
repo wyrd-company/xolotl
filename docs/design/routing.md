@@ -79,9 +79,9 @@ A policy (`src/policy.rs`) is stored in OpenBao at `policies/<name>`, and every 
 - a name in the view returns its targets;
 - otherwise, `provider/model` returns that single target, if the provider exists and the policy allows the model. This form works even for a model that lost its plain name.
 
-The resolved view for any policy can be inspected with `xolotl policies view <name>` (`GET /admin/policies/<name>/view`). Its `accounts` maps each subscription provider the policy allows to the accounts that exist now and that the policy's `accounts` entry takes.
+The resolved view for any policy can be inspected with `xolotl policies view <name>` (`GET /admin/policies/<name>/view`). Its `accounts` maps each subscription provider the policy allows to the accounts that exist now and that the policy's `accounts` entry takes. It is `null` when the accounts can't be read, and the rest of the view still answers, because the web UI's save depends on the preview; a policy that allows no subscription provider reads nothing.
 
-`PUT /admin/policies/<name>` adds a `warnings` list to its answer, present only when there is a warning, naming each allowed subscription provider with no `accounts` entry, for a policy with the `proxy` or `admin` scope. The warning reads the policy and not the pool, so an entry that names only removed accounts does not warn; it shows as an empty list in the view.
+`PUT /admin/policies/<name>` adds a `warnings` list to its answer, present only when there is a warning, naming each allowed subscription provider with no `accounts` entry, for a policy with the `proxy` or `admin` scope. The warning reads the policy and not the pool, so an entry that names only removed accounts does not warn; it shows as an empty list in the view. `warnings` is read-only: `PUT` drops it from its input, so that an answer can be sent back, and refuses every other unknown field.
 
 ### Example
 

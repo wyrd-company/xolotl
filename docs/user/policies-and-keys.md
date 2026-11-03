@@ -108,7 +108,8 @@ claude = ["*"]                                    # every account, also new ones
 - Saving a policy still succeeds in that case, but tells you. `xolotl policies put`
   prints a warning to stderr, `PUT /admin/policies/{name}` adds a `warnings` list
   to its answer, and the web UI's policy editor shows the warning under the
-  provider. Each warning names one subscription provider. `providers = ["*"]`
+  provider. `PUT` ignores `warnings` in its input, so a saved answer can be sent
+  back. Each warning names one subscription provider. `providers = ["*"]`
   allows them all, so it warns for each one with no entry. A policy whose scopes
   don't include `proxy` or `admin` gets no warning, as its keys call no provider.
 - `xolotl accounts list` shows the account IDs.
