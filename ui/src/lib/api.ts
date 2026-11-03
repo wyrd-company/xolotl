@@ -226,6 +226,8 @@ export interface KeyInfo {
   expires_at: string | null;
   disabled: boolean;
   previous_expires_at?: string;
+  /** Only in the answer to issuing a key. */
+  status?: "created" | "exists";
   /** Only in the key list. */
   usage?: Consumption;
   /** The key's policy limits, when it has any. */

@@ -16,10 +16,10 @@ use serde_json::{Value, json};
 
 use super::{AppState, authorize, json_error};
 use crate::db::{UsageFilter, now};
-use crate::keys::{IssueRequest, Scope};
+use crate::keys::{InvalidIssue, IssueRequest, Issued, Revoked, Scope};
 use crate::limits::Meter;
 use crate::policy::Policy;
-use crate::secrets::SecretStore;
+use crate::secrets::{Conflict, SecretStore};
 use crate::subscription::SubProvider;
 
 pub fn router() -> Router<AppState> {
@@ -282,13 +282,46 @@ async fn list_keys(State(s): State<AppState>, h: HeaderMap) -> Res {
     ok(keys)
 }
 
+/// The answer to a failed issue or revoke: whether sending it again can help.
+fn key_error(e: anyhow::Error) -> Response {
+    if e.is::<InvalidIssue>() {
+        bad(e)
+    } else if e.is::<Conflict>() {
+        json_error(StatusCode::CONFLICT, format!("{e:#}"))
+    } else {
+        internal(e)
+    }
+}
+
 /// Issues a key into the vault. The key itself is never returned: the client
-/// reads it from `vault_path` with its own Vault policy.
+/// reads it from `vault_path` with its own Vault policy. A new key answers 201
+/// with `status: created`. A name with a live key answers 200 with
+/// `status: exists` and leaves the key as it is.
 async fn issue_key(State(s): State<AppState>, h: HeaderMap, Json(req): Json<IssueRequest>) -> Res {
     admin(&s, &h).await?;
-    let info = s.keys.issue(req).await.map_err(bad)?;
-    tracing::info!(client = %info.client_id, "issued client key");
-    ok(info)
+    let issued = s.keys.issue(req).await.map_err(key_error)?;
+    let (code, status) = match &issued {
+        Issued::Created(info) => {
+            tracing::info!(client = %info.client_id, "issued client key");
+            (StatusCode::CREATED, "created")
+        }
+        Issued::Exists(info) => {
+            tracing::info!(client = %info.client_id, "client key exists, not changed");
+            (StatusCode::OK, "exists")
+        }
+    };
+    let mut body = json!(issued.info());
+    body["status"] = json!(status);
+    Ok((code, Json(body)).into_response())
+}
+
+/// The vault path of a key named in a URL, where a name can hold any
+/// character once it is decoded.
+fn key_id(policy: &str, name: &str) -> Result<String, Response> {
+    if !crate::keys::valid_name(policy) || !crate::keys::valid_name(name) {
+        return Err(json_error(StatusCode::BAD_REQUEST, "policy and key names are lowercase letters, digits, '-' or '_' (max 63)"));
+    }
+    Ok(format!("{policy}/{name}"))
 }
 
 #[derive(Deserialize, Default)]
@@ -304,24 +337,30 @@ async fn rotate_key(
     body: Option<Json<RotateReq>>,
 ) -> Res {
     admin(&s, &h).await?;
-    let id = format!("{policy}/{name}");
+    let id = key_id(&policy, &name)?;
     let grace = body.map(|b| b.0.grace_secs).unwrap_or(0);
     let info = s.keys.rotate(&id, grace).await.map_err(|e| json_error(StatusCode::NOT_FOUND, format!("{e:#}")))?;
     tracing::info!(client = %id, grace, "rotated client key");
     ok(info)
 }
 
+/// Safe to repeat: `status` says what was found. An error means a version in
+/// the vault may still hold the key, so send it again.
 async fn revoke_key(State(s): State<AppState>, h: HeaderMap, Path((policy, name)): Path<(String, String)>) -> Res {
     admin(&s, &h).await?;
-    let id = format!("{policy}/{name}");
-    s.keys.revoke(&id).await.map_err(|e| json_error(StatusCode::NOT_FOUND, format!("{e:#}")))?;
-    tracing::info!(client = %id, "revoked client key");
-    ok(json!({"revoked": id}))
+    let id = key_id(&policy, &name)?;
+    let status = match s.keys.revoke(&id).await.map_err(key_error)? {
+        Revoked::Revoked => "revoked",
+        Revoked::AlreadyRevoked => "already_revoked",
+        Revoked::Absent => "absent",
+    };
+    tracing::info!(client = %id, status, "revoke of client key");
+    ok(json!({"revoked": id, "status": status}))
 }
 
 async fn set_key_disabled(State(s): State<AppState>, h: HeaderMap, Path((policy, name)): Path<(String, String)>, disabled: bool) -> Res {
     admin(&s, &h).await?;
-    let id = format!("{policy}/{name}");
+    let id = key_id(&policy, &name)?;
     ok(s.keys.set_disabled(&id, disabled).await.map_err(|e| json_error(StatusCode::NOT_FOUND, format!("{e:#}")))?)
 }
 

@@ -25,7 +25,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::policy::Policy;
-use crate::secrets::Secrets;
+use crate::secrets::{Conflict, Secrets};
 
 pub const KEY_PREFIX: &str = "xol_";
 const ID_ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyz23456789";
@@ -120,6 +120,37 @@ pub struct IssueRequest {
     pub ttl_secs: Option<i64>,
 }
 
+/// A request to issue a key that can never succeed as sent.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidIssue(String);
+
+/// What a request to issue a key did. Neither answer holds key material.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Issued {
+    Created(KeyInfo),
+    /// A live key has this name. It is unchanged, so this is what the record holds.
+    Exists(KeyInfo),
+}
+
+impl Issued {
+    pub fn info(&self) -> &KeyInfo {
+        match self {
+            Issued::Created(info) | Issued::Exists(info) => info,
+        }
+    }
+}
+
+/// What a request to revoke a key found. After each answer, no version in the
+/// vault holds the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revoked {
+    Revoked,
+    AlreadyRevoked,
+    /// No record exists, or its latest version has no data.
+    Absent,
+}
+
 struct Entry {
     info: KeyInfo,
     revoked: bool,
@@ -163,12 +194,26 @@ fn key_path(client_id: &str) -> String {
     format!("keys/{client_id}")
 }
 
-fn valid_name(name: &str) -> bool {
+/// A policy or key name. It becomes one segment of a vault path, so this also
+/// keeps `..`, `/` and `?` out of that path.
+pub fn valid_name(name: &str) -> bool {
     let b = name.as_bytes();
     !b.is_empty()
         && b.len() <= 63
         && b[0].is_ascii_alphanumeric()
         && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
+}
+
+fn is_revocation_marker(record: &serde_json::Map<String, Value>) -> bool {
+    record.get("revoked").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// When a key with this lifetime expires. A lifetime too long to compute is
+/// refused, since the arithmetic would panic.
+fn expiry(now: DateTime<Utc>, ttl_secs: Option<i64>) -> Result<Option<DateTime<Utc>>> {
+    let Some(secs) = ttl_secs else { return Ok(None) };
+    let at = chrono::TimeDelta::try_seconds(secs).and_then(|ttl| now.checked_add_signed(ttl));
+    Ok(Some(at.ok_or_else(|| InvalidIssue(format!("ttl_secs {secs} is out of range")))?))
 }
 
 impl KeyManager {
@@ -353,30 +398,49 @@ impl KeyManager {
     }
 
     /// Issue a key. The key is written to the vault only; the response shows
-    /// where the client reads it.
-    pub async fn issue(&self, req: IssueRequest) -> Result<KeyInfo> {
-        anyhow::ensure!(valid_name(&req.name), "key name must be lowercase letters, digits, '-' or '_' (max 63)");
+    /// where the client reads it. A repeat finds the live key and changes
+    /// nothing, also when it asks for another description or lifetime, so a
+    /// caller that lost the answer can safely send it again.
+    pub async fn issue(&self, req: IssueRequest) -> Result<Issued> {
+        if !valid_name(&req.name) {
+            return Err(InvalidIssue("key name must be lowercase letters, digits, '-' or '_' (max 63)".into()).into());
+        }
+        let now = Utc::now();
+        let expires_at = expiry(now, req.ttl_secs)?;
         let _writes = self.writes.lock().await;
         // Checked under the lock, so a concurrent delete_policy can't slip in between.
-        anyhow::ensure!(self.policy(&req.policy).is_some(), "policy {:?} does not exist", req.policy);
-        let id = format!("{}/{}", req.policy, req.name);
-        let (existing, version) = self.secrets.get_versioned(&key_path(&id)).await?;
-        let was_revoked = existing.as_ref().is_some_and(|m| m.get("revoked").and_then(Value::as_bool).unwrap_or(false));
-        anyhow::ensure!(existing.is_none() || was_revoked, "key {id} already exists; rotate it instead");
-        let now = Utc::now();
+        if self.policy(&req.policy).is_none() {
+            return Err(InvalidIssue(format!("policy {:?} does not exist", req.policy)).into());
+        }
         let record = KeyRecord {
-            api_key: Some(new_key()),
-            client_id: id.clone(),
+            api_key: None,
+            client_id: format!("{}/{}", req.policy, req.name),
             policy: req.policy,
             name: req.name,
             description: req.description.trim().to_string(),
             created_at: Some(now),
-            expires_at: req.ttl_secs.map(|s| now + chrono::Duration::seconds(s)),
+            expires_at,
             ..Default::default()
         };
+        match self.issue_locked(&record).await {
+            // Another instance wrote the name after the read: see what it wrote.
+            Err(e) if e.is::<Conflict>() => self.issue_locked(&record).await,
+            result => result,
+        }
+    }
+
+    async fn issue_locked(&self, template: &KeyRecord) -> Result<Issued> {
+        let id = &template.client_id;
+        let (existing, version) = self.secrets.get_versioned(&key_path(id)).await?;
+        if let Some(existing) = existing.filter(|m| !is_revocation_marker(m)) {
+            let record: KeyRecord = serde_json::from_value(Value::Object(existing)).with_context(|| format!("reading key {id}"))?;
+            self.cache(id, &record);
+            return Ok(Issued::Exists(self.get(id).context("existing key missing from cache")?));
+        }
+        let record = KeyRecord { api_key: Some(new_key()), ..template.clone() };
         // CAS against the version we saw (0 = new, or the revocation marker).
-        self.write(&id, &record, version).await?;
-        self.get(&id).context("issued key missing from cache")
+        self.write(id, &record, version).await?;
+        Ok(Issued::Created(self.get(id).context("issued key missing from cache")?))
     }
 
     /// Replace a key. The old key keeps working for `grace_secs`.
@@ -407,22 +471,50 @@ impl KeyManager {
 
     /// Write a revocation marker as the latest version and destroy the data
     /// of every earlier version. Metadata stays so versions never repeat.
-    pub async fn revoke(&self, client_id: &str) -> Result<()> {
-        let _writes = self.writes.lock().await;
-        let (record, version) = self.fetch(client_id).await?;
+    ///
+    /// A key that is already revoked or gone answers without an error, and
+    /// the destroy runs again: an earlier attempt may have written the marker
+    /// and failed before it. The answer is an error whenever a version may
+    /// still hold the key.
+    pub async fn revoke(&self, client_id: &str) -> Result<Revoked> {
+        let (policy, name) = client_id.split_once('/').with_context(|| format!("key id {client_id:?} must be <policy>/<name>"))?;
         let marker = KeyRecord {
-            api_key: None,
-            client_id: record.client_id,
-            policy: record.policy,
-            name: record.name,
+            client_id: client_id.to_string(),
+            policy: policy.to_string(),
+            name: name.to_string(),
             revoked: true,
             revoked_at: Some(Utc::now()),
             ..Default::default()
         };
-        let new_version = self.write(client_id, &marker, version).await?;
-        let old: Vec<u64> = (1..new_version).collect();
-        self.secrets.destroy_versions(&key_path(client_id), &old).await?;
-        Ok(())
+        let _writes = self.writes.lock().await;
+        match self.revoke_locked(&marker).await {
+            // Another instance changed the record after the read: look again.
+            Err(e) if e.is::<Conflict>() => self.revoke_locked(&marker).await,
+            result => result,
+        }
+    }
+
+    async fn revoke_locked(&self, marker: &KeyRecord) -> Result<Revoked> {
+        let id = &marker.client_id;
+        let path = key_path(id);
+        let (data, version) = self.secrets.get_versioned(&path).await?;
+        let Some(data) = data else {
+            // A deleted latest version keeps its data until destroyed, and so
+            // do the versions before it.
+            self.forget(id);
+            let all: Vec<u64> = (1..=version).collect();
+            self.secrets.destroy_versions(&path, &all).await?;
+            return Ok(Revoked::Absent);
+        };
+        let (answer, newest) = if is_revocation_marker(&data) {
+            self.cache(id, marker);
+            (Revoked::AlreadyRevoked, version)
+        } else {
+            (Revoked::Revoked, self.write(id, marker, version).await?)
+        };
+        let old: Vec<u64> = (1..newest).collect();
+        self.secrets.destroy_versions(&path, &old).await?;
+        Ok(answer)
     }
 
     async fn fetch(&self, client_id: &str) -> Result<(KeyRecord, u64)> {
@@ -438,13 +530,25 @@ impl KeyManager {
             _ => unreachable!("record serializes to an object"),
         };
         let version = self.secrets.put_cas(&key_path(client_id), data, cas).await?;
-        let mut st = self.state.write();
-        if let Some(old) = st.keys.remove(client_id) {
-            st.by_hash.retain(|_, id| id != client_id);
-            drop(old);
-        }
-        insert_entry(&mut st, client_id, record);
+        self.cache(client_id, record);
         Ok(version)
+    }
+
+    /// Replace what the cache knows about a key with what the vault holds.
+    fn cache(&self, client_id: &str, record: &KeyRecord) {
+        let mut st = self.state.write();
+        remove_entry(&mut st, client_id);
+        insert_entry(&mut st, client_id, record);
+    }
+
+    fn forget(&self, client_id: &str) {
+        remove_entry(&mut self.state.write(), client_id);
+    }
+}
+
+fn remove_entry(st: &mut State, client_id: &str) {
+    if st.keys.remove(client_id).is_some() {
+        st.by_hash.retain(|_, id| id != client_id);
     }
 }
 
@@ -559,9 +663,9 @@ mod tests {
         let (km, s) = manager().await;
         assert!(km.issue(IssueRequest { policy: "nope".into(), name: "a".into(), ..Default::default() }).await.is_err());
         let info = km.issue(IssueRequest { policy: "dev".into(), name: "devcontainer".into(), ..Default::default() }).await.unwrap();
-        assert_eq!(info.client_id, "dev/devcontainer");
-        assert_eq!(info.vault_path, "keys/dev/devcontainer");
-        assert!(km.issue(IssueRequest { policy: "dev".into(), name: "devcontainer".into(), ..Default::default() }).await.is_err());
+        assert!(matches!(info, Issued::Created(_)));
+        assert_eq!(info.info().client_id, "dev/devcontainer");
+        assert_eq!(info.info().vault_path, "keys/dev/devcontainer");
 
         let key = vault_key(&s, "dev/devcontainer").await;
         assert!(key.starts_with("xol_"));
@@ -589,10 +693,207 @@ mod tests {
         assert_eq!(marker["revoked"], true);
         assert!(marker.get("api_key").is_none());
         assert!(km.list().is_empty());
-        assert!(km.revoke("dev/devcontainer").await.is_err());
+        assert_eq!(km.revoke("dev/devcontainer").await.unwrap(), Revoked::AlreadyRevoked);
         // Re-issuing after revocation is allowed.
         km.issue(IssueRequest { policy: "dev".into(), name: "devcontainer".into(), ..Default::default() }).await.unwrap();
         assert!(km.delete_policy("dev").await.is_err(), "policy with keys can't be deleted");
+    }
+
+    fn req(name: &str) -> IssueRequest {
+        IssueRequest { policy: "dev".into(), name: name.into(), ..Default::default() }
+    }
+
+    async fn gated() -> (Arc<crate::secrets::testing::GatedStore>, Secrets, Arc<KeyManager>) {
+        let store = Arc::new(crate::secrets::testing::GatedStore::default());
+        let s: Secrets = store.clone();
+        let km = Arc::new(KeyManager::new(s.clone()));
+        km.put_policy(Policy { name: "dev".into(), providers: vec!["claude".into()], ..Default::default() }, &known(), &BTreeSet::new())
+            .await
+            .unwrap();
+        (store, s, km)
+    }
+
+    #[tokio::test]
+    async fn repeated_issue_reports_the_key_and_never_changes_it() {
+        let (km, s) = manager().await;
+        let first = km.issue(IssueRequest { description: "first".into(), ..req("a") }).await.unwrap();
+        let key = vault_key(&s, "dev/a").await;
+        let (record, version) = s.get_versioned("keys/dev/a").await.unwrap();
+
+        let again = km.issue(IssueRequest { description: "second".into(), ttl_secs: Some(60), ..req("a") }).await.unwrap();
+
+        assert_eq!(again, Issued::Exists(first.info().clone()), "reports the stored key, not the request");
+        assert_eq!(s.get_versioned("keys/dev/a").await.unwrap(), (record, version), "nothing written");
+        assert_eq!(vault_key(&s, "dev/a").await, key);
+        assert!(km.authenticate(&key).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn repeated_issue_reports_a_disabled_or_expired_key_as_it_is() {
+        let (km, s) = manager().await;
+        km.issue(req("a")).await.unwrap();
+        km.set_disabled("dev/a", true).await.unwrap();
+        let Issued::Exists(info) = km.issue(req("a")).await.unwrap() else { panic!("disabled key is not new") };
+        assert!(info.disabled);
+
+        km.issue(req("b")).await.unwrap();
+        let mut record = s.get("keys/dev/b").await.unwrap().unwrap();
+        record.insert("expires_at".into(), json!("2000-01-01T00:00:00Z"));
+        s.put("keys/dev/b", record).await.unwrap();
+        let Issued::Exists(info) = km.issue(req("b")).await.unwrap() else { panic!("expired key is not new") };
+        assert!(info.expires_at.is_some_and(|at| at < Utc::now()));
+    }
+
+    #[tokio::test]
+    async fn repeated_issue_refuses_a_record_it_cannot_read_and_leaves_it() {
+        let (km, s) = manager().await;
+        s.put("keys/dev/a", json!({"api_key": "xol_old"}).as_object().unwrap().clone()).await.unwrap();
+        assert!(km.issue(req("a")).await.is_err());
+        assert_eq!(vault_key(&s, "dev/a").await, "xol_old");
+    }
+
+    #[tokio::test]
+    async fn issue_after_a_lost_answer_finds_the_key_it_wrote() {
+        let (store, s, km) = gated().await;
+        store.lose_put_answer.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(km.issue(req("a")).await.is_err());
+        let key = vault_key(&s, "dev/a").await;
+
+        assert!(matches!(km.issue(req("a")).await.unwrap(), Issued::Exists(_)));
+        assert_eq!(vault_key(&s, "dev/a").await, key, "not rotated");
+        assert!(km.authenticate(&key).await.is_some(), "the answer also fills the cache");
+    }
+
+    #[tokio::test]
+    async fn issue_that_loses_a_race_with_another_instance_reports_exists() {
+        let (store, s, km) = gated().await;
+        let other = KeyManager::new(s.clone());
+        other.reload().await.unwrap();
+
+        // This instance has read version 0, and pauses before its write.
+        store.arm("put", "keys/dev/a");
+        let held = tokio::spawn({
+            let km = km.clone();
+            async move { km.issue(req("a")).await }
+        });
+        store.reached.notified().await;
+        assert!(matches!(other.issue(req("a")).await.unwrap(), Issued::Created(_)));
+        let winner = vault_key(&s, "dev/a").await;
+        store.release.notify_one();
+
+        assert!(matches!(held.await.unwrap().unwrap(), Issued::Exists(_)));
+        assert_eq!(vault_key(&s, "dev/a").await, winner, "the winner's key stays");
+        assert!(km.authenticate(&winner).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn issue_refuses_a_lifetime_it_cannot_compute() {
+        let (km, s) = manager().await;
+        for ttl in [i64::MAX, i64::MIN, i64::MAX / 1000 + 1] {
+            let e = km.issue(IssueRequest { ttl_secs: Some(ttl), ..req("a") }).await.unwrap_err();
+            assert!(e.is::<InvalidIssue>(), "{ttl}: {e:#}");
+        }
+        assert!(s.get("keys/dev/a").await.unwrap().is_none());
+        let issued = km.issue(req("a")).await.unwrap();
+        assert_eq!(issued.info().expires_at, None, "no lifetime means no expiry");
+    }
+
+    #[tokio::test]
+    async fn revoke_of_a_missing_key_is_safe_and_writes_nothing() {
+        let (store, s, km) = gated().await;
+        assert_eq!(km.revoke("dev/never").await.unwrap(), Revoked::Absent);
+        assert_eq!(s.get_versioned("keys/dev/never").await.unwrap(), (None, 0));
+        assert_eq!(*store.destroyed.lock(), vec![("keys/dev/never".to_string(), vec![])]);
+    }
+
+    #[tokio::test]
+    async fn revoke_of_a_deleted_record_destroys_what_it_kept() {
+        let (store, _s, km) = gated().await;
+        km.issue(req("a")).await.unwrap();
+        km.rotate("dev/a", 0).await.unwrap();
+        let key = vault_key(&_s, "dev/a").await;
+        // Deleted behind this instance's back: the cache still has the key.
+        store.soft_delete("keys/dev/a");
+        assert!(km.authenticate(&key).await.is_some());
+
+        assert_eq!(km.revoke("dev/a").await.unwrap(), Revoked::Absent);
+        assert_eq!(*store.destroyed.lock(), vec![("keys/dev/a".to_string(), vec![1, 2])]);
+        assert!(km.authenticate(&key).await.is_none(), "stops at once");
+    }
+
+    #[tokio::test]
+    async fn revoke_again_finishes_a_destroy_that_failed() {
+        let (store, s, km) = gated().await;
+        km.issue(req("a")).await.unwrap();
+        km.rotate("dev/a", 0).await.unwrap();
+        let key = vault_key(&s, "dev/a").await;
+
+        store.fail_destroys.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(km.revoke("dev/a").await.is_err(), "versions may still hold the key");
+        assert!(km.authenticate(&key).await.is_none(), "the marker already stopped the key");
+
+        store.fail_destroys.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(km.revoke("dev/a").await.unwrap(), Revoked::AlreadyRevoked);
+        assert_eq!(*store.destroyed.lock(), vec![("keys/dev/a".to_string(), vec![1, 2])], "every version before the marker");
+
+        assert_eq!(km.revoke("dev/a").await.unwrap(), Revoked::AlreadyRevoked);
+        assert!(s.get("keys/dev/a").await.unwrap().unwrap().get("api_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_after_a_lost_answer_stops_the_key_here() {
+        let (store, s, km) = gated().await;
+        km.issue(req("a")).await.unwrap();
+        let key = vault_key(&s, "dev/a").await;
+
+        store.lose_put_answer.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(km.revoke("dev/a").await.is_err());
+        assert!(km.authenticate(&key).await.is_some(), "this instance has not seen the marker yet");
+
+        assert_eq!(km.revoke("dev/a").await.unwrap(), Revoked::AlreadyRevoked);
+        assert!(km.authenticate(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_stops_a_key_another_instance_already_revoked() {
+        let (_store, s, km) = gated().await;
+        km.issue(req("a")).await.unwrap();
+        let key = vault_key(&s, "dev/a").await;
+        let other = KeyManager::new(s.clone());
+        other.reload().await.unwrap();
+        other.revoke("dev/a").await.unwrap();
+        assert!(km.authenticate(&key).await.is_some(), "not reloaded yet");
+
+        assert_eq!(km.revoke("dev/a").await.unwrap(), Revoked::AlreadyRevoked);
+        assert!(km.authenticate(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_that_loses_a_race_looks_again() {
+        let (store, s, km) = gated().await;
+        km.issue(req("a")).await.unwrap();
+        let other = KeyManager::new(s.clone());
+        other.reload().await.unwrap();
+
+        store.arm("put", "keys/dev/a");
+        let held = tokio::spawn({
+            let km = km.clone();
+            async move { km.revoke("dev/a").await }
+        });
+        store.reached.notified().await;
+        other.rotate("dev/a", 0).await.unwrap();
+        store.release.notify_one();
+
+        assert_eq!(held.await.unwrap().unwrap(), Revoked::Revoked, "the rotated key is revoked too");
+        assert!(s.get("keys/dev/a").await.unwrap().unwrap().get("api_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_removes_a_record_that_does_not_parse() {
+        let (km, s) = manager().await;
+        s.put("keys/dev/a", json!({"api_key": "xol_old"}).as_object().unwrap().clone()).await.unwrap();
+        assert_eq!(km.revoke("dev/a").await.unwrap(), Revoked::Revoked);
+        assert!(s.get("keys/dev/a").await.unwrap().unwrap().get("api_key").is_none());
     }
 
     #[tokio::test]

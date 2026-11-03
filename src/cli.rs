@@ -141,6 +141,7 @@ pub enum Command {
 pub enum KeysCmd {
     /// Issue a key into the vault at keys/<policy>/<name>. The key is never
     /// printed; the client reads it from the vault with its own Vault policy.
+    /// A name with a live key reports that it exists and changes nothing.
     Issue {
         #[arg(long)]
         policy: String,
@@ -161,6 +162,7 @@ pub enum KeysCmd {
         grace: Option<String>,
     },
     /// Revoke `<policy>/<name>`: writes a marker and destroys old versions.
+    /// Safe to repeat on a key that is already revoked or gone.
     Revoke {
         id: String,
     },
@@ -470,7 +472,7 @@ async fn keys(c: Client, cmd: KeysCmd) -> Result<()> {
             if c.json {
                 return c.print(v);
             }
-            println!("issued {}", v["client_id"].as_str().unwrap_or(""));
+            println!("{}", issue_summary(&v));
             println!("vault:  <mount>/<prefix>/{}  (field api_key)", v["vault_path"].as_str().unwrap_or(""));
             Ok(())
         }
@@ -501,9 +503,33 @@ async fn keys(c: Client, cmd: KeysCmd) -> Result<()> {
             let grace_secs = grace.as_deref().map(parse_duration).transpose()?.unwrap_or(0);
             c.print(c.post(&format!("{}/rotate", key_path(&id)?), json!({"grace_secs": grace_secs})).await?)
         }
-        KeysCmd::Revoke { id } => c.print(c.delete(&key_path(&id)?).await?),
+        KeysCmd::Revoke { id } => {
+            let v = c.delete(&key_path(&id)?).await?;
+            if c.json {
+                return c.print(v);
+            }
+            println!("{}", revoke_summary(&v));
+            Ok(())
+        }
         KeysCmd::Enable { id } => c.print(c.post(&format!("{}/enable", key_path(&id)?), json!({})).await?),
         KeysCmd::Disable { id } => c.print(c.post(&format!("{}/disable", key_path(&id)?), json!({})).await?),
+    }
+}
+
+fn issue_summary(v: &Value) -> String {
+    let id = v["client_id"].as_str().unwrap_or("");
+    match v["status"].as_str() {
+        Some("exists") => format!("exists {id}: a live key has this name, and it was not changed"),
+        _ => format!("issued {id}"),
+    }
+}
+
+fn revoke_summary(v: &Value) -> String {
+    let id = v["revoked"].as_str().unwrap_or("");
+    match v["status"].as_str() {
+        Some("already_revoked") => format!("already revoked {id}"),
+        Some("absent") => format!("no key {id}"),
+        _ => format!("revoked {id}"),
     }
 }
 
@@ -935,6 +961,18 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_answers_say_what_happened() {
+        assert_eq!(issue_summary(&json!({"client_id": "a/b", "status": "created"})), "issued a/b");
+        assert_eq!(
+            issue_summary(&json!({"client_id": "a/b", "status": "exists"})),
+            "exists a/b: a live key has this name, and it was not changed"
+        );
+        assert_eq!(revoke_summary(&json!({"revoked": "a/b", "status": "revoked"})), "revoked a/b");
+        assert_eq!(revoke_summary(&json!({"revoked": "a/b", "status": "already_revoked"})), "already revoked a/b");
+        assert_eq!(revoke_summary(&json!({"revoked": "a/b", "status": "absent"})), "no key a/b");
+    }
 
     #[test]
     fn unloaded_policies_become_warnings() {

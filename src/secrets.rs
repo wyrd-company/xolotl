@@ -129,6 +129,11 @@ pub mod testing {
     pub struct GatedStore {
         pub inner: MemoryStore,
         pub fail_writes: AtomicBool,
+        /// `put_cas` writes the value, then reports a failure, once.
+        pub lose_put_answer: AtomicBool,
+        pub fail_destroys: AtomicBool,
+        /// The versions of each accepted destroy.
+        pub destroyed: Mutex<Vec<(String, Vec<u64>)>>,
         gate: Mutex<Option<(&'static str, String)>>,
         /// Notified when the armed operation is reached (and paused).
         pub reached: tokio::sync::Notify,
@@ -140,6 +145,13 @@ pub mod testing {
         /// Pause the next `op` (`"get"`, `"got"` or `"put"`) on `key`.
         pub fn arm(&self, op: &'static str, key: &str) {
             *self.gate.lock() = Some((op, key.to_string()));
+        }
+
+        /// Delete the latest version the way the vault does: its number stays.
+        pub fn soft_delete(&self, key: &str) {
+            if let Some(entry) = self.inner.data.lock().get_mut(key) {
+                entry.1 = None;
+            }
         }
 
         pub fn set_fail_writes(&self, fail: bool) {
@@ -193,9 +205,13 @@ pub mod testing {
         async fn put_cas(&self, key: &str, data: Map<String, Value>, cas: u64) -> Result<u64> {
             self.pass("put", key).await;
             self.writable()?;
-            self.inner.put_cas(key, data, cas).await
+            let version = self.inner.put_cas(key, data, cas).await?;
+            anyhow::ensure!(!self.lose_put_answer.swap(false, Ordering::SeqCst), "connection lost");
+            Ok(version)
         }
         async fn destroy_versions(&self, key: &str, versions: &[u64]) -> Result<()> {
+            anyhow::ensure!(!self.fail_destroys.load(Ordering::SeqCst), "vault unavailable");
+            self.destroyed.lock().push((key.to_string(), versions.to_vec()));
             self.inner.destroy_versions(key, versions).await
         }
     }

@@ -50,7 +50,9 @@ export function KeysPage() {
       {issued && (
         <Card role="status" aria-label="Issued" className="border-success/30 bg-success-muted gap-3">
           <CardHeader>
-            <CardTitle className="text-success text-base">Issued {issued.client_id}</CardTitle>
+            <CardTitle className="text-success text-base">
+              {issued.status === "exists" ? "Exists" : "Issued"} {issued.client_id}
+            </CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-2 text-sm">
             <div>The client reads it with:</div>
@@ -106,6 +108,7 @@ function IssueKey({ onIssued }: { onIssued: (k: KeyInfo) => void }) {
     () => post<KeyInfo>("/admin/keys", { policy, name: name.trim(), description: description.trim(), ttl_secs: TTLS[Number(ttl)][1] }),
     {
       invalidate: [["keys"]],
+      success: (k) => (k.status === "exists" ? `${k.client_id} already has a live key. It was not changed.` : ""),
       onSuccess: (k) => {
         onIssued(k);
         setName("");

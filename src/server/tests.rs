@@ -131,7 +131,8 @@ impl Harness {
     async fn key(&self, p: Policy) -> String {
         let name = p.name.clone();
         self.state.keys.put_policy(p, &self.state.catalog.known_providers(), &self.state.mcp.server_names()).await.unwrap();
-        let info = self.state.keys.issue(IssueRequest { policy: name, name: "client".into(), ..Default::default() }).await.unwrap();
+        let issued = self.state.keys.issue(IssueRequest { policy: name, name: "client".into(), ..Default::default() }).await.unwrap();
+        let info = issued.info();
         let rec = self.state.secrets.get(&info.vault_path).await.unwrap().unwrap();
         rec["api_key"].as_str().unwrap().to_string()
     }
@@ -165,6 +166,73 @@ async fn health_and_auth() {
     let proxy_key = h.key(policy("p")).await;
     assert_eq!(h.call("GET", "/admin/keys", Some(&proxy_key), None).await.0, 403);
     assert_eq!(h.call("GET", "/v0/management/auth-files", Some(&proxy_key), None).await.0, 401);
+}
+
+#[tokio::test]
+async fn repeating_issue_and_revoke_is_safe_over_http() {
+    let h = harness().await;
+    h.state.keys.put_policy(policy("dev"), &h.state.catalog.known_providers(), &h.state.mcp.server_names()).await.unwrap();
+    let issue = json!({"policy": "dev", "name": "a"});
+
+    let (status, first) = h.call("POST", "/admin/keys", Some(&h.admin), Some(issue.clone())).await;
+    assert_eq!((status, first["status"].as_str()), (201, Some("created")), "{first}");
+    let key = h.state.secrets.get("keys/dev/a").await.unwrap().unwrap()["api_key"].as_str().unwrap().to_string();
+
+    let (status, again) = h.call("POST", "/admin/keys", Some(&h.admin), Some(issue.clone())).await;
+    assert_eq!((status, again["status"].as_str()), (200, Some("exists")), "{again}");
+    assert_eq!(again["vault_path"], "keys/dev/a");
+    assert!(again.get("api_key").is_none());
+    assert!(!again.to_string().contains(&key), "no key material in the answer");
+    assert!(h.state.keys.authenticate(&key).await.is_some(), "not rotated");
+
+    let (status, gone) = h.call("DELETE", "/admin/keys/dev/a", Some(&h.admin), None).await;
+    assert_eq!((status, gone["status"].as_str(), gone["revoked"].as_str()), (200, Some("revoked"), Some("dev/a")));
+    let (status, again) = h.call("DELETE", "/admin/keys/dev/a", Some(&h.admin), None).await;
+    assert_eq!((status, again["status"].as_str()), (200, Some("already_revoked")));
+    let (status, missing) = h.call("DELETE", "/admin/keys/dev/never", Some(&h.admin), None).await;
+    assert_eq!((status, missing["status"].as_str()), (200, Some("absent")));
+
+    let (status, reissued) = h.call("POST", "/admin/keys", Some(&h.admin), Some(issue)).await;
+    assert_eq!((status, reissued["status"].as_str()), (201, Some("created")), "a revoked name can be issued again");
+}
+
+#[tokio::test]
+async fn invalid_issues_are_refused_and_vault_failures_are_not_blamed_on_the_request() {
+    let store = Arc::new(crate::secrets::testing::GatedStore::default());
+    let h = harness_with_secrets(|_| {}, store.clone()).await;
+    h.state.keys.put_policy(policy("dev"), &h.state.catalog.known_providers(), &h.state.mcp.server_names()).await.unwrap();
+
+    for bad in [
+        json!({"policy": "nope", "name": "a"}),
+        json!({"policy": "dev", "name": "A/b"}),
+        json!({"policy": "dev", "name": "a", "ttl_secs": i64::MAX}),
+    ] {
+        assert_eq!(h.call("POST", "/admin/keys", Some(&h.admin), Some(bad.clone())).await.0, 400, "{bad}");
+    }
+
+    store.set_fail_writes(true);
+    assert_eq!(h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "dev", "name": "a"}))).await.0, 500);
+    store.set_fail_writes(false);
+    assert_eq!(h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "dev", "name": "a"}))).await.0, 201);
+
+    store.fail_destroys.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(h.call("DELETE", "/admin/keys/dev/a", Some(&h.admin), None).await.0, 500, "versions may still hold the key");
+}
+
+#[tokio::test]
+async fn key_routes_refuse_a_name_that_leaves_the_vault_path() {
+    let h = harness().await;
+    h.state.keys.put_policy(policy("dev"), &h.state.catalog.known_providers(), &h.state.mcp.server_names()).await.unwrap();
+    for (method, uri) in [
+        ("DELETE", "/admin/keys/dev/..%2F..%2Fadmin"),
+        ("DELETE", "/admin/keys/..%2F..%2Fadmin/x"),
+        ("DELETE", "/admin/keys/dev/a%3Fversion=1"),
+        ("POST", "/admin/keys/dev/..%2F..%2Fadmin/disable"),
+        ("POST", "/admin/keys/dev/..%2F..%2Fadmin/enable"),
+        ("POST", "/admin/keys/dev/..%2F..%2Fadmin/rotate"),
+    ] {
+        assert_eq!(h.call(method, uri, Some(&h.admin), None).await.0, 400, "{method} {uri}");
+    }
 }
 
 #[tokio::test]
@@ -809,7 +877,8 @@ async fn admin_policies_keys_and_accounts() {
     // Keys: issued into the vault, never returned.
     let (status, issued) =
         h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "dev", "name": "laptop", "ttl_secs": 3600}))).await;
-    assert_eq!(status, 200, "{issued}");
+    assert_eq!(status, 201, "{issued}");
+    assert_eq!(issued["status"], "created");
     assert!(issued.get("api_key").is_none());
     assert_eq!(issued["vault_path"], "keys/dev/laptop");
     let key = h.state.secrets.get("keys/dev/laptop").await.unwrap().unwrap()["api_key"].as_str().unwrap().to_string();
@@ -819,7 +888,6 @@ async fn admin_policies_keys_and_accounts() {
     assert_eq!(h.call("POST", "/admin/keys/dev/laptop/rotate", Some(&h.admin), Some(json!({"grace_secs": 0}))).await.0, 200);
     assert!(h.state.keys.authenticate(&key).await.is_none());
     assert_eq!(h.call("DELETE", "/admin/keys/dev/laptop", Some(&h.admin), None).await.0, 200);
-    assert_eq!(h.call("DELETE", "/admin/keys/dev/laptop", Some(&h.admin), None).await.0, 404);
     assert_eq!(h.call("DELETE", "/admin/policies/dev", Some(&h.admin), None).await.0, 200);
 
     // API-key account import and listing.
