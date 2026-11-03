@@ -7,6 +7,7 @@ assets:
   - assets/favicon.svg
   - assets/social.png
   - assets/usage-sessions.png
+  - assets/policy-no-accounts.png
 products:
   xolotl:
     name: xolotl

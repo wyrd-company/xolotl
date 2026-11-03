@@ -116,6 +116,8 @@ claude = ["*"]                                    # every account, also new ones
   listed accounts are disabled, cooling down or at a limit, the pool answers
   as it does for a pool with no usable accounts.
 
+![The policy editor warning under claude, which has an account that is not checked](assets/policy-no-accounts.png)
+
 ### Policies from before 0.4.0
 
 Version 0.4.0 replaced `allow_models` and `deny_models` with `rules`, and added
