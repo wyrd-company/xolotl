@@ -107,6 +107,52 @@ claude = ["*"]                                    # every account, also new ones
   listed accounts are disabled, cooling down or at a limit, the pool answers
   as it does for a pool with no usable accounts.
 
+### Policies from before 0.4.0
+
+Version 0.4.0 replaced `allow_models` and `deny_models` with `rules`, and added
+`accounts`. Xolotl migrates a stored policy that has either old field each time
+it loads the policy, with the same effect:
+
+- Each `deny_models` glob becomes a `deny` rule, followed by each
+  `allow_models` glob as an `allow` rule.
+- `deny_other_models` is `true` when `allow_models` had entries.
+- `accounts` gets `["*"]` for each subscription provider the policy allows.
+
+The migration is in memory, and Xolotl logs it once per policy. The record in
+OpenBao stays as it is until you save the policy, so `xolotl policies get` shows
+the migrated form and OpenBao shows the old one. To store the migrated form, save
+the policy in the web UI, or with `xolotl policies get` and `xolotl policies put`.
+A version before 0.4.0 can't read a policy saved this way.
+
+Xolotl can't tell a policy from before 0.4.0 that has neither old field from a
+current policy that uses no accounts, so it leaves that policy as it is, and it
+loses its subscription accounts in the upgrade. Its keys still work for gateway
+providers, and get a 403 from each subscription provider. To restore access,
+add `accounts` and save the policy:
+
+```sh
+xolotl policies get devcontainer > devcontainer.json
+# Add, for each subscription provider the policy uses:
+#   "accounts": { "claude": ["*"], "codex": ["*"] }
+xolotl policies put devcontainer.json
+```
+
+`xolotl policies put` and `PUT /admin/policies/{name}` take the current fields
+only. Rewrite an old policy file before you save it.
+
+### Policies that do not load
+
+A stored policy that Xolotl can't read or parse is not in use. Its keys get a
+`401 invalid API key`, and Xolotl logs the client and the policy at warn level
+for each refused request. The policy shows up:
+
+- as a warning from `xolotl policies list`, on stderr
+- with its error from `xolotl policies get <name>` and `xolotl policies view <name>`
+- in `unloaded_policies` of `GET /admin/status`
+- under **Needs action** on the web UI's Overview page, and on its Policies page
+
+To repair it, save a valid policy with the same name.
+
 ## Model names
 
 A client sends a model name. The policy turns it into one or more targets

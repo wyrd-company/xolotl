@@ -68,8 +68,10 @@ screen after sign-in and can be reached with Tab and opened with Enter.
 
 ### Overview
 
-**Needs action** lists enabled accounts whose credentials were refused, plus
-OpenBao and SQLite failures. Account actions open that account's details.
+**Needs action** lists enabled accounts whose credentials were refused, stored
+policies that did not load, plus OpenBao and SQLite failures. Account actions
+open that account's details. See
+[Policies that do not load](policies-and-keys#policies-that-do-not-load).
 Cooling accounts and credentials waiting to save appear under **Health**;
 xolotl retries saving refreshed credentials.
 

@@ -58,7 +58,7 @@ See [Subscription accounts](accounts).
 
 | Command | Does |
 |---|---|
-| `xolotl policies list` | Policies with providers and scopes |
+| `xolotl policies list` | Policies with providers and scopes, and a warning on stderr for each stored policy that did not load |
 | `xolotl policies get <name>` | One policy as JSON |
 | `xolotl policies put <file>` | Create or replace a policy from a TOML or JSON file |
 | `xolotl policies view <name>` | The names a key sees, where they route, their endpoints, and the MCP tools |
