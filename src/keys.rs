@@ -10,7 +10,7 @@
 //! revoked elsewhere. Revocation writes a marker as the latest version and
 //! destroys every earlier version's data.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -127,9 +127,21 @@ struct Entry {
     previous: Option<(String, DateTime<Utc>)>,
 }
 
+/// A stored policy that did not load, and why. Its keys get 401 until a
+/// valid version is saved.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UnloadedPolicy {
+    pub name: String,
+    pub error: String,
+}
+
 #[derive(Default)]
 struct State {
     policies: HashMap<String, Arc<Policy>>,
+    /// Stored policies that did not load: name -> why.
+    unloaded: BTreeMap<String, String>,
+    /// Stored policies in use after migrating them in memory; each is logged once.
+    migrated: BTreeSet<String>,
     keys: HashMap<String, Entry>,
     /// key hash -> client id (current and in-grace previous hashes).
     by_hash: HashMap<String, String>,
@@ -173,15 +185,31 @@ impl KeyManager {
                 continue;
             }
             match self.secrets.get(&format!("policies/{name}")).await {
-                Ok(Some(m)) => match serde_json::from_value::<Policy>(Value::Object(m)) {
-                    Ok(mut p) => {
-                        p.normalize();
+                Ok(Some(m)) => match crate::policy::from_stored(m) {
+                    Ok((p, upgraded)) => {
+                        if upgraded {
+                            if !self.state.read().migrated.contains(&name) {
+                                tracing::warn!(
+                                    policy = %name,
+                                    rules = p.rules.len(),
+                                    accounts = ?p.accounts,
+                                    "using a policy from before 0.4.0, migrated in memory: allow_models and deny_models are now rules, with accounts for its subscription providers. Save the policy to store this form"
+                                );
+                            }
+                            fresh.migrated.insert(name.clone());
+                        }
                         fresh.policies.insert(p.name.clone(), Arc::new(p));
                     }
-                    Err(e) => tracing::warn!(policy = %name, error = %e, "skipping invalid policy"),
+                    Err(e) => {
+                        tracing::warn!(policy = %name, error = %e, "skipping invalid policy");
+                        fresh.unloaded.insert(name, format!("{e:#}"));
+                    }
                 },
                 Ok(None) => {}
-                Err(e) => tracing::warn!(policy = %name, error = %e, "skipping unreadable policy"),
+                Err(e) => {
+                    tracing::warn!(policy = %name, error = %e, "skipping unreadable policy");
+                    fresh.unloaded.insert(name, format!("{e:#}"));
+                }
             }
         }
         for dir in self.secrets.list("keys").await? {
@@ -256,7 +284,10 @@ impl KeyManager {
             return None;
         }
         // Keys whose policy is missing fail closed.
-        let policy = st.policies.get(&e.info.policy)?.clone();
+        let Some(policy) = st.policies.get(&e.info.policy).cloned() else {
+            tracing::warn!(client = %id, policy = %e.info.policy, "refusing a valid key: its policy is not loaded");
+            return None;
+        };
         Some(Principal { client_id: Some(id.clone()), policy })
     }
 
@@ -272,6 +303,16 @@ impl KeyManager {
         self.state.read().policies.get(name).cloned()
     }
 
+    /// Stored policies that did not load, by name.
+    pub fn unloaded_policies(&self) -> Vec<UnloadedPolicy> {
+        self.state.read().unloaded.iter().map(|(name, error)| UnloadedPolicy { name: name.clone(), error: error.clone() }).collect()
+    }
+
+    /// Why a stored policy did not load.
+    pub fn unloaded_policy(&self, name: &str) -> Option<String> {
+        self.state.read().unloaded.get(name).cloned()
+    }
+
     pub async fn put_policy(&self, mut policy: Policy, known: &BTreeSet<String>, mcp: &BTreeSet<String>) -> Result<Arc<Policy>> {
         policy.normalize();
         policy.validate(known, mcp)?;
@@ -282,7 +323,9 @@ impl KeyManager {
         };
         self.secrets.put(&format!("policies/{}", policy.name), data).await?;
         let p = Arc::new(policy);
-        self.state.write().policies.insert(p.name.clone(), p.clone());
+        let mut st = self.state.write();
+        st.unloaded.remove(&p.name);
+        st.policies.insert(p.name.clone(), p.clone());
         Ok(p)
     }
 
@@ -291,7 +334,9 @@ impl KeyManager {
         let in_use = self.state.read().keys.values().any(|e| !e.revoked && e.info.policy == name);
         anyhow::ensure!(!in_use, "policy {name} still has keys; revoke them first");
         self.secrets.delete(&format!("policies/{name}")).await?;
-        self.state.write().policies.remove(name);
+        let mut st = self.state.write();
+        st.unloaded.remove(name);
+        st.policies.remove(name);
         Ok(())
     }
 
@@ -638,6 +683,149 @@ mod tests {
         delete.await.unwrap().unwrap();
         assert!(issue.await.unwrap().is_err(), "no key is issued under a deleted policy");
         assert!(s.get("keys/dev/a").await.unwrap().is_none());
+    }
+
+    /// A policy record exactly as a version before 0.4.0 stored it.
+    fn legacy_record(name: &str) -> serde_json::Map<String, Value> {
+        json!({
+            "name": name,
+            "providers": ["claude", "codex", "vercel"],
+            "allow_models": ["claude-*", "gpt-*"],
+            "deny_models": ["claude-opus-*"],
+            "scopes": ["proxy"],
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    /// A key under `dev`, whose stored policy is then replaced by `record`.
+    async fn key_under_stored(km: &KeyManager, s: &Secrets, record: serde_json::Map<String, Value>) -> String {
+        km.issue(IssueRequest { policy: "dev".into(), name: "a".into(), ..Default::default() }).await.unwrap();
+        s.put("policies/dev", record).await.unwrap();
+        vault_key(s, "dev/a").await
+    }
+
+    #[tokio::test]
+    async fn reload_migrates_an_old_policy_without_writing_it() {
+        let (km, s) = manager().await;
+        let record = legacy_record("dev");
+        let key = key_under_stored(&km, &s, record.clone()).await;
+        let version = s.get_versioned("policies/dev").await.unwrap().1;
+        km.reload().await.unwrap();
+
+        let p = km.authenticate(&key).await.expect("the key keeps working").policy;
+        assert!(p.allows_model("claude", "claude-haiku-5-5"));
+        assert!(!p.allows_model("claude", "claude-opus-5"), "deny still wins");
+        assert!(!p.allows_model("vercel", "kimi-k3"), "still outside the allow list");
+        assert!(p.allows_account("claude", "claude-a1") && p.allows_account("codex", "codex-a1"), "every account, as before");
+        assert!(km.unloaded_policies().is_empty());
+
+        // A reload that wrote could restore a stale record over one that another
+        // instance deleted and recreated: their version numbers can be the same.
+        let (stored, after) = s.get_versioned("policies/dev").await.unwrap();
+        assert_eq!((stored.unwrap(), after), (record, version), "the record stays as it is");
+
+        km.reload().await.unwrap();
+        assert!(km.authenticate(&key).await.is_some(), "and every later reload migrates it again");
+    }
+
+    #[tokio::test]
+    async fn saving_a_migrated_policy_stores_the_current_form() {
+        let (km, s) = manager().await;
+        let key = key_under_stored(&km, &s, legacy_record("dev")).await;
+        km.reload().await.unwrap();
+        let migrated = km.policy("dev").unwrap().as_ref().clone();
+        km.put_policy(migrated.clone(), &["claude", "codex", "vercel"].iter().map(|p| p.to_string()).collect(), &BTreeSet::new())
+            .await
+            .unwrap();
+
+        let stored = s.get("policies/dev").await.unwrap().unwrap();
+        assert!(!stored.contains_key("allow_models") && !stored.contains_key("deny_models"));
+        let parsed: Policy = serde_json::from_value(Value::Object(stored)).unwrap();
+        assert_eq!(parsed, migrated);
+        km.reload().await.unwrap();
+        assert!(km.state.read().migrated.is_empty(), "no longer migrated on load");
+        assert_eq!(km.authenticate(&key).await.unwrap().policy.as_ref(), &migrated, "same effect");
+    }
+
+    #[tokio::test]
+    async fn a_current_policy_without_accounts_keeps_none() {
+        let (km, s) = manager().await;
+        let record = json!({"name": "dev", "providers": ["*"], "scopes": ["proxy"]}).as_object().unwrap().clone();
+        let key = key_under_stored(&km, &s, record.clone()).await;
+        km.reload().await.unwrap();
+        let p = km.authenticate(&key).await.unwrap().policy;
+        assert!(!p.allows_account("claude", "claude-a1"), "not widened");
+        assert_eq!(s.get("policies/dev").await.unwrap().unwrap(), record, "not rewritten");
+    }
+
+    #[tokio::test]
+    async fn a_policy_that_does_not_load_is_reported_until_it_is_replaced() {
+        let (km, s) = manager().await;
+        let mut bad = legacy_record("dev");
+        bad.insert("rules".into(), json!([]));
+        let key = key_under_stored(&km, &s, bad.clone()).await;
+        s.put("policies/typo", json!({"name": "typo", "providerz": []}).as_object().unwrap().clone()).await.unwrap();
+        km.reload().await.unwrap();
+
+        assert!(km.policy("dev").is_none() && km.authenticate(&key).await.is_none(), "fails closed");
+        let unloaded = km.unloaded_policies();
+        assert_eq!(unloaded.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["dev", "typo"]);
+        assert!(unloaded[0].error.contains("can't be combined with rules"), "{}", unloaded[0].error);
+        assert!(unloaded[1].error.contains("providerz"), "{}", unloaded[1].error);
+        assert_eq!(s.get("policies/dev").await.unwrap().unwrap(), bad, "an invalid record is left as it is");
+
+        // Replacing or deleting one clears it at once, without a reload.
+        km.put_policy(Policy { name: "dev".into(), providers: vec!["claude".into()], ..Default::default() }, &known(), &BTreeSet::new())
+            .await
+            .unwrap();
+        assert!(km.authenticate(&key).await.is_some());
+        km.delete_policy("typo").await.unwrap();
+        assert!(km.unloaded_policies().is_empty());
+
+        // A later reload finds it again if the record is still bad.
+        s.put("policies/dev", bad).await.unwrap();
+        km.reload().await.unwrap();
+        assert_eq!(km.unloaded_policy("dev").as_deref().map(|e| e.contains("rules")), Some(true));
+        s.put("policies/dev", legacy_record("dev")).await.unwrap();
+        km.reload().await.unwrap();
+        assert!(km.unloaded_policies().is_empty(), "a repair in the vault clears it at the next reload");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_policy_is_reported() {
+        struct Unreadable(MemoryStore);
+        #[async_trait::async_trait]
+        impl crate::secrets::SecretStore for Unreadable {
+            async fn get(&self, key: &str) -> Result<Option<serde_json::Map<String, Value>>> {
+                anyhow::ensure!(key != "policies/dev", "vault read denied");
+                self.0.get(key).await
+            }
+            async fn put(&self, key: &str, data: serde_json::Map<String, Value>) -> Result<()> {
+                self.0.put(key, data).await
+            }
+            async fn delete(&self, key: &str) -> Result<()> {
+                self.0.delete(key).await
+            }
+            async fn list(&self, dir: &str) -> Result<Vec<String>> {
+                self.0.list(dir).await
+            }
+            async fn get_versioned(&self, key: &str) -> Result<(Option<serde_json::Map<String, Value>>, u64)> {
+                self.0.get_versioned(key).await
+            }
+            async fn put_cas(&self, key: &str, data: serde_json::Map<String, Value>, cas: u64) -> Result<u64> {
+                self.0.put_cas(key, data, cas).await
+            }
+            async fn destroy_versions(&self, key: &str, versions: &[u64]) -> Result<()> {
+                self.0.destroy_versions(key, versions).await
+            }
+        }
+        let s: Secrets = Arc::new(Unreadable(MemoryStore::default()));
+        s.put("policies/dev", legacy_record("dev")).await.unwrap();
+        let km = KeyManager::new(s);
+        km.reload().await.unwrap();
+        assert_eq!(km.unloaded_policy("dev").as_deref(), Some("vault read denied"));
     }
 
     #[tokio::test]

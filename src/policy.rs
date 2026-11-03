@@ -17,11 +17,15 @@
 //! Whether a model is allowed: the first matching entry of `rules` decides,
 //! else the model's `models` switch; a model with neither is allowed unless
 //! `deny_other_models` is set.
+//!
+//! [`from_stored`] reads a stored policy and brings one written before 0.4.0
+//! to this format with the same effect.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::keys::{Scope, glob_match};
 use crate::limits::Limits;
@@ -214,6 +218,64 @@ fn valid_name(name: &str) -> bool {
         && b.len() <= 63
         && b[0].is_ascii_alphanumeric()
         && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
+}
+
+/// Read a stored policy. The flag says whether it was in the format before
+/// 0.4.0, and so differs from what is stored. The record is not rewritten: a
+/// write here could restore it over a newer one, and only saving the policy
+/// through [`crate::keys::KeyManager::put_policy`] stores the current form.
+pub fn from_stored(mut stored: Map<String, Value>) -> Result<(Policy, bool)> {
+    let upgraded = upgrade_stored(&mut stored)?;
+    let mut policy: Policy = serde_json::from_value(Value::Object(stored))?;
+    policy.normalize();
+    Ok((policy, upgraded))
+}
+
+/// Rewrite a record that has `allow_models` or `deny_models`, the fields that
+/// `rules` replaced in 0.4.0, keeping what it meant then:
+///
+/// - A deny glob won over an allow glob, so denies come first under
+///   first-match-wins.
+/// - A model no glob matched was denied only when the allow list had entries.
+/// - Every account of a pool served every policy that allowed its provider.
+///
+/// Those fields prove the record predates `accounts`. A record without them
+/// proves nothing: no `accounts` is also how a current policy says "no
+/// accounts", and granting them here would widen its access.
+fn upgrade_stored(stored: &mut Map<String, Value>) -> Result<bool> {
+    if !stored.contains_key("allow_models") && !stored.contains_key("deny_models") {
+        return Ok(false);
+    }
+    // No release wrote these next to the old fields, so there is no earlier meaning to keep.
+    for field in ["rules", "models", "deny_other_models"] {
+        anyhow::ensure!(!stored.contains_key(field), "allow_models and deny_models can't be combined with {field}");
+    }
+    let mut globs = |field: &str| -> Result<Vec<String>> {
+        let Some(value) = stored.remove(field) else { return Ok(Vec::new()) };
+        let list: Vec<String> = serde_json::from_value(value).with_context(|| field.to_string())?;
+        // As the normalizing of these fields did: a blank glob is no glob.
+        Ok(list.iter().map(|g| g.trim()).filter(|g| !g.is_empty()).map(str::to_string).collect())
+    };
+    let deny = globs("deny_models")?;
+    let allow = globs("allow_models")?;
+    if !allow.is_empty() {
+        stored.insert("deny_other_models".into(), Value::Bool(true));
+    }
+    let rules: Vec<Rule> = deny.into_iter().map(Rule::Deny).chain(allow.into_iter().map(Rule::Allow)).collect();
+    stored.insert("rules".into(), serde_json::to_value(rules)?);
+    if !stored.contains_key("accounts") {
+        let providers: Vec<String> = stored.get("providers").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+        let providers: Vec<String> = providers.iter().map(|p| p.trim().to_ascii_lowercase()).collect();
+        let every = vec![Value::String("*".into())];
+        let accounts: Map<String, Value> = crate::subscription::SubProvider::ALL
+            .into_iter()
+            .map(|p| p.as_str())
+            .filter(|p| providers.iter().any(|allowed| allowed == "*" || allowed == p))
+            .map(|p| (p.to_string(), Value::Array(every.clone())))
+            .collect();
+        stored.insert("accounts".into(), Value::Object(accounts));
+    }
+    Ok(true)
 }
 
 impl Policy {
@@ -507,7 +569,10 @@ impl View {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::subscription::SubProvider;
 
     fn catalog() -> Catalog {
         let mut c = Catalog::new();
@@ -714,6 +779,124 @@ mod tests {
         let mut p = rename(" claude/claude-opus-5 ", "  ");
         p.normalize();
         assert!(p.renames.is_empty(), "a blank name removes the rename");
+    }
+
+    /// How 0.3.0 decided a model: `model_rule` at the commit before `rules`.
+    fn decided_before_rules(allow: &[&str], deny: &[&str], provider: &str, model: &str) -> bool {
+        let qualified = format!("{provider}/{model}");
+        let hit = |patterns: &[&str]| patterns.iter().any(|p| glob_match(p, model) || glob_match(p, &qualified));
+        if hit(deny) {
+            return false;
+        }
+        hit(allow) || allow.is_empty()
+    }
+
+    fn stored(value: serde_json::Value) -> Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn an_old_policy_decides_every_model_as_it_did() {
+        let lists: &[&[&str]] = &[
+            &[],
+            &["*"],
+            &["claude-*"],
+            &["claude-*", "kimi-*"],
+            &["claude/claude-opus-5"],
+            &["vercel/*/gpt-*"],
+            &["openai/gpt-6"],
+            &["kimi-k3", "claude-opus-*"],
+        ];
+        let models = [
+            ("claude", "claude-opus-5"),
+            ("claude", "claude-haiku-5-5"),
+            ("opencode-go", "claude-haiku-5-5"),
+            ("opencode-go", "kimi-k3"),
+            ("vercel", "kimi-k3"),
+            ("vercel", "openai/gpt-6"),
+            ("codex", "gpt-6-codex"),
+        ];
+        let mut denied = 0;
+        for allow in lists {
+            for deny in lists {
+                let (p, upgraded) =
+                    from_stored(stored(json!({"name": "a", "providers": ["*"], "allow_models": allow, "deny_models": deny}))).unwrap();
+                assert!(upgraded);
+                for (provider, model) in models {
+                    let before = decided_before_rules(allow, deny, provider, model);
+                    denied += usize::from(!before);
+                    assert_eq!(p.allows_model(provider, model), before, "allow {allow:?} deny {deny:?}: {provider}/{model}");
+                }
+            }
+        }
+        assert!(denied > 0 && denied < lists.len() * lists.len() * models.len(), "the corpus decides both ways");
+    }
+
+    #[test]
+    fn an_old_policy_is_rewritten_deny_first() {
+        let (p, _) = from_stored(stored(json!({
+            "name": "a", "providers": ["claude"], "allow_models": ["claude-*"], "deny_models": ["claude-opus-*"],
+        })))
+        .unwrap();
+        assert_eq!(p.rules, vec![Rule::Deny("claude-opus-*".into()), Rule::Allow("claude-*".into())]);
+        assert!(p.deny_other_models);
+
+        let (p, _) = from_stored(stored(json!({"name": "a", "providers": ["claude"], "deny_models": ["claude-opus-*"]}))).unwrap();
+        assert_eq!(p.rules, vec![Rule::Deny("claude-opus-*".into())]);
+        assert!(!p.deny_other_models, "no allow list: everything else stays allowed");
+
+        let (p, _) = from_stored(stored(json!({"name": "a", "providers": ["claude"], "allow_models": [" ", ""]}))).unwrap();
+        assert!(p.rules.is_empty());
+        assert!(!p.deny_other_models, "a list of blanks was an empty list");
+    }
+
+    #[test]
+    fn an_old_policy_gets_every_account_of_its_subscription_providers() {
+        let accounts = |record: serde_json::Value| from_stored(stored(record)).unwrap().0.accounts;
+        let every = vec!["*".to_string()];
+        assert_eq!(
+            accounts(json!({"name": "a", "providers": [" Claude ", "codex", "vercel"], "deny_models": ["x"]})),
+            BTreeMap::from([("claude".to_string(), every.clone()), ("codex".to_string(), every.clone())]),
+            "only subscription providers it allows"
+        );
+        assert_eq!(accounts(json!({"name": "a", "providers": ["*"], "allow_models": []})).len(), SubProvider::ALL.len());
+        assert!(accounts(json!({"name": "a", "providers": ["vercel"], "deny_models": ["x"]})).is_empty());
+        assert_eq!(
+            accounts(json!({"name": "a", "providers": ["claude"], "deny_models": ["x"], "accounts": {"claude": ["claude-a1"]}})),
+            BTreeMap::from([("claude".to_string(), vec!["claude-a1".to_string()])]),
+            "accounts it names stay"
+        );
+    }
+
+    #[test]
+    fn a_migrated_policy_passes_validation() {
+        let (p, _) = from_stored(stored(json!({"name": "a", "providers": ["claude", "vercel"], "deny_models": ["x"]}))).unwrap();
+        p.validate(&known(), &BTreeSet::new()).unwrap();
+    }
+
+    #[test]
+    fn a_current_policy_is_read_as_it_is() {
+        let record = json!({"name": "a", "providers": ["*"], "rules": [{"allow": "x"}], "deny_other_models": true});
+        let (p, upgraded) = from_stored(stored(record)).unwrap();
+        assert!(!upgraded);
+        assert!(p.accounts.is_empty(), "no accounts stays no accounts");
+        assert_eq!(p.rules, vec![Rule::Allow("x".into())]);
+    }
+
+    #[test]
+    fn a_record_that_is_not_an_old_policy_is_refused() {
+        for (record, why) in [
+            (json!({"name": "a", "deny_models": ["x"], "rules": []}), "combined with rules"),
+            (json!({"name": "a", "deny_models": ["x"], "models": {}}), "combined with models"),
+            (json!({"name": "a", "deny_models": ["x"], "deny_other_models": false}), "combined with deny_other_models"),
+            (json!({"name": "a", "allow_models": "x"}), "allow_models"),
+            (json!({"name": "a", "deny_models": [1]}), "deny_models"),
+            (json!({"name": "a", "deny_models": ["x"], "providers": "claude"}), "invalid type"),
+            (json!({"name": "a", "unknown": 1}), "unknown field"),
+        ] {
+            let err = format!("{:#}", from_stored(stored(record.clone())).unwrap_err());
+            assert!(err.contains(why), "{record}: {err}");
+        }
     }
 
     #[test]

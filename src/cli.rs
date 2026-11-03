@@ -507,10 +507,31 @@ async fn keys(c: Client, cmd: KeysCmd) -> Result<()> {
     }
 }
 
+/// A warning per stored policy that did not load, from the status response.
+fn unloaded_policy_lines(status: &Value) -> Vec<String> {
+    status["unloaded_policies"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            format!(
+                "warning: policy {} did not load, and its keys get 401: {}",
+                p["name"].as_str().unwrap_or("?"),
+                p["error"].as_str().unwrap_or("unknown error")
+            )
+        })
+        .collect()
+}
+
 async fn policies(c: Client, cmd: PoliciesCmd) -> Result<()> {
     match cmd {
         PoliciesCmd::List => {
             let v = c.get("/admin/policies").await?;
+            // On stderr, so `--json` keeps its shape and still shows them.
+            match c.get("/admin/status").await {
+                Ok(status) => unloaded_policy_lines(&status).iter().for_each(|line| eprintln!("{line}")),
+                Err(e) => eprintln!("warning: could not check for policies that did not load: {e:#}"),
+            }
             if c.json {
                 return c.print(v);
             }
@@ -914,6 +935,20 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unloaded_policies_become_warnings() {
+        let status = json!({"unloaded_policies": [{"name": "dev", "error": "unknown field `x`"}, {"name": "ci", "error": "bad"}]});
+        assert_eq!(
+            unloaded_policy_lines(&status),
+            vec![
+                "warning: policy dev did not load, and its keys get 401: unknown field `x`",
+                "warning: policy ci did not load, and its keys get 401: bad",
+            ]
+        );
+        assert!(unloaded_policy_lines(&json!({"unloaded_policies": []})).is_empty());
+        assert!(unloaded_policy_lines(&json!({"version": "older server"})).is_empty());
+    }
 
     #[test]
     fn key_usage_columns() {

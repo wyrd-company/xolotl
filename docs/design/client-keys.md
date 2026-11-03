@@ -23,6 +23,7 @@ Xolotl itself keeps only SHA-256 hashes in memory.
 
 The result is a principal: client id plus policy.
 
+- **Refusals:** a key whose policy is not loaded fails closed. The client gets the same 401 as for an unknown key. The log names the client and the policy at warn level.
 - **Reloads:** keys and policies reload every 60 s. An unknown `xol_` key also triggers a reload, at most once per 10 s, so a key issued elsewhere works without waiting for the next periodic reload.
 - **Bootstrap admin token:** the token stored at `admin` authenticates with an unrestricted policy and the `admin` scope. The CLI uses it.
 
@@ -36,5 +37,9 @@ All writes use KV v2 check-and-set against the version that was read, so an inst
 | rotate `--grace` | New key; the old key's hash and a grace expiry are kept in the record so both work until then |
 | disable / enable | Flag in the record |
 | revoke | Writes a revocation marker (no key) as the newest version, then **destroys** the data of every earlier version, so the key can't be recovered from history. Requires `update` on `secret/destroy/xolotl/*`. |
+
+A stored policy that can't be read or parsed is left out of the loaded state and listed in `unloaded_policies` of `GET /admin/status`, with its error. Saving or deleting that name clears the entry.
+
+A record with `allow_models` or `deny_models` was written before 0.4.0. `policy::from_stored` migrates it in memory with the same effect, at every reload. A reload does not write it back: `delete_policy` removes every version, so a recreated policy can have the version number a reload read, and check-and-set can't stop a stale migration from overwriting it. Saving the policy stores the current form. A record without those fields is not migrated: no `accounts` is also how a current policy says it has none, so granting accounts there would widen access.
 
 A policy can't be deleted while keys still reference it. Policy writes are validated: known providers, winners and alias targets allowed by the policy, valid names, `accounts` entries of allowed subscription providers that list that provider's account IDs (or `*`; no entry means no accounts), `models` keys of the form `provider/model`, and provider and account limits on what the policy uses.

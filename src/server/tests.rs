@@ -1126,6 +1126,65 @@ async fn ui_sign_in_with_oidc_refusals() {
 }
 
 #[tokio::test]
+async fn upgrading_keeps_the_keys_of_old_policies_working() {
+    let h = harness().await;
+    let key = h.key(policy("old")).await;
+    // As a version before 0.4.0 stored it.
+    let record = json!({
+        "name": "old", "providers": ["claude", "llama"], "allow_models": ["qwen3", "claude-*"], "deny_models": ["claude-opus-*"], "scopes": ["proxy"],
+    });
+    h.state.secrets.put("policies/old", record.as_object().unwrap().clone()).await.unwrap();
+    h.state.keys.reload().await.unwrap();
+
+    let (status, models) = h.call("GET", "/v1/models", Some(&key), None).await;
+    assert_eq!(status, 200, "{models}");
+    let mut names: Vec<&str> = models["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, vec!["claude-haiku-5-5", "qwen3"]);
+
+    let (_, stored) = h.call("GET", "/admin/policies/old", Some(&h.admin), None).await;
+    assert_eq!(stored["rules"], json!([{"deny": "claude-opus-*"}, {"allow": "qwen3"}, {"allow": "claude-*"}]));
+    assert_eq!(stored["accounts"], json!({"claude": ["*"]}));
+    assert_eq!(stored["deny_other_models"], true);
+}
+
+#[tokio::test]
+async fn a_policy_that_does_not_load_is_visible_to_the_operator() {
+    let h = harness().await;
+    let key = h.key(policy("broken")).await;
+    let record = json!({"name": "broken", "providers": ["*"], "providerz": []});
+    h.state.secrets.put("policies/broken", record.as_object().unwrap().clone()).await.unwrap();
+    h.state.keys.reload().await.unwrap();
+
+    // The client's answer does not change.
+    let (status, body) = h.call("GET", "/v1/models", Some(&key), None).await;
+    assert_eq!(status, 401, "{body}");
+    assert!(!body.to_string().contains("providerz"), "{body}");
+
+    let (status, s) = h.call("GET", "/admin/status", Some(&h.admin), None).await;
+    assert_eq!(status, 200, "{s}");
+    assert_eq!(s["unloaded_policies"][0]["name"], "broken");
+    assert!(s["unloaded_policies"][0]["error"].as_str().unwrap().contains("providerz"), "{s}");
+    let (_, listed) = h.call("GET", "/admin/policies", Some(&h.admin), None).await;
+    assert_eq!(listed, json!([]), "the list keeps its shape");
+    for path in ["/admin/policies/broken", "/admin/policies/broken/view"] {
+        let (status, body) = h.call("GET", path, Some(&h.admin), None).await;
+        assert_eq!(status, 404, "{path}");
+        assert!(body["error"]["message"].as_str().unwrap().contains("did not load"), "{path}: {body}");
+        assert!(body["error"]["message"].as_str().unwrap().contains("providerz"), "{path}: {body}");
+    }
+    let (_, body) = h.call("GET", "/admin/policies/absent", Some(&h.admin), None).await;
+    assert_eq!(body["error"]["message"], "no such policy");
+
+    // Saving a valid version repairs it through the same API.
+    let (status, body) = h.call("PUT", "/admin/policies/broken", Some(&h.admin), Some(json!({"name": "broken", "providers": ["*"]}))).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(h.call("GET", "/v1/models", Some(&key), None).await.0, 200);
+    let (_, s) = h.call("GET", "/admin/status", Some(&h.admin), None).await;
+    assert_eq!(s["unloaded_policies"], json!([]));
+}
+
+#[tokio::test]
 async fn ui_admin_endpoints() {
     let h = harness().await;
     let (status, s) = h.call("GET", "/admin/status", Some(&h.admin), None).await;

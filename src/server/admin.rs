@@ -99,9 +99,18 @@ async fn list_policies(State(s): State<AppState>, h: HeaderMap) -> Res {
     ok(s.keys.policies().iter().map(|p| p.as_ref().clone()).collect::<Vec<_>>())
 }
 
+/// The answer for a policy that is not loaded: it may be stored but invalid.
+fn no_policy(s: &AppState, name: &str) -> Response {
+    let message = match s.keys.unloaded_policy(name) {
+        Some(error) => format!("policy {name} is stored but did not load: {error}"),
+        None => "no such policy".to_string(),
+    };
+    json_error(StatusCode::NOT_FOUND, message)
+}
+
 async fn get_policy(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
     admin(&s, &h).await?;
-    ok(s.keys.policy(&name).ok_or_else(|| json_error(StatusCode::NOT_FOUND, "no such policy"))?.as_ref().clone())
+    ok(s.keys.policy(&name).ok_or_else(|| no_policy(&s, &name))?.as_ref().clone())
 }
 
 async fn put_policy(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>, Json(mut policy): Json<Policy>) -> Res {
@@ -126,7 +135,7 @@ async fn delete_policy(State(s): State<AppState>, h: HeaderMap, Path(name): Path
 /// The resolved model names a policy exposes, with targets and reachable endpoints.
 async fn policy_view(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
     admin(&s, &h).await?;
-    let policy = s.keys.policy(&name).ok_or_else(|| json_error(StatusCode::NOT_FOUND, "no such policy"))?;
+    let policy = s.keys.policy(&name).ok_or_else(|| no_policy(&s, &name))?;
     ok(view_json(&s, &policy))
 }
 
@@ -782,6 +791,7 @@ async fn status(State(s): State<AppState>, h: HeaderMap) -> Res {
         "vault": vault,
         "catalog_refreshed_secs_ago": s.catalog.last_refresh().map(|t| t.elapsed().as_secs()),
         "unsaved_credentials": s.subs.unsaved_count(),
+        "unloaded_policies": s.keys.unloaded_policies(),
         "recent_errors": s.db.recent_errors(20).await.map_err(internal)?,
         "dashboard_url": s.cfg.telemetry.dashboard_url,
         // To show clients the full vault path of their key.
