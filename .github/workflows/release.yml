@@ -75,9 +75,19 @@ jobs:
       - run: cargo test --locked
 
   binary:
+    name: binary (${{ matrix.target }})
     needs: [guard, test]
     if: needs.guard.outputs.release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -96,19 +106,71 @@ jobs:
         run: pnpm build
         working-directory: ui
       - run: cargo build --release --locked
+      - name: Check it runs and has the tag's version
+        run: '[[ "$(target/release/xolotl --version)" == "xolotl ${GITHUB_REF_NAME}" ]]'
       - name: Package
         run: |
-          name=xolotl-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu
+          name=xolotl-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir "$name" && cp target/release/xolotl README.md CHANGELOG.md LICENSE config.example.toml "$name/"
-          tar czf "$name.tar.gz" "$name" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          tar czf "$name.tar.gz" "$name" && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xolotl-${{ matrix.target }}
+          path: |
+            xolotl-*.tar.gz
+            xolotl-*.tar.gz.sha256
+          if-no-files-found: error
+
+  github-release:
+    needs: [guard, binary]
+    if: needs.guard.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
       - name: Release notes from the changelog
         run: awk -v h="## ${GITHUB_REF_NAME}" '$0==h{f=1;next} /^## /{f=0} f' CHANGELOG.md > release-notes.md
       - uses: softprops/action-gh-release@v2
         with:
           body_path: release-notes.md
           files: |
-            xolotl-*.tar.gz
-            xolotl-*.tar.gz.sha256
+            dist/xolotl-*.tar.gz
+            dist/xolotl-*.tar.gz.sha256
+
+  # After the Release, so that the formula never points at a missing archive.
+  homebrew:
+    needs: [guard, github-release]
+    if: needs.guard.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: actions/checkout@v4
+        with:
+          repository: wyrd-company/homebrew-tools
+          path: homebrew-tools
+          ssh-key: ${{ secrets.FORMULAE_PUBLISH_KEY }}
+      - name: Write the formula
+        run: .github/scripts/homebrew-formula.sh "$GITHUB_REF_NAME" dist > homebrew-tools/Formula/xolotl.rb
+      - name: Publish the formula
+        working-directory: homebrew-tools
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/xolotl.rb
+          # --cached also sees the first version of the formula.
+          if git diff --cached --quiet -- Formula/xolotl.rb; then
+            echo "Formula already up to date."
+            exit 0
+          fi
+          git commit -m "xolotl ${GITHUB_REF_NAME}"
+          git push origin HEAD
 
   image:
     needs: [guard, test]
@@ -143,9 +205,9 @@ jobs:
 
   # A release made with GITHUB_TOKEN starts no other workflows, and wyrd.foo
   # reads the GitHub Release of the tag, so the code unit publishes from here,
-  # after the binary job created the Release.
+  # after the github-release job created the Release.
   docs:
-    needs: [guard, binary, image]
+    needs: [guard, github-release, image]
     if: needs.guard.outputs.release == 'true'
     uses: wyrd-company/wyrd.foo/.github/workflows/publish-docs.yml@v2
     with:

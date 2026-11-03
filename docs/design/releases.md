@@ -38,7 +38,8 @@ Intentional finds tags by name, so the release history survives a squash merge o
 On pushes to `main` and on pull requests:
 - `cargo fmt --check`, `clippy -D warnings` and `cargo test`;
 - the web UI: `pnpm test` and `pnpm build` (which type-checks);
-- a Docker build per architecture, each on a native runner (`amd64` on `ubuntu-latest`, `arm64` on `ubuntu-24.04-arm`), with a separate build cache per architecture.
+- a Docker build per architecture, each on a native runner (`amd64` on `ubuntu-latest`, `arm64` on `ubuntu-24.04-arm`), with a separate build cache per architecture;
+- a build of the binary on `macos-latest` and `ubuntu-24.04-arm`, the targets only the release uses otherwise.
 
 Intentional is not checked here. `intentional check` only validates the config, the intent files and the committed version projections (it doesn't require a change to carry an intent), so it runs once, as the release gate. A malformed intent therefore shows up when a release is cut, not on the PR that added it.
 
@@ -55,11 +56,13 @@ Triggered by any `X.Y.Z` tag. A `guard` job decides whether the tag is a real re
 
 Only when the guard outputs `release=true` do the other jobs run:
 - tests;
-- a Linux x86_64 binary on a GitHub release, with notes from the CHANGELOG section;
+- a binary per target, each built on a native runner: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` and `aarch64-apple-darwin`;
+- a GitHub release with those archives and their `.sha256` files, with notes from the CHANGELOG section;
+- after the GitHub release, the Homebrew formula `Formula/xolotl.rb` in `wyrd-company/homebrew-tools`, written by `.github/scripts/homebrew-formula.sh` and pushed with the org secret `FORMULAE_PUBLISH_KEY`;
 - the GHCR image `ghcr.io/wyrd-company/xolotl` for amd64 and arm64, tagged `X.Y.Z`, `X.Y` and `latest`;
-- after the binary and the image, the code unit is published to wyrd.foo by calling the wyrd.foo v2 reusable workflow (`publish-docs.yml@v2`) with the tag as `ref`.
+- after the GitHub release and the image, the code unit is published to wyrd.foo by calling the wyrd.foo v2 reusable workflow (`publish-docs.yml@v2`) with the tag as `ref`.
 
-The code unit publishes from this workflow, not from the tag push on its own: wyrd.foo reads the GitHub release of the tag, the release is created by the binary job, and a release created with `GITHUB_TOKEN` starts no other workflows. The reusable workflow needs the org secrets `WYRD_TOOLS_DOCS_PUBLISHER_APP_ID` and `WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY`; without them the `docs` job fails after the binary and the image are released.
+The code unit publishes from this workflow, not from the tag push on its own: wyrd.foo reads the GitHub release of the tag, the release is created by the `github-release` job, and a release created with `GITHUB_TOKEN` starts no other workflows. The reusable workflow needs the org secrets `WYRD_TOOLS_DOCS_PUBLISHER_APP_ID` and `WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY`; without them the `docs` job fails after the binaries and the image are released. The `homebrew` and `docs` jobs do not depend on each other.
 
 The guard script was tested locally against a baseline tag, a release tag, a hand-made annotated tag and a lightweight tag.
 

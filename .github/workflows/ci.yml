@@ -40,6 +40,20 @@ jobs:
       - run: pnpm build
         working-directory: ui
 
+  # The release builds these targets. Linux x86_64 is covered by `check`.
+  cli:
+    name: cli (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [macos-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: target/debug/xolotl --version
+
   docker:
     name: docker (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}

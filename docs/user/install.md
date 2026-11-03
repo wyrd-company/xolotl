@@ -31,8 +31,15 @@ docker run -d --name xolotl -p 8317:8317 \
 
 ## Release binary
 
-Each [GitHub release](https://github.com/wyrd-company/xolotl/releases) has a
-Linux x86_64 archive with a `.sha256` file. The web UI is built into the binary.
+Each [GitHub release](https://github.com/wyrd-company/xolotl/releases) has an
+archive with a `.sha256` file for each of these targets. The web UI is built
+into the binary.
+
+| Platform | Target |
+|---|---|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux arm64 | `aarch64-unknown-linux-gnu` |
+| macOS arm64 | `aarch64-apple-darwin` |
 
 ```sh
 version=0.2.0
@@ -42,6 +49,18 @@ tar xzf "xolotl-$version-x86_64-unknown-linux-gnu.tar.gz"
 ```
 
 You can also use this binary as the CLI on your workstation.
+
+## Homebrew
+
+On macOS arm64 and on Linux, Homebrew installs the same binary:
+
+```sh
+brew install wyrd-company/tools/xolotl
+xolotl --version
+```
+
+To use it as the CLI of a server on another machine, set `XOLOTL_URL` and
+`XOLOTL_ADMIN_TOKEN`. See [CLI reference](cli#connection-options).
 
 ## Build from source
 
