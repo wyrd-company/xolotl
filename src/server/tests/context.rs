@@ -333,6 +333,33 @@ async fn an_unavailable_account_breaks_the_lock_with_its_reason() {
 }
 
 #[tokio::test]
+async fn an_account_without_a_loaded_credential_breaks_the_lock() {
+    let (h, _, _) = pool(|_| {}).await;
+    let key = h.key(policy("p")).await;
+    let row = crate::db::AccountRow {
+        id: "claude-unloaded".into(),
+        provider: "claude".into(),
+        label: "unloaded".into(),
+        email: None,
+        external_id: None,
+        plan: None,
+        enabled: true,
+        priority: 0,
+        cooldown_until: None,
+        cooldown_reason: None,
+        auth_failed: false,
+        last_error: None,
+        last_used_at: None,
+        created_at: now(),
+    };
+    h.state.db.upsert_account(&row).await.unwrap();
+    locked(&h, "p/client", "s", &opus_on(&row.id)).await;
+    reset_to(&h, answer(5000), answer(5000)).await;
+    assert_eq!(send(&h, &key, OPUS, "s").await.0, 200);
+    assert_eq!(session_row(&h, "p/client", 2).await.last_break_reason.as_deref(), Some("account_lost"));
+}
+
+#[tokio::test]
 async fn a_policy_that_drops_the_account_breaks_the_lock() {
     let (h, a, b) = pool(|_| {}).await;
     let p = Policy { accounts: BTreeMap::from([("claude".to_string(), vec![b.clone()])]), ..policy("p") };
@@ -662,6 +689,24 @@ async fn a_messages_response_counts_its_tools_and_a_failed_one_does_not() {
     assert_eq!(send(&h, &key, OPUS, "s").await.0, 400);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(tools_of(&h).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_response_through_the_tap_counts_no_tools() {
+    let h = harness().await;
+    let key = h.key(policy("p")).await;
+    let named = json!({"error": "boom", "choices": [{"message": {"tool_calls": [{"function": {"name": "bad"}}]}}]});
+    chat_mock(&h, "qwen3", ResponseTemplate::new(500).set_body_json(named.clone())).await;
+    chat_mock(
+        &h,
+        "busy",
+        ResponseTemplate::new(200).set_body_json(json!({"choices": [{"message": {"tool_calls": [{"function": {"name": "good"}}]}}]})),
+    )
+    .await;
+    assert_eq!(chat(&h, &key, "llama/qwen3").await, 500);
+    assert_eq!(chat(&h, &key, "llama/busy").await, 200);
+    // Written after each response finishes; the later success shows the writes have run.
+    assert_eq!(tools_of(&h).await, [("good".to_string(), "llm".to_string(), 1)]);
 }
 
 #[tokio::test]
