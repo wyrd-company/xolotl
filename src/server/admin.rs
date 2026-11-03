@@ -294,19 +294,11 @@ fn refused(caller: &Principal, policy: &str, action: &str) -> Response {
     json_error(StatusCode::FORBIDDEN, format!("key may not manage keys of policy {policy:?}"))
 }
 
-/// The caller of a key route that a `keys` key may use for this policy. The
-/// key manager decides again when it has waited its turn to write.
-async fn key_caller(s: &AppState, h: &HeaderMap, policy: &str, action: &str) -> Result<Principal, Response> {
-    let caller = authorize(s, h, Scope::Keys).await?;
-    if !s.keys.may_manage(&caller, policy) {
-        return Err(refused(&caller, policy, action));
-    }
-    Ok(caller)
-}
-
 /// The answer to a failed issue or revoke: whether sending it again can help.
-fn key_error(e: anyhow::Error) -> Response {
-    if e.is::<InvalidIssue>() {
+fn key_error(caller: &Principal, policy: &str, action: &str, e: anyhow::Error) -> Response {
+    if e.is::<NotPermitted>() {
+        refused(caller, policy, action)
+    } else if e.is::<InvalidIssue>() {
         bad(e)
     } else if e.is::<Conflict>() {
         json_error(StatusCode::CONFLICT, format!("{e:#}"))
@@ -320,13 +312,9 @@ fn key_error(e: anyhow::Error) -> Response {
 /// with `status: created`. A name with a live key answers 200 with
 /// `status: exists` and leaves the key as it is.
 async fn issue_key(State(s): State<AppState>, h: HeaderMap, Json(req): Json<IssueRequest>) -> Res {
-    let caller = key_caller(&s, &h, &req.policy, "issue").await?;
+    let caller = authorize(&s, &h, Scope::Keys).await?;
     let policy = req.policy.clone();
-    let issued = s
-        .keys
-        .issue_as(&caller, req)
-        .await
-        .map_err(|e| if e.is::<NotPermitted>() { refused(&caller, &policy, "issue") } else { key_error(e) })?;
+    let issued = s.keys.issue_as(&caller, req).await.map_err(|e| key_error(&caller, &policy, "issue", e))?;
     let actor = actor(&caller);
     let (code, status) = match &issued {
         Issued::Created(info) => {
@@ -375,13 +363,9 @@ async fn rotate_key(
 /// Safe to repeat: `status` says what was found. An error means a version in
 /// the vault may still hold the key, so send it again.
 async fn revoke_key(State(s): State<AppState>, h: HeaderMap, Path((policy, name)): Path<(String, String)>) -> Res {
-    let caller = key_caller(&s, &h, &policy, "revoke").await?;
+    let caller = authorize(&s, &h, Scope::Keys).await?;
     let id = key_id(&policy, &name)?;
-    let revoked = s
-        .keys
-        .revoke_as(&caller, &id)
-        .await
-        .map_err(|e| if e.is::<NotPermitted>() { refused(&caller, &policy, "revoke") } else { key_error(e) })?;
+    let revoked = s.keys.revoke_as(&caller, &id).await.map_err(|e| key_error(&caller, &policy, "revoke", e))?;
     let status = match revoked {
         Revoked::Revoked => "revoked",
         Revoked::AlreadyRevoked => "already_revoked",
@@ -394,7 +378,7 @@ async fn revoke_key(State(s): State<AppState>, h: HeaderMap, Path((policy, name)
 /// Enabling stays with `admin`: a `keys` key must not undo a disable by an
 /// operator.
 async fn set_key_disabled(State(s): State<AppState>, h: HeaderMap, Path((policy, name)): Path<(String, String)>, disabled: bool) -> Res {
-    let caller = if disabled { key_caller(&s, &h, &policy, "disable").await? } else { authorize(&s, &h, Scope::Admin).await? };
+    let caller = authorize(&s, &h, if disabled { Scope::Keys } else { Scope::Admin }).await?;
     let id = key_id(&policy, &name)?;
     let info = s.keys.set_disabled_as(&caller, &id, disabled).await.map_err(|e| {
         if e.is::<NotPermitted>() { refused(&caller, &policy, "disable") } else { json_error(StatusCode::NOT_FOUND, format!("{e:#}")) }

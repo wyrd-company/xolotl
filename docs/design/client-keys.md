@@ -49,7 +49,7 @@ Issue and revoke are safe to repeat, so a caller retries after any failure:
 
 A policy with the `keys` scope lists policies in `key_policies`. Its keys can issue, revoke, disable and list keys under those policies, and reach no other route. `admin` implies it for every policy. A web UI session counts as `admin`.
 
-`KeyManager::may_manage` decides, against the caller's policy and the listed policy as loaded now. A route asks before it starts, and the key manager asks again under `writes`, which policy changes also hold. So on one instance, a key change that waited behind a policy change sees that change. Another instance sees it at its next reload, within 60 s, and until then it decides from the policies it has loaded:
+`KeyManager::may_manage` decides, against the caller's policy and the listed policy as loaded now. It decides under `writes`, which policy changes also hold. So on one instance, a key change that waited behind a policy change sees that change. Another instance sees it at its next reload, within 60 s, and until then it decides from the policies it has loaded:
 
 - **Only client use:** a listed policy must grant nothing beyond `proxy` and `mcp`. `admin` and `management` reach accounts or more. `keys` could list a policy the issuer does not, which would widen its reach. The check is on the target's scopes, and not at save time, because the target can change after it is listed. A scope added later is refused until it is judged here.
 - **Not loaded:** a listed policy that is stored but did not load can't be checked, so it is refused; an operator with `admin` cleans it up. A listed policy that does not exist passes, which lets a retried revoke finish. Issue under it still fails: no such policy.
