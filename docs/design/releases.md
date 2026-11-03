@@ -39,7 +39,8 @@ On pushes to `main` and on pull requests:
 - `cargo fmt --check`, `clippy -D warnings` and `cargo test`;
 - the web UI: `pnpm test` and `pnpm build` (which type-checks);
 - a Docker build per architecture, each on a native runner (`amd64` on `ubuntu-latest`, `arm64` on `ubuntu-24.04-arm`), with a separate build cache per architecture;
-- a build of the binary on `macos-latest` and `ubuntu-24.04-arm`, the targets only the release uses otherwise.
+- a build of the binary on `macos-latest` and `ubuntu-24.04-arm`, the targets only the release uses otherwise;
+- `brand/published-copies.sh check`, which fails when a logo, dark logo or favicon in `docs/user/assets` differs from its source.
 
 Intentional is not checked here. `intentional check` only validates the config, the intent files and the committed version projections (it doesn't require a change to carry an intent), so it runs once, as the release gate. A malformed intent therefore shows up when a release is cut, not on the PR that added it.
 

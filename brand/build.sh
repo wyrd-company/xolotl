@@ -3,7 +3,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 public=../ui/public
-assets=../docs/user/assets
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -32,6 +31,4 @@ render_dark 440 "$tmp/social.png"
 magick -size 1280x640 xc:'#192029' "$tmp/social.png" -gravity center -composite xolotl-social.png
 
 # Copies published to wyrd.foo with the user docs (docs/user/docs.yml: logo, logo-dark, favicon).
-cp xolotl-icon.svg "$assets/logo.svg"
-cp xolotl-icon-dark.svg "$assets/logo-dark.svg"
-cp "$public/favicon.svg" "$assets/favicon.svg"
+./published-copies.sh write
