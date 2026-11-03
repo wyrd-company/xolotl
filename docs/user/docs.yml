@@ -6,6 +6,7 @@ assets:
   - assets/logo-dark.svg
   - assets/favicon.svg
   - assets/social.png
+  - assets/usage-sessions.png
 products:
   xolotl:
     name: xolotl

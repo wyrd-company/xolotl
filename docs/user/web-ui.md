@@ -143,6 +143,8 @@ model, account, client and provider that is not shown or narrowed yet. Each
 filter shows as a chip; remove a chip to widen the view again. The URL keeps
 the filters (`/#/usage?group=model&client=...`), so you can bookmark a view.
 
+![The Usage screen: requests per client, then sessions with their size, cache hits and lock, then the tools each key called](assets/usage-sessions.png)
+
 **Sessions** lists the 100 most recently used conversations: how full each one
 is against its model's context window, its peak, its turns, its share of prompt
 tokens read from cache, and its [context lock](accounts#context-lock) with any
