@@ -1,5 +1,5 @@
 // relationships:
-//   references: docs/subscriptions.md
+//   references: docs/design/subscriptions.md
 import type { Account } from "./api";
 
 export function accountPath(id: string): string {
