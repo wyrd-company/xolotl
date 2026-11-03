@@ -162,6 +162,10 @@ A tool call returns the tool's structured content, else its text, else its
 content blocks. A tool error throws. `console.log` output is in `logs`.
 `codemode.call(server, tool, args)` calls a tool by name.
 
+Await every tool call you depend on. When the code returns, a call it did not
+await is cancelled. If that call had not started, it never starts and is not in
+the call log.
+
 ### Limits
 
 Each `execute` runs in a fresh QuickJS runtime with no file system, network or

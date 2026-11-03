@@ -219,6 +219,8 @@ Each execution gets a fresh [QuickJS](https://bellard.org/quickjs/) runtime (thr
 
 Code mode has no approvals and no durable replay: a tool call happens when the code makes it. Use `deny_tools` to keep destructive tools away from a key.
 
+An execution ends its tool calls before it ends, however it ends: each call still running is aborted and joined, including its teardown. A call the code did not await can be aborted before its first poll. It then never starts, reaches no upstream and has no call log row.
+
 ## Endpoint security
 
 - **Authentication:** `/mcp` takes a client key in `Authorization: Bearer`. A 401 carries `WWW-Authenticate: Bearer`. The OAuth resource-server profile of the MCP authorization spec is not implemented: keys are issued by xolotl.
