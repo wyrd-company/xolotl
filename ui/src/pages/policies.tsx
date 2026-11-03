@@ -12,6 +12,7 @@ import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
 import { PolicyLimits } from "@/components/policy-limits";
 import { SaveToolbar } from "@/components/save-toolbar";
 import { Section, SectionContent } from "@/components/section";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -32,6 +33,8 @@ import {
   type Policy,
   type PolicyView,
   type Scope,
+  type Status,
+  type UnloadedPolicy,
 } from "@/lib/api";
 import { useAction } from "@/lib/hooks";
 import { accountProvider, allowsAccount, providerHealth } from "@/lib/policy-models";
@@ -53,7 +56,9 @@ export function PoliciesPage() {
   const { name } = useParams();
   const policies = useQuery({ queryKey: ["policies"], queryFn: () => get<Policy[]>("/admin/policies") });
   const keys = useQuery({ queryKey: ["keys"], queryFn: () => get<KeyInfo[]>("/admin/keys") });
+  const status = useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/admin/status") });
   const list = policies.data ?? [];
+  const unloaded = status.data?.unloaded_policies ?? [];
   const keyCount = (p: string) => (keys.data ?? []).filter((k) => k.policy === p).length;
 
   if (!name && list.length) return <Navigate to={`/policies/${list[0].name}`} replace />;
@@ -72,6 +77,7 @@ export function PoliciesPage() {
         </Button>
       </PageHeader>
       <QueryError error={policies.error} />
+      <UnloadedPolicies policies={unloaded} />
       <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
         <aside aria-label="Policies" className="flex shrink-0 flex-col gap-1 lg:w-56">
           {list.map((p) => (
@@ -92,15 +98,39 @@ export function PoliciesPage() {
               </span>
             </Link>
           ))}
-          {policies.isSuccess && list.length === 0 && name !== NEW && <p className="text-muted-foreground px-3 text-sm">No policies yet.</p>}
+          {policies.isSuccess && list.length === 0 && !unloaded.length && name !== NEW && (
+            <p className="text-muted-foreground px-3 text-sm">No policies yet.</p>
+          )}
         </aside>
         <div className="min-w-0 flex-1">
           {name === NEW && <PolicyEditor key={NEW} initial={null} keyCount={0} />}
           {current && <PolicyEditor key={current.name} initial={current} keyCount={keyCount(current.name)} />}
-          {name && name !== NEW && policies.isSuccess && !current && <Empty>No policy named {name}.</Empty>}
+          {name && name !== NEW && policies.isSuccess && !current && !unloaded.some((p) => p.name === name) && (
+            <Empty>No policy named {name}.</Empty>
+          )}
         </div>
       </div>
     </>
+  );
+}
+
+/** Stored policies the server could not load: they are in no list, and their keys get 401. */
+export function UnloadedPolicies({ policies }: { policies: UnloadedPolicy[] }) {
+  if (!policies.length) return null;
+  return (
+    <Alert variant="destructive" aria-label="Policies that did not load">
+      <AlertTitle>Stored policies did not load</AlertTitle>
+      <AlertDescription>
+        <p>Their keys get 401. To repair one, save a valid policy with the same name.</p>
+        <ul className="mt-1">
+          {policies.map((p) => (
+            <li key={p.name} className="break-words">
+              <span className="font-mono font-medium">{p.name}</span>: {p.error}
+            </li>
+          ))}
+        </ul>
+      </AlertDescription>
+    </Alert>
   );
 }
 

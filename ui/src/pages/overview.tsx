@@ -100,8 +100,12 @@ export function OverviewPage() {
       .map((p) => `${p.name} (no key)`),
   ];
   const failed = accts.filter((a) => a.enabled && a.auth_failed);
+  const unloaded = s?.unloaded_policies ?? [];
   const actionCount =
-    failed.length + (s && !s.vault.ok ? 1 : 0) + (s && !s.database.ok ? 1 : 0);
+    failed.length +
+    unloaded.length +
+    (s && !s.vault.ok ? 1 : 0) +
+    (s && !s.database.ok ? 1 : 0);
   const modelCount = new Map<string, number>();
   for (const r of routes.data ?? [])
     modelCount.set(r.provider, (modelCount.get(r.provider) ?? 0) + 1);
@@ -164,6 +168,24 @@ export function OverviewPage() {
                 </Button>
               </ActionRow>
             )}
+            {unloaded.map((p) => (
+              <ActionRow
+                key={p.name}
+                badge="Not loaded"
+                name={`Policy ${p.name}`}
+                cause={`Its keys get 401. ${p.error}`}
+              >
+                <Button asChild size="sm">
+                  <a
+                    href="https://wyrd.foo/docs/xolotl/policies-and-keys/#policies-that-do-not-load"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Repair policy
+                  </a>
+                </Button>
+              </ActionRow>
+            ))}
             {failed.map((a) => (
               <ActionRow
                 key={a.id}

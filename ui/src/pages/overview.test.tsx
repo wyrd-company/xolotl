@@ -37,6 +37,7 @@ const status: Status = {
   database: { ok: true },
   catalog_refreshed_secs_ago: 10,
   unsaved_credentials: 0,
+  unloaded_policies: [],
   recent_errors: [],
   dashboard_url: null,
   vault_mount: "secret",
@@ -58,6 +59,19 @@ const gateway = (change: Partial<GatewayProvider>): GatewayProvider => ({
   has_key: true,
   ...change,
 });
+test("names a stored policy that did not load as needing action", () => {
+  const html = render([], [], {
+    ...status,
+    unloaded_policies: [{ name: "sample", error: "unknown field `other`" }],
+  });
+  expect(html).toContain("Needs action");
+  expect(html).toContain("Policy sample");
+  expect(html).toContain("Not loaded");
+  expect(html).toContain("unknown field `other`");
+  expect(html).toContain("#policies-that-do-not-load");
+  expect(html).not.toContain("Nothing needs action");
+});
+
 function render(
   accounts: Account[],
   providers: GatewayProvider[] = [],

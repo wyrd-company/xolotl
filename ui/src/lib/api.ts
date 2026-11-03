@@ -89,12 +89,19 @@ export interface LoggedRequest {
   trace_id: string | null;
 }
 
+export interface UnloadedPolicy {
+  name: string;
+  error: string;
+}
+
 export interface Status {
   version: string;
   database: Health;
   vault: Health;
   catalog_refreshed_secs_ago: number | null;
   unsaved_credentials: number;
+  /** Stored policies that did not load. Their keys get 401. */
+  unloaded_policies: UnloadedPolicy[];
   recent_errors: LoggedRequest[];
   dashboard_url: string | null;
   vault_mount: string;
