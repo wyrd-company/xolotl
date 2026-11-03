@@ -50,8 +50,14 @@ The OpenBao values win over `[telemetry.otlp_headers]`.
 | `xolotl.mcp.executions` | status | `execute` calls |
 | `xolotl.limit.consumption` | client, unit (`requests`, `tokens`), window (`minute`, `day`) | Rate limit consumption of each key |
 | `xolotl.limit.rejections` | policy, client, limit | Requests refused by a rate limit |
+| `xolotl.session.context_tokens` | provider, model | Prompt size of each successful request |
+| `xolotl.session.context_utilization` | provider, model | Prompt size as a fraction of the model's context window, when known |
+| `xolotl.session.locks` | event (`formed`, `broken`), provider, and reason when broken | Context locks. See [Context lock](accounts#context-lock) |
+| `xolotl.tool_calls` | client, tool | Tool calls named in LLM responses |
 
 ## Request log
 
 Every LLM request is also in the SQLite request log, for `database.retention_days`
-(90). Read it with `xolotl usage` or on the web UI's **Usage** screen.
+(90). Read it with `xolotl usage` or on the web UI's **Usage** screen. Each row
+holds `session_key`, a digest that identifies its conversation, `context_tokens`,
+the prompt's size, and `context_window`, the model's window when known.

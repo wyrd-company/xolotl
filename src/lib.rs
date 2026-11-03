@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod cli;
 pub mod config;
+pub mod context;
 pub mod db;
 pub mod gateway;
 pub mod keys;

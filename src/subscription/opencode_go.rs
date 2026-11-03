@@ -40,8 +40,10 @@ pub fn prepare(headers: &mut HeaderMap, body: &mut Value, cred: &Credential, pat
     }
 }
 
+pub const SESSION_HEADER: &str = "x-opencode-session";
+
 pub fn session_key(headers: &HeaderMap, client_id: Option<&str>) -> String {
-    ["x-opencode-session", "x-claude-code-session-id", "session_id"]
+    [SESSION_HEADER, "x-claude-code-session-id", "session_id"]
         .iter()
         .find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()).filter(|v| !v.trim().is_empty()).map(str::to_string))
         .unwrap_or_else(|| format!("xolotl-{}", hex::encode(Sha256::digest(client_id.unwrap_or("anonymous").as_bytes()))))

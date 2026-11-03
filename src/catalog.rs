@@ -126,6 +126,14 @@ impl ModelCatalog {
         self.metadata.read().lookup(provider, model, self.cfg.metadata.get(&format!("{provider}/{model}")))
     }
 
+    /// The model's context window: a configured override, what Codex reports, else its metadata.
+    pub fn context_window(&self, provider: &str, model: &str) -> Option<u64> {
+        let configured = self.cfg.metadata.get(&format!("{provider}/{model}")).and_then(|o| o.values.max_input_tokens);
+        let native =
+            if provider == "codex" { self.codex_entries.read().get(model).and_then(|m| m["context_window"].as_u64()) } else { None };
+        configured.or(native).or(self.metadata(provider, model).values.max_input_tokens)
+    }
+
     pub async fn refresh_metadata(&self, http: &reqwest::Client) {
         let _guard = self.refresh_lock.lock().await;
         self.refresh_metadata_unlocked(http).await;
@@ -266,18 +274,7 @@ impl ModelCatalog {
             entry["description"] = json!(metadata.description(&first.provider));
         }
         // An alias's context must be safe for every fallback target. Unknown is unknown.
-        let limits: Option<Vec<u64>> = targets
-            .iter()
-            .map(|t| {
-                let configured = self.cfg.metadata.get(&t.qualified()).and_then(|o| o.values.max_input_tokens);
-                let native = if t.provider == "codex" {
-                    self.codex_entries.read().get(&t.model).and_then(|m| m["context_window"].as_u64())
-                } else {
-                    None
-                };
-                configured.or(native).or(self.metadata(&t.provider, &t.model).values.max_input_tokens)
-            })
-            .collect();
+        let limits: Option<Vec<u64>> = targets.iter().map(|t| self.context_window(&t.provider, &t.model)).collect();
         let preserve_native_window = targets.len() == 1
             && first.provider == "codex"
             && entry["context_window"].as_u64().is_some()

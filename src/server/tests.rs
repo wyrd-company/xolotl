@@ -21,6 +21,8 @@ use crate::policy::{AliasTargets, Policy};
 use crate::secrets::MemoryStore;
 use crate::subscription::{Credential, auth_index};
 
+mod context;
+
 struct Harness {
     state: AppState,
     admin: String,

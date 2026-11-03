@@ -88,8 +88,10 @@ pub fn prepare(headers: &mut HeaderMap, body: &mut Value, cred: &Credential, con
     }
 }
 
+pub const SESSION_HEADERS: &[&str] = &["x-grok-session-id", "x-grok-conv-id"];
+
 pub fn session_key(headers: &HeaderMap, body: &Value) -> Option<String> {
-    ["x-grok-session-id", "x-grok-conv-id"]
+    SESSION_HEADERS
         .iter()
         .find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty()).map(str::to_string))
         .or_else(|| body.get("prompt_cache_key").and_then(Value::as_str).map(str::to_string))

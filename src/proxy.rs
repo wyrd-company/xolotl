@@ -15,6 +15,8 @@ use futures::Stream;
 use opentelemetry::KeyValue;
 use serde_json::Value;
 
+use crate::context::SessionTrack;
+use crate::context::tools::{ToolCalls, mentions_tool};
 use crate::db::{Db, RequestRecord};
 use crate::limits::Limiter;
 use crate::telemetry::metrics;
@@ -150,6 +152,9 @@ pub struct Accounting {
     pub started: Instant,
     limiter: Option<Arc<Limiter>>,
     prices: Option<crate::metadata::Metadata>,
+    session: Option<SessionTrack>,
+    /// Tool calls the response named.
+    tools: Vec<String>,
 }
 
 impl Accounting {
@@ -168,6 +173,8 @@ impl Accounting {
             started: Instant::now(),
             limiter: None,
             prices: None,
+            session: None,
+            tools: Vec::new(),
         }
     }
 
@@ -181,6 +188,11 @@ impl Accounting {
         self
     }
 
+    pub fn with_session(mut self, session: Option<SessionTrack>) -> Self {
+        self.session = session;
+        self
+    }
+
     pub fn finish(mut self, status: u16, usage: TokenUsage) {
         self.record.api_equivalent_cost = self.prices.and_then(|p| p.cost(usage));
         self.record.status = status;
@@ -188,6 +200,11 @@ impl Accounting {
         self.record.output_tokens = usage.output;
         self.record.cached_tokens = usage.cached;
         self.record.latency_ms = self.started.elapsed().as_millis() as i64;
+        if let Some(s) = &self.session {
+            self.record.session_key = Some(s.key().to_string());
+            self.record.context_tokens = Some(s.tokens(usage.input));
+            self.record.context_window = s.window();
+        }
         let r = &self.record;
         if let (Some(limiter), Some(client)) = (&self.limiter, &r.client_id) {
             let tokens = usage.input.unwrap_or(0).max(0) + usage.output.unwrap_or(0).max(0);
@@ -223,11 +240,35 @@ impl Accounting {
             latency_ms = r.latency_ms,
             "request complete"
         );
+        let success = (200..300).contains(&status);
+        if success {
+            if let Some(tokens) = r.context_tokens.filter(|n| *n >= 0) {
+                m.session_context_tokens.record(tokens as u64, &attrs[..2]);
+                if let Some(window) = r.context_window.filter(|w| *w > 0) {
+                    m.session_context_utilization.record(tokens as f64 / window as f64, &attrs[..2]);
+                }
+            }
+            if let Some(client) = &r.client_id {
+                for tool in &self.tools {
+                    m.tool_calls.add(1, &[KeyValue::new("client", client.clone()), KeyValue::new("tool", tool.clone())]);
+                }
+            }
+        }
         let record = self.record;
         let db = self.db;
+        let session = self.session.filter(|_| success);
+        let tools = if success { self.tools } else { Vec::new() };
         tokio::spawn(async move {
             if let Err(e) = db.log_request(&record).await {
                 tracing::warn!(error = %e, "failed to write request log");
+            }
+            if let Some(session) = session {
+                session.record(&db, &record.provider, record.account_id.as_deref(), usage.input, usage.cached).await;
+            }
+            if let Some(client) = record.client_id.as_deref().filter(|_| !tools.is_empty())
+                && let Err(e) = db.count_tools(client, &tools).await
+            {
+                tracing::warn!(error = %e, "failed to count tool calls");
             }
         });
     }
@@ -265,13 +306,23 @@ pub struct TapStream<S> {
     line_buf: Vec<u8>,
     json_buf: Vec<u8>,
     usage: TokenUsage,
+    tools: ToolCalls,
     status: u16,
     accounting: Option<Accounting>,
 }
 
 impl<S> TapStream<S> {
     pub fn new(inner: S, sse: bool, status: u16, accounting: Option<Accounting>) -> Self {
-        Self { inner, sse, line_buf: Vec::new(), json_buf: Vec::new(), usage: TokenUsage::default(), status, accounting }
+        Self {
+            inner,
+            sse,
+            line_buf: Vec::new(),
+            json_buf: Vec::new(),
+            usage: TokenUsage::default(),
+            tools: ToolCalls::default(),
+            status,
+            accounting,
+        }
     }
 
     fn feed(&mut self, chunk: &[u8]) {
@@ -296,24 +347,33 @@ impl<S> TapStream<S> {
 
     fn observe_line(&mut self, line: &[u8]) {
         let Some(data) = line.strip_prefix(b"data:") else { return };
-        // Cheap pre-filter: only parse events that mention usage.
-        if !data.windows(5).any(|w| w == b"usage") {
+        // Cheap pre-filter: only parse events that mention usage or a tool call.
+        if !data.windows(5).any(|w| w == b"usage") && !mentions_tool(data) {
             return;
         }
         if let Ok(v) = serde_json::from_slice::<Value>(data.trim_ascii()) {
             self.usage.observe(&v);
+            self.tools.observe(&v);
+        }
+    }
+
+    fn settle(&mut self) {
+        if let Some(mut acc) = self.accounting.take() {
+            acc.tools = std::mem::take(&mut self.tools).into_names();
+            acc.finish(self.status, self.usage);
         }
     }
 
     fn finish(&mut self) {
-        if let Some(acc) = self.accounting.take() {
+        if self.accounting.is_some() {
             if self.sse {
                 let rest = std::mem::take(&mut self.line_buf);
                 self.observe_line(&rest);
             } else if let Ok(v) = serde_json::from_slice::<Value>(&self.json_buf) {
                 self.usage.observe(&v);
+                self.tools.observe(&v);
             }
-            acc.finish(self.status, self.usage);
+            self.settle();
         }
     }
 }
@@ -341,9 +401,7 @@ where
 impl<S> Drop for TapStream<S> {
     fn drop(&mut self) {
         // Client disconnected mid-stream: still account for what we saw.
-        if let Some(acc) = self.accounting.take() {
-            acc.finish(self.status, self.usage);
-        }
+        self.settle();
     }
 }
 

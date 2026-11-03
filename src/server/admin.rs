@@ -54,6 +54,8 @@ pub fn router() -> Router<AppState> {
         .route("/providers", get(list_providers))
         .route("/providers/{name}/key", post(set_provider_key))
         .route("/usage", get(usage))
+        .route("/sessions", get(sessions))
+        .route("/tools", get(tools))
         .route("/mcp/servers", get(mcp_servers).post(mcp_create_server))
         .route("/mcp/servers/{name}", axum::routing::put(mcp_update_server).delete(mcp_delete_server))
         .route("/mcp/servers/{name}/tools", get(mcp_tools))
@@ -602,6 +604,48 @@ async fn usage(State(s): State<AppState>, h: HeaderMap, Query(q): Query<UsageQue
     let mut rows = s.db.usage_summary(&q.group_by, now() - q.since_secs, &filter).await.map_err(bad)?;
     let _ = &mut rows;
     ok(rows)
+}
+
+#[derive(Deserialize)]
+struct SessionsQuery {
+    client: Option<String>,
+    #[serde(default = "default_sessions_limit")]
+    limit: i64,
+}
+
+fn default_sessions_limit() -> i64 {
+    100
+}
+
+/// Sessions by most recent use, with their utilization and cache hit ratio.
+async fn sessions(State(s): State<AppState>, h: HeaderMap, Query(q): Query<SessionsQuery>) -> Res {
+    admin(&s, &h).await?;
+    let rows = s.db.sessions(q.client.as_deref(), q.limit.clamp(1, 1000)).await.map_err(bad)?;
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            let ratio = |n: i64, d: Option<i64>| d.filter(|d| *d > 0).map(|d| n as f64 / d as f64);
+            let (utilization, peak) = (ratio(r.current_tokens, r.context_window), ratio(r.peak_tokens, r.context_window));
+            let cache_hit_ratio = ratio(r.cached_tokens, Some(r.prompt_tokens));
+            let mut v = json!(r);
+            v["utilization"] = json!(utilization);
+            v["peak_utilization"] = json!(peak);
+            v["cache_hit_ratio"] = json!(cache_hit_ratio);
+            v
+        })
+        .collect();
+    ok(out)
+}
+
+#[derive(Deserialize)]
+struct ToolsQuery {
+    client: Option<String>,
+}
+
+/// Tool calls per client key, from LLM responses and from `/mcp`.
+async fn tools(State(s): State<AppState>, h: HeaderMap, Query(q): Query<ToolsQuery>) -> Res {
+    admin(&s, &h).await?;
+    ok(s.db.tool_usage(q.client.as_deref()).await.map_err(bad)?)
 }
 
 // ---- MCP gateway

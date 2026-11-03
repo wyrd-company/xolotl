@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::{Strategy, SubscriptionConfig};
+use crate::context::{self, AccountPin, RequestSession};
 use crate::db::{AccountRow, AccountUsage, Db, UsageWindow, now};
 use crate::keys::Principal;
 use crate::limits::{Charge, Exceeded, Limiter, Meter};
@@ -653,6 +654,7 @@ impl Subscriptions {
         provider: SubProvider,
         principal: Option<&Principal>,
         session: Option<&str>,
+        pinned: Option<&str>,
         tried: &HashSet<String>,
         charge: &mut Charge<'_>,
     ) -> Result<AccountRow, SelectError> {
@@ -695,7 +697,7 @@ impl Subscriptions {
                 .unwrap_or(0.0);
             candidates.push((r, max_used));
         }
-        match self.admit_one(provider, session, principal, candidates, charge, &mut limited) {
+        match self.admit_one(provider, session, pinned, principal, candidates, charge, &mut limited) {
             Ok(Some(chosen)) => Ok(chosen),
             Ok(None) => Err(match (limited, earliest) {
                 (Some(e), Some(until)) if until - t < e.retry_after => SelectError::AllCooling { until },
@@ -712,10 +714,12 @@ impl Subscriptions {
     /// request took since it was checked is passed over, its refusal kept in
     /// `limited`; `None` when every candidate was. A limit of a pending meter
     /// refuses the request on every account.
+    #[allow(clippy::too_many_arguments)]
     fn admit_one(
         &self,
         provider: SubProvider,
         session: Option<&str>,
+        pinned: Option<&str>,
         principal: Option<&Principal>,
         mut candidates: Vec<(AccountRow, f64)>,
         charge: &mut Charge<'_>,
@@ -723,7 +727,8 @@ impl Subscriptions {
     ) -> Result<Option<AccountRow>, Exceeded> {
         let pending = charge.pending().to_vec();
         while !candidates.is_empty() {
-            let chosen = candidates.remove(self.choose(provider, session, &candidates)).0;
+            let index = pinned.and_then(|id| candidates.iter().position(|(r, _)| r.id == id));
+            let chosen = candidates.remove(index.unwrap_or_else(|| self.choose(provider, session, &candidates))).0;
             if let Some(p) = principal
                 && let Some(client) = p.client_id()
             {
@@ -810,10 +815,53 @@ impl Subscriptions {
         }
     }
 
+    /// Why a session's locked account can't serve a request now, if it is the
+    /// account that can't: a limit on another meter refuses every account.
+    async fn lock_unavailable(&self, provider: SubProvider, principal: Option<&Principal>, account: &str, t: i64) -> Option<&'static str> {
+        let row = self.db.get_account(account).await.ok().flatten();
+        let Some(row) = row.filter(|r| r.enabled && !r.auth_failed && self.creds.read().contains_key(&r.id)) else {
+            return Some(context::reason::ACCOUNT_LOST);
+        };
+        if row.cooling_down(t) {
+            return Some(context::reason::COOLDOWN);
+        }
+        let p = principal?;
+        if !p.policy.allows_account(provider.as_str(), account) {
+            return Some(context::reason::POLICY);
+        }
+        let client = p.client_id()?;
+        self.limiter.check(client, &p.policy, &[Meter::Account(account)], t).is_err().then_some(context::reason::LIMIT)
+    }
+
+    /// Whether a failed request stays on its locked account, for the client to
+    /// retry there. A cooldown or a lost account breaks the lock instead, and
+    /// a run of `max_attempts` failures does too.
+    async fn stays_on_lock(&self, session: Option<&RequestSession>, pin: Option<&AccountPin>, failure: &Failure, status: u16) -> bool {
+        let (Some(session), Some(_)) = (session, pin.filter(|p| p.held)) else { return false };
+        match failure {
+            Failure::Auth => {
+                session.break_lock(context::reason::ACCOUNT_LOST).await;
+                false
+            }
+            Failure::Exhausted { .. } => {
+                session.break_lock(context::reason::COOLDOWN).await;
+                false
+            }
+            Failure::Transient { retry_after: Some(_) } if status == 429 => {
+                session.break_lock(context::reason::COOLDOWN).await;
+                false
+            }
+            Failure::Transient { .. } => session.upstream_failure().await,
+            // The request itself is bad: says nothing about the account.
+            Failure::Fatal => true,
+        }
+    }
+
     /// Proxy one request through the provider's account pool, failing over
     /// between accounts on quota, auth and transient errors. The request
     /// counts on the meters `charge` has pending together with the first
-    /// account that admits it.
+    /// account that admits it. A session's lock keeps the request on its
+    /// account until the lock breaks.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
@@ -825,6 +873,7 @@ impl Subscriptions {
         principal: Option<&Principal>,
         model: Option<&str>,
         charge: &mut Charge<'_>,
+        tracked: Option<&RequestSession>,
     ) -> Response {
         let client_id = principal.and_then(Principal::client_id);
         let ep = &self.cfg.endpoints;
@@ -846,14 +895,30 @@ impl Subscriptions {
         };
         let prices =
             self.catalog.as_ref().and_then(|c| Some(c.metadata(provider.as_str(), body_json.as_ref()?.get("model")?.as_str()?).values));
-        let mut accounting =
-            Accounting::new(self.db.clone(), provider.as_str(), path, client_id, model).with_limiter(&self.limiter).with_prices(prices);
+        let upstream_model = body_json.as_ref().and_then(|b| b.get("model")?.as_str()).unwrap_or_default().to_string();
+        let window = self.catalog.as_ref().and_then(|c| c.context_window(provider.as_str(), &upstream_model));
+        let mut accounting = Accounting::new(self.db.clone(), provider.as_str(), path, client_id, model)
+            .with_limiter(&self.limiter)
+            .with_prices(prices)
+            .with_session(tracked.map(|s| s.track(&upstream_model, window)));
         let mut tried = HashSet::new();
         // Last failed upstream response, returned if every attempt fails.
         let mut last: Option<(u16, reqwest::header::HeaderMap, Bytes, String)> = None;
 
         'accounts: for _ in 0..self.cfg.max_attempts {
-            let account = match self.select(provider, principal, session.as_deref(), &tried, charge).await {
+            let pin = tracked.and_then(|s| s.account_pin(provider.as_str(), &upstream_model));
+            let selected =
+                self.select(provider, principal, session.as_deref(), pin.as_ref().map(|p| p.account.as_str()), &tried, charge).await;
+            if let (Some(s), Some(p)) = (tracked, pin.as_ref().filter(|p| p.held))
+                && selected.as_ref().map_or(true, |a| a.id != p.account)
+            {
+                let why = self.lock_unavailable(provider, principal, &p.account, now()).await;
+                // Selected another account: another request took its last slot.
+                if let Some(why) = why.or(selected.is_ok().then_some(context::reason::LIMIT)) {
+                    s.break_lock(why).await;
+                }
+            }
+            let account = match selected {
                 Ok(a) => a,
                 Err(_) if last.is_some() => break,
                 Err(SelectError::NotAllowed) => {
@@ -898,6 +963,9 @@ impl Subscriptions {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!(account = %account.id, error = %e, "account credential unavailable");
+                        if let (Some(s), Some(_)) = (tracked, pin.as_ref().filter(|p| p.held)) {
+                            s.break_lock(context::reason::ACCOUNT_LOST).await;
+                        }
                         continue 'accounts;
                     }
                 };
@@ -929,6 +997,10 @@ impl Subscriptions {
                             Bytes::from(json!({"error": {"type": "api_error", "message": "upstream request failed"}}).to_string()),
                             account.id.clone(),
                         ));
+                        let transport = Failure::Transient { retry_after: None };
+                        if self.stays_on_lock(tracked, pin.as_ref(), &transport, 502).await {
+                            break 'accounts;
+                        }
                         continue 'accounts;
                     }
                 };
@@ -956,6 +1028,9 @@ impl Subscriptions {
                                     body,
                                     account.id.clone(),
                                 ));
+                                if self.stays_on_lock(tracked, pin.as_ref(), &failure, status).await {
+                                    break 'accounts;
+                                }
                                 continue 'accounts;
                             }
                         }
@@ -1017,6 +1092,9 @@ impl Subscriptions {
                     let _ = self.record_account_result(&account.id, Some(reason)).await;
                 }
                 last = Some((status, resp_headers, bytes, account.id.clone()));
+                if self.stays_on_lock(tracked, pin.as_ref(), &failure, status).await {
+                    break 'accounts;
+                }
                 continue 'accounts;
             }
         }

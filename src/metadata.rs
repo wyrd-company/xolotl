@@ -168,7 +168,7 @@ impl Resolved {
 /// A text/JSON byte heuristic, not a tokenizer or an admission check. Includes
 /// tools and system prompts; byte count deliberately errs high on non-ASCII text.
 pub fn estimate_tokens(body: &Value) -> u64 {
-    ["system", "messages", "tools", "tool_choice"]
+    ["system", "instructions", "messages", "input", "tools", "tool_choice"]
         .iter()
         .filter_map(|k| body.get(*k))
         .map(|v| v.to_string().len() as u64)

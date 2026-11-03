@@ -100,7 +100,7 @@ For `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`, `/v1/responses
 1. Authorize with the `proxy` scope; parse the body and read `model`.
 2. Look the name up in the view. If it's not found: 404.
 3. Keep the targets the endpoint reaches, natively or through translation. If none (`count_tokens`, `compact`, or a Claude subscription account off `/v1/messages`): 400 naming the endpoints the model *is* served on.
-4. Try each target in order. A 429 or 5xx moves on to the next target; the last target's response is returned. A translated target gets the request in its own format, and its response is translated back.
+4. Try each target in order. A 429 or 5xx moves on to the next target; the last target's response is returned. A session's [context lock](sessions.md#context-lock) puts its locked target first, and the request moves on only when the lock breaks. A translated target gets the request in its own format, and its response is translated back.
    - **Pool targets:** `model` is rewritten to the provider's name and the request goes to the pool ([Subscription accounts](subscriptions.md)).
    - **Gateway targets:** the provider's key is injected (Bearer, plus `x-api-key` on `/v1/messages`). For Mistral, a few OpenAI parameter spellings it rejects are rewritten.
 

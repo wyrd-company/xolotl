@@ -23,6 +23,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::catalog::{ModelCatalog, Route, Wire};
 use crate::config::Config;
+use crate::context::{RequestSession, reason};
 use crate::db::Db;
 use crate::gateway::Gateway;
 use crate::keys::{KeyManager, Principal, Scope};
@@ -384,6 +385,18 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             .unwrap_or_default();
         return err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("model {model:?} is not available on {path}{hint}"));
     }
+    let session = session_for(state, &principal, path, &headers, &json, &model, true).await;
+    let mut usable = usable;
+    if let Some(s) = session.as_ref().filter(|s| s.locks_requested_name())
+        && let Some(lock) = s.lock()
+    {
+        // The locked target goes first, and the others wait for the lock to break.
+        match usable.iter().position(|t| t.provider == lock.provider && t.model == lock.model) {
+            Some(i) => usable[..=i].rotate_right(1),
+            None => s.break_lock(reason::TARGET_UNAVAILABLE).await,
+        }
+    }
+    let holds = |t: &Target| session.as_ref().is_some_and(|s| s.holds(&t.provider, &t.model));
     let fwd = forward_request_headers(&headers);
     let last = usable.len() - 1;
     // The request counts once in total, on the first target admitted; each
@@ -404,6 +417,9 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             };
             if let Err(e) = admitted {
                 if i < last && e.on.is_some() {
+                    if let Some(s) = session.as_ref().filter(|_| holds(target)) {
+                        s.break_lock(reason::LIMIT).await;
+                    }
                     tracing::info!(target = %target.qualified(), limit = e.limit, "provider limit reached; trying the next alias target");
                     continue;
                 }
@@ -417,12 +433,22 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
                     Ok(x) => x,
                     Err(msg) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", msg),
                 };
-                let resp =
-                    send(state, target, upstream.path(), translated_headers(&fwd, upstream), body, &principal, &model, &mut charge).await;
+                let resp = send(
+                    state,
+                    target,
+                    upstream.path(),
+                    translated_headers(&fwd, upstream),
+                    body,
+                    &principal,
+                    &model,
+                    &mut charge,
+                    session.as_ref(),
+                )
+                .await;
                 (resp, Some(t))
             }
             _ => {
-                let resp = send(state, target, path, fwd.clone(), json.clone(), &principal, &model, &mut charge).await;
+                let resp = send(state, target, path, fwd.clone(), json.clone(), &principal, &model, &mut charge, session.as_ref()).await;
                 let streams = json.get("stream").and_then(Value::as_bool).unwrap_or(false);
                 let grok = pool(&target.provider) == Some(SubProvider::Grok);
                 let resp = if grok && wire == Some(Wire::Responses) && !streams { collect_grok(resp).await } else { resp };
@@ -431,7 +457,12 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
         };
         counted |= !pooled || charge.is_settled();
         let status = resp.status().as_u16();
-        if i < last && (status == 429 || status >= 500) {
+        let failed = status == 429 || status >= 500;
+        // A pool counts failures on its locked account itself. A gateway target has no account.
+        if let Some(s) = session.as_ref().filter(|_| failed && !pooled && holds(target)) {
+            s.upstream_failure().await;
+        }
+        if i < last && failed && !holds(target) {
             tracing::info!(target = %target.qualified(), status, "falling back to next alias target");
             continue;
         }
@@ -486,6 +517,40 @@ async fn collect_grok(resp: Response) -> Response {
     }
 }
 
+/// The session of an LLM request. Only a client key's requests on the wire
+/// formats have one, and counting tokens is not a turn of the conversation.
+async fn session_for(
+    state: &AppState,
+    principal: &Principal,
+    path: &str,
+    headers: &HeaderMap,
+    body: &Value,
+    requested: &str,
+    lockable: bool,
+) -> Option<RequestSession> {
+    if Wire::for_path(path).is_none() || path == "/v1/messages/count_tokens" {
+        return None;
+    }
+    RequestSession::begin(&state.db, &state.cfg, principal.client_id()?, headers, body, requested, lockable).await
+}
+
+/// The session of a passthrough request, whose body is only parsed here.
+async fn passthrough_session(
+    state: &AppState,
+    principal: &Principal,
+    rest: &str,
+    headers: &HeaderMap,
+    body: Option<&Bytes>,
+    label: Option<&str>,
+    lockable: bool,
+) -> Option<RequestSession> {
+    let path = format!("/{rest}");
+    Wire::for_path(&path)?;
+    let json: Value = serde_json::from_slice(body?).ok()?;
+    let requested = label.unwrap_or_default();
+    session_for(state, principal, &path, headers, &json, requested, lockable && label.is_some()).await
+}
+
 /// Send a JSON request to one target: a subscription pool or a gateway provider.
 #[allow(clippy::too_many_arguments)]
 async fn send(
@@ -497,6 +562,7 @@ async fn send(
     principal: &Principal,
     model: &str,
     charge: &mut Charge<'_>,
+    session: Option<&RequestSession>,
 ) -> Response {
     let client_id = principal.client_id();
     // Mistral and Grok drop `stream_options`; they report usage anyway.
@@ -505,9 +571,9 @@ async fn send(
         Some(p) => {
             body["model"] = Value::String(target.model.clone());
             let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
-            state.subs.execute(p, Method::POST, path, headers, bytes, Some(principal), Some(model), charge).await
+            state.subs.execute(p, Method::POST, path, headers, bytes, Some(principal), Some(model), charge, session).await
         }
-        None => state.gateway.execute(target, Method::POST, path, headers, body, client_id, model).await,
+        None => state.gateway.execute(target, Method::POST, path, headers, body, client_id, model, session).await,
     }
 }
 
@@ -705,12 +771,17 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
     let path = path_and_query(&rest, &parts.uri);
     let fwd = forward_request_headers(&parts.headers);
     let label = model.map(|m| format!("{provider}/{m}"));
+    // Nothing routes a passthrough, so there is nothing for a lock to pin.
+    let session = passthrough_session(&state, &principal, &rest, &parts.headers, bytes.as_ref(), label.as_deref(), false).await;
     let upstream = match (bytes, stream) {
         (Some(b), _) => reqwest::Body::from(b),
         (None, Some(s)) => reqwest::Body::wrap_stream(s.into_data_stream()),
         (None, None) => reqwest::Body::from(Vec::new()),
     };
-    state.gateway.passthrough(&provider, parts.method, &path, fwd, upstream, principal.client_id(), label.as_deref()).await
+    state
+        .gateway
+        .passthrough(&provider, parts.method, &path, fwd, upstream, principal.client_id(), label.as_deref(), session.as_ref())
+        .await
 }
 
 /// `/opencode-go/<rest>`: raw OpenCode Go API through the account pool
@@ -746,7 +817,21 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
         return limited(&principal, &e, rest.starts_with("v1/messages"));
     }
     let mut charge = Charge::new(&meters);
-    state.subs.execute(SubProvider::OpencodeGo, parts.method, &path, fwd, bytes, Some(&principal), label.as_deref(), &mut charge).await
+    let session = passthrough_session(&state, &principal, &rest, &parts.headers, Some(&bytes), label.as_deref(), true).await;
+    state
+        .subs
+        .execute(
+            SubProvider::OpencodeGo,
+            parts.method,
+            &path,
+            fwd,
+            bytes,
+            Some(&principal),
+            label.as_deref(),
+            &mut charge,
+            session.as_ref(),
+        )
+        .await
 }
 
 #[cfg(test)]

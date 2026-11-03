@@ -54,11 +54,11 @@ come back to xolotl and finish without a pasted URL.
 ```toml
 [database]
 path = "xolotl.db"      # the container image uses /data/xolotl.db
-retention_days = 90     # request log and MCP call log
+retention_days = 90     # request log, MCP call log, sessions and tool counts
 ```
 
 The database holds cooldowns, usage snapshots, the account index, the request
-log and the MCP call log. It holds no secrets. If you lose it, xolotl rebuilds
+log, the MCP call log, sessions and tool counts. It holds no secrets. If you lose it, xolotl rebuilds
 the account index from OpenBao.
 
 ## `[vault]`
@@ -124,6 +124,17 @@ refresh_margin_secs = 300  # refresh OAuth tokens this long before they expire
 soft_limit_percent = 95.0  # accounts above this in any window are used last
 session_affinity_secs = 3600   # 0 disables session affinity
 ```
+
+## `[sessions]`
+
+```toml
+[sessions]
+lock_tokens = 60000     # 0 disables the context lock
+```
+
+A session whose prompt reaches `lock_tokens` stays on its account and model, so
+that its prompt cache is kept. Set it to `0` to turn this off and keep failover
+for every request. See [Context lock](accounts#context-lock).
 
 ## `[gateway.providers.<name>]`
 

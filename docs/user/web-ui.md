@@ -57,7 +57,7 @@ server log has the details.
 | Client keys | Issue, rotate with a grace period, enable or disable, revoke. Consumption against the policy's rate limits. Shows the OpenBao path, the `bao` command and the OpenBao policy the client needs. Never shows the key |
 | MCP servers | Upstream servers: add, edit and remove runtime servers, set header secrets, OAuth sign-in, tools, recent tool calls |
 | Providers & models | Gateway providers and their key state, set a key, the model catalog with each model's endpoints |
-| Usage | The request log grouped by client, account, provider or model, and a link to `telemetry.dashboard_url` |
+| Usage | The request log grouped by client, account, provider or model, sessions, the tools each key called, and a link to `telemetry.dashboard_url` |
 
 Every member of the admin group has full access.
 
@@ -142,6 +142,14 @@ Select a row to narrow the view to it. The view then groups by the first of
 model, account, client and provider that is not shown or narrowed yet. Each
 filter shows as a chip; remove a chip to widen the view again. The URL keeps
 the filters (`/#/usage?group=model&client=...`), so you can bookmark a view.
+
+**Sessions** lists the 100 most recently used conversations: how full each one
+is against its model's context window, its peak, its turns, its share of prompt
+tokens read from cache, and its [context lock](accounts#context-lock) with any
+failures and breaks. **Tools called** lists each tool a key called and how
+often, so you can remove unused tools from its policy by hand. Both follow the
+client filter. Tool names are as the upstream sent them: a name that xolotl
+shortened for a translated request stays shortened.
 
 ## Models
 

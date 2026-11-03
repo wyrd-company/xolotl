@@ -57,6 +57,9 @@ refresh_margin_secs = 300
 soft_limit_percent = 95.0  # accounts above this are used last
 session_affinity_secs = 3600
 
+[sessions]
+lock_tokens = 60000        # pin a session to its account and model at this prompt size; 0 disables
+
 # Gateway providers are addressed as <name>/<model> and passthrough /<name>/...
 # API keys come from the vault secret providers/<name> (field api_key).
 [gateway.providers.vercel]

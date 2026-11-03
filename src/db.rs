@@ -19,7 +19,7 @@ pub fn now() -> i64 {
 
 #[derive(Clone)]
 pub struct Db {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, PartialEq)]
@@ -87,6 +87,12 @@ pub struct RequestRecord {
     pub api_equivalent_cost: Option<f64>,
     pub latency_ms: i64,
     pub trace_id: Option<String>,
+    /// Digest identifying the conversation ([`crate::context`]).
+    pub session_key: Option<String>,
+    /// The prompt's size: reported by the upstream, else estimated.
+    pub context_tokens: Option<i64>,
+    /// The model's context window, when known.
+    pub context_window: Option<i64>,
 }
 
 /// Requests admitted or tokens finished by one client in one second, for
@@ -191,6 +197,9 @@ pub struct LoggedRequest {
     pub status: i64,
     pub latency_ms: i64,
     pub trace_id: Option<String>,
+    pub session_key: Option<String>,
+    pub context_tokens: Option<i64>,
+    pub context_window: Option<i64>,
 }
 
 impl Db {
@@ -375,8 +384,9 @@ impl Db {
     pub async fn log_request(&self, r: &RequestRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO request_log (ts, started_at, client_id, provider, account_id, model, endpoint, status,
-               input_tokens, output_tokens, cached_tokens, latency_ms, trace_id, api_equivalent_cost)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               input_tokens, output_tokens, cached_tokens, latency_ms, trace_id, api_equivalent_cost,
+               session_key, context_tokens, context_window)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(now())
         .bind(r.started_at)
@@ -392,6 +402,9 @@ impl Db {
         .bind(r.latency_ms)
         .bind(&r.trace_id)
         .bind(r.api_equivalent_cost)
+        .bind(&r.session_key)
+        .bind(r.context_tokens)
+        .bind(r.context_window)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -400,7 +413,8 @@ impl Db {
     /// The latest failed requests (status 400 and up), newest first.
     pub async fn recent_errors(&self, limit: i64) -> Result<Vec<LoggedRequest>> {
         Ok(sqlx::query_as(
-            "SELECT ts, client_id, provider, account_id, model, endpoint, status, latency_ms, trace_id
+            "SELECT ts, client_id, provider, account_id, model, endpoint, status, latency_ms, trace_id,
+               session_key, context_tokens, context_window
              FROM request_log WHERE status >= 400 ORDER BY ts DESC, id DESC LIMIT ?",
         )
         .bind(limit)
@@ -468,7 +482,8 @@ impl Db {
         let cutoff = now() - i64::from(retention_days) * 86_400;
         let r = sqlx::query("DELETE FROM request_log WHERE ts < ?").bind(cutoff).execute(&self.pool).await?;
         let m = sqlx::query("DELETE FROM mcp_call_log WHERE ts < ?").bind(cutoff).execute(&self.pool).await?;
-        Ok(r.rows_affected() + m.rows_affected())
+        let s = self.prune_sessions(cutoff).await?;
+        Ok(r.rows_affected() + m.rows_affected() + s)
     }
 
     // ---- MCP call log ----

@@ -54,9 +54,11 @@ A SQLite index failure cannot prevent a rotated credential from being saved to O
 2. **Tier:** accounts below `soft_limit_percent` (95%) of every usage window first, then by highest `priority`.
 3. **Strategy** within the best tier: `round-robin` (default), `fill-first` or `least-used`.
 
+A session's [context lock](sessions.md#context-lock) comes before all three, including the soft limit.
+
 ## Failover
 
-`Subscriptions::execute` tries up to `max_attempts` (3) accounts. Each provider classifies an upstream failure as one of four kinds:
+`Subscriptions::execute` tries up to `max_attempts` (3) accounts. A session's [context lock](sessions.md#context-lock) narrows this: a request on its locked account fails over only when the lock breaks. Each provider classifies an upstream failure as one of four kinds:
 
 | Class | Examples | Effect |
 |---|---|---|

@@ -15,6 +15,7 @@ use parking_lot::RwLock;
 use serde_json::{Value, json};
 
 use crate::config::{GatewayConfig, ProviderConfig, ProviderKind};
+use crate::context::RequestSession;
 use crate::db::Db;
 use crate::limits::Limiter;
 use crate::policy::Target;
@@ -128,6 +129,10 @@ impl Gateway {
         Ok(resp)
     }
 
+    fn window(&self, provider: &str, model: &str) -> Option<u64> {
+        self.catalog.as_ref().and_then(|c| c.context_window(provider, model))
+    }
+
     /// Send a JSON request (`/v1/chat/completions`, `/v1/embeddings`,
     /// `/v1/ocr`, `/v1/responses`, `/v1/messages`, ...) to one target.
     #[allow(clippy::too_many_arguments)]
@@ -140,6 +145,7 @@ impl Gateway {
         mut body: Value,
         client_id: Option<&str>,
         requested_model: &str,
+        session: Option<&RequestSession>,
     ) -> Response {
         if let Some(obj) = body.as_object_mut() {
             obj.insert("model".into(), Value::String(target.model.clone()));
@@ -149,7 +155,8 @@ impl Gateway {
         }
         let accounting = Accounting::new(self.db.clone(), &target.provider, path, client_id, Some(requested_model))
             .with_prices(self.catalog.as_ref().map(|c| c.metadata(&target.provider, &target.model).values))
-            .with_limiter(&self.limiter);
+            .with_limiter(&self.limiter)
+            .with_session(session.map(|s| s.track(&target.model, self.window(&target.provider, &target.model))));
         let bytes = serde_json::to_vec(&body).unwrap_or_default();
         match self.send(&target.provider, method, path, headers, reqwest::Body::from(bytes)).await {
             Ok(r) => proxy::relay(r, Some(accounting)),
@@ -172,14 +179,18 @@ impl Gateway {
         body: reqwest::Body,
         client_id: Option<&str>,
         model: Option<&str>,
+        session: Option<&RequestSession>,
     ) -> Response {
         let endpoint = path_and_query.split('?').next().unwrap_or(path_and_query);
         let prices = self.catalog.as_ref().and_then(|c| {
             let model = model?.strip_prefix(&format!("{provider}/")).unwrap_or(model?);
             Some(c.metadata(provider, model).values)
         });
-        let accounting =
-            Accounting::new(self.db.clone(), provider, endpoint, client_id, model).with_limiter(&self.limiter).with_prices(prices);
+        let upstream_model = model.map(|m| m.strip_prefix(&format!("{provider}/")).unwrap_or(m)).unwrap_or_default();
+        let accounting = Accounting::new(self.db.clone(), provider, endpoint, client_id, model)
+            .with_limiter(&self.limiter)
+            .with_prices(prices)
+            .with_session(session.map(|s| s.track(upstream_model, self.window(provider, upstream_model))));
         match self.send(provider, method, path_and_query, headers, body).await {
             Ok(r) => proxy::relay(r, Some(accounting)),
             Err(e) => {
@@ -259,7 +270,7 @@ mod tests {
             .await;
         let g = gateway("b", &s).await;
         let t = Target { provider: "b".into(), model: "m2".into() };
-        let resp = g.execute(&t, Method::POST, "/v1/chat/completions", HeaderMap::new(), json!({"model": "x"}), None, "x").await;
+        let resp = g.execute(&t, Method::POST, "/v1/chat/completions", HeaderMap::new(), json!({"model": "x"}), None, "x", None).await;
         assert_eq!(resp.status(), 200);
         assert_eq!(g.fetch_models("b").await.unwrap(), vec!["m2", "m3"]);
     }

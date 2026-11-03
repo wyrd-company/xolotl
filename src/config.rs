@@ -20,6 +20,21 @@ pub struct Config {
     pub catalog: CatalogConfig,
     pub mcp: McpConfig,
     pub ui: UiConfig,
+    pub sessions: SessionsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionsConfig {
+    /// Pin a session to its account and model once its prompt reaches this many
+    /// tokens, so that failover and routing keep the prompt cache. 0 disables it.
+    pub lock_tokens: u64,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self { lock_tokens: 60_000 }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

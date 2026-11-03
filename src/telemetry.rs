@@ -124,6 +124,10 @@ pub struct Metrics {
     pub mcp_tool_call_duration: Histogram<f64>,
     pub mcp_executions: Counter<u64>,
     pub limit_rejections: Counter<u64>,
+    pub session_context_tokens: Histogram<u64>,
+    pub session_context_utilization: Histogram<f64>,
+    pub session_locks: Counter<u64>,
+    pub tool_calls: Counter<u64>,
 }
 
 pub fn metrics() -> &'static Metrics {
@@ -161,6 +165,16 @@ pub fn metrics() -> &'static Metrics {
                 .u64_counter("xolotl.limit.rejections")
                 .with_description("Requests refused by a policy's rate limits, by policy, client and limit")
                 .build(),
+            session_context_tokens: meter
+                .u64_histogram("xolotl.session.context_tokens")
+                .with_description("Prompt size per request")
+                .build(),
+            session_context_utilization: meter
+                .f64_histogram("xolotl.session.context_utilization")
+                .with_description("Prompt size as a fraction of the model's context window")
+                .build(),
+            session_locks: meter.u64_counter("xolotl.session.locks").with_description("Context locks formed and broken").build(),
+            tool_calls: meter.u64_counter("xolotl.tool_calls").with_description("Tool calls in LLM responses, by client and tool").build(),
         }
     })
 }

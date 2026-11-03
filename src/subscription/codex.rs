@@ -66,8 +66,10 @@ pub fn prepare(headers: &mut HeaderMap, body: &mut Value, cred: &Credential, pat
     }
 }
 
+pub const SESSION_HEADERS: &[&str] = &["session_id", "session-id", "thread-id"];
+
 pub fn session_key(headers: &HeaderMap, body: &Value) -> Option<String> {
-    ["session_id", "session-id", "thread-id"]
+    SESSION_HEADERS
         .iter()
         .find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()).map(str::to_string))
         .or_else(|| body.get("prompt_cache_key").and_then(Value::as_str).map(str::to_string))

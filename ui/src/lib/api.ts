@@ -282,6 +282,42 @@ export interface UsageRow {
   priced_requests?: number;
 }
 
+export interface SessionRow {
+  client_id: string;
+  session_key: string;
+  source: string;
+  first_seen: number;
+  last_seen: number;
+  turns: number;
+  current_tokens: number;
+  peak_tokens: number;
+  prompt_tokens: number;
+  cached_tokens: number;
+  context_window: number | null;
+  provider: string | null;
+  model: string | null;
+  utilization: number | null;
+  peak_utilization: number | null;
+  cache_hit_ratio: number | null;
+  lock_name: string | null;
+  lock_provider: string | null;
+  lock_model: string | null;
+  lock_account: string | null;
+  locked_at: number | null;
+  lock_failures: number;
+  lock_breaks: number;
+  last_break_reason: string | null;
+  last_break_at: number | null;
+}
+
+export interface ToolUsageRow {
+  client_id: string;
+  tool: string;
+  source: "llm" | "mcp";
+  calls: number;
+  last_used: number;
+}
+
 export interface McpServer {
   name: string;
   url: string;

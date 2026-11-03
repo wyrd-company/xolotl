@@ -79,7 +79,7 @@ async fn run_as(
     headers: HeaderMap,
     body: Bytes,
 ) -> (Option<String>, (u16, String)) {
-    let resp = subs.execute(provider, Method::POST, path, headers, body, Some(principal), Some("m"), &mut Charge::default()).await;
+    let resp = subs.execute(provider, Method::POST, path, headers, body, Some(principal), Some("m"), &mut Charge::default(), None).await;
     let status = resp.status().as_u16();
     let retry = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_string);
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -211,7 +211,17 @@ async fn all_accounts_cooling_returns_429_with_retry_after() {
     let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
     subs.db.set_cooldown(&a.id, now() + 300, "test").await.unwrap();
     let resp = subs
-        .execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), None, None, &mut Charge::default())
+        .execute(
+            SubProvider::Codex,
+            Method::POST,
+            "/v1/responses",
+            HeaderMap::new(),
+            responses_body(),
+            None,
+            None,
+            &mut Charge::default(),
+            None,
+        )
         .await;
     assert_eq!(resp.status(), 429);
     let ra: i64 = resp.headers()["retry-after"].to_str().unwrap().parse().unwrap();
@@ -620,7 +630,17 @@ async fn codex_headerless_stream_is_accounted() {
         .mount(&server)
         .await;
     let resp = subs
-        .execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), None, None, &mut Charge::default())
+        .execute(
+            SubProvider::Codex,
+            Method::POST,
+            "/v1/responses",
+            HeaderMap::new(),
+            responses_body(),
+            None,
+            None,
+            &mut Charge::default(),
+            None,
+        )
         .await;
     assert_eq!(resp.headers()["content-type"], "text/event-stream");
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -1319,6 +1339,7 @@ async fn served_by(subs: &Subscriptions, principal: &Principal) -> (u16, Option<
             Some(principal),
             None,
             &mut Charge::default(),
+            None,
         )
         .await;
     let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -1443,7 +1464,7 @@ async fn an_account_filled_since_its_check_is_passed_over() {
 
     let mut charge = Charge::new(&[Meter::Total]);
     let mut limited = None;
-    let chosen = subs.admit_one(SubProvider::Codex, None, Some(&key), candidates(), &mut charge, &mut limited).unwrap();
+    let chosen = subs.admit_one(SubProvider::Codex, None, None, Some(&key), candidates(), &mut charge, &mut limited).unwrap();
     assert_eq!(chosen.map(|r| r.id), Some(b.id.clone()), "a is passed over");
     assert!(charge.is_settled() && limited.as_ref().is_some_and(|e| e.is_on(Meter::Account(&a.id))));
     assert_eq!(limiter.consumption("p/client", now()).requests_per_day, 1, "counted in total with b");
@@ -1451,7 +1472,7 @@ async fn an_account_filled_since_its_check_is_passed_over() {
     let only_a: Vec<_> = candidates().into_iter().filter(|(r, _)| r.id == a.id).collect();
     let mut charge = Charge::new(&[Meter::Total]);
     let mut limited = None;
-    let chosen = subs.admit_one(SubProvider::Codex, None, Some(&key), only_a, &mut charge, &mut limited).unwrap();
+    let chosen = subs.admit_one(SubProvider::Codex, None, None, Some(&key), only_a, &mut charge, &mut limited).unwrap();
     assert!(chosen.is_none() && limited.is_some_and(|e| e.retry_after > 0), "the refusal says when to retry");
     assert!(!charge.is_settled());
     assert_eq!(limiter.consumption("p/client", now()).requests_per_day, 1, "nothing counted");
@@ -1462,7 +1483,7 @@ async fn an_account_filled_since_its_check_is_passed_over() {
     }
     let mut charge = Charge::new(&[Meter::Total]);
     let mut limited = None;
-    let e = subs.admit_one(SubProvider::Codex, None, Some(&key), candidates(), &mut charge, &mut limited).unwrap_err();
+    let e = subs.admit_one(SubProvider::Codex, None, None, Some(&key), candidates(), &mut charge, &mut limited).unwrap_err();
     assert!(e.is_on(Meter::Total), "{e:?}");
     assert_eq!(limiter.policy_consumption("p", Meter::Account(&b.id), now()).requests_per_minute, 1, "b not counted again");
 }
@@ -1484,14 +1505,14 @@ async fn a_restart_counts_pool_requests_as_admission_did() {
     let mut charge = Charge::new(&[Meter::Total]);
     // Admitted, then the account's credential fails: counted.
     let resp = subs
-        .execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), Some(&key), None, &mut charge)
+        .execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), Some(&key), None, &mut charge, None)
         .await;
     assert_eq!(resp.status(), 503);
     assert!(charge.is_settled());
     // The account now needs a login: refused before any account, not counted.
     let mut charge = Charge::new(&[Meter::Total]);
     let resp = subs
-        .execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), Some(&key), None, &mut charge)
+        .execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), Some(&key), None, &mut charge, None)
         .await;
     assert_eq!(resp.status(), 503);
     assert!(!charge.is_settled());
@@ -1594,7 +1615,7 @@ async fn cached_internal_window_does_not_affect_selection_or_account_output() {
         .await
         .unwrap();
     let selected = subs
-        .select(SubProvider::Claude, None, None, &HashSet::new(), &mut Charge::default())
+        .select(SubProvider::Claude, None, None, None, &HashSet::new(), &mut Charge::default())
         .await
         .unwrap_or_else(|_| panic!("an account must be selected"));
     assert_eq!(selected.id, a.id, "the cached internal bucket must not soft-limit the preferred account");

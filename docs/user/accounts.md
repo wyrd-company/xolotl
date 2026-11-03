@@ -155,7 +155,8 @@ do not need a new login. Then:
    where that is lowest. For example, an account at 10% in its 5-hour window
    and 99% in its 7-day window loses to an account at 40% in both.
 
-Set these in [`[subscription]`](configuration#subscription).
+Set these in [`[subscription]`](configuration#subscription). A session's
+[context lock](#context-lock) comes before all of them.
 
 ## When an account fails
 
@@ -165,7 +166,7 @@ Xolotl tries up to `max_attempts` (3) accounts for one request.
 |---|---|
 | Quota used up (for example Codex `usage_limit_reached`, a Claude 5-hour or 7-day limit) | Cools the account down until its reset time and tries the next account |
 | 401 or revoked login | Refreshes the token once and retries. If that fails, marks the account `re-login` and tries the next one |
-| 5xx, overloaded, short 429 | Tries the next account |
+| 5xx, overloaded, short 429 | Tries the next account, except on a session's [context lock](#context-lock) |
 | 400, context length exceeded | Returns the error to the client, because another account fails the same way |
 | OpenCode Go 403 | Returns the error to the client. The account stays available, because a 403 refuses the request, not the key |
 
@@ -174,6 +175,42 @@ set to the earliest reset.
 
 The account's last error shows why the upstream refused, with credentials
 removed. A successful request clears it.
+
+## Context lock
+
+A long conversation is cheap only while the provider's prompt cache holds it, and
+that cache belongs to one account and one model. So a session whose prompt
+reaches `lock_tokens` (60 000 tokens) stays on the account and model that served
+it, ahead of alias order, `soft_limit_percent` and the strategy above. The session
+is identified from what the client sends, or else from its system prompt and
+first message.
+
+Xolotl breaks the lock, moves the request on and records why, when:
+
+| Reason | What happened |
+|---|---|
+| `cooldown` | The account is cooling down |
+| `account_lost` | The account was removed or disabled, needs a new login, or its credential is unavailable |
+| `policy` | The key's policy no longer allows the account |
+| `limit` | The account or provider is at a limit of the key's policy |
+| `upstream_errors` | `max_attempts` (3) requests in a row failed on the account |
+| `target_unavailable` | The model name no longer offers the locked target |
+
+**A locked session does not fail over on a short failure.** A 5xx, a transport
+error or a 429 without `Retry-After` from the locked account goes back to the
+client, which sees an error it would not see without the lock. A success ends the
+count. The third failure in a row breaks the lock and fails over in that same
+request. To keep failover on every request, turn the lock off with
+`lock_tokens = 0` in [`[sessions]`](configuration#sessions).
+
+The lock belongs to the model name the client asked for. A request in the same
+session for another name, such as a smaller model for a background task, routes
+normally and leaves the lock alone. It still prefers the locked account when its
+model is on the same provider.
+
+After a break, the session locks again wherever its next success lands. See
+locks, failures and breaks on the web UI's **Usage** screen, at
+`GET /admin/sessions`, and in the `xolotl.session.locks` metric.
 
 ## Token refresh
 

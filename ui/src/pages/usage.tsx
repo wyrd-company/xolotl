@@ -18,6 +18,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { get, type GroupBy, type Status, type UsageRow } from "@/lib/api";
 import { num } from "@/lib/format";
+import { SessionsCard, ToolsCard } from "@/pages/usage-sessions";
 import { GROUPS, narrowTo, PERIODS, readView, withParams } from "@/lib/usage-view";
 
 const EMPTY_KEY: Record<GroupBy, string> = { client: "admin token", account: "no account (gateway)", provider: "-", model: "no model" };
@@ -33,6 +34,7 @@ export function UsagePage() {
     queryFn: () => get<UsageRow[]>(`/admin/usage?${api}`),
   });
   const rows = usage.data ?? [];
+  const clientFilter = filters.find(([g]) => g === "client")?.[1];
   const dashboard = status.data?.dashboard_url;
   const setView = (change: Record<string, string>) => setParams(withParams(params, change), { replace: true });
 
@@ -143,6 +145,8 @@ export function UsagePage() {
           <Empty>{filters.length || errorsOnly ? "No matching requests in this period." : "No requests in this period."}</Empty>
         )}
       </Card>
+      <SessionsCard client={clientFilter} />
+      <ToolsCard client={clientFilter} />
     </>
   );
 }
