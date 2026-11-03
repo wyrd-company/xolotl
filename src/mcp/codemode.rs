@@ -783,9 +783,11 @@ mod tests {
         let host = Arc::new(Counting::default());
         let permit = permits.clone().acquire_owned().await.unwrap();
         let h = host.clone();
-        let outer = tokio::spawn(async move { execute("await gh_work.effect({})", ns(), h, limits(), Some(permit)).await });
-        while host.started.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        let patient = Limits { timeout: Duration::from_secs(25), ..limits() };
+        let mut outer = tokio::spawn(async move { execute("await gh_work.effect({})", ns(), h, patient, Some(permit)).await });
+        tokio::select! {
+            _ = host.effect_running.notified() => {}
+            _ = &mut outer => panic!("the execution ended before the call started"),
         }
         outer.abort();
         let _ = outer.await;
