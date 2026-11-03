@@ -671,13 +671,16 @@ mod tests {
         }
     }
 
-    /// Counts started calls; `effect` sleeps, then records that it ran.
-    /// A call's future takes 300 ms to drop, and records when it has.
+    /// Counts started calls; `effect` holds for far longer than a test runs
+    /// when it works, then records that it ran. `effect_started` returns once
+    /// an `effect` call has started. A call's future takes 300 ms to drop, and
+    /// records when it has.
     #[derive(Default)]
     struct Counting {
         started: std::sync::atomic::AtomicUsize,
         effects: std::sync::atomic::AtomicUsize,
         dropped: Arc<std::sync::atomic::AtomicUsize>,
+        effect_running: tokio::sync::Notify,
     }
 
     struct SlowDrop(Arc<std::sync::atomic::AtomicUsize>);
@@ -693,9 +696,16 @@ mod tests {
     impl ToolHost for Counting {
         async fn call(&self, _server: String, tool: String, _arguments: Value) -> Result<Value, String> {
             use std::sync::atomic::Ordering;
+            if tool == "effect_started" {
+                self.effect_running.notified().await;
+                return Ok(Value::Null);
+            }
             self.started.fetch_add(1, Ordering::SeqCst);
             let _teardown = SlowDrop(self.dropped.clone());
-            tokio::time::sleep(Duration::from_millis(if tool == "effect" { 350 } else { 50 })).await;
+            if tool == "effect" {
+                self.effect_running.notify_one();
+            }
+            tokio::time::sleep(if tool == "effect" { Duration::from_secs(30) } else { Duration::from_millis(50) }).await;
             self.effects.fetch_add(1, Ordering::SeqCst);
             Ok(Value::Null)
         }
@@ -716,16 +726,35 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn no_tool_work_outlives_the_execution() {
         use std::sync::atomic::Ordering;
-        let quick = Limits { timeout: Duration::from_millis(100), ..limits() };
         let ns = || vec![("gh_work".to_string(), "gh-work".to_string())];
-        // Timed out while a call is in flight; and returned without awaiting one.
-        for code in ["await gh_work.effect({})", "gh_work.effect({}); return 1"] {
-            let host = Arc::new(Counting::default());
-            let o = execute(code, ns(), host.clone(), quick.clone(), None).await;
-            assert_eq!(host.started.load(Ordering::SeqCst), 1, "{code}");
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            assert_eq!(host.effects.load(Ordering::SeqCst), 0, "{code}: {:?}", o.result);
-        }
+        // Read as `execute` returns: a stopped call's teardown has finished by then.
+        let counts = |host: &Counting| {
+            (host.started.load(Ordering::SeqCst), host.dropped.load(Ordering::SeqCst), host.effects.load(Ordering::SeqCst))
+        };
+
+        // Timed out while a call is in flight. The deadline leaves a loaded
+        // host time to start the call.
+        let host = Arc::new(Counting::default());
+        let timed = Limits { timeout: Duration::from_secs(2), ..limits() };
+        let o = execute("await gh_work.effect({})", ns(), host.clone(), timed, None).await;
+        assert!(o.result.unwrap_err().contains("timed out"));
+        assert_eq!(counts(&host), (1, 1, 0), "timed out");
+
+        // Returned while a call is in flight: `effect_started` shows it started.
+        let host = Arc::new(Counting::default());
+        let code = "gh_work.effect({}); await gh_work.effect_started({}); return 1";
+        let o = execute(code, ns(), host.clone(), limits(), None).await;
+        assert_eq!(o.result.unwrap(), json!(1));
+        assert_eq!(counts(&host), (1, 1, 0), "returned in flight");
+
+        // Returned straight after making a call: the abort can reach the call
+        // before its first poll, and then it never starts. Both orders are correct.
+        let host = Arc::new(Counting::default());
+        let o = execute("gh_work.effect({}); return 1", ns(), host.clone(), limits(), None).await;
+        assert_eq!(o.result.unwrap(), json!(1));
+        let (started, dropped, effects) = counts(&host);
+        assert!(started <= 1, "{started} calls started");
+        assert_eq!((dropped, effects), (started, 0), "returned straight after the call");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -749,7 +778,6 @@ mod tests {
         assert!(back.is_ok(), "the permit was never released");
         assert_eq!(host.dropped.load(Ordering::SeqCst), 1, "the tool call's teardown finished before the permit came back");
         drop(back);
-        tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!((host.started.load(Ordering::SeqCst), host.effects.load(Ordering::SeqCst)), (1, 0));
 
         // Cancelled while JavaScript is busy: it is interrupted long before the deadline.
