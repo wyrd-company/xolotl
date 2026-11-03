@@ -102,8 +102,15 @@ codex = ["codex-1a2b3c4d5e", "codex-f6a7b8c9d0"]   # only these two
 claude = ["*"]                                    # every account, also new ones
 ```
 
-- A provider without an entry has no accounts: its requests get a 403. In
-  the web UI, a provider you turn on starts with the accounts it has now.
+- A provider without an entry has no accounts: its requests get a 403. An empty
+  list is the same as no entry. In the web UI, a provider you turn on starts
+  with the accounts it has now.
+- Saving a policy still succeeds in that case, but tells you. `xolotl policies put`
+  prints a warning to stderr, `PUT /admin/policies/{name}` adds a `warnings` list
+  to its answer, and the web UI's policy editor shows the warning under the
+  provider. Each warning names one subscription provider. `providers = ["*"]`
+  allows them all, so it warns for each one with no entry. A policy whose scopes
+  don't include `proxy` or `admin` gets no warning, as its keys call no provider.
 - `xolotl accounts list` shows the account IDs.
 - When none of the listed accounts exists, a request gets a 403. When the
   listed accounts are disabled, cooling down or at a limit, the pool answers
@@ -196,7 +203,9 @@ xolotl policies view devcontainer
 ```
 
 This lists every name, where it routes, and the endpoints it is served on,
-natively and through translation. With MCP servers, it also lists the tools a
+natively and through translation. It lists the accounts that exist now and that
+keys can use for each subscription provider the policy allows, and says
+`no accounts` where there are none. With MCP servers, it also lists the tools a
 key can call. A client gets the same names from `GET /v1/models`.
 
 ## Rate limits

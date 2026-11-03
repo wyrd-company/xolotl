@@ -60,8 +60,8 @@ See [Subscription accounts](accounts).
 |---|---|
 | `xolotl policies list` | Policies with providers and scopes, and a warning on stderr for each stored policy that did not load |
 | `xolotl policies get <name>` | One policy as JSON |
-| `xolotl policies put <file>` | Create or replace a policy from a TOML or JSON file |
-| `xolotl policies view <name>` | The names a key sees, where they route, their endpoints, and the MCP tools |
+| `xolotl policies put <file>` | Create or replace a policy from a TOML or JSON file. Warns on stderr about a subscription provider with no accounts |
+| `xolotl policies view <name>` | The names a key sees, where they route, their endpoints, the accounts of each subscription provider, and the MCP tools |
 | `xolotl policies delete <name>` | Delete a policy that no key uses |
 | `xolotl keys issue --policy <p> --name <n> [--ttl <d>] [--description <s>]` | Issue a key into OpenBao at `keys/<p>/<n>`. A name with a live key reports that it exists and changes nothing |
 | `xolotl keys list` | Keys with policy, state, rotation, expiry and rate limit consumption |
