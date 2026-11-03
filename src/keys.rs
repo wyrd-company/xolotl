@@ -41,6 +41,9 @@ pub enum Scope {
     Management,
     /// The MCP gateway (`/mcp`), limited to the policy's MCP servers and tools.
     Mcp,
+    /// Issue, revoke, disable and list client keys under the policies in the
+    /// policy's `key_policies`.
+    Keys,
     /// Full administration. Implies every other scope.
     Admin,
 }

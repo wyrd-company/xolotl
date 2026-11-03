@@ -83,6 +83,10 @@ pub struct Policy {
     /// Globs that remove tools; deny wins over allow.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_tools: Vec<String>,
+    /// With the `keys` scope: the policies whose client keys keys of this
+    /// policy may manage. No wildcard: each one is named.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_policies: Vec<String>,
     /// Rate limits and token budgets of the LLM endpoints.
     #[serde(default, skip_serializing_if = "Limits::is_empty")]
     pub limits: Limits,
@@ -317,6 +321,7 @@ impl Policy {
             .collect();
         self.models = std::mem::take(&mut self.models).into_iter().map(|(t, on)| (t.trim().to_string(), on)).collect();
         lower(&mut self.mcp_servers);
+        lower(&mut self.key_policies);
         self.rules = std::mem::take(&mut self.rules)
             .into_iter()
             .map(|r| match r {
@@ -346,9 +351,15 @@ impl Policy {
     pub fn validate(&self, known: &BTreeSet<String>, mcp: &BTreeSet<String>) -> Result<()> {
         anyhow::ensure!(valid_name(&self.name), "policy name must be lowercase letters, digits, '-' or '_' (max 63)");
         anyhow::ensure!(
-            !self.providers.is_empty() || !self.mcp_servers.is_empty(),
-            "policy must allow at least one provider or MCP server (use * for all)"
+            !self.providers.is_empty() || !self.mcp_servers.is_empty() || !self.key_policies.is_empty(),
+            "policy must allow at least one provider or MCP server (use * for all), or list key_policies"
         );
+        anyhow::ensure!(self.key_policies.is_empty() || self.has_scope(Scope::Keys), "key_policies needs the keys scope");
+        anyhow::ensure!(!self.scopes.contains(&Scope::Keys) || !self.key_policies.is_empty(), "the keys scope needs key_policies");
+        for p in &self.key_policies {
+            anyhow::ensure!(valid_name(p), "key_policies: {p:?} is not a policy name");
+            anyhow::ensure!(*p != self.name, "key_policies: a policy can't list itself");
+        }
         for s in &self.mcp_servers {
             anyhow::ensure!(s == "*" || mcp.contains(s), "unknown MCP server {s:?}");
         }
@@ -408,6 +419,13 @@ impl Policy {
 
     pub fn has_scope(&self, scope: Scope) -> bool {
         self.scopes.contains(&Scope::Admin) || self.scopes.contains(&scope)
+    }
+
+    /// Whether a `keys` key may manage this policy's keys, when it lists this
+    /// policy. A key under it can do nothing beyond the LLM and MCP endpoints.
+    /// `management` reaches accounts, and `keys` could list wider policies.
+    pub fn grants_only_client_use(&self) -> bool {
+        self.scopes.iter().all(|s| matches!(s, Scope::Proxy | Scope::Mcp))
     }
 
     pub fn allows_provider(&self, provider: &str) -> bool {
@@ -986,6 +1004,43 @@ rules = [{ deny = "*-preview" }, { allow = " x " }, { allow = " " }]"#,
         assert!(p.validate(&known(), &mcp).unwrap_err().to_string().contains("mcp scope"));
         p.mcp_servers.clear();
         assert!(p.validate(&known(), &mcp).is_err(), "nothing allowed");
+    }
+
+    #[test]
+    fn key_policies_need_the_scope_and_name_each_policy() {
+        let none = BTreeSet::new();
+        let issuer = |scopes: Vec<Scope>, list: &[&str]| Policy {
+            name: "issuer".into(),
+            scopes,
+            key_policies: list.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        issuer(vec![Scope::Keys], &["dev"]).validate(&known(), &none).expect("needs no provider or MCP server");
+        for (policy, why) in [
+            (issuer(vec![Scope::Proxy], &["dev"]), "needs the keys scope"),
+            (issuer(vec![Scope::Keys], &[]), "at least one provider"),
+            (issuer(vec![Scope::Keys], &["*"]), "not a policy name"),
+            (issuer(vec![Scope::Keys], &["../dev"]), "not a policy name"),
+            (issuer(vec![Scope::Keys], &["issuer"]), "can't list itself"),
+        ] {
+            assert!(policy.validate(&known(), &none).unwrap_err().to_string().contains(why), "{why}");
+        }
+        let with_provider = Policy { providers: vec!["claude".into()], ..issuer(vec![Scope::Keys], &[]) };
+        assert!(with_provider.validate(&known(), &none).unwrap_err().to_string().contains("needs key_policies"));
+
+        let mut parsed: Policy = serde_json::from_str(r#"{"name":"issuer","scopes":["keys"],"key_policies":[" Dev ","dev"]}"#).unwrap();
+        parsed.normalize();
+        assert_eq!(parsed.key_policies, vec!["dev"]);
+        assert!(!serde_json::to_string(&Policy::default()).unwrap().contains("key_policies"), "absent from other policies");
+    }
+
+    #[test]
+    fn only_client_use_can_be_managed_by_a_keys_key() {
+        let with = |scopes: Vec<Scope>| Policy { scopes, ..Default::default() };
+        assert!(with(vec![Scope::Proxy, Scope::Mcp]).grants_only_client_use());
+        for scope in [Scope::Management, Scope::Keys, Scope::Admin] {
+            assert!(!with(vec![Scope::Proxy, scope]).grants_only_client_use(), "{scope:?}");
+        }
     }
 }
 

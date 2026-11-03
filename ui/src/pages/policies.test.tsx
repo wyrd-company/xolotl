@@ -7,7 +7,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, expect, test, vi } from "vitest";
 import type { Policy, UnloadedPolicy } from "@/lib/api";
-import { PoliciesPage } from "./policies";
+import { PoliciesPage, toDraft, toPolicy } from "./policies";
 
 const policy: Policy = {
   name: "sample",
@@ -15,12 +15,12 @@ const policy: Policy = {
   scopes: ["proxy"],
 };
 
-function render(path: string, withKeys = false, unloaded: UnloadedPolicy[] = []) {
+function render(path: string, withKeys = false, unloaded: UnloadedPolicy[] = [], stored: Policy = policy) {
   vi.stubGlobal("localStorage", { getItem: () => null });
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   });
-  client.setQueryData(["policies"], [policy]);
+  client.setQueryData(["policies"], [stored]);
   client.setQueryData(["status"], { unloaded_policies: unloaded });
   client.setQueryData(["keys"], withKeys ? [{ policy: "sample" }] : []);
   client.setQueryData(["providers"], []);
@@ -83,4 +83,22 @@ test("new policy uses the same top actions and requires a name before creating",
   const bar = actions(render("/policies/+new"));
   expect(bar).toMatch(/<button[^>]*type="submit"[^>]*disabled=""[^>]*>Create policy/);
   expect(bar).not.toContain(">Delete");
+});
+
+const issuer: Policy = { name: "sample", providers: [], scopes: ["keys"], key_policies: ["first", "second"] };
+
+test("a keys policy shows its key policies", () => {
+  const html = render("/policies/sample", false, [], issuer);
+  expect(html).toContain("keys (issue client keys)");
+  expect(html).toContain('id="p-key-policies"');
+  expect(html).toContain("first\nsecond");
+});
+
+test("key policies are asked for only under the keys scope", () => {
+  expect(render("/policies/sample")).not.toContain('id="p-key-policies"');
+});
+
+test("saving a policy keeps its key policies", () => {
+  expect(toPolicy(toDraft(issuer)).key_policies).toEqual(["first", "second"]);
+  expect(toPolicy({ ...toDraft(issuer), keyPolicies: " first \n\n" }).key_policies).toEqual(["first"]);
 });

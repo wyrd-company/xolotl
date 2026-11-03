@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use super::{AppState, authorize, json_error};
 use crate::db::{UsageFilter, now};
-use crate::keys::{InvalidIssue, IssueRequest, Issued, Revoked, Scope};
+use crate::keys::{InvalidIssue, IssueRequest, Issued, Principal, Revoked, Scope};
 use crate::limits::Meter;
 use crate::policy::Policy;
 use crate::secrets::{Conflict, SecretStore};
@@ -263,12 +263,13 @@ fn refresh_catalog_later(s: &AppState) {
 /// also the `limits` and the consumption they are checked against
 /// (`limit_usage`: the key's own, or the policy's total with `per = "policy"`).
 async fn list_keys(State(s): State<AppState>, h: HeaderMap) -> Res {
-    admin(&s, &h).await?;
+    let caller = authorize(&s, &h, Scope::Keys).await?;
     let at = now();
     let keys: Vec<Value> = s
         .keys
         .list()
         .into_iter()
+        .filter(|k| may_manage_keys(&s, &caller, &k.policy))
         .map(|k| {
             let mut v = json!(k);
             v["usage"] = json!(s.limiter.consumption(&k.client_id, at));
@@ -280,6 +281,39 @@ async fn list_keys(State(s): State<AppState>, h: HeaderMap) -> Res {
         })
         .collect();
     ok(keys)
+}
+
+/// Who acted, for the log: a client key's id, or `admin` for the bootstrap
+/// admin token and web UI sessions.
+fn actor(caller: &Principal) -> &str {
+    caller.client_id().unwrap_or("admin")
+}
+
+/// Whether the caller may manage keys under a policy. An `admin` caller may
+/// manage any. A `keys` caller may manage the ones its policy lists, unless
+/// such a key could do more than use the LLM and MCP endpoints. A listed policy
+/// that is not loaded can't be checked, so only a missing one passes: it has no
+/// scopes to grant.
+fn may_manage_keys(s: &AppState, caller: &Principal, policy: &str) -> bool {
+    if caller.has_scope(Scope::Admin) {
+        return true;
+    }
+    let listed = caller.has_scope(Scope::Keys) && caller.policy.key_policies.iter().any(|p| p == policy);
+    listed
+        && match s.keys.policy(policy) {
+            Some(target) => target.grants_only_client_use(),
+            None => s.keys.unloaded_policy(policy).is_none(),
+        }
+}
+
+/// The caller of a key route that a `keys` key may use for this policy.
+async fn key_caller(s: &AppState, h: &HeaderMap, policy: &str, action: &str) -> Result<Principal, Response> {
+    let caller = authorize(s, h, Scope::Keys).await?;
+    if !may_manage_keys(s, &caller, policy) {
+        tracing::warn!(actor = actor(&caller), policy, action, "refused a client key request outside the key's key_policies");
+        return Err(json_error(StatusCode::FORBIDDEN, format!("key may not manage keys of policy {policy:?}")));
+    }
+    Ok(caller)
 }
 
 /// The answer to a failed issue or revoke: whether sending it again can help.
@@ -298,15 +332,16 @@ fn key_error(e: anyhow::Error) -> Response {
 /// with `status: created`. A name with a live key answers 200 with
 /// `status: exists` and leaves the key as it is.
 async fn issue_key(State(s): State<AppState>, h: HeaderMap, Json(req): Json<IssueRequest>) -> Res {
-    admin(&s, &h).await?;
+    let caller = key_caller(&s, &h, &req.policy, "issue").await?;
     let issued = s.keys.issue(req).await.map_err(key_error)?;
+    let actor = actor(&caller);
     let (code, status) = match &issued {
         Issued::Created(info) => {
-            tracing::info!(client = %info.client_id, "issued client key");
+            tracing::info!(client = %info.client_id, actor, "issued client key");
             (StatusCode::CREATED, "created")
         }
         Issued::Exists(info) => {
-            tracing::info!(client = %info.client_id, "client key exists, not changed");
+            tracing::info!(client = %info.client_id, actor, "client key exists, not changed");
             (StatusCode::OK, "exists")
         }
     };
@@ -336,32 +371,36 @@ async fn rotate_key(
     Path((policy, name)): Path<(String, String)>,
     body: Option<Json<RotateReq>>,
 ) -> Res {
-    admin(&s, &h).await?;
+    let caller = authorize(&s, &h, Scope::Admin).await?;
     let id = key_id(&policy, &name)?;
     let grace = body.map(|b| b.0.grace_secs).unwrap_or(0);
     let info = s.keys.rotate(&id, grace).await.map_err(|e| json_error(StatusCode::NOT_FOUND, format!("{e:#}")))?;
-    tracing::info!(client = %id, grace, "rotated client key");
+    tracing::info!(client = %id, actor = actor(&caller), grace, "rotated client key");
     ok(info)
 }
 
 /// Safe to repeat: `status` says what was found. An error means a version in
 /// the vault may still hold the key, so send it again.
 async fn revoke_key(State(s): State<AppState>, h: HeaderMap, Path((policy, name)): Path<(String, String)>) -> Res {
-    admin(&s, &h).await?;
+    let caller = key_caller(&s, &h, &policy, "revoke").await?;
     let id = key_id(&policy, &name)?;
     let status = match s.keys.revoke(&id).await.map_err(key_error)? {
         Revoked::Revoked => "revoked",
         Revoked::AlreadyRevoked => "already_revoked",
         Revoked::Absent => "absent",
     };
-    tracing::info!(client = %id, status, "revoke of client key");
+    tracing::info!(client = %id, actor = actor(&caller), status, "revoke of client key");
     ok(json!({"revoked": id, "status": status}))
 }
 
+/// Enabling stays with `admin`: a `keys` key must not undo a disable by an
+/// operator.
 async fn set_key_disabled(State(s): State<AppState>, h: HeaderMap, Path((policy, name)): Path<(String, String)>, disabled: bool) -> Res {
-    admin(&s, &h).await?;
+    let caller = if disabled { key_caller(&s, &h, &policy, "disable").await? } else { authorize(&s, &h, Scope::Admin).await? };
     let id = key_id(&policy, &name)?;
-    ok(s.keys.set_disabled(&id, disabled).await.map_err(|e| json_error(StatusCode::NOT_FOUND, format!("{e:#}")))?)
+    let info = s.keys.set_disabled(&id, disabled).await.map_err(|e| json_error(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    tracing::info!(client = %id, actor = actor(&caller), disabled, "changed client key");
+    ok(info)
 }
 
 // ---- accounts

@@ -152,7 +152,7 @@ export type FlowStatus =
   | { status: "complete"; account_id: string; email: string | null }
   | { status: "failed"; error: string };
 
-export type Scope = "proxy" | "management" | "mcp" | "admin";
+export type Scope = "proxy" | "management" | "mcp" | "keys" | "admin";
 
 export interface Policy {
   name: string;
@@ -175,6 +175,8 @@ export interface Policy {
   mcp_servers?: string[];
   allow_tools?: string[];
   deny_tools?: string[];
+  /** With the `keys` scope: the policies whose keys its keys may manage. */
+  key_policies?: string[];
   limits?: Limits;
 }
 

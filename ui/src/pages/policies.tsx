@@ -49,6 +49,7 @@ const SCOPES: [Scope, string][] = [
   ["proxy", "proxy"],
   ["management", "management (T3Code hubs)"],
   ["mcp", "mcp (MCP gateway)"],
+  ["keys", "keys (issue client keys)"],
   ["admin", "admin"],
 ];
 
@@ -154,6 +155,7 @@ export interface Draft {
   mcpServers: string[];
   allowTools: string;
   denyTools: string;
+  keyPolicies: string;
   limits: Limits;
 }
 
@@ -161,7 +163,7 @@ export type SetDraft = <K extends keyof Draft>(k: K, v: Draft[K]) => void;
 
 export const rowId = () => Math.random().toString(36).slice(2);
 
-function toDraft(p: Policy | null): Draft {
+export function toDraft(p: Policy | null): Draft {
   return {
     name: p?.name ?? "",
     description: p?.description ?? "",
@@ -178,11 +180,12 @@ function toDraft(p: Policy | null): Draft {
     mcpServers: p?.mcp_servers ?? [],
     allowTools: (p?.allow_tools ?? []).join("\n"),
     denyTools: (p?.deny_tools ?? []).join("\n"),
+    keyPolicies: (p?.key_policies ?? []).join("\n"),
     limits: p?.limits ?? {},
   };
 }
 
-function toPolicy(d: Draft): Policy {
+export function toPolicy(d: Draft): Policy {
   const aliases: Record<string, string | string[]> = {};
   for (const a of d.aliases) {
     const targets = a.targets.map((t) => t.trim()).filter(Boolean);
@@ -226,6 +229,7 @@ function toPolicy(d: Draft): Policy {
     mcp_servers: d.mcpServers,
     allow_tools: lines(d.allowTools),
     deny_tools: lines(d.denyTools),
+    key_policies: lines(d.keyPolicies),
     limits,
   };
 }
@@ -356,6 +360,22 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
               ))}
             </div>
           </fieldset>
+          {(draft.scopes.includes("keys") || draft.keyPolicies.trim() !== "") && (
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="p-key-policies">Key policies (one per line)</Label>
+              <Textarea
+                id="p-key-policies"
+                className="font-mono"
+                rows={3}
+                value={draft.keyPolicies}
+                onChange={(e) => set("keyPolicies", e.target.value)}
+              />
+              <p className="text-muted-foreground text-xs">
+                The policies whose client keys this policy's keys may issue, revoke, disable and list. A listed policy with a scope other
+                than proxy or mcp is refused when a key uses it.
+              </p>
+            </div>
+          )}
         </SectionContent>
       </Section>
 

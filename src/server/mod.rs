@@ -256,11 +256,11 @@ pub fn presented_key(headers: &HeaderMap) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Resolve the caller from its key. Without a key, an admin route also
+/// Resolve the caller from its key. Without a key, an admin or key route also
 /// accepts a web UI session (cookie plus CSRF header).
 pub async fn authorize(state: &AppState, headers: &HeaderMap, scope: Scope) -> Result<Principal, Response> {
     let Some(key) = presented_key(headers) else {
-        if scope == Scope::Admin
+        if matches!(scope, Scope::Admin | Scope::Keys)
             && let Some(p) = state.sessions.principal(headers)
         {
             return Ok(p);

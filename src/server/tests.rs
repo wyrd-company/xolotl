@@ -15,7 +15,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::*;
 use crate::config::{CatalogConfig, Endpoints, GatewayConfig, ProviderConfig, ProviderKind};
 use crate::db::now;
-use crate::keys::IssueRequest;
+use crate::keys::{IssueRequest, Scope};
 use crate::limits::{Limits, Meter};
 use crate::policy::{AliasTargets, Policy};
 use crate::secrets::MemoryStore;
@@ -233,6 +233,190 @@ async fn key_routes_refuse_a_name_that_leaves_the_vault_path() {
     ] {
         assert_eq!(h.call(method, uri, Some(&h.admin), None).await.0, 400, "{method} {uri}");
     }
+}
+
+impl Harness {
+    async fn save(&self, p: Policy) {
+        self.state.keys.put_policy(p, &self.state.catalog.known_providers(), &self.state.mcp.server_names()).await.unwrap();
+    }
+
+    /// A policy `issuer` with the `keys` scope, its key, and the listed policy `target`.
+    async fn issuer_key(&self) -> String {
+        self.save(policy("target")).await;
+        self.key(Policy { name: "issuer".into(), scopes: vec![Scope::Keys], key_policies: vec!["target".into()], ..Default::default() })
+            .await
+    }
+}
+
+#[tokio::test]
+async fn keys_key_manages_keys_of_listed_policies() {
+    let h = harness().await;
+    let issuer = h.issuer_key().await;
+    let k = Some(issuer.as_str());
+    h.save(policy("other")).await;
+    h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "other", "name": "theirs"}))).await;
+
+    let (status, issued) = h.call("POST", "/admin/keys", k, Some(json!({"policy": "target", "name": "a"}))).await;
+    assert_eq!((status, issued["status"].as_str()), (201, Some("created")), "{issued}");
+    let (status, again) = h.call("POST", "/admin/keys", k, Some(json!({"policy": "target", "name": "a"}))).await;
+    assert_eq!((status, again["status"].as_str()), (200, Some("exists")), "{again}");
+    assert_eq!(h.call("POST", "/admin/keys", k, Some(json!({"policy": "target", "name": "bad/name"}))).await.0, 400);
+
+    let (status, listed) = h.call("GET", "/admin/keys", k, None).await;
+    assert_eq!(status, 200);
+    let ids: Vec<&str> = listed.as_array().unwrap().iter().filter_map(|k| k["client_id"].as_str()).collect();
+    assert_eq!(ids, vec!["target/a"], "only listed policies, and not its own key");
+
+    let (status, disabled) = h.call("POST", "/admin/keys/target/a/disable", k, None).await;
+    assert_eq!((status, disabled["disabled"].as_bool()), (200, Some(true)));
+    assert_eq!(h.call("POST", "/admin/keys/target/a/disable", k, None).await.0, 200, "safe to repeat");
+    assert_eq!(h.call("POST", "/admin/keys/target/a/enable", k, None).await.0, 403, "enable stays with admin");
+    assert_eq!(h.call("POST", "/admin/keys/target/a/rotate", k, Some(json!({}))).await.0, 403);
+
+    let (status, revoked) = h.call("DELETE", "/admin/keys/target/a", k, None).await;
+    assert_eq!((status, revoked["status"].as_str()), (200, Some("revoked")));
+    assert_eq!(h.call("DELETE", "/admin/keys/target/a", k, None).await.1["status"], "already_revoked");
+    assert_eq!(h.call("DELETE", "/admin/keys/target/never", k, None).await.1["status"], "absent");
+    assert!(h.state.secrets.get("keys/target/a").await.unwrap().unwrap().get("api_key").is_none());
+}
+
+#[tokio::test]
+async fn keys_key_is_refused_outside_its_list_and_changes_nothing() {
+    let h = harness().await;
+    let issuer = h.issuer_key().await;
+    let k = Some(issuer.as_str());
+    h.save(policy("other")).await;
+    h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "other", "name": "theirs"}))).await;
+    let stored = h.state.secrets.get_versioned("keys/other/theirs").await.unwrap();
+
+    assert_eq!(h.call("POST", "/admin/keys", k, Some(json!({"policy": "other", "name": "new"}))).await.0, 403);
+    assert_eq!(h.call("POST", "/admin/keys", k, Some(json!({"policy": "other", "name": "theirs"}))).await.0, 403);
+    assert_eq!(h.call("POST", "/admin/keys", k, Some(json!({"policy": "absent", "name": "new"}))).await.0, 403, "no hint a policy exists");
+    assert_eq!(h.call("DELETE", "/admin/keys/other/theirs", k, None).await.0, 403);
+    assert_eq!(h.call("DELETE", "/admin/keys/absent/never", k, None).await.0, 403);
+    assert_eq!(h.call("POST", "/admin/keys/other/theirs/disable", k, None).await.0, 403);
+
+    assert_eq!(h.state.secrets.get_versioned("keys/other/theirs").await.unwrap(), stored);
+    assert!(h.state.secrets.get("keys/other/new").await.unwrap().is_none());
+}
+
+/// A key under a listed policy must not be worth more than the key that made it.
+#[tokio::test]
+async fn keys_key_cannot_manage_keys_that_could_do_more_than_it() {
+    for (scopes, extra) in
+        [(vec![Scope::Admin], vec![]), (vec![Scope::Proxy, Scope::Management], vec![]), (vec![Scope::Keys], vec!["target".to_string()])]
+    {
+        let h = harness().await;
+        let issuer = h.issuer_key().await;
+        let k = Some(issuer.as_str());
+        h.save(policy("wide")).await;
+        h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "wide", "name": "live"}))).await;
+        h.save(Policy {
+            name: "issuer".into(),
+            scopes: vec![Scope::Keys],
+            key_policies: vec!["target".into(), "wide".into()],
+            ..Default::default()
+        })
+        .await;
+        h.save(Policy { scopes: scopes.clone(), key_policies: extra, ..policy("wide") }).await;
+        let stored = h.state.secrets.get_versioned("keys/wide/live").await.unwrap();
+
+        assert_eq!(h.call("POST", "/admin/keys", k, Some(json!({"policy": "wide", "name": "new"}))).await.0, 403, "{scopes:?}");
+        assert_eq!(h.call("DELETE", "/admin/keys/wide/live", k, None).await.0, 403, "{scopes:?}");
+        assert_eq!(h.call("POST", "/admin/keys/wide/live/disable", k, None).await.0, 403, "{scopes:?}");
+        assert_eq!(h.call("GET", "/admin/keys", k, None).await.1, json!([]), "{scopes:?}");
+
+        assert_eq!(h.state.secrets.get_versioned("keys/wide/live").await.unwrap(), stored, "{scopes:?}");
+        assert!(h.state.secrets.get("keys/wide/new").await.unwrap().is_none(), "{scopes:?}");
+    }
+}
+
+#[tokio::test]
+async fn keys_key_under_a_listed_policy_that_did_not_load_is_refused() {
+    let h = harness().await;
+    let issuer = h.issuer_key().await;
+    let k = Some(issuer.as_str());
+    h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "target", "name": "live"}))).await;
+    h.state.secrets.put("policies/target", json!({"name": "target", "unknown": 1}).as_object().unwrap().clone()).await.unwrap();
+    h.state.keys.reload().await.unwrap();
+
+    assert_eq!(h.call("DELETE", "/admin/keys/target/live", k, None).await.0, 403, "its scopes can't be checked");
+    assert_eq!(h.call("GET", "/admin/keys", k, None).await.1, json!([]));
+    assert_eq!(h.call("DELETE", "/admin/keys/target/live", Some(&h.admin), None).await.0, 200, "admin can still clean up");
+}
+
+#[tokio::test]
+async fn keys_key_can_finish_cleanup_after_a_listed_policy_is_deleted() {
+    let h = harness().await;
+    let issuer = h.issuer_key().await;
+    let k = Some(issuer.as_str());
+    assert_eq!(h.call("DELETE", "/admin/policies/target", Some(&h.admin), None).await.0, 200);
+
+    assert_eq!(h.call("DELETE", "/admin/keys/target/gone", k, None).await.1["status"], "absent");
+    assert_eq!(h.call("POST", "/admin/keys", k, Some(json!({"policy": "target", "name": "new"}))).await.0, 400, "nothing to issue under");
+}
+
+#[tokio::test]
+async fn keys_key_reaches_nothing_else() {
+    let h = harness().await;
+    let issuer = h.issuer_key().await;
+    let k = Some(issuer.as_str());
+
+    // With valid bodies, so that the scope is what answers.
+    for (method, uri, body) in [
+        ("PUT", "/admin/policies/target", Some(json!({"name": "target", "providers": ["*"], "scopes": ["admin"]}))),
+        ("PUT", "/admin/policies/issuer", Some(json!({"name": "issuer", "scopes": ["admin"], "providers": ["*"]}))),
+        ("DELETE", "/admin/policies/target", None),
+        ("GET", "/admin/policies", None),
+        ("POST", "/admin/accounts/import", Some(json!({"provider": "codex", "data": {}}))),
+        ("GET", "/admin/accounts", None),
+        ("DELETE", "/admin/accounts/codex-x", None),
+        ("POST", "/admin/providers/llama/key", Some(json!({"api_key": "new"}))),
+        ("GET", "/admin/providers", None),
+        ("GET", "/admin/status", None),
+        ("POST", "/admin/reload", None),
+        ("POST", "/v1/chat/completions", Some(json!({"model": "qwen3", "messages": []}))),
+        ("GET", "/v1/models", None),
+    ] {
+        assert_eq!(h.call(method, uri, k, body).await.0, 403, "{method} {uri}");
+    }
+    assert_eq!(h.call("GET", "/v0/management/auth-files", k, None).await.0, 401);
+    assert_eq!(h.call("POST", "/mcp", k, Some(json!({}))).await.0, 403);
+    assert_eq!(h.state.keys.policy("target").unwrap().scopes, vec![Scope::Proxy]);
+    assert_eq!(h.state.secrets.get("providers/llama").await.unwrap().unwrap()["api_key"], "llama-key");
+
+    // Every admin route, read from the router's source: only the key routes
+    // and the two public routes answer anything but a refusal to this key.
+    let source = include_str!("admin.rs");
+    let allowed = ["GET /keys", "POST /keys", "DELETE /keys/{policy}/{name}", "POST /keys/{policy}/{name}/disable"];
+    let public = ["GET /mcp/oauth/callback", "GET /mcp/oauth/client-metadata.json"];
+    let routes: Vec<&str> = source.lines().filter_map(|l| l.trim().strip_prefix(".route(\"")).filter_map(|l| l.split('"').next()).collect();
+    assert!(routes.len() > 40, "{}", routes.len());
+    for route in routes {
+        let uri = format!(
+            "/admin{}",
+            route.replace("{policy}", "other").replace("{name}", "x").replace("{id}", "x").replace("{provider}", "codex")
+        );
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            let name = format!("{method} {route}");
+            if allowed.contains(&name.as_str()) || public.contains(&name.as_str()) {
+                continue;
+            }
+            let (status, body) = h.call(method, &uri, k, None).await;
+            assert!(!(200..300).contains(&status), "{name}: {status} {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn admin_manages_keys_of_every_policy() {
+    let h = harness().await;
+    h.issuer_key().await;
+    h.save(Policy { scopes: vec![Scope::Admin], ..policy("wide") }).await;
+    let (status, _) = h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "wide", "name": "a"}))).await;
+    assert_eq!(status, 201, "the listing rules bind only a keys key");
+    let (_, listed) = h.call("GET", "/admin/keys", Some(&h.admin), None).await;
+    assert_eq!(listed.as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
