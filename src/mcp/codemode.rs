@@ -122,8 +122,10 @@ struct Calls {
 /// The execution runs in a task of its own, which owns `permit`. If the
 /// caller stops waiting (the client went away), the task is told to stop:
 /// it interrupts the JavaScript, aborts and joins the tool calls still
-/// running, and only then releases the permit. Either way no gateway work
-/// continues, or starts, after the execution.
+/// running, and only then releases the permit. Either way no tool call's task
+/// continues, or starts, after the execution. A request already handed to an
+/// MCP client can still be sent: its connection owns the send, and the client
+/// has no way to stop or join it.
 pub async fn execute(
     code: &str,
     namespaces: Vec<(String, String)>,
@@ -727,30 +729,43 @@ mod tests {
     async fn no_tool_work_outlives_the_execution() {
         use std::sync::atomic::Ordering;
         let ns = || vec![("gh_work".to_string(), "gh-work".to_string())];
-        // Read as `execute` returns: a stopped call's teardown has finished by then.
+        // These cover the `ToolHost` call. Read as `execute` returns: a stopped
+        // call's teardown has finished by then.
         let counts = |host: &Counting| {
             (host.started.load(Ordering::SeqCst), host.dropped.load(Ordering::SeqCst), host.effects.load(Ordering::SeqCst))
         };
 
-        // Timed out while a call is in flight. The deadline leaves a loaded
-        // host time to start the call.
-        let host = Arc::new(Counting::default());
-        let timed = Limits { timeout: Duration::from_secs(2), ..limits() };
-        let o = execute("await gh_work.effect({})", ns(), host.clone(), timed, None).await;
-        assert!(o.result.unwrap_err().contains("timed out"));
-        assert_eq!(counts(&host), (1, 1, 0), "timed out");
+        // Timed out while a call is in flight. The deadline can also end the
+        // execution before the call's first poll. That is correct but proves
+        // nothing about a call in flight, so try again with a longer deadline.
+        // The longest one is shorter than `effect` holds.
+        let mut timeout = Duration::from_millis(100);
+        loop {
+            let host = Arc::new(Counting::default());
+            let timed = Limits { timeout, ..limits() };
+            let o = execute("await gh_work.effect({})", ns(), host.clone(), timed, None).await;
+            assert!(o.result.unwrap_err().contains("timed out"));
+            let (started, dropped, effects) = counts(&host);
+            assert_eq!((dropped, effects), (started, 0), "timed out after {timeout:?}");
+            if started == 1 {
+                break;
+            }
+            timeout *= 2;
+            assert!(timeout < Duration::from_secs(30), "no call started before a deadline");
+        }
 
         // Returned while a call is in flight: `effect_started` shows it started.
+        let patient = Limits { timeout: Duration::from_secs(25), ..limits() };
         let host = Arc::new(Counting::default());
         let code = "gh_work.effect({}); await gh_work.effect_started({}); return 1";
-        let o = execute(code, ns(), host.clone(), limits(), None).await;
+        let o = execute(code, ns(), host.clone(), patient.clone(), None).await;
         assert_eq!(o.result.unwrap(), json!(1));
         assert_eq!(counts(&host), (1, 1, 0), "returned in flight");
 
         // Returned straight after making a call: the abort can reach the call
         // before its first poll, and then it never starts. Both orders are correct.
         let host = Arc::new(Counting::default());
-        let o = execute("gh_work.effect({}); return 1", ns(), host.clone(), limits(), None).await;
+        let o = execute("gh_work.effect({}); return 1", ns(), host.clone(), patient, None).await;
         assert_eq!(o.result.unwrap(), json!(1));
         let (started, dropped, effects) = counts(&host);
         assert!(started <= 1, "{started} calls started");

@@ -219,7 +219,9 @@ Each execution gets a fresh [QuickJS](https://bellard.org/quickjs/) runtime (thr
 
 Code mode has no approvals and no durable replay: a tool call happens when the code makes it. Use `deny_tools` to keep destructive tools away from a key.
 
-An execution ends its tool calls before it ends, however it ends: each call still running is aborted and joined, including its teardown. A call the code did not await can be aborted before its first poll. It then never starts, reaches no upstream and has no call log row.
+An execution ends its tool calls' tasks before it ends, however it ends: each task still running is aborted and joined, including its teardown. A call the code did not await can be aborted before its first poll. It then never starts, reaches no upstream and has no call log row.
+
+A request already handed to the MCP client is out of the execution's control. The upstream connection owns the send, and `rmcp` has no way to stop or join it, so the request can still go out after the execution ends. The gateway does not tell the upstream that it has stopped waiting. The call log records such a call as `cancelled`, with its outcome unknown.
 
 ## Endpoint security
 
