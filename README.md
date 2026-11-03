@@ -65,7 +65,7 @@ User documentation is on [wyrd.foo](https://wyrd.foo/docs/xolotl/). Its source i
 | Page | Covers |
 |---|---|
 | [Overview](docs/user/overview.md) | What xolotl does and how it fits together |
-| [Installation](docs/user/install.md) | Container image, release binary, building from source, OpenBao setup, running |
+| [Installation](docs/user/install.md) | Container image, release binary, Homebrew, building from source, OpenBao setup, running |
 | [Configuration](docs/user/configuration.md) | The config file, environment variables, OpenBao paths |
 | [Subscription accounts](docs/user/accounts.md) | Codex, Claude, Grok and OpenCode Go accounts: login, import, states, failover |
 | [Policies and client keys](docs/user/policies-and-keys.md) | Policies, model names, renames and aliases, rate limits, issuing and rotating keys, usage |
@@ -137,16 +137,21 @@ Each user-visible change ships with an intent:
 intentional add --release-unit xolotl:minor --message "Describe the change."
 ```
 
-To release, on `main`:
+To release, on a branch from `main`:
 
 ```sh
 intentional status && intentional check
-intentional plan > release-plan.json
+intentional plan > release-plan.json  # committed with the release; the tag step reads it
 intentional apply                     # version projections, changelogs, consumes intents
 cargo update -w --offline             # keep Cargo.lock in step
 git add -A && git commit -m "chore: release $(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-intentional tag --plan release-plan.json
-git push origin main --follow-tags
 ```
 
-Intentional is checked only at release time: the release workflow runs `intentional check` and only deploys a tag that is an Intentional release record (annotated, `baseline: false`, matching `Cargo.toml` and `CHANGELOG.md`): it tests, publishes `ghcr.io/<repo>:<version>` (amd64 + arm64) and a GitHub release with a Linux binary. Baseline records are skipped and any other tag is refused.
+Raise a PR with only that commit. After it merges, on `main` at that commit:
+
+```sh
+intentional tag --plan release-plan.json
+git push origin --follow-tags main    # the code tag and the docs tag together
+```
+
+Intentional is checked only at release time: the release workflow runs `intentional check` and only deploys a tag that is an Intentional release record (annotated, `baseline: false`, matching `Cargo.toml` and `CHANGELOG.md`): it tests, then publishes a GitHub release with the Linux x86_64, Linux arm64 and macOS arm64 binaries, the Homebrew formula, `ghcr.io/<repo>:<version>` (amd64 + arm64) and the wyrd.foo docs. Baseline records are skipped and any other tag is refused.

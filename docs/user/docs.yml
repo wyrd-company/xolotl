@@ -41,6 +41,11 @@ products:
           - method: docker
             default: true
             command: docker pull ghcr.io/wyrd-company/xolotl:latest
+          - method: homebrew
+            os:
+              - macos
+              - linux
+            command: brew install wyrd-company/tools/xolotl
     nav:
       - section: Get started
         groups:

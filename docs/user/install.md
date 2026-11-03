@@ -42,7 +42,7 @@ into the binary.
 | macOS arm64 | `aarch64-apple-darwin` |
 
 ```sh
-version=0.2.0
+version=0.6.0
 curl -LO "https://github.com/wyrd-company/xolotl/releases/download/$version/xolotl-$version-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf "xolotl-$version-x86_64-unknown-linux-gnu.tar.gz"
 "xolotl-$version-x86_64-unknown-linux-gnu/xolotl" --version
