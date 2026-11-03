@@ -31,7 +31,7 @@ The baseline tag carries a record with `baseline: true`.
 
 Intentional finds tags by name, so the release history survives a squash merge of this branch.
 
-`intentional apply` updates `Cargo.toml` and `CHANGELOG.md` but not `Cargo.lock`, so the release steps run `cargo update -w --offline` before committing. Otherwise `--locked` builds fail.
+`intentional apply` updates `Cargo.toml`, `docs/user/docs.yml`, `CHANGELOG.md` and `docs/user/CHANGELOG.md` but not `Cargo.lock`, so the release steps run `cargo update -w --offline` before committing. Otherwise `--locked` builds fail.
 
 ## CI (`.github/workflows/ci.yml`)
 
@@ -40,7 +40,7 @@ On pushes to `main` and on pull requests:
 - the web UI: `pnpm test` and `pnpm build` (which type-checks);
 - a Docker build per architecture, each on a native runner (`amd64` on `ubuntu-latest`, `arm64` on `ubuntu-24.04-arm`), with a separate build cache per architecture.
 
-Intentional is not checked here. `intentional check` only validates the config and intent files (it doesn't require a change to carry an intent), so it runs once, as the release gate. A malformed intent therefore shows up when a release is cut, not on the PR that added it.
+Intentional is not checked here. `intentional check` only validates the config, the intent files and the committed version projections (it doesn't require a change to carry an intent), so it runs once, as the release gate. A malformed intent therefore shows up when a release is cut, not on the PR that added it.
 
 ## Release workflow (`.github/workflows/release.yml`)
 

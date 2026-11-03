@@ -142,7 +142,7 @@ To release, on `main`:
 ```sh
 intentional status && intentional check
 intentional plan > release-plan.json
-intentional apply                     # Cargo.toml, CHANGELOG.md, consumes intents
+intentional apply                     # version projections, changelogs, consumes intents
 cargo update -w --offline             # keep Cargo.lock in step
 git add -A && git commit -m "chore: release $(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 intentional tag --plan release-plan.json
