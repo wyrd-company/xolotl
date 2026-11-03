@@ -10,7 +10,6 @@
 //! shared between instances.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
@@ -35,7 +34,6 @@ use serde_json::{Value, json};
 use super::{AppState, json_error};
 use crate::config::OidcConfig;
 use crate::keys::{Principal, random_id, sha256_hex};
-use crate::policy::Policy;
 
 pub const COOKIE: &str = "xolotl_session";
 pub const CSRF_HEADER: &str = "x-csrf-token";
@@ -146,8 +144,7 @@ impl Sessions {
     pub fn principal(&self, headers: &HeaderMap) -> Option<Principal> {
         let (expected, _) = self.session(headers)?;
         let presented = headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok())?;
-        crate::keys::ct_eq(expected.as_bytes(), presented.as_bytes())
-            .then(|| Principal { client_id: None, policy: Arc::new(Policy::unrestricted()) })
+        crate::keys::ct_eq(expected.as_bytes(), presented.as_bytes()).then(Principal::operator)
     }
 
     fn remove(&self, headers: &HeaderMap) -> Option<String> {

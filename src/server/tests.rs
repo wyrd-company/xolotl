@@ -356,6 +356,43 @@ async fn keys_key_can_finish_cleanup_after_a_listed_policy_is_deleted() {
     assert_eq!(h.call("POST", "/admin/keys", k, Some(json!({"policy": "target", "name": "new"}))).await.0, 400, "nothing to issue under");
 }
 
+/// Over the routes: a request passes the first check, then waits behind a
+/// policy write that makes its target an admin policy.
+#[tokio::test]
+async fn keys_key_request_waiting_behind_a_policy_write_is_refused() {
+    for (method, uri, body) in [
+        ("POST", "/admin/keys", Some(json!({"policy": "target", "name": "new"}))),
+        ("DELETE", "/admin/keys/target/live", None),
+        ("POST", "/admin/keys/target/live/disable", None),
+    ] {
+        let store = Arc::new(crate::secrets::testing::GatedStore::default());
+        let h = Arc::new(harness_with_secrets(|_| {}, store.clone()).await);
+        let issuer = h.issuer_key().await;
+        h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "target", "name": "live"}))).await;
+        let before = h.state.secrets.get_versioned("keys/target/live").await.unwrap();
+
+        store.arm("put", "policies/target");
+        let write = tokio::spawn({
+            let h = h.clone();
+            async move { h.save(Policy { scopes: vec![Scope::Admin], ..policy("target") }).await }
+        });
+        store.reached.notified().await;
+        let queued = tokio::spawn({
+            let h = h.clone();
+            async move { h.call(method, uri, Some(&issuer), body).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!queued.is_finished(), "{method} {uri} passes the first check and waits");
+        store.release.notify_one();
+        write.await.unwrap();
+
+        let (status, answer) = queued.await.unwrap();
+        assert_eq!(status, 403, "{method} {uri}: {answer}");
+        assert_eq!(h.state.secrets.get_versioned("keys/target/live").await.unwrap(), before, "{method} {uri}");
+        assert!(h.state.secrets.get("keys/target/new").await.unwrap().is_none(), "{method} {uri}");
+    }
+}
+
 #[tokio::test]
 async fn keys_key_reaches_nothing_else() {
     let h = harness().await;

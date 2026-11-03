@@ -104,6 +104,10 @@ pub struct Principal {
 }
 
 impl Principal {
+    /// The bootstrap admin token or a web UI session.
+    pub fn operator() -> Self {
+        Principal { client_id: None, policy: Arc::new(Policy::unrestricted()) }
+    }
     pub fn has_scope(&self, scope: Scope) -> bool {
         self.policy.has_scope(scope)
     }
@@ -127,6 +131,11 @@ pub struct IssueRequest {
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct InvalidIssue(String);
+
+/// The caller may not manage keys under this policy.
+#[derive(Debug, thiserror::Error)]
+#[error("key may not manage keys of policy {0:?}")]
+pub struct NotPermitted(pub String);
 
 /// What a request to issue a key did. Neither answer holds key material.
 #[derive(Debug, Clone, PartialEq)]
@@ -318,7 +327,7 @@ impl KeyManager {
     fn lookup(&self, hash: &str) -> Option<Principal> {
         let st = self.state.read();
         if st.bootstrap_hash.as_deref().is_some_and(|b| ct_eq(b.as_bytes(), hash.as_bytes())) {
-            return Some(Principal { client_id: None, policy: Arc::new(Policy::unrestricted()) });
+            return Some(Principal::operator());
         }
         let id = st.by_hash.get(hash)?;
         let e = st.keys.get(id)?;
@@ -390,6 +399,38 @@ impl KeyManager {
 
     // ---- keys
 
+    /// Whether the caller may manage keys under a policy, from the policies
+    /// loaded now: its own policy may have changed since it authenticated.
+    ///
+    /// An `admin` caller may manage any. A `keys` caller may manage the ones
+    /// its policy lists, unless such a key could do more than use the LLM and
+    /// MCP endpoints. A listed policy that is not loaded can't be checked, so
+    /// only a missing one passes: it has no scopes to grant.
+    pub fn may_manage(&self, caller: &Principal, policy: &str) -> bool {
+        if caller.client_id.is_none() {
+            return true;
+        }
+        let Some(own) = self.policy(&caller.policy.name) else { return false };
+        if own.has_scope(Scope::Admin) {
+            return true;
+        }
+        let listed = own.has_scope(Scope::Keys) && own.key_policies.iter().any(|p| p == policy);
+        listed
+            && match self.policy(policy) {
+                Some(target) => target.grants_only_client_use(),
+                None => self.unloaded_policy(policy).is_none(),
+            }
+    }
+
+    /// Call with `writes` held. A policy change holds it too, so the answer
+    /// still stands when the change this guards reaches the vault.
+    fn permit(&self, caller: &Principal, policy: &str) -> Result<()> {
+        if !self.may_manage(caller, policy) {
+            return Err(NotPermitted(policy.to_string()).into());
+        }
+        Ok(())
+    }
+
     pub fn list(&self) -> Vec<KeyInfo> {
         let mut v: Vec<_> = self.state.read().keys.values().filter(|e| !e.revoked).map(|e| e.info.clone()).collect();
         v.sort_by(|a, b| a.client_id.cmp(&b.client_id));
@@ -405,12 +446,18 @@ impl KeyManager {
     /// nothing, also when it asks for another description or lifetime, so a
     /// caller that lost the answer can safely send it again.
     pub async fn issue(&self, req: IssueRequest) -> Result<Issued> {
+        self.issue_as(&Principal::operator(), req).await
+    }
+
+    /// [`Self::issue`] for a caller that may lose its permission while it waits.
+    pub async fn issue_as(&self, caller: &Principal, req: IssueRequest) -> Result<Issued> {
         if !valid_name(&req.name) {
             return Err(InvalidIssue("key name must be lowercase letters, digits, '-' or '_' (max 63)".into()).into());
         }
         let now = Utc::now();
         let expires_at = expiry(now, req.ttl_secs)?;
         let _writes = self.writes.lock().await;
+        self.permit(caller, &req.policy)?;
         // Checked under the lock, so a concurrent delete_policy can't slip in between.
         if self.policy(&req.policy).is_none() {
             return Err(InvalidIssue(format!("policy {:?} does not exist", req.policy)).into());
@@ -465,7 +512,14 @@ impl KeyManager {
     }
 
     pub async fn set_disabled(&self, client_id: &str, disabled: bool) -> Result<KeyInfo> {
+        self.set_disabled_as(&Principal::operator(), client_id, disabled).await
+    }
+
+    /// [`Self::set_disabled`] for a caller that may lose its permission while it waits.
+    pub async fn set_disabled_as(&self, caller: &Principal, client_id: &str, disabled: bool) -> Result<KeyInfo> {
+        let (policy, _) = client_id.split_once('/').with_context(|| format!("key id {client_id:?} must be <policy>/<name>"))?;
         let _writes = self.writes.lock().await;
+        self.permit(caller, policy)?;
         let (mut record, version) = self.fetch(client_id).await?;
         record.disabled = disabled;
         self.write(client_id, &record, version).await?;
@@ -480,6 +534,11 @@ impl KeyManager {
     /// and failed before it. The answer is an error whenever a version may
     /// still hold the key.
     pub async fn revoke(&self, client_id: &str) -> Result<Revoked> {
+        self.revoke_as(&Principal::operator(), client_id).await
+    }
+
+    /// [`Self::revoke`] for a caller that may lose its permission while it waits.
+    pub async fn revoke_as(&self, caller: &Principal, client_id: &str) -> Result<Revoked> {
         let (policy, name) = client_id.split_once('/').with_context(|| format!("key id {client_id:?} must be <policy>/<name>"))?;
         let marker = KeyRecord {
             client_id: client_id.to_string(),
@@ -490,6 +549,7 @@ impl KeyManager {
             ..Default::default()
         };
         let _writes = self.writes.lock().await;
+        self.permit(caller, policy)?;
         match self.revoke_locked(&marker).await {
             // Another instance changed the record after the read: look again.
             Err(e) if e.is::<Conflict>() => self.revoke_locked(&marker).await,
@@ -897,6 +957,107 @@ mod tests {
         s.put("keys/dev/a", json!({"api_key": "xol_old"}).as_object().unwrap().clone()).await.unwrap();
         assert_eq!(km.revoke("dev/a").await.unwrap(), Revoked::Revoked);
         assert!(s.get("keys/dev/a").await.unwrap().unwrap().get("api_key").is_none());
+    }
+
+    /// Keys of `target`, and a key of `issuer` that lists it.
+    async fn issuer_and_target() -> (Arc<crate::secrets::testing::GatedStore>, Secrets, Arc<KeyManager>, Principal) {
+        let (store, s, km) = gated().await;
+        let none = BTreeSet::new();
+        km.put_policy(Policy { name: "target".into(), providers: vec!["claude".into()], ..Default::default() }, &known(), &none)
+            .await
+            .unwrap();
+        km.put_policy(
+            Policy { name: "issuer".into(), scopes: vec![Scope::Keys], key_policies: vec!["target".into()], ..Default::default() },
+            &known(),
+            &none,
+        )
+        .await
+        .unwrap();
+        km.issue(IssueRequest { policy: "issuer".into(), name: "robot".into(), ..Default::default() }).await.unwrap();
+        km.issue(IssueRequest { policy: "target".into(), name: "live".into(), ..Default::default() }).await.unwrap();
+        let caller = km.authenticate(&vault_key(&s, "issuer/robot").await).await.unwrap();
+        (store, s, km, caller)
+    }
+
+    /// Hold a policy write at the vault, queue a key change behind it while the
+    /// cache still has the old policy, then let the write finish.
+    async fn queued_behind<T: Send + 'static>(
+        store: &crate::secrets::testing::GatedStore,
+        km: &Arc<KeyManager>,
+        changed: Policy,
+        change: impl Future<Output = T> + Send + 'static,
+    ) -> T {
+        store.arm("put", &format!("policies/{}", changed.name));
+        let write = tokio::spawn({
+            let km = km.clone();
+            async move { km.put_policy(changed, &known(), &BTreeSet::new()).await.unwrap() }
+        });
+        store.reached.notified().await;
+        let queued = tokio::spawn(change);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!queued.is_finished(), "the change waits for the policy write");
+        store.release.notify_one();
+        write.await.unwrap();
+        queued.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_queued_key_change_is_refused_when_the_target_gains_a_scope() {
+        let wide = || Policy { name: "target".into(), providers: vec!["claude".into()], scopes: vec![Scope::Admin], ..Default::default() };
+
+        let (store, s, km, caller) = issuer_and_target().await;
+        let issue = {
+            let km = km.clone();
+            async move { km.issue_as(&caller, IssueRequest { policy: "target".into(), name: "new".into(), ..Default::default() }).await }
+        };
+        let e = queued_behind(&store, &km, wide(), issue).await.unwrap_err();
+        assert!(e.is::<NotPermitted>(), "{e:#}");
+        assert!(s.get("keys/target/new").await.unwrap().is_none());
+
+        let (store, s, km, caller) = issuer_and_target().await;
+        let before = s.get_versioned("keys/target/live").await.unwrap();
+        let revoke = {
+            let km = km.clone();
+            async move { km.revoke_as(&caller, "target/live").await }
+        };
+        assert!(queued_behind(&store, &km, wide(), revoke).await.unwrap_err().is::<NotPermitted>());
+        assert_eq!(s.get_versioned("keys/target/live").await.unwrap(), before);
+        assert!(store.destroyed.lock().is_empty());
+
+        let (store, s, km, caller) = issuer_and_target().await;
+        let before = s.get_versioned("keys/target/live").await.unwrap();
+        let disable = {
+            let km = km.clone();
+            async move { km.set_disabled_as(&caller, "target/live", true).await }
+        };
+        assert!(queued_behind(&store, &km, wide(), disable).await.unwrap_err().is::<NotPermitted>());
+        assert_eq!(s.get_versioned("keys/target/live").await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_queued_key_change_is_refused_when_the_caller_loses_the_policy() {
+        let (store, s, km, caller) = issuer_and_target().await;
+        let narrowed =
+            Policy { name: "issuer".into(), scopes: vec![Scope::Keys], key_policies: vec!["another".into()], ..Default::default() };
+        let issue = {
+            let km = km.clone();
+            async move { km.issue_as(&caller, IssueRequest { policy: "target".into(), name: "new".into(), ..Default::default() }).await }
+        };
+        assert!(queued_behind(&store, &km, narrowed, issue).await.unwrap_err().is::<NotPermitted>());
+        assert!(s.get("keys/target/new").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn may_manage_reads_the_callers_policy_as_loaded_now() {
+        let (_store, _s, km, caller) = issuer_and_target().await;
+        assert!(km.may_manage(&caller, "target"));
+        assert!(!km.may_manage(&caller, "dev"));
+        assert!(km.may_manage(&Principal::operator(), "dev"));
+
+        km.delete_policy("issuer").await.unwrap_err();
+        km.revoke("issuer/robot").await.unwrap();
+        km.delete_policy("issuer").await.unwrap();
+        assert!(!km.may_manage(&caller, "target"), "its policy is gone");
     }
 
     #[tokio::test]

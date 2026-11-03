@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use super::{AppState, authorize, json_error};
 use crate::db::{UsageFilter, now};
-use crate::keys::{InvalidIssue, IssueRequest, Issued, Principal, Revoked, Scope};
+use crate::keys::{InvalidIssue, IssueRequest, Issued, NotPermitted, Principal, Revoked, Scope};
 use crate::limits::Meter;
 use crate::policy::Policy;
 use crate::secrets::{Conflict, SecretStore};
@@ -269,7 +269,7 @@ async fn list_keys(State(s): State<AppState>, h: HeaderMap) -> Res {
         .keys
         .list()
         .into_iter()
-        .filter(|k| may_manage_keys(&s, &caller, &k.policy))
+        .filter(|k| s.keys.may_manage(&caller, &k.policy))
         .map(|k| {
             let mut v = json!(k);
             v["usage"] = json!(s.limiter.consumption(&k.client_id, at));
@@ -289,29 +289,17 @@ fn actor(caller: &Principal) -> &str {
     caller.client_id().unwrap_or("admin")
 }
 
-/// Whether the caller may manage keys under a policy. An `admin` caller may
-/// manage any. A `keys` caller may manage the ones its policy lists, unless
-/// such a key could do more than use the LLM and MCP endpoints. A listed policy
-/// that is not loaded can't be checked, so only a missing one passes: it has no
-/// scopes to grant.
-fn may_manage_keys(s: &AppState, caller: &Principal, policy: &str) -> bool {
-    if caller.has_scope(Scope::Admin) {
-        return true;
-    }
-    let listed = caller.has_scope(Scope::Keys) && caller.policy.key_policies.iter().any(|p| p == policy);
-    listed
-        && match s.keys.policy(policy) {
-            Some(target) => target.grants_only_client_use(),
-            None => s.keys.unloaded_policy(policy).is_none(),
-        }
+fn refused(caller: &Principal, policy: &str, action: &str) -> Response {
+    tracing::warn!(actor = actor(caller), policy, action, "refused a client key request outside the key's key_policies");
+    json_error(StatusCode::FORBIDDEN, format!("key may not manage keys of policy {policy:?}"))
 }
 
-/// The caller of a key route that a `keys` key may use for this policy.
+/// The caller of a key route that a `keys` key may use for this policy. The
+/// key manager decides again when it has waited its turn to write.
 async fn key_caller(s: &AppState, h: &HeaderMap, policy: &str, action: &str) -> Result<Principal, Response> {
     let caller = authorize(s, h, Scope::Keys).await?;
-    if !may_manage_keys(s, &caller, policy) {
-        tracing::warn!(actor = actor(&caller), policy, action, "refused a client key request outside the key's key_policies");
-        return Err(json_error(StatusCode::FORBIDDEN, format!("key may not manage keys of policy {policy:?}")));
+    if !s.keys.may_manage(&caller, policy) {
+        return Err(refused(&caller, policy, action));
     }
     Ok(caller)
 }
@@ -333,7 +321,12 @@ fn key_error(e: anyhow::Error) -> Response {
 /// `status: exists` and leaves the key as it is.
 async fn issue_key(State(s): State<AppState>, h: HeaderMap, Json(req): Json<IssueRequest>) -> Res {
     let caller = key_caller(&s, &h, &req.policy, "issue").await?;
-    let issued = s.keys.issue(req).await.map_err(key_error)?;
+    let policy = req.policy.clone();
+    let issued = s
+        .keys
+        .issue_as(&caller, req)
+        .await
+        .map_err(|e| if e.is::<NotPermitted>() { refused(&caller, &policy, "issue") } else { key_error(e) })?;
     let actor = actor(&caller);
     let (code, status) = match &issued {
         Issued::Created(info) => {
@@ -384,7 +377,12 @@ async fn rotate_key(
 async fn revoke_key(State(s): State<AppState>, h: HeaderMap, Path((policy, name)): Path<(String, String)>) -> Res {
     let caller = key_caller(&s, &h, &policy, "revoke").await?;
     let id = key_id(&policy, &name)?;
-    let status = match s.keys.revoke(&id).await.map_err(key_error)? {
+    let revoked = s
+        .keys
+        .revoke_as(&caller, &id)
+        .await
+        .map_err(|e| if e.is::<NotPermitted>() { refused(&caller, &policy, "revoke") } else { key_error(e) })?;
+    let status = match revoked {
         Revoked::Revoked => "revoked",
         Revoked::AlreadyRevoked => "already_revoked",
         Revoked::Absent => "absent",
@@ -398,7 +396,9 @@ async fn revoke_key(State(s): State<AppState>, h: HeaderMap, Path((policy, name)
 async fn set_key_disabled(State(s): State<AppState>, h: HeaderMap, Path((policy, name)): Path<(String, String)>, disabled: bool) -> Res {
     let caller = if disabled { key_caller(&s, &h, &policy, "disable").await? } else { authorize(&s, &h, Scope::Admin).await? };
     let id = key_id(&policy, &name)?;
-    let info = s.keys.set_disabled(&id, disabled).await.map_err(|e| json_error(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    let info = s.keys.set_disabled_as(&caller, &id, disabled).await.map_err(|e| {
+        if e.is::<NotPermitted>() { refused(&caller, &policy, "disable") } else { json_error(StatusCode::NOT_FOUND, format!("{e:#}")) }
+    })?;
     tracing::info!(client = %id, actor = actor(&caller), disabled, "changed client key");
     ok(info)
 }
