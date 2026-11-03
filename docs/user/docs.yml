@@ -5,6 +5,7 @@ assets:
   - assets/logo.svg
   - assets/logo-dark.svg
   - assets/favicon.svg
+  - assets/social.png
 products:
   xolotl:
     name: xolotl
@@ -21,6 +22,7 @@ products:
     logo: assets/logo.svg
     logo-dark: assets/logo-dark.svg
     favicon: assets/favicon.svg
+    social-image: assets/social.png
     highlights:
       - Give coding agents one URL and one client key for subscriptions, AI gateways and MCP servers.
       - Keep every real credential in OpenBao, never in the agents' containers.
