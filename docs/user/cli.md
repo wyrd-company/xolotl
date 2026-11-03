@@ -14,7 +14,7 @@ These options work on every command except `serve` and `check-config`.
 | Option | Environment | Default | Meaning |
 |---|---|---|---|
 | `--url` | `XOLOTL_URL` | `http://127.0.0.1:8317` | Server URL |
-| `--token` | `XOLOTL_ADMIN_TOKEN` | none | The bootstrap admin token, or a key whose policy has the `admin` scope |
+| `--token` | `XOLOTL_ADMIN_TOKEN` | none | The bootstrap admin token, a key whose policy has the `admin` scope, or for the `keys` commands a key with the `keys` scope |
 | `--json` | | off | Print raw JSON |
 
 Commands that read a secret (`providers set-key`, `accounts add-key`,
@@ -63,11 +63,11 @@ See [Subscription accounts](accounts).
 | `xolotl policies put <file>` | Create or replace a policy from a TOML or JSON file |
 | `xolotl policies view <name>` | The names a key sees, where they route, their endpoints, and the MCP tools |
 | `xolotl policies delete <name>` | Delete a policy that no key uses |
-| `xolotl keys issue --policy <p> --name <n> [--ttl <d>] [--description <s>]` | Issue a key into OpenBao at `keys/<p>/<n>` |
+| `xolotl keys issue --policy <p> --name <n> [--ttl <d>] [--description <s>]` | Issue a key into OpenBao at `keys/<p>/<n>`. A name with a live key reports that it exists and changes nothing |
 | `xolotl keys list` | Keys with policy, state, rotation, expiry and rate limit consumption |
 | `xolotl keys rotate <p>/<n> [--grace <d>]` | Write a new key. The old key works for the grace period |
 | `xolotl keys enable\|disable <p>/<n>` | Turn a key on or off |
-| `xolotl keys revoke <p>/<n>` | Revoke the key and destroy its earlier versions |
+| `xolotl keys revoke <p>/<n>` | Revoke the key and destroy its earlier versions. Safe to repeat on a key that is already revoked or gone |
 
 See [Policies and client keys](policies-and-keys).
 

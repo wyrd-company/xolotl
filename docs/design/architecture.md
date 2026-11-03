@@ -35,7 +35,7 @@ clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web
 ## Request path
 
 1. `authorize` takes the key from `Authorization` (Bearer or bare), `x-api-key` or `x-management-key`, and resolves it to a principal: client id plus policy. The bootstrap admin token resolves to an unrestricted policy. Without a key, an `/admin` route also accepts a web UI session.
-2. The route checks the scope it needs (`proxy`, `management` or `admin`).
+2. The route checks the scope it needs (`proxy`, `mcp`, `management`, `keys` or `admin`).
 3. LLM endpoints resolve `model` through the policy, count the request against the policy's [rate limits](limits.md) (429 when one is reached) and dispatch to a pool or a gateway provider, translating the request when the provider doesn't speak the endpoint's format ([Routing](routing.md)). Passthroughs check only the provider (and `model`, when the body is JSON).
 4. Responses are relayed as they arrive. `TapStream` (`src/proxy.rs`) reads token usage from the upstream JSON or SSE body on the way through, and `Accounting` writes the request log row and metrics, and counts the tokens against the rate limits, when the response finishes. A translated response is translated after this tap, so usage always comes from what the upstream sent.
 

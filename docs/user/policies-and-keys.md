@@ -76,6 +76,7 @@ writes `models`.
 | `scopes` | What the key can do. Default `["proxy"]` |
 | `mcp_servers` | MCP servers the key can use through `/mcp`, or `*` |
 | `allow_tools`, `deny_tools` | Globs on `tool` or `server/tool`. Deny wins. See [MCP gateway](mcp-gateway#policies) |
+| `key_policies` | With the `keys` scope, the policies whose client keys the key can manage. See [Issue keys from a script](#issue-keys-from-a-script) |
 | `limits` | Request and token limits on the LLM endpoints, also per provider and per account. See [Rate limits](#rate-limits) |
 
 ### Scopes
@@ -85,9 +86,10 @@ writes `models`.
 | `proxy` | The LLM endpoints (`/v1/...`) and the passthroughs |
 | `mcp` | The MCP gateway at `/mcp` |
 | `management` | The T3 Code hubs endpoints (`/v0/management/...`) |
+| `keys` | Issue, revoke, disable and list client keys under the policies in `key_policies` |
 | `admin` | The admin API, the same as the bootstrap admin token |
 
-A policy that allows MCP servers needs no `providers`.
+A policy that allows MCP servers or lists `key_policies` needs no `providers`.
 
 ### Accounts
 
@@ -303,7 +305,10 @@ xolotl keys revoke devcontainer/laptop
 - **Revoke** writes a revocation marker and destroys every earlier version of
   the record, so nobody can recover the key from history. You can then issue a
   new key with the same name.
-- **Issue** refuses a name that has a live key. Rotate it instead.
+- **Issue** on a name that has a live key changes nothing. It reports that the
+  key exists. To replace the key, rotate it.
+- **Revoke** on a key that is already revoked, or that does not exist, is not an
+  error.
 
 The `USAGE` column of `xolotl keys list` shows requests per minute, requests per
 day, tokens per minute and tokens per day. A window the policy limits shows
@@ -311,6 +316,85 @@ day, tokens per minute and tokens per day. A window the policy limits shows
 show the total of all keys of the policy, and the column ends with `(policy)`.
 
 Durations are numbers with `s`, `m`, `h`, `d` or `w`, for example `30m` or `90d`.
+
+## Issue keys from a script
+
+A tool that provisions clients does not need the admin token. Give it a key from
+a policy with the `keys` scope, and name the policies it may issue under:
+
+```toml
+name = "provisioner"
+description = "Issues keys for new workspaces"
+scopes = ["keys"]
+key_policies = ["workspaces"]
+```
+
+```sh
+xolotl policies put provisioner.toml
+xolotl keys issue --policy provisioner --name robot
+```
+
+The client reads that key from OpenBao, as with any other key, and sends it as
+its bearer token.
+
+| The key can | The key can't |
+|---|---|
+| `POST /admin/keys` under a listed policy | Change, read or delete a policy |
+| `GET /admin/keys`, which shows only the keys of listed policies | Reach accounts, providers, MCP servers, usage or status |
+| `DELETE /admin/keys/<policy>/<name>` | Enable or rotate a key |
+| `POST /admin/keys/<policy>/<name>/disable` | Use the LLM endpoints, unless its policy also has `proxy` |
+
+`key_policies` names each policy. It has no wildcard, and a policy can't list
+itself. Give each host or tool its own policy to issue under, so that it can't
+reach the keys of another.
+
+A key can't manage keys of a listed policy that has any scope other than `proxy`
+or `mcp`. Such a key could do more than the key that issued it. The request gets
+a 403, also if you change the listed policy later. The same applies to a listed
+policy that did not load, because its scopes can't be read.
+
+### Safe to repeat
+
+A script can send each request again after a timeout or a failure. Neither
+request ever returns a key.
+
+**`POST /admin/keys`** with `policy` and `name`, and optionally `description` and
+`ttl_secs`. Without `ttl_secs`, the key does not expire.
+
+| Answer | `status` | Meaning |
+|---|---|---|
+| 201 | `created` | A new key is in OpenBao at `vault_path` |
+| 200 | `exists` | A live key has this name, and nothing changed. The other fields are the stored key's, also if the request asked for another description or lifetime. Check `disabled` and `expires_at` |
+| 400 | | The name is not valid, the policy does not exist, or `ttl_secs` is out of range |
+| 403 | | The key may not manage keys of this policy |
+| 409 | | Another Xolotl instance is changing this key. Send it again |
+| 500 | | OpenBao failed. Send it again: a key that was written is reported as `exists` |
+
+A name whose key was revoked can be issued again, which gives `created`.
+
+**`DELETE /admin/keys/<policy>/<name>`**
+
+| Answer | `status` | Meaning |
+|---|---|---|
+| 200 | `revoked` | The key is revoked, and every earlier version is destroyed |
+| 200 | `already_revoked` | It was revoked before. Xolotl destroyed the earlier versions again |
+| 200 | `absent` | No record, or its latest version has no data. Xolotl destroyed any versions it kept |
+| 500 | | OpenBao failed, and a version may still hold the key. Send it again |
+
+After a 200, no version in OpenBao holds the key. A revoked key's record stays as
+a marker without a key.
+
+### Who did it
+
+The log names the caller of each change as `actor`: the client ID of the key, or
+`admin` for the bootstrap admin token and web UI sessions. The log has one line
+for each issue, including an answer of `exists`, and for each revoke, disable,
+enable and rotate. A request outside `key_policies` logs a warning with `actor`,
+`policy` and `action`. Keys are not in the log.
+
+```text
+INFO issued client key client=workspaces/a actor="provisioner/robot"
+```
 
 ## Usage by client
 

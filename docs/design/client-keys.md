@@ -33,10 +33,35 @@ All writes use KV v2 check-and-set against the version that was read, so an inst
 
 | Operation | Effect |
 |---|---|
-| issue | New random key under `<policy>/<name>`. Refused if a live key with that name exists (rotate it instead); a revoked name can be issued again. |
+| issue | New random key under `<policy>/<name>`; a revoked name can be issued again. If a live key has that name, including a disabled or expired one, it answers `exists` with the stored record and writes nothing. A record that can't be read is an error, never overwritten. |
 | rotate `--grace` | New key; the old key's hash and a grace expiry are kept in the record so both work until then |
 | disable / enable | Flag in the record |
-| revoke | Writes a revocation marker (no key) as the newest version, then **destroys** the data of every earlier version, so the key can't be recovered from history. Requires `update` on `secret/destroy/xolotl/*`. |
+| revoke | Writes a revocation marker (no key) as the newest version, then **destroys** the data of every earlier version, so the key can't be recovered from history. Requires `update` on `secret/destroy/xolotl/*`. A key already revoked or absent answers without an error, and the destroy runs again. |
+
+Issue and revoke are safe to repeat, so a caller retries after any failure:
+
+- **A lost answer:** the write happened, so the retry reads the key (`exists`) or the marker (`already_revoked`), and the cache catches up.
+- **A failed destroy:** the marker is written and the key stops at once, but the answer is an error, because a version may still hold the key. The retry runs the destroy again.
+- **A lost race:** another instance wrote first, so check-and-set fails. The operation reads the record again once. A second conflict answers 409.
+- **Deleted in OpenBao:** the latest version has no data but keeps its number. Revoke answers `absent`, destroys every version, and removes the key from the cache.
+
+## Keys that manage keys
+
+A policy with the `keys` scope lists policies in `key_policies`. Its keys can issue, revoke, disable and list keys under those policies, and reach no other route. `admin` implies it for every policy. A web UI session counts as `admin`.
+
+`admin::may_manage_keys` decides per request, against the listed policy as loaded now:
+
+- **Only client use:** a listed policy must grant nothing beyond `proxy` and `mcp`. `admin` and `management` reach accounts or more. `keys` could list a policy the issuer does not, which would widen its reach. The check is on the target's scopes, and not at save time, because the target can change after it is listed. A scope added later is refused until it is judged here.
+- **Not loaded:** a listed policy that is stored but did not load can't be checked, so it is refused; an operator with `admin` cleans it up. A listed policy that does not exist passes, which lets a retried revoke finish. Issue under it still fails: no such policy.
+- **No enable, no rotate:** the issuer must not be able to undo an operator's disable. It can revoke and issue again, which ends in a new key the operator can see in the log.
+
+Revoke, disable, enable and rotate take names from the URL. A decoded name can hold `/`, `..` or `?`, and the vault client puts names into the URL as they are, so the routes refuse a name outside the format.
+
+## Audit
+
+The log is the audit record. Each change to a key logs `actor`: the client ID, or `admin` for the bootstrap token and web UI sessions. A refusal under `key_policies` logs at warn level with `actor`, `policy` and `action`. Xolotl has no separate audit store.
+
+## Policies
 
 A stored policy that can't be read or parsed is left out of the loaded state and listed in `unloaded_policies` of `GET /admin/status`, with its error. Saving or deleting that name clears the entry.
 
