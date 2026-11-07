@@ -10,6 +10,8 @@ pub mod tools;
 
 pub use store::{SessionRow, ToolUsageRow, Turn};
 
+use std::sync::Arc;
+
 use axum::http::HeaderMap;
 use opentelemetry::KeyValue;
 use parking_lot::Mutex;
@@ -18,6 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 use crate::db::Db;
+use crate::export::Capture;
 use crate::subscription::{claude, codex, grok, opencode_go};
 use crate::telemetry::metrics;
 
@@ -121,6 +124,7 @@ pub struct RequestSession {
     lockable: bool,
     max_failures: i64,
     lock: Mutex<Option<Lock>>,
+    capture: Option<Arc<Capture>>,
 }
 
 impl RequestSession {
@@ -156,7 +160,14 @@ impl RequestSession {
             lockable,
             max_failures: cfg.subscription.max_attempts as i64,
             lock: Mutex::new(lock),
+            capture: None,
         })
+    }
+
+    /// Export the request and its response ([`crate::export`]).
+    pub fn with_capture(mut self, capture: Option<Arc<Capture>>) -> Self {
+        self.capture = capture;
+        self
     }
 
     /// The lock as the request sees it now.
@@ -230,6 +241,7 @@ impl RequestSession {
             estimate: self.estimate,
             lock_tokens: if self.lockable { self.lock_tokens as i64 } else { 0 },
             side: self.lock.lock().as_ref().is_some_and(|l| l.name != self.requested),
+            capture: self.capture.clone(),
         }
     }
 }
@@ -245,11 +257,27 @@ pub struct SessionTrack {
     estimate: i64,
     lock_tokens: i64,
     side: bool,
+    capture: Option<Arc<Capture>>,
 }
 
 impl SessionTrack {
     pub fn key(&self) -> &str {
         &self.id.key
+    }
+
+    /// What the key came from ([`SessionId::source`]).
+    pub fn source(&self) -> &'static str {
+        self.id.source
+    }
+
+    /// The upstream model that serves the request.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The export of this request, when exporting is on.
+    pub fn capture(&self) -> Option<&Arc<Capture>> {
+        self.capture.as_ref()
     }
 
     pub fn window(&self) -> Option<i64> {

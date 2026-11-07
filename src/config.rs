@@ -21,6 +21,64 @@ pub struct Config {
     pub mcp: McpConfig,
     pub ui: UiConfig,
     pub sessions: SessionsConfig,
+    pub export: ExportConfig,
+}
+
+/// Copies of LLM exchanges sent elsewhere for analysis.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExportConfig {
+    /// Each session request and its response as a row in a ClickHouse table.
+    pub clickhouse: Option<ClickHouseConfig>,
+}
+
+/// A ClickHouse table, written through the HTTP interface. The password is
+/// the vault secret `clickhouse` (fields `password` and, optionally, `user`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClickHouseConfig {
+    /// HTTP interface, e.g. `http://clickhouse:8123`.
+    pub url: String,
+    pub database: String,
+    pub table: String,
+    /// ClickHouse user, unless the vault secret names one.
+    pub user: Option<String>,
+    /// PEM CA bundle for a privately signed ClickHouse certificate.
+    pub ca_cert: Option<PathBuf>,
+    /// Create the table before the first insert when it doesn't exist. The database must exist.
+    pub create_table: bool,
+    /// Rows older than this are deleted by ClickHouse. Applies to a table xolotl creates. 0 keeps them.
+    pub ttl_days: u32,
+    /// Include the request and response bodies. Without them a row holds the
+    /// request log fields only.
+    pub bodies: bool,
+    /// Longer request and response bodies are cut, and the row says so.
+    pub max_body_bytes: usize,
+    /// Rows per insert.
+    pub batch_rows: usize,
+    /// Longest a row waits before it is inserted.
+    pub flush_secs: u64,
+    /// Megabytes of rows waiting to be inserted; rows past it are dropped and counted.
+    pub queue_mb: usize,
+}
+
+impl Default for ClickHouseConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            database: "xolotl".into(),
+            table: "llm_exchanges".into(),
+            user: None,
+            ca_cert: None,
+            create_table: true,
+            ttl_days: 0,
+            bodies: true,
+            max_body_bytes: 4 * 1024 * 1024,
+            batch_rows: 100,
+            flush_secs: 5,
+            queue_mb: 256,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -568,6 +626,9 @@ impl Config {
         if let Some(v) = env("XOLOTL_LOG_FORMAT") {
             self.telemetry.log_format = v;
         }
+        if let Some(v) = env("XOLOTL_CLICKHOUSE_URL") {
+            self.export.clickhouse.get_or_insert_with(Default::default).url = v;
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -635,6 +696,19 @@ impl Config {
             let url = url::Url::parse(u).context("mcp.oauth.client_metadata_url: invalid url")?;
             anyhow::ensure!(url.scheme() == "https" && url.path() != "/", "mcp.oauth.client_metadata_url must be an https URL with a path");
         }
+        if let Some(ch) = &self.export.clickhouse {
+            let url = url::Url::parse(&ch.url).context("export.clickhouse.url: invalid url")?;
+            anyhow::ensure!(matches!(url.scheme(), "http" | "https"), "export.clickhouse.url must be http or https");
+            // A query string could carry `user` and `password`, and the url is logged.
+            anyhow::ensure!(
+                url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none(),
+                "export.clickhouse.url must not hold credentials or a query string; put credentials in the vault secret `clickhouse`"
+            );
+            let ident = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            anyhow::ensure!(ident(&ch.database) && ident(&ch.table), "export.clickhouse.database and table must be alphanumeric or '_'");
+            anyhow::ensure!(ch.batch_rows >= 1, "export.clickhouse.batch_rows must be >= 1");
+            anyhow::ensure!(ch.queue_mb >= 1, "export.clickhouse.queue_mb must be >= 1");
+        }
         anyhow::ensure!(self.subscription.max_attempts >= 1, "subscription.max_attempts must be >= 1");
         anyhow::ensure!(matches!(self.telemetry.log_format.as_str(), "pretty" | "json"), "telemetry.log_format must be pretty or json");
         Ok(())
@@ -666,6 +740,25 @@ mod tests {
             assert!(!out.contains(&format!("\"{secret}\"")), "{secret} leaked:\n{out}");
         }
         assert!(out.contains("/run/secret_id"), "file paths are not secret");
+    }
+
+    #[test]
+    fn clickhouse_export_is_validated() {
+        let cfg: Config = toml::from_str("[export.clickhouse]\nurl = \"http://ch:8123\"\n").unwrap();
+        cfg.validate().unwrap();
+        let ch = cfg.export.clickhouse.unwrap();
+        assert_eq!((ch.database.as_str(), ch.table.as_str(), ch.bodies), ("xolotl", "llm_exchanges", true));
+        for bad in [
+            "url = \"ch:8123\"",
+            "url = \"http://ch\"\ntable = \"x; DROP TABLE y\"",
+            "url = \"http://ch\"\nbatch_rows = 0",
+            "url = \"http://u:p@ch:8123\"",
+            "url = \"https://ch:8443/?user=xolotl&password=secret\"",
+            "url = \"http://ch:8123/?\"",
+        ] {
+            let cfg: Config = toml::from_str(&format!("[export.clickhouse]\n{bad}\n")).unwrap();
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

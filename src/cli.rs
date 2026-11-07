@@ -420,6 +420,14 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
     let mcp = Arc::new(crate::mcp::McpHub::new(&cfg, secrets.clone(), db.clone()));
     let n = mcp.reload().await.context("loading MCP servers from the vault")?;
     tracing::info!(config = cfg.mcp.servers.len(), vault = n, "loaded MCP servers");
+    let export = match &cfg.export.clickhouse {
+        Some(ch) => {
+            let secret = secrets.get("clickhouse").await.context("reading the clickhouse secret from the vault")?.unwrap_or_default();
+            let field = |k: &str| secret.get(k).and_then(|v| v.as_str()).map(str::to_string);
+            Some(crate::export::Exporter::start(ch.clone(), field("user"), field("password"))?)
+        }
+        None => None,
+    };
     let state = AppState {
         cfg: Arc::new(cfg),
         db,
@@ -432,11 +440,15 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
         sessions: Default::default(),
         mcp,
         limiter,
+        export: export.clone(),
     };
     server::spawn_background(state.clone());
     let subs = state.subs.clone();
     let mcp = state.mcp.clone();
     let result = server::serve(state).await;
+    if let Some(export) = export {
+        export.shutdown().await;
+    }
     // Last chance to save refreshed credentials whose vault write failed.
     if subs.unsaved_count() > 0 {
         let left = subs.flush_unsaved().await;

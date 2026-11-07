@@ -33,6 +33,7 @@ Environment variables override the file.
 | `XOLOTL_VAULT_SECRET_ID` | `vault.approle.secret_id` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `telemetry.otlp_endpoint` |
 | `XOLOTL_LOG_FORMAT` | `telemetry.log_format` |
+| `XOLOTL_CLICKHOUSE_URL` | `export.clickhouse.url`; sets up the export with its defaults when the file has no `[export.clickhouse]` |
 
 The CLI uses `XOLOTL_URL` and `XOLOTL_ADMIN_TOKEN` (see [CLI](cli)).
 
@@ -94,6 +95,21 @@ metrics_interval_secs = 30
 ```
 
 See [Telemetry](telemetry).
+
+## `[export.clickhouse]`
+
+Copies each session's requests and responses to a ClickHouse table. Off
+without this section.
+
+```toml
+[export.clickhouse]
+url = "http://clickhouse:8123"
+database = "xolotl"
+table = "llm_exchanges"
+bodies = true            # false: request log fields only
+```
+
+See [ClickHouse export](clickhouse-export) for every setting and the table.
 
 ## `[ui.oidc]`
 
@@ -267,6 +283,7 @@ All paths are under `<mount>/<prefix>/`, by default `secret/xolotl/`.
 | `admin` | `token`: the bootstrap admin token | you |
 | `oidc` | `client_secret`: the web UI's OpenID Connect client secret | you |
 | `telemetry` | OTLP header values, keyed by header name | you |
+| `clickhouse` | `password` and, optionally, `user` for the [ClickHouse export](clickhouse-export) | you |
 | `providers/<name>` | `api_key` of a gateway provider | `xolotl providers set-key` |
 | `accounts/<provider>/<id>` | OAuth tokens or API key of a subscription account | xolotl, at login and on refresh |
 | `policies/<policy>` | a client key policy | `xolotl policies put` |

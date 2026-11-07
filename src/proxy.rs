@@ -18,6 +18,7 @@ use serde_json::Value;
 use crate::context::SessionTrack;
 use crate::context::tools::{ToolCalls, mentions_tool};
 use crate::db::{Db, RequestRecord};
+use crate::export::{Captured, Finished};
 use crate::limits::Limiter;
 use crate::telemetry::metrics;
 
@@ -150,11 +151,14 @@ pub struct Accounting {
     pub db: Db,
     pub record: RequestRecord,
     pub started: Instant,
+    started_at: chrono::DateTime<chrono::Utc>,
     limiter: Option<Arc<Limiter>>,
     prices: Option<crate::metadata::Metadata>,
     session: Option<SessionTrack>,
     /// Tool calls the response named.
     tools: Vec<String>,
+    /// The response body, when the request is exported with its bodies.
+    response: Option<Captured>,
 }
 
 impl Accounting {
@@ -171,10 +175,12 @@ impl Accounting {
                 ..Default::default()
             },
             started: Instant::now(),
+            started_at: chrono::Utc::now(),
             limiter: None,
             prices: None,
             session: None,
             tools: Vec::new(),
+            response: None,
         }
     }
 
@@ -191,6 +197,12 @@ impl Accounting {
     pub fn with_session(mut self, session: Option<SessionTrack>) -> Self {
         self.session = session;
         self
+    }
+
+    /// The most response bytes to keep for the export, or `None` when the
+    /// request isn't exported with its bodies.
+    pub fn capture_limit(&self) -> Option<usize> {
+        self.session.as_ref()?.capture()?.response_limit()
     }
 
     pub fn finish(mut self, status: u16, usage: TokenUsage) {
@@ -256,9 +268,24 @@ impl Accounting {
         }
         let record = self.record;
         let db = self.db;
+        let export =
+            self.session.as_ref().and_then(|s| Some((s.capture()?.pending(), s.key().to_string(), s.source(), s.model().to_string())));
         let session = self.session.filter(|_| success);
         let tools = if success { self.tools } else { Vec::new() };
+        let (started_at, response) = (self.started_at, self.response);
         tokio::spawn(async move {
+            if let Some((pending, key, source, model)) = export {
+                pending.submit(Finished {
+                    record: &record,
+                    started_at,
+                    session_key: &key,
+                    session_source: source,
+                    upstream_model: &model,
+                    usage,
+                    tools: &tools,
+                    response,
+                });
+            }
             if let Err(e) = db.log_request(&record).await {
                 tracing::warn!(error = %e, "failed to write request log");
             }
@@ -308,11 +335,14 @@ pub struct TapStream<S> {
     usage: TokenUsage,
     tools: ToolCalls,
     status: u16,
+    /// The response body for the export, and how much of it to keep.
+    capture: Option<(Captured, usize)>,
     accounting: Option<Accounting>,
 }
 
 impl<S> TapStream<S> {
     pub fn new(inner: S, sse: bool, status: u16, accounting: Option<Accounting>) -> Self {
+        let capture = accounting.as_ref().and_then(Accounting::capture_limit).map(|limit| (Captured { sse, ..Default::default() }, limit));
         Self {
             inner,
             sse,
@@ -321,6 +351,7 @@ impl<S> TapStream<S> {
             usage: TokenUsage::default(),
             tools: ToolCalls::default(),
             status,
+            capture,
             accounting,
         }
     }
@@ -328,6 +359,9 @@ impl<S> TapStream<S> {
     fn feed(&mut self, chunk: &[u8]) {
         if self.accounting.is_none() {
             return;
+        }
+        if let Some((captured, limit)) = &mut self.capture {
+            captured.push(chunk, *limit);
         }
         if !self.sse {
             if self.json_buf.len() + chunk.len() <= MAX_JSON_SCAN {
@@ -360,6 +394,7 @@ impl<S> TapStream<S> {
     fn settle(&mut self) {
         if let Some(mut acc) = self.accounting.take() {
             acc.tools = std::mem::take(&mut self.tools).into_names();
+            acc.response = self.capture.take().map(|(c, _)| c);
             acc.finish(self.status, self.usage);
         }
     }
@@ -445,8 +480,13 @@ where
 
 /// Relay an already-buffered upstream response.
 pub fn relay_buffered(status: u16, headers: &reqwest::header::HeaderMap, body: Bytes, accounting: Option<Accounting>) -> Response {
-    if let Some(acc) = accounting {
+    if let Some(mut acc) = accounting {
         let mut usage = TokenUsage::default();
+        if let Some(limit) = acc.capture_limit() {
+            let mut captured = Captured { sse: is_sse(headers), ..Default::default() };
+            captured.push(&body, limit);
+            acc.response = Some(captured);
+        }
         if is_sse(headers) {
             for line in body.split(|b| *b == b'\n') {
                 if let Some(d) = line.strip_prefix(b"data:")

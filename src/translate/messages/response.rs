@@ -114,16 +114,16 @@ pub fn error_body(kind: &str, message: &str) -> Value {
 #[derive(Default)]
 pub struct StreamDecoder {
     em: Emitter,
-    /// Whether the content block at each index is translated (server tool
-    /// blocks are skipped).
-    live: Vec<bool>,
+    /// The indices of the content blocks that are translated (server tool
+    /// blocks are skipped). A set, as the upstream picks the indices.
+    live: std::collections::HashSet<u64>,
     usage: Usage,
     stop: StopReason,
 }
 
 impl StreamDecoder {
     fn live(&self, v: &Value) -> bool {
-        v.get("index").and_then(Value::as_u64).and_then(|i| self.live.get(i as usize).copied()).unwrap_or(false)
+        v.get("index").and_then(Value::as_u64).is_some_and(|i| self.live.contains(&i))
     }
 }
 
@@ -138,10 +138,7 @@ impl Decoder for StreamDecoder {
                 }
             }
             "content_block_start" => {
-                let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                if self.live.len() <= index {
-                    self.live.resize(index + 1, false);
-                }
+                let index = v.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let b = v.get("content_block").cloned().unwrap_or(Value::Null);
                 let bs = |k: &str| b.get(k).and_then(Value::as_str).unwrap_or_default();
                 let live = match bs("type") {
@@ -166,7 +163,11 @@ impl Decoder for StreamDecoder {
                     }
                     _ => false,
                 };
-                self.live[index] = live;
+                if live {
+                    self.live.insert(index);
+                } else {
+                    self.live.remove(&index);
+                }
             }
             "content_block_delta" if self.live(&v) => match s("/delta/type") {
                 "text_delta" => self.em.delta(s("/delta/text")),

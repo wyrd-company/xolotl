@@ -60,7 +60,20 @@ async fn state(secrets: Secrets) -> AppState {
             .with_catalog(catalog.clone()),
     );
     let mcp = Arc::new(McpHub::new(&cfg, secrets.clone(), db.clone()));
-    AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: None, sessions: Default::default(), mcp, limiter }
+    AppState {
+        cfg: Arc::new(cfg),
+        db,
+        secrets,
+        keys,
+        subs,
+        gateway,
+        catalog,
+        vault: None,
+        sessions: Default::default(),
+        mcp,
+        limiter,
+        export: None,
+    }
 }
 
 async fn call(state: &AppState, method: &str, uri: &str, key: &str, body: Option<Value>) -> u16 {

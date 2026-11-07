@@ -38,6 +38,21 @@ metrics_interval_secs = 30
 [telemetry.otlp_headers]
 # Authorization = "Basic ..."   # prefer the vault secret instead
 
+# Copy each session's requests and responses to ClickHouse for analysis.
+# The password is the vault secret `xolotl/clickhouse` (fields password, user).
+# [export.clickhouse]
+# url = "http://clickhouse:8123"   # Env: XOLOTL_CLICKHOUSE_URL
+# database = "xolotl"
+# table = "llm_exchanges"
+# ca_cert = "/etc/xolotl/clickhouse-ca.pem"   # https with a private CA
+# create_table = true
+# ttl_days = 0
+# bodies = true                    # false: request log fields only
+# max_body_bytes = 4194304
+# batch_rows = 100
+# flush_secs = 5
+# queue_mb = 256
+
 [ui.oidc]
 # Web UI sign-in with OpenID Connect (e.g. Pocket ID). Register a confidential
 # client with this redirect URL; its secret is the vault secret `xolotl/oidc`

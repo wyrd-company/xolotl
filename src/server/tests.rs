@@ -89,8 +89,20 @@ async fn harness_with_secrets(tweak: impl FnOnce(&mut Config), secrets: Secrets)
             .with_catalog(catalog.clone()),
     );
     let mcp = Arc::new(McpHub::new(&cfg, secrets.clone(), db.clone()));
-    let state =
-        AppState { cfg: Arc::new(cfg), db, secrets, keys, subs, gateway, catalog, vault: None, sessions: Default::default(), mcp, limiter };
+    let state = AppState {
+        cfg: Arc::new(cfg),
+        db,
+        secrets,
+        keys,
+        subs,
+        gateway,
+        catalog,
+        vault: None,
+        sessions: Default::default(),
+        mcp,
+        limiter,
+        export: None,
+    };
     Harness { state, admin: "boot".into(), upstream }
 }
 
@@ -3196,4 +3208,59 @@ async fn codex_catalog_uses_reachable_alias_targets() {
     let alias = list["models"].as_array().unwrap().iter().find(|m| m["slug"] == "sample-fallback").unwrap();
     assert_eq!(alias["context_window"], 128000);
     assert_eq!(alias["shell_type"], "unified_exec");
+}
+
+#[tokio::test]
+async fn session_exchanges_are_exported_to_clickhouse() {
+    let mut h = harness().await;
+    let clickhouse = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&clickhouse).await;
+    let cfg = crate::config::ClickHouseConfig { url: clickhouse.uri(), create_table: false, flush_secs: 3600, ..Default::default() };
+    let export = crate::export::Exporter::start(cfg, None, None).unwrap();
+    h.state.export = Some(export.clone());
+    // A Messages client on a Chat-only provider: the request is translated and streamed back.
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi \"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"there\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/llama/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .mount(&h.upstream)
+        .await;
+    let key = h.key(Policy { name: "local".into(), providers: vec!["llama".into()], ..Default::default() }).await;
+    let auth = format!("Bearer {key}");
+    let body = json!({"model": "llama/qwen3", "max_tokens": 64, "stream": true, "messages": [{"role": "user", "content": "hello"}]});
+    let (status, _) =
+        h.call_with("POST", "/v1/messages", &[("authorization", &auth), ("x-claude-code-session-id", "s-1")], Some(body)).await;
+    assert_eq!(status, 200);
+    // Not a session: an operator's request has no client key.
+    let (status, _) = h.call("POST", "/v1/chat/completions", Some(&h.admin), Some(json!({"model": "llama/qwen3", "messages": []}))).await;
+    assert_eq!(status, 200);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    export.shutdown().await;
+
+    let inserts: Vec<String> =
+        clickhouse.received_requests().await.unwrap().iter().map(|r| String::from_utf8_lossy(&r.body).into_owned()).collect();
+    let rows: Vec<Value> =
+        inserts.iter().flat_map(|b| b.lines().map(|l| serde_json::from_str(l).unwrap()).collect::<Vec<Value>>()).collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    let (logged,): (String,) =
+        sqlx::query_as("SELECT session_key FROM request_log WHERE session_key IS NOT NULL").fetch_one(&h.state.db.pool).await.unwrap();
+    assert_eq!(row["session_key"], logged);
+    assert_eq!(row["session_source"], "claude-code");
+    assert_eq!(row["client_endpoint"], "/v1/messages");
+    assert_eq!(row["endpoint"], "/v1/chat/completions");
+    assert_eq!(row["provider"], "llama");
+    assert_eq!(row["upstream_model"], "qwen3");
+    assert_eq!(row["streamed"], true);
+    assert_eq!(row["input_tokens"], 9);
+    assert_eq!(row["output_text"], "Hi there");
+    assert_eq!(row["stop_reason"], "end");
+    let request: Value = serde_json::from_str(row["request"].as_str().unwrap()).unwrap();
+    assert_eq!(request["messages"][0]["content"], "hello");
+    assert_eq!(row["response"], sse);
 }
