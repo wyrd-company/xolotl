@@ -110,6 +110,36 @@ fn shorten_tool_names(req: &mut ir::Request) -> HashMap<String, String> {
     renamed
 }
 
+/// Assemble a whole upstream response body, JSON or SSE, in `wire` format
+/// into one format-neutral response, with the failure the body reports. A
+/// stream that failed or was cut short keeps what arrived before.
+pub fn assemble(wire: Wire, body: &[u8], sse: bool) -> (ir::Response, Option<(String, String)>) {
+    let t = Translation { client: wire, upstream: wire, stream: false, info: ClientInfo::default(), renamed: HashMap::new() };
+    if !sse {
+        return match serde_json::from_slice::<Value>(body) {
+            Ok(v) => match t.decode_json(&v) {
+                Ok(r) => (r, None),
+                Err(e) => (ir::Response::default(), Some(e)),
+            },
+            Err(e) => (ir::Response::default(), Some(("api_error".to_string(), format!("invalid JSON: {e}")))),
+        };
+    }
+    let mut parser = SseParser::default();
+    let mut decoder = t.decoder();
+    let mut c = Collector::default();
+    // In chunks: the parser drains each line from the front of its buffer.
+    for chunk in body.chunks(16 * 1024) {
+        for ev in parser.feed(chunk) {
+            decoder.feed(&ev).into_iter().for_each(|e| c.push(e));
+        }
+    }
+    for ev in parser.end() {
+        decoder.feed(&ev).into_iter().for_each(|e| c.push(e));
+    }
+    decoder.end().into_iter().for_each(|e| c.push(e));
+    c.into_parts()
+}
+
 trait Decoder: Send {
     fn feed(&mut self, ev: &SseEvent) -> Vec<Event>;
     /// The upstream stream ended.
@@ -294,7 +324,7 @@ fn with_headers(mut resp: Response, headers: HeaderMap) -> Response {
 }
 
 /// The error type and message of an upstream error body in any format.
-fn upstream_error(status: StatusCode, body: &[u8]) -> (String, String) {
+pub fn upstream_error(status: StatusCode, body: &[u8]) -> (String, String) {
     let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let err = v.get("error").unwrap_or(&v);
     let message = err

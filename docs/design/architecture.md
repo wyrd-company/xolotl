@@ -11,7 +11,8 @@ clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web
         │                                     └── /mcp code mode ── upstream MCP servers
         ├── OpenBao (KV v2, AppRole): every secret
         ├── SQLite: runtime state, no secrets
-        └── OpenTelemetry (OTLP/HTTP): traces, logs, metrics
+        ├── OpenTelemetry (OTLP/HTTP): traces, logs, metrics
+        └── ClickHouse (HTTP, optional): session requests and responses
 ```
 
 ## Two kinds of upstream
@@ -28,6 +29,7 @@ clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web
 | Store | Holds | Why |
 |---|---|---|
 | OpenBao, KV v2 under `secret/xolotl/` | admin token, telemetry headers, provider keys, account credentials, MCP servers added at runtime and their secrets, policies, client key records | Secrets stay off disk and out of env vars. Writes that can race use check-and-set. |
+| ClickHouse (`export.clickhouse`, optional) | a row for each session request: request log fields, request and response bodies, the assembled output | Analysis of conversations. Off by default; see [Exchange export](export.md). |
 | SQLite (`database.path`) | accounts index, cooldowns, usage snapshots, request log and MCP call log, sessions and tool counts (pruned after `retention_days`, default 90) | Cheap, frequently changing state. Holds no secrets and is rebuilt from OpenBao if lost. Rate limit counters are rebuilt from the request log at startup. |
 
 `src/vault.rs` is the OpenBao client: AppRole login, re-login on 403, KV v2 get/put/list/delete, versioned reads, check-and-set writes and version destroy. It implements the `SecretStore` trait (`src/secrets.rs`); tests use the in-memory `MemoryStore`.
@@ -82,3 +84,4 @@ On graceful shutdown the server makes one last attempt to save unsaved credentia
 | `src/db.rs`, `migrations/` | SQLite |
 | `src/vault.rs`, `src/secrets.rs` | OpenBao client and the `SecretStore` trait |
 | `src/telemetry.rs` | OpenTelemetry setup and metrics |
+| `src/export.rs` | ClickHouse export of session exchanges ([Exchange export](export.md)) |

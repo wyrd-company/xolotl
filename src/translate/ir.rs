@@ -411,6 +411,11 @@ impl Collector {
         }
     }
 
+    /// What was assembled, and the error the stream ended with, if any.
+    pub fn into_parts(self) -> (Response, Option<(String, String)>) {
+        (self.resp, self.error)
+    }
+
     /// The response, or the error the stream ended with.
     pub fn finish(self) -> Result<Response, (String, String)> {
         match self.error {

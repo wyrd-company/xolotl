@@ -49,6 +49,8 @@ pub struct AppState {
     pub sessions: Arc<session::Sessions>,
     pub mcp: Arc<McpHub>,
     pub limiter: Arc<Limiter>,
+    /// Session exchanges exported for analysis, when configured.
+    pub export: Option<Arc<crate::export::Exporter>>,
 }
 
 impl AppState {
@@ -385,7 +387,7 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             .unwrap_or_default();
         return err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("model {model:?} is not available on {path}{hint}"));
     }
-    let session = session_for(state, &principal, path, &headers, &json, &model, true).await;
+    let session = session_for(state, &principal, path, &headers, &json, &body, &model, true).await;
     let mut usable = usable;
     if let Some(s) = session.as_ref().filter(|s| s.locks_requested_name())
         && let Some(lock) = s.lock()
@@ -526,19 +528,23 @@ async fn collect_grok(resp: Response) -> Response {
 
 /// The session of an LLM request. Only a client key's requests on the wire
 /// formats have one, and counting tokens is not a turn of the conversation.
+#[allow(clippy::too_many_arguments)]
 async fn session_for(
     state: &AppState,
     principal: &Principal,
     path: &str,
     headers: &HeaderMap,
     body: &Value,
+    raw: &Bytes,
     requested: &str,
     lockable: bool,
 ) -> Option<RequestSession> {
     if Wire::for_path(path).is_none() || path == "/v1/messages/count_tokens" {
         return None;
     }
-    RequestSession::begin(&state.db, &state.cfg, principal.client_id()?, headers, body, requested, lockable).await
+    let session = RequestSession::begin(&state.db, &state.cfg, principal.client_id()?, headers, body, requested, lockable).await?;
+    // `raw`, not `body`: the bytes the client sent, without serializing them again.
+    Some(session.with_capture(state.export.as_ref().map(|e| e.capture(path, raw))))
 }
 
 /// The session of a passthrough request, whose body is only parsed here.
@@ -553,9 +559,10 @@ async fn passthrough_session(
 ) -> Option<RequestSession> {
     let path = format!("/{rest}");
     Wire::for_path(&path)?;
-    let json: Value = serde_json::from_slice(body?).ok()?;
+    let raw = body?;
+    let json: Value = serde_json::from_slice(raw).ok()?;
     let requested = label.unwrap_or_default();
-    session_for(state, principal, &path, headers, &json, requested, lockable && label.is_some()).await
+    session_for(state, principal, &path, headers, &json, raw, requested, lockable && label.is_some()).await
 }
 
 /// Send a JSON request to one target: a subscription pool or a gateway provider.

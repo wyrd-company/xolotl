@@ -650,3 +650,14 @@ async fn context_errors_in_json_and_sse_trigger_messages_compaction() {
     let (_, _, body) = run(t, upstream_response(400, "application/json", failed)).await;
     assert!(body.contains("prompt is too long"), "{body}");
 }
+
+#[test]
+fn a_far_messages_block_index_costs_nothing() {
+    let sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1000000000000,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1000000000000,\"delta\":{\"type\":\"text_delta\",\"text\":\"far\"}}\n\n",
+    );
+    let (r, _) = super::assemble(Wire::Messages, sse.as_bytes(), true);
+    assert_eq!(r.blocks, vec![ir::Block::Text("far".into())]);
+}

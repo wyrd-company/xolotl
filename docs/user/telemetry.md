@@ -54,6 +54,7 @@ The OpenBao values win over `[telemetry.otlp_headers]`.
 | `xolotl.session.context_utilization` | provider, model | Prompt size as a fraction of the model's context window, when known |
 | `xolotl.session.locks` | event (`formed`, `broken`), provider, and reason when broken | Context locks. See [Context lock](accounts#context-lock) |
 | `xolotl.tool_calls` | client, tool | Tool calls named in LLM responses |
+| `xolotl.export.rows` | sink, outcome | Exchanges exported: `inserted`, `dropped` (queue full) or `failed` (ClickHouse refused the batch). See [ClickHouse export](clickhouse-export) |
 
 ## Request log
 
