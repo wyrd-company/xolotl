@@ -22,7 +22,7 @@ The row's `endpoint` and `response` are the upstream's, and `client_endpoint` an
 
 A response that isn't 2xx is not assembled. `error` is `translate::upstream_error` on its body. The wire is `Wire::for_path` on the upstream endpoint without its query string, which a passthrough may keep.
 
-The SSE body is fed to the parser in 16 KiB chunks: the parser drains each line from the front of its buffer, and a whole body at once would make that quadratic. The Messages decoder keeps its live block indices in a set, as the indices come from the upstream.
+`SseParser` reads each byte once, whether the body comes whole or as many small chunks: it keeps only an unfinished line, searches for its end from the new bytes, and removes the lines it found in one step. A long line in many chunks, or many lines in one, would otherwise cost time quadratic in its length. This parser also serves translated streams. The Messages decoder keeps its live block indices in a set, as the indices come from the upstream.
 
 Two gaps remain:
 

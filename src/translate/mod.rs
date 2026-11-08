@@ -127,11 +127,8 @@ pub fn assemble(wire: Wire, body: &[u8], sse: bool) -> (ir::Response, Option<(St
     let mut parser = SseParser::default();
     let mut decoder = t.decoder();
     let mut c = Collector::default();
-    // In chunks: the parser drains each line from the front of its buffer.
-    for chunk in body.chunks(16 * 1024) {
-        for ev in parser.feed(chunk) {
-            decoder.feed(&ev).into_iter().for_each(|e| c.push(e));
-        }
+    for ev in parser.feed(body) {
+        decoder.feed(&ev).into_iter().for_each(|e| c.push(e));
     }
     for ev in parser.end() {
         decoder.feed(&ev).into_iter().for_each(|e| c.push(e));
