@@ -28,8 +28,11 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /xolotl /usr/local/bin/xolotl
 # Owned by nonroot (65532) so a fresh named volume mounted here is writable.
 COPY --from=build --chown=65532:65532 /data /data
+# Two glibc malloc arenas, not one per thread: request bodies freed on another
+# thread otherwise stay in their arena, and RSS keeps growing under load.
 ENV XOLOTL_DATABASE=/data/xolotl.db \
-    XOLOTL_LOG_FORMAT=json
+    XOLOTL_LOG_FORMAT=json \
+    MALLOC_ARENA_MAX=2
 VOLUME ["/data"]
 EXPOSE 8317
 USER nonroot
