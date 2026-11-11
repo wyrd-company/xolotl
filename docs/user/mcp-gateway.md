@@ -25,9 +25,11 @@ under two names, to use two accounts.
 
 1. Open **MCP servers** in the [web UI](web-ui.md) and select **Add server**.
 2. Enter the **Name**, the **URL** and a **Description**. Pick the
-   **Authentication**: **Headers**, whose values can take
-   [secrets](#header-secrets), or **OAuth login**.
-3. Select **Add server**.
+   **Authentication**: **Headers** or **OAuth login**.
+3. For **Headers**, select **Add header** and enter a name and a value, for
+   example `Authorization` and `Bearer {token}`. `{token}` is a
+   [secret](#header-secrets) that you set after you add the server.
+4. Select **Add server**.
 
 To change a server, select **Edit** on its card, then **Save**. Servers added this way, or with the
 CLI, are stored in OpenBao. Changes take effect at once. You can't rename a
@@ -123,7 +125,10 @@ until you sign in again.
 
 ## Policies
 
-A key needs the `mcp` scope and the servers in `mcp_servers`:
+A key needs the `mcp` scope and the servers in `mcp_servers`. In the web UI's
+policy editor, check **mcp (MCP gateway)** under **Scopes**, then pick the
+servers and the tool globs in the **MCP servers** section. See
+[Write a policy](policies-and-keys.md#write-a-policy). In a policy file:
 
 ```toml
 scopes = ["proxy", "mcp"]
@@ -200,8 +205,9 @@ timers. The only way out is a tool call.
 
 ## Inspect and monitor
 
-Each card on the **MCP servers** screen shows the server's state, its tools and
-its **Recent calls**.
+Each card on the **MCP servers** screen shows the server's state and tool
+count; **Show tools** lists the tools. **Recent calls**, below the cards, lists
+the latest tool calls of every server as `server/tool`.
 
 With the CLI:
 
