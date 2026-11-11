@@ -6,7 +6,10 @@ relationships:
   references: accounts
 ---
 
-`xolotl serve` serves an admin web UI at `/`. It does what the CLI does.
+`xolotl serve` serves an admin web UI at `/`. Use it to add accounts, write
+policies, issue client keys, add MCP servers and watch usage. The task pages
+give the web UI steps first and the CLI commands after them. The
+[CLI](cli.md) does the same, with the bootstrap admin token.
 
 ## Set up sign-in
 
@@ -40,7 +43,8 @@ can't sign in, even if the identity provider lets them through.
 A session lasts 12 hours. Sessions are in memory, so a restart signs everyone
 out. Signing out of xolotl does not sign you out of the identity provider.
 
-When the identity provider is down, use the CLI with the bootstrap admin token.
+When the identity provider is down, use the [CLI](cli.md) with the bootstrap
+admin token.
 
 If sign-in fails, xolotl returns you to `/?signin=<reason>`: `denied`,
 `expired`, `failed`, `forbidden` (not in the admin group) or `unavailable`. The
@@ -52,10 +56,10 @@ server log has the details.
 |---|---|
 | Overview | Fixable failures with **Replace key** or **Log in again** links, OpenBao and SQLite health, configured account pools with state bars and usage windows, Claude and Codex reset credit totals, traffic and provider split for the last 24 hours, configured gateway providers, recent failed requests |
 | Accounts | Accounts by provider with their state and cooldown reason: refresh usage, refresh models, enable or disable. Details: set priority, **Retry**, log in again (OAuth accounts) or replace the key (API-key accounts), remove, last error, Claude and Codex reset credits |
-| Add account | Codex device or browser login, Claude login, OpenCode Go key, import of a CLI credential file |
-| Policies | Providers and the accounts of each subscription provider, scopes (with `key_policies` under the `keys` scope), MCP access, rate limits (in total, per provider and per account) with the policy's consumption, and the model list (below). Each section folds away |
-| Client keys | Issue, rotate with a grace period, enable or disable, revoke. Consumption against the policy's rate limits. Shows the OpenBao path, the `bao` command and the OpenBao policy the client needs. Never shows the key |
-| MCP servers | Upstream servers: add, edit and remove runtime servers, set header secrets, OAuth sign-in, tools, recent tool calls |
+| [Add account](accounts.md#add-an-account) | Codex device or browser login, Claude login, OpenCode Go key, import of a CLI credential file |
+| [Policies](policies-and-keys.md#write-a-policy) | Providers and the accounts of each subscription provider, scopes (with `key_policies` under the `keys` scope), MCP access, rate limits (in total, per provider and per account) with the policy's consumption, and the model list (below). Each section folds away |
+| [Client keys](policies-and-keys.md#issue-a-client-key) | Issue, rotate with a grace period, enable or disable, revoke. Consumption against the policy's rate limits. Shows the OpenBao path, the `bao` command and the OpenBao policy the client needs. Never shows the key |
+| [MCP servers](mcp-gateway.md#in-the-web-ui) | Upstream servers: add, edit and remove runtime servers, set header secrets, OAuth sign-in, tools, recent tool calls |
 | Providers & models | Gateway providers and their key state, set a key, the model catalog with each model's endpoints |
 | Usage | The request log grouped by client, account, provider or model, sessions, the tools each key called, and a link to `telemetry.dashboard_url` |
 
