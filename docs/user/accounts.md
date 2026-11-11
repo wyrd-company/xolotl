@@ -110,8 +110,8 @@ xolotl accounts import claude ~/.claude/.credentials.json --label work
 The **Accounts** screen lists the accounts by provider, with their plan, state,
 usage windows, priority and last use. **Refresh usage** fetches the usage
 windows from the provider now. The details button at the end of a row shows
-the label, cooldown reason, last error, token expiry, reset credits and
-OpenBao path.
+the label, cooldown reason, last error, token expiry, reset credits and the
+date it was added.
 
 With the CLI:
 
