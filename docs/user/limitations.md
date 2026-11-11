@@ -13,7 +13,7 @@ product: xolotl
 Smaller points, not tracked separately:
 
 - **Codex streams only.** Codex always gets `stream: true`, so a non-streaming `/v1/responses` request through the Codex pool gets an SSE response. Codex CLI always streams.
-- **Codex usage starts with the first turn.** Codex reads account usage at startup only from ChatGPT, with a ChatGPT login. Through xolotl, `/status` has limits only after a reply, and they are the limits of the account that served it. See [Usage limits in Codex](clients#usage-limits-in-codex).
+- **Codex usage starts with the first turn.** Codex reads account usage at startup only from ChatGPT, with a ChatGPT login. Through xolotl, `/status` has limits only after a reply, and they are the limits of the account that served it. See [Usage limits in Codex](clients.md#usage-limits-in-codex).
 - **No WebSocket transport for Codex.** `GET /v1/responses` returns 426 and Codex falls back to HTTP.
 - **Web UI: one role.** Every member of the admin group is a full admin. Sessions and sign-ins in progress live in memory, so a restart signs everyone out.
 - **Providers come only from the config file.** Gateway providers can't be added at runtime; only their keys can be set, on the web UI's **Providers & models** screen or with `xolotl providers set-key`.
