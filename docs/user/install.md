@@ -60,7 +60,7 @@ xolotl --version
 ```
 
 To use it as the CLI of a server on another machine, set `XOLOTL_URL` and
-`XOLOTL_ADMIN_TOKEN`. See [CLI reference](cli#connection-options).
+`XOLOTL_ADMIN_TOKEN`. See [CLI reference](cli.md#connection-options).
 
 ## Build from source
 
@@ -93,7 +93,7 @@ bao write -f -field=secret_id auth/approle/role/xolotl/secret-id
 ```
 
 Give the role ID and secret ID to xolotl in `XOLOTL_VAULT_ROLE_ID` and
-`XOLOTL_VAULT_SECRET_ID`, or in files (see [Configuration](configuration)).
+`XOLOTL_VAULT_SECRET_ID`, or in files (see [Configuration](configuration.md)).
 
 Then store the bootstrap admin token. The CLI uses it:
 
@@ -101,7 +101,7 @@ Then store the bootstrap admin token. The CLI uses it:
 bao kv put secret/xolotl/admin token="$(openssl rand -base64 32)"
 ```
 
-The [Configuration](configuration#openbao-paths) page lists every path xolotl
+The [Configuration](configuration.md#openbao-paths) page lists every path xolotl
 reads and writes.
 
 ## Run
@@ -130,4 +130,4 @@ export XOLOTL_ADMIN_TOKEN=$(bao kv get -field=token secret/xolotl/admin)
 xolotl accounts list
 ```
 
-Next: [add accounts](accounts), or set up the [web UI](web-ui).
+Next: [add accounts](accounts.md), or set up the [web UI](web-ui.md).
