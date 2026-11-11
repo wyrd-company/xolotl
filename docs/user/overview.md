@@ -49,16 +49,11 @@ Claude Code, Codex CLI, Grok CLI, SDKs, MCP clients, T3 Code
 
 ## Get started
 
-1. [Install](install) xolotl and prepare OpenBao.
-2. [Configure](configuration) the server.
-3. Add [subscription accounts](accounts) or gateway provider keys.
-4. Write a [policy and issue a client key](policies-and-keys).
-5. [Connect your clients](clients).
+1. [Install](install.md) xolotl and prepare OpenBao.
+2. [Configure](configuration.md) the server.
+3. Add [subscription accounts](accounts.md) or gateway provider keys.
+4. Write a [policy and issue a client key](policies-and-keys.md).
+5. [Connect your clients](clients.md).
 
-Xolotl runs as a single instance. Read [Known limitations](limitations) before
+Xolotl runs as a single instance. Read [Known limitations](limitations.md) before
 you depend on it.
-
-## Design notes
-
-How xolotl is built, and why, is in the
-[design notes](https://github.com/wyrd-company/xolotl/tree/main/docs/design).
