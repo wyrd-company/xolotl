@@ -90,6 +90,21 @@ echo "$OPENCODE_GO_KEY" | xolotl accounts add-key --label personal
 
 If you leave out the pipe, the CLI asks for the key without echo.
 
+#### Service-account keys
+
+You can add an OpenCode
+[service-account key](https://opencode.ai/docs/console/api) the same way as
+a personal key: under **OpenCode Go**, or with `xolotl accounts add-key`. Both
+are static `oc_sk_...` bearer keys, and xolotl uses them the same way.
+
+- A key can have an expiration. Xolotl can't renew an expired key. Create a new
+  key in the OpenCode console and enter it in **Replace key** on the account's
+  details page in the web UI, so that the account keeps its history.
+- OpenCode says that
+  [service accounts are not covered by Go Teams](https://opencode.ai/docs/console/go).
+  Check which plan pays for a service account's usage before you rely on it.
+- Xolotl has not been tested with a real service-account key.
+
 Every request to OpenCode Go carries a session ID in `x-opencode-session`.
 Xolotl takes it from the client's `x-opencode-session`, `x-claude-code-session-id`
 or `session_id` header. Without one, it uses a fixed ID derived from the client

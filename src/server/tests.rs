@@ -2950,6 +2950,23 @@ async fn account_recovery_refreshes_models_and_reports_discovery_errors() {
 }
 
 #[tokio::test]
+async fn opencode_go_accepts_service_account_keys() {
+    // A service-account key is a static `oc_sk_` bearer key, like a personal key.
+    let h = harness().await;
+    let first = "oc_sk_sample0000000000000000000000";
+    let (status, row) =
+        h.call("POST", "/admin/accounts/import", Some(&h.admin), Some(json!({"provider":"opencode-go", "data":{"api_key":first}}))).await;
+    assert_eq!(status, 200);
+    let id = row["id"].as_str().unwrap();
+    let record = h.state.secrets.get(&format!("accounts/opencode-go/{id}")).await.unwrap().unwrap();
+    assert_eq!(record["api_key"], first);
+    let second = "oc_sk_sample1111111111111111111111";
+    assert_eq!(h.call("POST", &format!("/admin/accounts/{id}/key"), Some(&h.admin), Some(json!({"api_key":second}))).await.0, 200);
+    let record = h.state.secrets.get(&format!("accounts/opencode-go/{id}")).await.unwrap().unwrap();
+    assert_eq!(record["api_key"], second);
+}
+
+#[tokio::test]
 async fn api_key_imports_preserve_replacements_and_deduplicate() {
     let h = harness().await;
     assert!(h.state.subs.save_account(Credential { provider: SubProvider::OpencodeGo, ..Default::default() }).await.is_err());
