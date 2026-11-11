@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.2
+
+### Features
+
+- NATS export: with `[export.nats]`, xolotl publishes each exported exchange to a NATS JetStream stream, and ClickHouse loads the stream with its NATS table engine. Rows published while ClickHouse is down wait in the stream; rows waiting while NATS restarts are held in xolotl's queue and retried until NATS takes them. A row too large for a message has its bodies cut, or is refused and counted. Xolotl checks at startup that the stream exists and takes `xolotl.exchanges.>`. The new NATS export page gives the stream, consumer and table commands, permissions, sizing and alerts. The direct ClickHouse export is unchanged. Building from source needs Rust 1.89.
+- Anthropic and OpenAI API accounts: the new provider kinds `anthropic` and `openai` take an API key (personal, project or service account) and serve the same endpoints as Claude and Codex subscription accounts, so a client can use either. An Anthropic account serves `/v1/messages` and `/v1/messages/count_tokens` natively, with the key in `x-api-key` and the subscription OAuth beta flag dropped, so Claude Code requests and their cache breakpoints reach the API unchanged; an OpenAI account serves `/v1/responses` and `/v1/chat/completions` natively. Alias a model to a subscription and an API account to move to the API account when the subscription is at its limit. In the config file, an Anthropic or OpenAI account can authenticate with workload identity federation (`workload_identity`) instead of a key: xolotl exchanges a JWT from a file for a service account access token and renews it before it expires. The Accounts page documents both.
+- Provider accounts: a provider is now one more kind of account. Add and remove Vercel, Mistral and OpenAI-compatible providers at runtime, on the web UI's Add account screen or with `xolotl accounts add-provider`, without editing the config file. The Accounts screen lists provider accounts next to pool accounts; the Providers & models screen is now Models. Config-file providers and their stored keys keep working.
+- The ClickHouse and NATS exports now cover every kind of account, not only the sessions of subscription accounts: provider accounts (Vercel, Mistral, OpenAI-compatible) and API key accounts are exported too, and so are requests without a session, such as embeddings, OCR and passthroughs. A new `account_kind` column names the kind of the account that served each row. Responses that are not text, such as audio, and passthrough uploads that are not JSON are exported without their bodies. A table made earlier keeps receiving rows without the new column; the ClickHouse and NATS export pages give the `ALTER TABLE` that adds it.
+
+### Fixes
+
+- Link docs pages to each other by file name, and remove the links to design notes, which are not published.
+- Codex shows its usage limits when the Codex pool runs out. When every Codex account is cooling down, the 429 now carries the `x-codex-*` usage headers of the account that comes back first. A quota error at the start of a stream keeps the account's usage headers and uses the error shape Codex reads. Before, Codex showed no limits at that point. The Codex client guide explains where Codex gets its limits through xolotl, and why `/status` has none before the first turn.
+- Give the web UI steps first on each task page (accounts, policies and keys, MCP servers, gateway provider keys), and the CLI commands after them. The web UI page now sits under Set up.
+- The configuration and client docs now say that every endpoint, including the T3 Code hubs endpoints under `/v0/management/`, is served on the one `server.listen` address, and that a reverse proxy must forward that path too.
+- Document how to add an OpenCode service-account key as an OpenCode Go account.
+
 ## 0.1.1
 
 ### Features
