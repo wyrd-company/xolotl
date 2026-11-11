@@ -21,6 +21,33 @@ an HTTP bridge.
 Each entry is one instance with its own credentials. List the same URL twice,
 under two names, to use two accounts.
 
+### In the web UI
+
+1. Open **MCP servers** in the [web UI](web-ui.md) and select **Add server**.
+2. Enter the **Name**, the **URL** and a **Description**. Pick the
+   **Authentication**: **Headers**, whose values can take
+   [secrets](#header-secrets), or **OAuth login**.
+3. Select **Add server**.
+
+To change a server, select **Edit** on its card, then **Save**. Servers added this way, or with the
+CLI, are stored in OpenBao. Changes take effect at once. You can't rename a
+server: remove it and add it again.
+
+### With the CLI
+
+A file for `xolotl mcp put` has `name` and the fields below:
+
+```toml
+name = "linear"
+url = "https://mcp.linear.app/mcp"
+auth = "oauth"
+```
+
+```sh
+xolotl mcp put linear.toml     # add, or change a server added this way
+xolotl mcp remove linear       # refused while a policy lists it by name
+```
+
 ### In the config file
 
 ```toml
@@ -35,24 +62,7 @@ description = "GitHub, personal account"
 headers = { Authorization = "Bearer {token}" }
 ```
 
-### At runtime
-
-Servers added with `xolotl mcp put` or the web UI's **Add server** form are
-stored in OpenBao. A file for `xolotl mcp put` has `name` and the same fields:
-
-```toml
-name = "linear"
-url = "https://mcp.linear.app/mcp"
-auth = "oauth"
-```
-
-```sh
-xolotl mcp put linear.toml     # add, or change a server added this way
-xolotl mcp remove linear       # refused while a policy lists it by name
-```
-
-Changes take effect at once. You can't change servers from the config file at
-runtime, and you can't rename a server: remove it and add it again.
+You can't change servers from the config file at runtime.
 
 ### Fields
 
@@ -71,29 +81,31 @@ Names are lowercase and start with a letter. In code, `-` becomes `_`, so
 
 ## Header secrets
 
+A header such as `Authorization = "Bearer {token}"` takes `{token}` from the
+server's secret in OpenBao. On the **MCP servers** screen, each server card
+lists its secret fields as **set** or **not set**. Enter a value and save it.
+
+With the CLI:
+
 ```sh
 gh auth token | xolotl mcp set-secret github-work token   # fills {token}
 xolotl mcp unset-secret github-work token
 ```
 
-You can also set them on the web UI's MCP page. A changed secret is used from
-the next call.
+A changed secret is used from the next call.
 
 ## OAuth logins
 
 A server with `auth = "oauth"` has one login, shared by every key whose policy
 allows that server.
 
-```sh
-xolotl mcp login linear
-```
-
-Open the URL the CLI prints and approve. What happens next depends on the
-configuration:
+On the **MCP servers** screen, select **Sign in** in the server's **OAuth**
+section and approve in the browser. With the CLI, run `xolotl mcp login linear`
+and open the URL it prints. What happens next depends on the configuration:
 
 | Configuration | The browser goes to | You |
 |---|---|---|
-| Nothing set | `http://127.0.0.1:33418/callback`, which does not load | Paste that page's URL into the CLI |
+| Nothing set | `http://127.0.0.1:33418/callback`, which does not load | Paste that page's full URL into the web UI form or the CLI |
 | `server.public_url` | `<public_url>/admin/mcp/oauth/callback` | Do nothing. Xolotl finishes the login |
 | `mcp.oauth.redirect_uri` | That URL | Paste the URL back, unless it is xolotl's callback |
 
@@ -104,9 +116,10 @@ Xolotl gets a client ID in this order: `oauth.client_id`; a Client ID Metadata
 Document, when `server.public_url` is HTTPS or `mcp.oauth.client_metadata_url`
 is set; Dynamic Client Registration.
 
-Xolotl refreshes the tokens itself. `xolotl mcp logout linear` forgets them.
-When the server refuses the tokens, `xolotl mcp servers` shows `SIGN-IN` and
-calls fail until you log in again.
+Xolotl refreshes the tokens itself. **Sign out** on the card, or `xolotl mcp
+logout linear`, forgets them. When the server refuses the tokens, the card
+shows **Sign-in needed** (`SIGN-IN` in `xolotl mcp servers`), and calls fail
+until you sign in again.
 
 ## Policies
 
@@ -187,6 +200,11 @@ timers. The only way out is a tool call.
 
 ## Inspect and monitor
 
+Each card on the **MCP servers** screen shows the server's state, its tools and
+its **Recent calls**.
+
+With the CLI:
+
 ```sh
 xolotl mcp servers               # source, state, tool count, secret fields
 xolotl mcp tools github-work     # every tool, without the policy filter
@@ -195,5 +213,4 @@ xolotl mcp usage --group-by tool --since 7d
 ```
 
 Group usage by `server`, `tool` or `client`. Every tool call is in the call log
-with its status: `ok`, `tool_error`, `error` or `cancelled`. The web UI shows
-recent calls.
+with its status: `ok`, `tool_error`, `error` or `cancelled`.
