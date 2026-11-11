@@ -39,9 +39,11 @@ Rules:
 - A name the config file uses is refused, and a vault account with such a name is skipped with a warning. So is an invalid one.
 - Runtime accounts get stricter checks than the config file: an `http(s)` base URL, valid header names and values, and no `secret`. The config file keeps its rules so existing files load.
 - Adding an account whose `providers/<name>` secret already holds a key, such as a provider moved out of the config file, keeps that key.
-- Writes use check-and-set, so two instances can't overwrite each other's change.
-- `PUT /admin/providers/<name>` changes an account and keeps its key when none is given. `POST /admin/providers/<name>/key` sets the key of either source and keeps the secret's other fields. `DELETE /admin/providers/<name>` removes an account and its key; it is refused for config-file providers and while a policy names the provider in `providers`, `precedence` or `winners`.
-- Changes apply at once. Other instances pick them up in the 60-second sync. The catalog follows: a removed provider's models leave it, and a new provider's models are discovered when it is saved.
+- Writes and removals use check-and-set, so two instances can't overwrite each other's change. A key set for an account another instance removed is refused.
+- `PUT /admin/providers/<name>` changes an account and keeps its key when none is given; an account that needs a key must keep one. `POST /admin/providers/<name>/key` sets the key of either source and keeps the secret's other fields.
+- `DELETE /admin/providers/<name>` empties the secret with check-and-set and destroys the versions that held the key. The empty secret is not an account, and adding the name again reuses it. Removal is refused for config-file providers and while a policy names the provider in `providers`, `precedence` or `winners`.
+- Changes apply at once. Other instances pick them up in the 60-second sync. A changed or removed account drops its cached key, and a vault read already in flight can't cache a key that a change replaced.
+- The catalog follows: a removed provider's models leave it, also when a refresh was running, and a new provider's models are discovered when it is saved.
 
 ## Adding a kind
 

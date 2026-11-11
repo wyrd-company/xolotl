@@ -576,7 +576,7 @@ pub enum ProviderKind {
     OpenaiCompatible,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,

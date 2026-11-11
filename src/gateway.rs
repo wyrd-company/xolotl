@@ -79,6 +79,9 @@ pub struct Gateway {
     http: reqwest::Client,
     db: Db,
     keys: RwLock<HashMap<String, (Option<String>, Instant)>>,
+    /// Bumped whenever cached keys are dropped, so a vault read that started
+    /// before a key change can't put the old key back in the cache.
+    key_generation: std::sync::atomic::AtomicU64,
     limiter: Arc<Limiter>,
     catalog: Option<Arc<crate::catalog::ModelCatalog>>,
 }
@@ -99,6 +102,7 @@ impl Gateway {
             http,
             db,
             keys: RwLock::new(HashMap::new()),
+            key_generation: Default::default(),
             catalog: None,
             limiter: Default::default(),
         }
@@ -175,13 +179,14 @@ impl Gateway {
                 Err(e) => tracing::warn!(provider = %name, error = %format!("{e:#}"), "invalid provider account in the vault ignored"),
             }
         }
-        let gone: Vec<String> = self.providers.read().keys().filter(|k| !next.contains_key(*k)).cloned().collect();
+        // A removed or changed provider must not keep a key cached for its old endpoint.
+        let stale: Vec<String> = {
+            let current = self.providers.read();
+            current.iter().filter(|(k, e)| next.get(*k).is_none_or(|n| n.cfg != e.cfg)).map(|(k, _)| k.clone()).collect()
+        };
         *self.providers.write() = next;
-        {
-            let mut keys = self.keys.write();
-            for name in gone {
-                keys.remove(&name);
-            }
+        for name in stale {
+            self.forget_key(&name);
         }
         if let Some(c) = &self.catalog {
             c.set_gateway_kinds(self.kinds());
@@ -217,7 +222,7 @@ impl Gateway {
         }
         let kept = current.as_ref().and_then(|d| d.get("api_key")).and_then(Value::as_str).filter(|k| !k.is_empty()).map(str::to_string);
         let key = api_key.or(kept);
-        if create && !cfg.no_auth && key.is_none() {
+        if !cfg.no_auth && key.is_none() {
             return Err(ProviderChangeError::Invalid(anyhow::anyhow!("provider {name}: give an API key, or set no_auth")));
         }
         let mut data = match serde_json::to_value(&cfg).map_err(|e| ProviderChangeError::Store(e.into()))? {
@@ -228,11 +233,8 @@ impl Gateway {
         if let Some(k) = key {
             data.insert("api_key".into(), Value::String(k));
         }
-        self.secrets.put_cas(&path, data, version).await.map_err(|e| match e.downcast::<crate::secrets::Conflict>() {
-            Ok(c) => ProviderChangeError::Conflict(c.to_string()),
-            Err(e) => ProviderChangeError::Store(e),
-        })?;
-        self.keys.write().remove(name);
+        self.secrets.put_cas(&path, data, version).await.map_err(cas_error)?;
+        self.forget_key(name);
         self.reload_locked().await.map_err(ProviderChangeError::Store)?;
         Ok(())
     }
@@ -246,8 +248,20 @@ impl Gateway {
         if self.providers.read().get(name).is_none_or(|p| p.source != ProviderSource::Vault) {
             return Err(ProviderChangeError::NotFound(name.to_string()));
         }
-        self.secrets.delete(&format!("{PROVIDERS_PREFIX}/{name}")).await.map_err(ProviderChangeError::Store)?;
-        self.keys.write().remove(name);
+        // Empty the secret with check-and-set, so a change another instance
+        // made meanwhile is not lost, then destroy the versions that held the
+        // key. The empty secret is not an account; adding the name again reuses it.
+        let path = format!("{PROVIDERS_PREFIX}/{name}");
+        let (current, version) = self.secrets.get_versioned(&path).await.map_err(ProviderChangeError::Store)?;
+        if !current.as_ref().is_some_and(|d| d.contains_key("kind")) {
+            return Err(ProviderChangeError::NotFound(name.to_string()));
+        }
+        self.secrets.put_cas(&path, Map::new(), version).await.map_err(cas_error)?;
+        let versions: Vec<u64> = (1..=version).collect();
+        if let Err(e) = self.secrets.destroy_versions(&path, &versions).await {
+            tracing::warn!(provider = %name, error = %format!("{e:#}"), "removed provider account; destroying its old key versions failed");
+        }
+        self.forget_key(name);
         self.reload_locked().await.map_err(ProviderChangeError::Store)?;
         Ok(())
     }
@@ -255,22 +269,31 @@ impl Gateway {
     /// Store a provider's API key, in config-file and vault providers alike.
     /// Other fields of the secret are kept.
     pub async fn set_key(&self, name: &str, api_key: &str) -> Result<(), ProviderChangeError> {
-        let entry = self.providers.read().get(name).cloned().ok_or_else(|| ProviderChangeError::NotFound(name.to_string()))?;
         let api_key = api_key.trim();
         if api_key.is_empty() {
             return Err(ProviderChangeError::Invalid(anyhow::anyhow!("the API key is empty")));
         }
         let _changes = self.changes.lock().await;
+        // Looked up under the lock, so a removal can't slip in before the write.
+        let entry = self.providers.read().get(name).cloned().ok_or_else(|| ProviderChangeError::NotFound(name.to_string()))?;
         let path = entry.secret();
         let (current, version) = self.secrets.get_versioned(&path).await.map_err(ProviderChangeError::Store)?;
+        // An account removed by another instance stays removed.
+        if entry.source == ProviderSource::Vault && !current.as_ref().is_some_and(|d| d.contains_key("kind")) {
+            return Err(ProviderChangeError::NotFound(name.to_string()));
+        }
         let mut data = current.unwrap_or_default();
         data.insert("api_key".into(), Value::String(api_key.to_string()));
-        self.secrets.put_cas(&path, data, version).await.map_err(|e| match e.downcast::<crate::secrets::Conflict>() {
-            Ok(c) => ProviderChangeError::Conflict(c.to_string()),
-            Err(e) => ProviderChangeError::Store(e),
-        })?;
-        self.keys.write().remove(name);
+        self.secrets.put_cas(&path, data, version).await.map_err(cas_error)?;
+        self.forget_key(name);
         Ok(())
+    }
+
+    /// Drop a cached key, and stop reads already in flight from caching theirs.
+    fn forget_key(&self, name: &str) {
+        let mut keys = self.keys.write();
+        self.key_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        keys.remove(name);
     }
 
     /// Whether the provider's key is stored.
@@ -307,18 +330,24 @@ impl Gateway {
             return Ok(k.clone());
         }
         let path = p.secret();
+        let generation = self.key_generation.load(std::sync::atomic::Ordering::SeqCst);
         let key = self
             .secrets
             .get(&path)
             .await?
             .and_then(|m| m.get("api_key").and_then(Value::as_str).map(str::to_string))
             .with_context(|| format!("no api_key in vault secret {path} for provider {name}"))?;
-        self.keys.write().insert(name.to_string(), (Some(key.clone()), Instant::now()));
+        let mut keys = self.keys.write();
+        if self.key_generation.load(std::sync::atomic::Ordering::SeqCst) == generation {
+            keys.insert(name.to_string(), (Some(key.clone()), Instant::now()));
+        }
         Ok(Some(key))
     }
 
     pub fn invalidate_keys(&self) {
-        self.keys.write().clear();
+        let mut keys = self.keys.write();
+        self.key_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        keys.clear();
     }
 
     async fn send(
@@ -345,7 +374,7 @@ impl Gateway {
         let resp = self.http.request(method, &url).headers(headers).body(body).send().await?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             // The key may have been rotated in the vault.
-            self.keys.write().remove(provider);
+            self.forget_key(provider);
         }
         Ok(resp)
     }
@@ -436,6 +465,13 @@ impl Gateway {
     }
 }
 
+fn cas_error(e: anyhow::Error) -> ProviderChangeError {
+    match e.downcast::<crate::secrets::Conflict>() {
+        Ok(c) => ProviderChangeError::Conflict(c.to_string()),
+        Err(e) => ProviderChangeError::Store(e),
+    }
+}
+
 /// A stored provider account's fields, without its key.
 fn stored_config(mut data: Map<String, Value>) -> Result<ProviderConfig> {
     data.remove("api_key");
@@ -517,6 +553,40 @@ mod tests {
         assert_eq!((stored["api_key"].as_str(), stored["note"].as_str()), (Some("new"), Some("kept")));
         assert!(secrets.get("providers/local").await.unwrap().is_none());
         assert!(matches!(g.set_key("nope", "k").await, Err(ProviderChangeError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn a_changed_account_drops_its_cached_key() {
+        let (a, b) = (MockServer::start().await, MockServer::start().await);
+        for (server, key) in [(&a, "key-a"), (&b, "key-b")] {
+            Mock::given(method("GET"))
+                .and(path("/v1/models"))
+                .and(header("authorization", format!("Bearer {key}").as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "m"}]})))
+                .mount(server)
+                .await;
+        }
+        let secrets: Secrets = Arc::new(MemoryStore::default());
+        let g = Gateway::new(
+            &GatewayConfig { providers: BTreeMap::new() },
+            secrets.clone(),
+            reqwest::Client::new(),
+            Db::in_memory().await.unwrap(),
+        );
+        let cfg = |base: &str| ProviderConfig { base_url: Some(base.to_string()), ..Default::default() };
+        g.put_provider("p", cfg(&a.uri()), Some("key-a".into()), true).await.unwrap();
+        assert_eq!(g.fetch_models("p").await.unwrap(), vec!["m"]);
+
+        // Another instance points the account at another server with another key.
+        let moved = json!({"kind": "openai-compatible", "base_url": b.uri(), "api_key": "key-b"});
+        secrets.put("providers/p", moved.as_object().unwrap().clone()).await.unwrap();
+        g.reload().await.unwrap();
+        assert_eq!(g.fetch_models("p").await.unwrap(), vec!["m"], "the new server gets the new key");
+
+        // Removed by another instance: a new key does not bring it back.
+        secrets.put("providers/p", Map::new()).await.unwrap();
+        assert!(matches!(g.set_key("p", "k").await, Err(ProviderChangeError::NotFound(_))));
+        assert_eq!(secrets.get("providers/p").await.unwrap(), Some(Map::new()));
     }
 
     #[test]
