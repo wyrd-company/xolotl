@@ -7,7 +7,7 @@ clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web
         │  client key (Authorization / x-api-key), or a web UI session
         ▼
   axum router ── authorize (keys + policy) ──┬── subscription pools: codex, claude, grok, opencode-go
-        │                                     ├── provider accounts: vercel, mistral, openai-compatible
+        │                                     ├── provider accounts: anthropic, openai, vercel, mistral, openai-compatible
         │                                     └── /mcp code mode ── upstream MCP servers
         ├── OpenBao (KV v2, AppRole): every secret
         ├── SQLite: runtime state, no secrets
@@ -20,7 +20,7 @@ clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web
 Every upstream credential is an account of one kind ([Accounts and account kinds](accounts.md)). A kind places its accounts in one of two ways:
 
 - **Subscription pools** (`claude`, `codex`, `grok`, `opencode-go`) hold several accounts per provider. Codex, Claude and Grok accounts use OAuth tokens; OpenCode Go accounts use API keys. A request goes to one account chosen by the pool, and fails over to another on quota, auth or transient errors. See [Subscription accounts](subscriptions.md).
-- **Provider accounts** have a `kind`: `vercel`, `mistral` or `openai-compatible` (used for llama.cpp). Each is a provider of its own, named by the operator, with one API key in OpenBao at `providers/<name>`, or `no_auth`. They come from the config file (`[gateway.providers.<name>]`) or are added at runtime and stored in OpenBao. Provider names become model prefixes and path prefixes, so names like `v1`, `admin` or `claude` are rejected.
+- **Provider accounts** have a `kind`: `anthropic`, `openai`, `vercel`, `mistral` or `openai-compatible` (used for llama.cpp). Each is a provider of its own, named by the operator, with one API key in OpenBao at `providers/<name>`, `no_auth`, or (Anthropic and OpenAI in the config file) workload identity federation. They come from the config file (`[gateway.providers.<name>]`) or are added at runtime and stored in OpenBao. Provider names become model prefixes and path prefixes, so names like `v1`, `admin` or `claude` are rejected.
 
 ## MCP gateway
 

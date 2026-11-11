@@ -189,16 +189,57 @@ kind = "mistral"
 kind = "openai-compatible"
 base_url = "http://llama.example.lan:8080"
 no_auth = true
+
+[gateway.providers.anthropic-team]
+kind = "anthropic"
+headers = { "anthropic-workspace-id" = "wrkspc_abc123" }
 ```
 
 | Field | Meaning |
 |---|---|
-| `kind` | `vercel`, `mistral` or `openai-compatible` (default) |
+| `kind` | `anthropic`, `openai`, `vercel`, `mistral` or `openai-compatible` (default). See [Anthropic and OpenAI API accounts](accounts.md#anthropic-and-openai-api-accounts) |
 | `base_url` | Required for `openai-compatible`; overrides the default for the others |
 | `secret` | OpenBao secret with the `api_key` field. Default `providers/<name>` |
 | `no_auth` | `true` for a server that needs no key |
 | `headers` | Extra static headers sent upstream |
 | `enabled` | `false` turns the provider off |
+| `workload_identity` | `anthropic` and `openai` only: authenticate with workload identity federation instead of a key. See below |
+
+### Workload identity
+
+An `anthropic` or `openai` provider with `workload_identity` has no key. Xolotl
+reads the JWT in `token_file`, exchanges it at the vendor's token endpoint for a
+service account's access token, and sends that token as a bearer token. It
+exchanges again 5 minutes before the token expires (at 80% of a shorter
+lifetime), and after a 401. It reads the file again for every exchange, so a
+token that your platform rotates on disk is picked up. One exchange runs at a
+time for each provider.
+
+```toml
+[gateway.providers.anthropic-ci]
+kind = "anthropic"
+workload_identity = { token_file = "/var/run/secrets/anthropic.com/token", service_account_id = "svac_...", federation_rule_id = "fdrl_...", organization_id = "00000000-0000-0000-0000-000000000000" }
+
+[gateway.providers.openai-ci]
+kind = "openai"
+workload_identity = { token_file = "/var/run/secrets/openai.com/token", service_account_id = "...", identity_provider_id = "..." }
+```
+
+| Field | Kind | Meaning |
+|---|---|---|
+| `token_file` | both | The file that holds the identity provider's JWT |
+| `service_account_id` | both | The service account the token acts as |
+| `federation_rule_id` | `anthropic` | The federation rule (`fdrl_...`) |
+| `organization_id` | `anthropic` | The organization's UUID |
+| `workspace_id` | `anthropic` | The workspace (`wrkspc_...`). Required when the rule is enabled for more than one |
+| `identity_provider_id` | `openai` | The Workload Identity Provider's ID |
+| `token_url` | both | The token endpoint. Default `https://api.anthropic.com/v1/oauth/token` or `https://auth.openai.com/oauth/token` |
+
+You can set `workload_identity` only in the config file, because it makes the
+server read a file. A failed exchange fails the request with a 502 that names
+the reason. Some identity tokens (those with a `jti` claim) can be exchanged
+only once; make sure your platform writes a new one before the access token
+expires.
 
 Without a `[gateway]` section, xolotl configures `vercel` and `mistral`. When
 you add any provider to the file, list every config-file provider you want.

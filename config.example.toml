@@ -101,6 +101,17 @@ kind = "openai-compatible"
 base_url = "http://llama.example.lan:8080"
 no_auth = true
 
+# Anthropic API with a service account key (vault secret providers/anthropic-team).
+# A key not scoped to one workspace needs the anthropic-workspace-id header.
+# [gateway.providers.anthropic-team]
+# kind = "anthropic"
+# headers = { "anthropic-workspace-id" = "wrkspc_..." }
+
+# OpenAI API with workload identity federation instead of a key.
+# [gateway.providers.openai-ci]
+# kind = "openai"
+# workload_identity = { token_file = "/var/run/secrets/openai.com/token", service_account_id = "...", identity_provider_id = "..." }
+
 # Model catalog: discovered from each provider, plus static entries. Client
 # key policies (stored in the vault) decide which of these names a key sees.
 [catalog]

@@ -16,8 +16,9 @@ credentials stay in OpenBao, not in the agents' containers.
   subscription accounts, and add OpenCode Go API keys. Xolotl keeps the OAuth
   tokens fresh, spreads requests over several accounts, and moves to the next
   account when one reaches its quota.
-- **AI gateway.** Send requests to Vercel AI Gateway, Mistral and
-  OpenAI-compatible servers such as llama.cpp with keys that xolotl injects.
+- **AI gateway.** Send requests to the Anthropic and OpenAI APIs, Vercel AI
+  Gateway, Mistral and OpenAI-compatible servers such as llama.cpp with keys
+  that xolotl injects, or with workload identity federation.
 - **One model namespace.** Clients send a model name. A policy decides which
   provider serves it. Xolotl translates between the Anthropic Messages, OpenAI
   Responses and Chat Completions formats, so Claude Code can use a Codex model
@@ -40,7 +41,7 @@ Claude Code, Codex CLI, Grok CLI, SDKs, MCP clients, T3 Code
         │  client key
         ▼
      xolotl ── policy ──┬── subscription accounts: codex, claude, grok, opencode-go
-        │               ├── provider accounts: vercel, mistral, openai-compatible
+        │               ├── provider accounts: anthropic, openai, vercel, mistral, openai-compatible
         │               └── /mcp ── upstream MCP servers
         ├── OpenBao: every secret
         ├── SQLite: runtime state, no secrets

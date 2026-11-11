@@ -11,8 +11,8 @@ you add it:
 - **Pool accounts** are logins to a consumer subscription or an API-key plan.
   Xolotl holds several accounts per provider, as a pool, and sends each request
   to one of them.
-- **Provider accounts** are API-key upstreams, such as Vercel AI Gateway,
-  Mistral or a llama.cpp server. You give each one a name, and clients address
+- **Provider accounts** are API-key upstreams, such as the Anthropic and
+  OpenAI APIs, Vercel AI Gateway, Mistral or a llama.cpp server. You give each one a name, and clients address
   it by that name: `<name>/<model>` and `/<name>/...`. A provider account is a
   provider of its own.
 
@@ -22,6 +22,8 @@ you add it:
 | `claude` | pool `claude` | Claude subscription (Claude Code) | **Claude (Pro / Max)**, or **Import a login** | `xolotl auth login claude` |
 | `grok` | pool `grok` | Grok Build (xAI) subscription | **Grok Build (xAI)** | `xolotl auth login grok` |
 | `opencode-go` | pool `opencode-go` | OpenCode Go API key | **OpenCode Go** | `xolotl accounts add-key` |
+| `anthropic` | provider | Anthropic API key: personal or service account | **Provider account**, kind **Anthropic API** | `xolotl accounts add-provider <name> --kind anthropic` |
+| `openai` | provider | OpenAI API key: project or service account | **Provider account**, kind **OpenAI API** | `xolotl accounts add-provider <name> --kind openai` |
 | `vercel` | provider | Vercel AI Gateway API key | **Provider account**, kind **Vercel AI Gateway** | `xolotl accounts add-provider <name> --kind vercel` |
 | `mistral` | provider | Mistral API key | **Provider account**, kind **Mistral** | `xolotl accounts add-provider <name> --kind mistral` |
 | `openai-compatible` | provider | Any OpenAI-compatible server, such as llama.cpp | **Provider account**, kind **OpenAI-compatible** | `xolotl accounts add-provider <name> --kind openai-compatible --base-url <url>` |
@@ -123,7 +125,7 @@ xolotl accounts add-provider llama --kind openai-compatible \
 
 | Option | Meaning |
 |---|---|
-| `--kind` | `vercel`, `mistral` or `openai-compatible` |
+| `--kind` | `anthropic`, `openai`, `vercel`, `mistral` or `openai-compatible` |
 | `--base-url` | Required for `openai-compatible`. Overrides the default URL of the others |
 | `--no-auth` | The server needs no key. Without it, the CLI reads the key from stdin |
 | `--header Name=value` | An extra static header sent upstream. Repeat it for more |
@@ -145,6 +147,72 @@ xolotl accounts remove-provider mistral-team              # remove the account a
 A provider account that a policy names in `providers`, `precedence` or
 `winners` can't be removed: change the policy first. You change and remove
 config-file providers in the config file.
+
+### Anthropic and OpenAI API accounts
+
+These accounts use pay-as-you-go API keys from the Claude Console or the OpenAI
+Platform, not a subscription. They serve the same endpoints as the subscription
+accounts, so a client can use either one:
+
+| Kind | Served natively | Served through translation |
+|---|---|---|
+| `anthropic` | `/v1/messages`, `/v1/messages/count_tokens` | `/v1/responses`, `/v1/chat/completions` |
+| `openai` | `/v1/responses`, `/v1/chat/completions` | `/v1/messages` |
+
+Use a service account key for a shared or automated workload:
+
+- **Anthropic:** a service account key (Claude Console, **API keys**, linked
+  account set to a service account) or a personal key. A key that is not
+  scoped to one workspace needs the workspace in a header:
+  `--header anthropic-workspace-id=wrkspc_...`.
+- **OpenAI:** a project service account key (`sk-svcacct-...`) or a project
+  key. To pick the organization or project of a key that has several, add
+  `--header OpenAI-Organization=org-...` or `--header OpenAI-Project=proj_...`.
+
+```sh
+echo "$ANTHROPIC_KEY" | xolotl accounts add-provider anthropic-team --kind anthropic
+echo "$OPENAI_KEY" | xolotl accounts add-provider openai-team --kind openai \
+  --header OpenAI-Project=proj_abc123
+```
+
+On the web UI, pick the kind **Anthropic API** or **OpenAI API** under
+**Provider account**, and put the headers in **Extra headers**.
+
+Xolotl sends the Anthropic key in `x-api-key`, adds `anthropic-version` when the
+client sends none, and drops the Claude subscription's OAuth beta flag, so a
+Claude Code request works without changes. Request bodies go upstream as the
+client sent them, so prompt cache breakpoints (`cache_control`) and OpenAI's
+`prompt_cache_key` keep working.
+
+A model that a subscription and an API account both serve is named by the
+subscription by default (see [precedence](policies-and-keys.md)). The API
+account's copy stays reachable as `<name>/<model>`. To use the API account when
+the subscription is at its limit, alias the model to both:
+
+```toml
+[aliases]
+"claude-opus-5-5" = ["claude/claude-opus-5-5", "anthropic-team/claude-opus-5-5"]
+```
+
+A 429 or 5xx from the subscription moves the request to the API account. An API
+account bills per token: allow it only in the policies that should spend money.
+
+#### Workload identity federation
+
+An Anthropic or OpenAI account in the config file can authenticate as a service
+account with workload identity federation instead of a stored key. Xolotl reads
+a JWT from your identity provider (for example a Kubernetes projected service
+account token) from a file and exchanges it for a short-lived access token. It
+exchanges again before the token expires. See
+[`workload_identity`](configuration.md#workload-identity).
+
+Set up the identity provider and the service account first:
+
+- **Anthropic:** a federation issuer, a federation rule and a service account in
+  the Claude Console. See Anthropic's Workload Identity Federation guide.
+- **OpenAI:** a Workload Identity Provider and a service account mapping in the
+  OpenAI Platform's organization security settings. See OpenAI's workload
+  identity federation guide. X.509 certificate federation is not supported.
 
 ### Import a CLI login
 

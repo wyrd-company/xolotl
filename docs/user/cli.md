@@ -45,7 +45,7 @@ Durations are a number with `s`, `m`, `h`, `d` or `w`, for example `90d`.
 | `xolotl accounts reset <id>` | Clear the cooldown and the re-login state |
 | `xolotl accounts usage <id>` | Fetch the usage windows from the provider now |
 | `xolotl accounts remove <id>` | Remove the account |
-| `xolotl accounts add-provider <name> --kind <k> [--base-url <url>] [--no-auth] [--header Name=value]...` | Add a provider account. `<k>` is `vercel`, `mistral` or `openai-compatible` |
+| `xolotl accounts add-provider <name> --kind <k> [--base-url <url>] [--no-auth] [--header Name=value]...` | Add a provider account. `<k>` is `anthropic`, `openai`, `vercel`, `mistral` or `openai-compatible` |
 | `xolotl accounts remove-provider <name>` | Remove a provider account added at runtime, with its key |
 | `xolotl providers set-key <name>` | Store a provider account's API key in OpenBao |
 

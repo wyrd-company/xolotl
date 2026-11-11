@@ -39,6 +39,7 @@
 - AI Gateway Server <!-- These are the services I use now -->
     - Reference implementations: bifrost, litellm
     - Provider support:
+        - Anthropic API and OpenAI API - API keys, service accounts, workload identity federation
         - Vercel AI Gateway - all methods
         - Mistral AI
             - OCR
