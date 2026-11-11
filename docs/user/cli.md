@@ -5,7 +5,8 @@ product: xolotl
 ---
 
 `xolotl serve` runs the server. Every other command calls a running server's
-admin API. `xolotl <command> --help` shows every option.
+admin API, with the bootstrap admin token. The [web UI](web-ui.md) does the
+same; the task pages show both. `xolotl <command> --help` shows every option.
 
 ## Connection options
 
