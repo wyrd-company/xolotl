@@ -46,12 +46,16 @@ struct Document {
     anchors: BTreeSet<String>,
     /// `[text][label]` and `[text][]` with no definition for the label.
     broken_references: Vec<Link>,
+    /// The source, which the publisher searches for asset paths.
+    text: String,
 }
 
 struct Site {
     /// Published pages, by path relative to docs/user.
     pages: BTreeMap<String, Document>,
     /// Assets that docs.yml lists, relative to docs/user.
+    listed: BTreeSet<String>,
+    /// The listed assets the publisher copies, relative to docs/user.
     assets: BTreeSet<String>,
     /// The docs.yml nav, in order.
     nav: Vec<String>,
@@ -71,8 +75,9 @@ impl Site {
                 pages.insert(rel, parse(&source));
             }
         }
-        let (assets, nav) = docs_yml();
-        Site { pages, assets, nav }
+        let (listed, named, nav) = docs_yml();
+        let assets = published_assets(&listed, &named, &pages);
+        Site { pages, listed, assets, nav }
     }
 
     /// The published page with this slug: its file name without `.md`.
@@ -197,7 +202,8 @@ fn page_links_are_checked_against_the_published_set() {
     pages.insert("one.md".to_string(), parse("# One\n## Run it\n"));
     pages.insert("two.md".to_string(), parse("# Two\n"));
     pages.insert("guides/three.md".to_string(), parse("# Three\n"));
-    let site = Site { pages, assets: BTreeSet::from(["assets/demo.gif".to_string(), "assets/gone.png".to_string()]), nav: vec![] };
+    let listed = BTreeSet::from(["assets/demo.gif".to_string(), "assets/logo.svg".to_string(), "assets/gone.png".to_string()]);
+    let site = Site { pages, listed, assets: BTreeSet::from(["assets/demo.gif".to_string()]), nav: vec![] };
     let ok = [
         "two.md",
         "two.md#two",
@@ -225,7 +231,7 @@ fn page_links_are_checked_against_the_published_set() {
         "/docs/xolotl/two",
         "assets/other.png",
         "assets/gone.png",
-        "assets/demo%2Egif",
+        "assets/logo.svg",
         "CHANGELOG.md",
         "https://github.com/wyrd-company/xolotl/blob/main/docs/design/x.md",
         "https://wyrd.foo/docs/xolotl/four",
@@ -236,13 +242,42 @@ fn page_links_are_checked_against_the_published_set() {
 }
 
 #[test]
+fn the_publisher_copies_listed_assets_that_are_named_or_written_out() {
+    let listed: BTreeSet<String> =
+        ["assets/demo.gif", "assets/logo.svg", "assets/favicon.svg", "assets/social.png"].map(String::from).into();
+    let named = BTreeSet::from(["assets/logo.svg".to_string()]);
+    let pages = BTreeMap::from([
+        ("one.md".to_string(), parse("![x](assets/demo.gif)\n")),
+        ("guides/two.md".to_string(), parse("![x](../assets/favicon.svg) ![y](assets/./social.png)\n")),
+    ]);
+    let published: Vec<_> = published_assets(&listed, &named, &pages).into_iter().collect();
+    assert_eq!(published, ["assets/demo.gif", "assets/favicon.svg", "assets/logo.svg"]);
+    assert_eq!(relative("guides", "assets/x.png"), "../assets/x.png");
+    assert_eq!(relative("", "assets/x.png"), "assets/x.png");
+}
+
+#[test]
 fn readme_and_changelog_rules() {
-    let site = Site { pages: BTreeMap::from([("two.md".to_string(), parse("# Two\n"))]), assets: BTreeSet::new(), nav: vec![] };
+    let site = Site {
+        pages: BTreeMap::from([("two.md".to_string(), parse("# Two\n"))]),
+        listed: BTreeSet::new(),
+        assets: BTreeSet::new(),
+        nav: vec![],
+    };
     let readme = parse("# Top\n");
-    for ok in ["src/metadata.rs", "docs/user/web-ui.md", "#top", "https://github.com/wyrd-company/xolotl/blob/main/src/metadata.rs"] {
+    for ok in [
+        "src/metadata.rs",
+        "src/metadata.rs#L10",
+        "src/metadata.rs#L10-L20",
+        "docs/user/web-ui.md",
+        "#top",
+        "https://github.com/wyrd-company/xolotl/blob/main/src/metadata.rs",
+    ] {
         assert_eq!(repo_link_problem(&site, &readme, ok), None, "{ok}");
     }
-    for refused in ["src/nowhere.rs", "docs/user/web-ui.md#nowhere", "/src/metadata.rs", "https://wyrd.foo/docs/xolotl/four"] {
+    for refused in
+        ["src/nowhere.rs", "src/metadata.rs#top", "docs/user/web-ui.md#nowhere", "/src/metadata.rs", "https://wyrd.foo/docs/xolotl/four"]
+    {
         assert!(repo_link_problem(&site, &readme, refused).is_some(), "{refused} must be refused");
     }
     assert_eq!(changelog_link_problem(&site, "https://wyrd.foo/docs/xolotl/two"), None);
@@ -284,15 +319,14 @@ fn page_link_problem(site: &Site, rel: &str, target: &str) -> Option<String> {
     }
     let exists = Path::new(ROOT).join(DOCS).join(&within).is_file();
     if site.assets.contains(&within) {
-        if percent_decode(path) != path {
-            // The publisher picks the assets a page uses by their literal path in its text.
-            return Some(format!("write the path as {within}, without percent-encoding, so wyrd.foo publishes the asset"));
-        }
-        return match (exists, anchor) {
-            (false, _) => Some(format!("docs.yml lists {within}, but {DOCS}/{within} does not exist")),
-            (true, Some(_)) => Some("an asset has no headings".into()),
-            (true, None) => None,
-        };
+        return anchor.map(|_| "an asset has no headings".into());
+    }
+    if site.listed.contains(&within) {
+        return Some(if exists {
+            format!("no page has the literal path to {within} (such as `{within}` from docs/user), so the publisher does not copy it")
+        } else {
+            format!("docs.yml lists {within}, but {DOCS}/{within} does not exist")
+        });
     }
     if exists {
         return Some(format!("{DOCS}/{within} is not in the assets list of docs.yml, so it is not published"));
@@ -333,7 +367,8 @@ fn repo_link_problem(site: &Site, doc: &Document, target: &str) -> Option<String
             let other = parse(&std::fs::read_to_string(&full).unwrap());
             anchor_problem(&other, anchor, &resolved.display().to_string())
         }
-        Some(_) => Some("only a Markdown file has headings to link to".into()),
+        Some(line) if is_line_anchor(line) => None,
+        Some(_) => Some("only a Markdown file has headings to link to; another file takes a line, such as #L10 or #L10-L20".into()),
         None => None,
     }
 }
@@ -370,6 +405,15 @@ fn site_url_problem(site: &Site, target: &str) -> Option<String> {
     }
 }
 
+/// A GitHub line fragment: `L10` or `L10-L20`.
+fn is_line_anchor(anchor: &str) -> bool {
+    let number = |s: &str| s.strip_prefix('L').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    match anchor.split_once('-') {
+        Some((from, to)) => number(from) && number(to),
+        None => number(anchor),
+    }
+}
+
 fn anchor_problem(doc: &Document, anchor: &str, place: &str) -> Option<String> {
     let anchor = percent_decode(anchor);
     if doc.anchors.contains(&anchor) { None } else { Some(format!("{place} has no heading with the anchor #{anchor}")) }
@@ -387,14 +431,45 @@ fn assert_no_problems(problems: Vec<String>) {
 
 // --- the published set -------------------------------------------------------------
 
-/// The assets list and the nav slugs of docs.yml.
-fn docs_yml() -> (BTreeSet<String>, Vec<String>) {
+/// The listed assets the publisher copies: each one that exists and that the
+/// catalog entry names, or whose path relative to a page is in that page's text.
+fn published_assets(listed: &BTreeSet<String>, named: &BTreeSet<String>, pages: &BTreeMap<String, Document>) -> BTreeSet<String> {
+    listed
+        .iter()
+        .filter(|asset| Path::new(ROOT).join(DOCS).join(asset).is_file())
+        .filter(|asset| {
+            named.contains(*asset)
+                || pages.iter().any(|(rel, doc)| doc.text.contains(&relative(rel.rsplit_once('/').map_or("", |(dir, _)| dir), asset)))
+        })
+        .cloned()
+        .collect()
+}
+
+/// `path` relative to the folder `dir`; both are relative to docs/user.
+fn relative(dir: &str, path: &str) -> String {
+    let dir: Vec<_> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    let path: Vec<_> = path.split('/').collect();
+    let common = dir.iter().zip(&path).take_while(|(a, b)| a == b).count();
+    let mut parts = vec![".."; dir.len() - common];
+    parts.extend(&path[common..]);
+    parts.join("/")
+}
+
+/// The assets list, the assets the catalog entry names, and the nav slugs of
+/// docs.yml.
+fn docs_yml() -> (BTreeSet<String>, BTreeSet<String>, Vec<String>) {
     let source = std::fs::read_to_string(Path::new(ROOT).join(DOCS).join("docs.yml")).unwrap();
     let docs = YamlLoader::load_from_str(&source).unwrap().remove(0);
     let strings = |yaml: &Yaml| -> Vec<String> {
         yaml.as_vec().map(|v| v.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()).unwrap_or_default()
     };
     let assets: BTreeSet<String> = strings(&docs["assets"]).into_iter().collect();
+    let product = &docs["products"][PRODUCT];
+    let mut named: BTreeSet<String> =
+        ["logo", "logo-dark", "favicon", "social-image"].iter().filter_map(|f| product[*f].as_str().map(str::to_string)).collect();
+    for item in product["media"].as_vec().into_iter().flatten() {
+        named.extend(item["src"].as_str().map(str::to_string));
+    }
     let mut nav = Vec::new();
     for section in docs["products"][PRODUCT]["nav"].as_vec().into_iter().flatten() {
         for group in section["groups"].as_vec().into_iter().flatten() {
@@ -402,7 +477,7 @@ fn docs_yml() -> (BTreeSet<String>, Vec<String>) {
         }
     }
     assert!(!nav.is_empty(), "docs.yml has no nav pages for {PRODUCT}");
-    (assets, nav)
+    (assets, named, nav)
 }
 
 fn page_product(source: &str) -> Option<String> {
@@ -479,7 +554,7 @@ fn parse(source: &str) -> Document {
             _ => {}
         }
     }
-    Document { links, anchors, broken_references: broken.into_inner() }
+    Document { links, anchors, broken_references: broken.into_inner(), text: source.to_string() }
 }
 
 /// Reads `href` and `src` attribute values from raw HTML, which pulldown-cmark
