@@ -35,7 +35,7 @@ Environment variables override the file.
 | `XOLOTL_LOG_FORMAT` | `telemetry.log_format` |
 | `XOLOTL_CLICKHOUSE_URL` | `export.clickhouse.url`; sets up the export with its defaults when the file has no `[export.clickhouse]` |
 
-The CLI uses `XOLOTL_URL` and `XOLOTL_ADMIN_TOKEN` (see [CLI](cli)).
+The CLI uses `XOLOTL_URL` and `XOLOTL_ADMIN_TOKEN` (see [CLI](cli.md)).
 
 ## `[server]`
 
@@ -98,7 +98,7 @@ metrics_interval_secs = 30
 # Authorization = "Basic ..."   # prefer the OpenBao secret `telemetry`
 ```
 
-See [Telemetry](telemetry).
+See [Telemetry](telemetry.md).
 
 ## `[export.clickhouse]`
 
@@ -113,7 +113,7 @@ table = "llm_exchanges"
 bodies = true            # false: request log fields only
 ```
 
-See [ClickHouse export](clickhouse-export) for every setting and the table.
+See [ClickHouse export](clickhouse-export.md) for every setting and the table.
 
 ## `[ui.oidc]`
 
@@ -128,11 +128,11 @@ redirect_url = "https://xolotl.example.lan/admin/session/callback"
 admin_group = "xolotl-admins"
 ```
 
-See [Web UI](web-ui).
+See [Web UI](web-ui.md).
 
 ## `[subscription]`
 
-How xolotl uses subscription accounts. See [Subscription accounts](accounts).
+How xolotl uses subscription accounts. See [Subscription accounts](accounts.md).
 
 ```toml
 [subscription]
@@ -154,7 +154,7 @@ lock_tokens = 60000     # 0 disables the context lock
 
 A session whose prompt reaches `lock_tokens` stays on its account and model, so
 that its prompt cache is kept. Set it to `0` to turn this off and keep failover
-for every request. See [Context lock](accounts#context-lock).
+for every request. See [Context lock](accounts.md#context-lock).
 
 ## `[gateway.providers.<name>]`
 
@@ -221,7 +221,7 @@ model list.
 
 `wires` sets the formats a provider, or one `provider/model`, speaks natively:
 `messages`, `responses` or `chat`. Xolotl translates other formats. You can't
-override `claude`. See [Clients](clients#wire-formats-and-translation).
+override `claude`. See [Clients](clients.md#wire-formats-and-translation).
 
 ### Model metadata
 
@@ -250,7 +250,12 @@ Only supplied values replace registry values. Unmatched models show unknown
 limits and prices. Prices are USD per token, displayed per million tokens.
 Codex catalog synthesis defaults to text input, no shell tools, and no reasoning
 levels. Declare supported capabilities explicitly. Native Codex entries retain
-the upstream fields. See [Model metadata design](https://github.com/wyrd-company/xolotl/blob/main/docs/design/model-metadata.md).
+the upstream fields.
+
+To find a model in the registry, xolotl tries `provider/model`, then the model
+under its provider family (Codex as OpenAI, Claude as Anthropic, Grok as xAI,
+OpenCode Go Qwen as DashScope), then the bare model name. `litellm_key`
+replaces this lookup.
 
 ## `[mcp]`
 
@@ -276,7 +281,7 @@ headers = { Authorization = "Bearer {token}" }
 # timeout_secs = 60
 ```
 
-See [MCP gateway](mcp-gateway).
+See [MCP gateway](mcp-gateway.md).
 
 ## OpenBao paths
 
@@ -287,7 +292,7 @@ All paths are under `<mount>/<prefix>/`, by default `secret/xolotl/`.
 | `admin` | `token`: the bootstrap admin token | you |
 | `oidc` | `client_secret`: the web UI's OpenID Connect client secret | you |
 | `telemetry` | OTLP header values, keyed by header name | you |
-| `clickhouse` | `password` and, optionally, `user` for the [ClickHouse export](clickhouse-export) | you |
+| `clickhouse` | `password` and, optionally, `user` for the [ClickHouse export](clickhouse-export.md) | you |
 | `providers/<name>` | `api_key` of a gateway provider | `xolotl providers set-key` |
 | `accounts/<provider>/<id>` | OAuth tokens or API key of a subscription account | xolotl, at login and on refresh |
 | `policies/<policy>` | a client key policy | `xolotl policies put` |
