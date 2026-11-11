@@ -67,11 +67,11 @@ User documentation is on [wyrd.foo](https://wyrd.foo/docs/xolotl/). Its source i
 | [Overview](docs/user/overview.md) | What xolotl does and how it fits together |
 | [Installation](docs/user/install.md) | Container image, release binary, Homebrew, building from source, OpenBao setup, running |
 | [Configuration](docs/user/configuration.md) | The config file, environment variables, OpenBao paths |
+| [Web UI](docs/user/web-ui.md) | Sign-in and the screens you administer xolotl from |
 | [Subscription accounts](docs/user/accounts.md) | Codex, Claude, Grok and OpenCode Go accounts: login, import, states, failover |
 | [Policies and client keys](docs/user/policies-and-keys.md) | Policies, model names, renames and aliases, rate limits, issuing and rotating keys, usage |
 | [Clients](docs/user/clients.md) | Claude Code, Codex CLI, Grok CLI, SDKs, MCP clients, T3 Code; endpoints and translation |
 | [MCP gateway](docs/user/mcp-gateway.md) | Upstream MCP servers, OAuth logins, code mode, MCP policies |
-| [Web UI](docs/user/web-ui.md) | OpenID Connect sign-in and the screens |
 | [CLI reference](docs/user/cli.md) | Every `xolotl` command |
 | [Telemetry](docs/user/telemetry.md) | OTLP export, logs, metrics |
 | [ClickHouse export](docs/user/clickhouse-export.md) | Session requests and responses in a ClickHouse table for analysis |
@@ -92,7 +92,8 @@ docker run -d --name xolotl -p 8317:8317 \
   -e XOLOTL_VAULT_ROLE_ID=... -e XOLOTL_VAULT_SECRET_ID=... \
   ghcr.io/wyrd-company/xolotl:latest
 
-# Administer, with the xolotl binary from a release archive
+# Administer in the web UI at http://xolotl:8317/ once [ui.oidc] is set
+# (see docs/user/web-ui.md), or with the xolotl binary from a release archive:
 export XOLOTL_ADMIN_TOKEN=$(bao kv get -field=token secret/xolotl/admin)
 xolotl auth login codex
 xolotl policies put examples/policies/devcontainer.toml
