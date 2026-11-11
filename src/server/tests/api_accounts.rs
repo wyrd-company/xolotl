@@ -109,7 +109,12 @@ async fn anthropic_api_accounts_serve_the_claude_code_path() {
 
 #[tokio::test]
 async fn openai_api_accounts_serve_responses_and_chat() {
-    let h = api_harness().await;
+    let mut h = api_harness().await;
+    let clickhouse = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&clickhouse).await;
+    let cfg = crate::config::ClickHouseConfig { url: clickhouse.uri(), create_table: false, flush_secs: 3600, ..Default::default() };
+    let export = crate::export::Exporter::new(vec![crate::export::clickhouse::start(cfg, None, None).unwrap()]);
+    h.state.export = Some(export.clone());
     Mock::given(method("POST"))
         .and(path("/oai/v1/responses"))
         .and(header("authorization", "Bearer oai-key"))
@@ -145,4 +150,17 @@ async fn openai_api_accounts_serve_responses_and_chat() {
     let gpt = models["data"].as_array().unwrap().iter().find(|m| m["id"] == "gpt-6").unwrap().clone();
     assert_eq!(gpt["endpoints"], json!(["/v1/responses", "/v1/chat/completions"]));
     assert_eq!(gpt["translated_endpoints"], json!(["/v1/messages"]));
+
+    // Exported like any other account, under its kind.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    export.shutdown().await;
+    let rows: Vec<Value> = clickhouse
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|r| String::from_utf8_lossy(&r.body).lines().map(|l| serde_json::from_str(l).unwrap()).collect::<Vec<Value>>())
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|r| r["account_kind"] == "openai" && r["provider"] == "oai"), "{rows:?}");
 }
