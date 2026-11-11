@@ -809,6 +809,14 @@ async fn provider_accounts_are_added_changed_and_removed_at_runtime() {
     let stored = h.state.secrets.get("providers/local").await.unwrap().unwrap();
     assert_eq!((stored["api_key"].as_str(), stored["kind"].as_str()), (Some("next"), Some("openai-compatible")));
     assert_eq!(h.call("PUT", "/admin/providers/llama", admin, Some(json!({"kind": "openai-compatible"}))).await.0, 409);
+    let keyless = json!({"kind": "openai-compatible", "base_url": format!("{uri}/local/v1"), "no_auth": true});
+    assert_eq!(h.call("PUT", "/admin/providers/local", admin, Some(keyless)).await.0, 200);
+    let needs_key = json!({"kind": "openai-compatible", "base_url": format!("{uri}/local/v1")});
+    assert_eq!(h.call("PUT", "/admin/providers/local", admin, Some(needs_key)).await.0, 200, "the stored key is kept");
+    h.state.secrets.put("providers/bare", json!({"kind": "mistral"}).as_object().unwrap().clone()).await.unwrap();
+    h.state.gateway.reload().await.unwrap();
+    let (status, body) = h.call("PUT", "/admin/providers/bare", admin, Some(json!({"kind": "mistral"}))).await;
+    assert_eq!(status, 400, "a change can't leave an account without a key: {body}");
 
     // A policy that names the provider keeps it.
     h.state
@@ -826,7 +834,7 @@ async fn provider_accounts_are_added_changed_and_removed_at_runtime() {
     assert_eq!(h.call("DELETE", "/admin/providers/llama", admin, None).await.0, 409, "config-file providers stay");
     let (status, body) = h.call("DELETE", "/admin/providers/local", admin, None).await;
     assert_eq!(status, 200, "{body}");
-    assert!(h.state.secrets.get("providers/local").await.unwrap().is_none());
+    assert_eq!(h.state.secrets.get("providers/local").await.unwrap(), Some(Default::default()), "emptied, key gone");
     assert!(!h.state.catalog.models().contains_key("local"));
     assert_eq!(h.call("GET", "/local/v1/props", Some(&key), None).await.0, 404);
     assert_eq!(h.call("DELETE", "/admin/providers/local", admin, None).await.0, 404);

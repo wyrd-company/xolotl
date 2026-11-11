@@ -264,14 +264,18 @@ impl ModelCatalog {
             };
             discovery.insert(name.clone(), DiscoveryStatus { refreshed_at: Some(crate::db::now()), error, models: 0 });
         }
-        // A provider account removed during the refresh stays removed.
+        // A provider account removed during the refresh stays removed:
+        // `set_gateway_kinds` changes the providers before it takes the
+        // snapshot lock, so reading them under that lock sees the removal.
+        let mut snapshot = self.snapshot.write();
         let known = self.known_providers();
         fresh.retain(|p, _| known.contains(p) || self.cfg.static_models.contains_key(p));
         discovery.retain(|p, _| known.contains(p));
         let models = self.with_static(fresh);
         let total: usize = models.values().map(BTreeSet::len).sum();
+        *snapshot = Arc::new(Snapshot { models, discovery, refreshed: Some(Instant::now()) });
+        drop(snapshot);
         tracing::info!(models = total, "model catalog refreshed");
-        *self.snapshot.write() = Arc::new(Snapshot { models, discovery, refreshed: Some(Instant::now()) });
     }
 
     /// Native Codex fields are retained; only the policy-visible identity changes.
