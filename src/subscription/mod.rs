@@ -683,7 +683,7 @@ impl Subscriptions {
                 // caller's policy admits a request on it, whichever is later.
                 let mut u = r.cooldown_until.unwrap_or(t);
                 if let Some((client, policy)) = limiter
-                    && let Err(e) = self.limiter.check(client, policy, &with_account(&r.id, &pending), t)
+                    && let Some(e) = self.limiter.longest_wait(client, policy, &with_account(&r.id, &pending), t)
                 {
                     u = u.max(t + e.retry_after);
                 }
