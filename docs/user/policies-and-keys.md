@@ -75,7 +75,7 @@ writes `models`.
 | `aliases` | Extra names. Each maps to one `provider/model`, or to a list tried in order |
 | `scopes` | What the key can do. Default `["proxy"]` |
 | `mcp_servers` | MCP servers the key can use through `/mcp`, or `*` |
-| `allow_tools`, `deny_tools` | Globs on `tool` or `server/tool`. Deny wins. See [MCP gateway](mcp-gateway#policies) |
+| `allow_tools`, `deny_tools` | Globs on `tool` or `server/tool`. Deny wins. See [MCP gateway](mcp-gateway.md#policies) |
 | `key_policies` | With the `keys` scope, the policies whose client keys the key can manage. See [Issue keys from a script](#issue-keys-from-a-script) |
 | `limits` | Request and token limits on the LLM endpoints, also per provider and per account. See [Rate limits](#rate-limits) |
 
@@ -275,7 +275,7 @@ Counters are kept in memory and rebuilt from the request log of the last
 shows it on the **Policies** and **Client keys** screens. The **Policies**
 screen also shows the consumption of each provider and account limit. The metrics are
 `xolotl.limit.consumption` and `xolotl.limit.rejections` (see
-[Telemetry](telemetry)).
+[Telemetry](telemetry.md)).
 
 ## Issue a client key
 
