@@ -71,7 +71,7 @@ screen after sign-in and can be reached with Tab and opened with Enter.
 **Needs action** lists enabled accounts whose credentials were refused, stored
 policies that did not load, plus OpenBao and SQLite failures. Account actions
 open that account's details. See
-[Policies that do not load](policies-and-keys#policies-that-do-not-load).
+[Policies that do not load](policies-and-keys.md#policies-that-do-not-load).
 Cooling accounts and credentials waiting to save appear under **Health**;
 xolotl retries saving refreshed credentials.
 
@@ -89,14 +89,14 @@ with **Errors only** selected. Remove that filter to include successful requests
 
 Check that the configured OpenBao address is reachable, OpenBao is unsealed,
 and xolotl's vault credentials can access its configured mount and prefix.
-See [Configuration](configuration). Refreshed credentials stay in memory while
+See [Configuration](configuration.md). Refreshed credentials stay in memory while
 xolotl retries saving them. Avoid restarting until they are saved.
 
 #### Restore SQLite
 
 Check that the configured database directory exists, its filesystem has free
 space, and the xolotl process can read and write it. See
-[Configuration](configuration) for the database path. The server log contains
+[Configuration](configuration.md) for the database path. The server log contains
 the storage error. Restore storage access without deleting the database.
 
 ### Account states
@@ -113,7 +113,7 @@ the storage error. Restore storage access without deleting the database.
 
 **Retry** clears the cooldown and the re-login state. It does not change the
 credential or reset the provider's quota. See
-[Recover an account](accounts#recover-an-account).
+[Recover an account](accounts.md#recover-an-account).
 
 ### Policy model list
 
@@ -134,7 +134,7 @@ The **Policies** screen shows the models of a policy in two modes.
   the state of the accounts the policy uses. Filter by provider, sort, and
   show or hide denied models.
 - **Precedence:** set the order of the providers for shared names. See
-[Policies and client keys](policies-and-keys).
+[Policies and client keys](policies-and-keys.md).
 
 ### Usage
 
@@ -147,7 +147,7 @@ the filters (`/#/usage?group=model&client=...`), so you can bookmark a view.
 
 **Sessions** lists the 100 most recently used conversations: how full each one
 is against its model's context window, its peak, its turns, its share of prompt
-tokens read from cache, and its [context lock](accounts#context-lock) with any
+tokens read from cache, and its [context lock](accounts.md#context-lock) with any
 failures and breaks. **Tools called** lists each tool a key called and how
 often, so you can remove unused tools from its policy by hand. Both follow the
 client filter. Tool names are as the upstream sent them: a name that xolotl
