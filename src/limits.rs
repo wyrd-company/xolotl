@@ -408,6 +408,13 @@ impl Limiter {
         meters.iter().try_for_each(|meter| check(&mut clients, client_id, policy, meter, now))
     }
 
+    /// The limit that refuses a request on `meters` longest: every limit it
+    /// reached must admit it again. `None` when none refuses it now.
+    pub fn longest_wait(&self, client_id: &str, policy: &Policy, meters: &[Meter], now: i64) -> Option<Exceeded> {
+        let mut clients = self.clients.lock();
+        meters.iter().flat_map(|meter| exceeded(&mut clients, client_id, policy, meter, now, false)).max_by_key(|e| e.retry_after)
+    }
+
     /// Count the tokens of a finished request, on its provider and account.
     pub fn record_tokens(&self, client_id: &str, provider: &str, account: Option<&str>, tokens: u64, now: i64) {
         if tokens > 0 {
@@ -497,8 +504,25 @@ impl Limiter {
 /// Check the policy's limits on `meter` for a key, or for all keys of the
 /// policy with `per = "policy"`.
 fn check(clients: &mut HashMap<String, ClientUsage>, client_id: &str, policy: &Policy, meter: &Meter, now: i64) -> Result<(), Exceeded> {
+    match exceeded(clients, client_id, policy, meter, now, true).into_iter().next() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// The limits of `meter` that refuse a request now; only the first one when
+/// `first_only`.
+fn exceeded(
+    clients: &mut HashMap<String, ClientUsage>,
+    client_id: &str,
+    policy: &Policy,
+    meter: &Meter,
+    now: i64,
+    first_only: bool,
+) -> Vec<Exceeded> {
     let limits = &policy.limits;
-    let Some(allowance) = limits.allowance(meter) else { return Ok(()) };
+    let mut out = Vec::new();
+    let Some(allowance) = limits.allowance(meter) else { return out };
     for (limit, value, unit, window) in allowance.checks() {
         let mut buckets: Vec<Bucket> = Vec::new();
         for (id, client) in clients.iter_mut() {
@@ -514,10 +538,13 @@ fn check(clients: &mut HashMap<String, ClientUsage>, client_id: &str, policy: &P
             }
         }
         if let Some(retry_after) = retry_after(buckets, unit, window, value, now) {
-            return Err(Exceeded { limit, on: meter.describe(), value, per: limits.per, retry_after });
+            out.push(Exceeded { limit, on: meter.describe(), value, per: limits.per, retry_after });
+            if first_only {
+                break;
+            }
         }
     }
-    Ok(())
+    out
 }
 
 /// `None` when consumption in the window is below `limit`; otherwise the
@@ -545,6 +572,19 @@ mod tests {
 
     fn policy(name: &str, limits: Limits) -> Policy {
         Policy { name: name.into(), providers: vec!["*".into()], limits, ..Default::default() }
+    }
+
+    #[test]
+    fn longest_wait_covers_every_limit_reached() {
+        let l = Limiter::default();
+        let p = policy("p", Limits { requests_per_minute: Some(1), requests_per_day: Some(1), ..Default::default() });
+        assert!(l.longest_wait("p/a", &p, &[Meter::Total], T0).is_none());
+        l.admit("p/a", &p, &[Meter::Total], T0).unwrap();
+        // `check` names the first limit; the day limit refuses longer.
+        assert_eq!(l.check("p/a", &p, &[Meter::Total], T0 + 10).unwrap_err().limit, "requests_per_minute");
+        let e = l.longest_wait("p/a", &p, &[Meter::Total], T0 + 10).unwrap();
+        assert_eq!(e.limit, "requests_per_day");
+        assert!((86_400 - 70..=86_400).contains(&e.retry_after), "{}", e.retry_after);
     }
 
     #[test]

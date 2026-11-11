@@ -287,7 +287,10 @@ async fn all_codex_accounts_cooling_respect_policy_limits() {
     subs.record_usage(&a.id, SubProvider::Codex, vec![window(100.0)], None).await;
     subs.record_usage(&b.id, SubProvider::Codex, vec![window(80.0)], None).await;
     let mut p = any_policy();
-    p.limits.accounts.insert(a.id.clone(), crate::limits::Allowance { requests_per_day: Some(1), ..Default::default() });
+    // Both limits are reached; the day limit, not the first one checked, sets when a can serve.
+    p.limits
+        .accounts
+        .insert(a.id.clone(), crate::limits::Allowance { requests_per_minute: Some(1), requests_per_day: Some(1), ..Default::default() });
     let key = principal(p);
     limiter.admit("p/client", &key.policy, &[crate::limits::Meter::Account(&a.id)], now()).unwrap();
 
