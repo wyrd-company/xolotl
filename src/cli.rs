@@ -420,14 +420,17 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
     let mcp = Arc::new(crate::mcp::McpHub::new(&cfg, secrets.clone(), db.clone()));
     let n = mcp.reload().await.context("loading MCP servers from the vault")?;
     tracing::info!(config = cfg.mcp.servers.len(), vault = n, "loaded MCP servers");
-    let export = match &cfg.export.clickhouse {
-        Some(ch) => {
-            let secret = secrets.get("clickhouse").await.context("reading the clickhouse secret from the vault")?.unwrap_or_default();
-            let field = |k: &str| secret.get(k).and_then(|v| v.as_str()).map(str::to_string);
-            Some(crate::export::Exporter::start(ch.clone(), field("user"), field("password"))?)
-        }
-        None => None,
-    };
+    let mut sinks = Vec::new();
+    if let Some(ch) = &cfg.export.clickhouse {
+        let secret = secrets.get("clickhouse").await.context("reading the clickhouse secret from the vault")?.unwrap_or_default();
+        let field = |k: &str| secret.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        sinks.push(crate::export::clickhouse::start(ch.clone(), field("user"), field("password"))?);
+    }
+    if let Some(n) = &cfg.export.nats {
+        let secret = secrets.get("nats").await.context("reading the nats secret from the vault")?;
+        sinks.push(crate::export::nats::start(n.clone(), secret).await.context("starting the NATS export")?);
+    }
+    let export = (!sinks.is_empty()).then(|| crate::export::Exporter::new(sinks));
     let state = AppState {
         cfg: Arc::new(cfg),
         db,

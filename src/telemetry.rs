@@ -178,7 +178,7 @@ pub fn metrics() -> &'static Metrics {
             tool_calls: meter.u64_counter("xolotl.tool_calls").with_description("Tool calls in LLM responses, by client and tool").build(),
             export_rows: meter
                 .u64_counter("xolotl.export.rows")
-                .with_description("Exported exchanges by sink and outcome: inserted, dropped (queue full) or failed")
+                .with_description("Exported exchanges by sink and outcome: inserted or published, dropped (queue full), failed or refused")
                 .build(),
         }
     })

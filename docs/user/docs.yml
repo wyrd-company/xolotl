@@ -64,4 +64,4 @@ products:
           - group: Administer
             pages: [cli]
           - group: Monitor and limits
-            pages: [telemetry, clickhouse-export, limitations]
+            pages: [telemetry, clickhouse-export, nats-export, limitations]

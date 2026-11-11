@@ -1,6 +1,6 @@
 # Exchange export
 
-With `[export.clickhouse]`, each LLM request that has a session becomes a row in a ClickHouse table: its request log fields, the request and response bodies, and the response assembled into one format. `src/export.rs` holds the row, the queue and the ClickHouse client. User documentation: [ClickHouse export](../user/clickhouse-export.md).
+Each LLM request that has a session becomes a row: its request log fields, the request and response bodies, and the response assembled into one format. Rows go to one or more destinations: `[export.clickhouse]` inserts them into a ClickHouse table, and `[export.nats]` publishes them to a NATS JetStream stream that ClickHouse loads. `src/export/mod.rs` holds the row, the capture and the queues; `src/export/clickhouse.rs` and `src/export/nats.rs` hold the destinations. User documentation: [ClickHouse export](../user/clickhouse-export.md) and [NATS export](../user/nats-export.md).
 
 ## Capture
 
@@ -29,7 +29,13 @@ Two gaps remain:
 - A target that an alias moves on from (`route_json`) is dropped with its body unread, so its row has no response. Reading it would delay the next target.
 - The Chat decoder emits tool calls only at `finish_reason`, so a stream cut short in a tool call's arguments loses that call. Emitting it early would change what translated clients receive.
 
-## Queue and delivery
+## Destinations
+
+`Exporter` takes each row once and hands it to every `Sink`. A sink is one destination: its own queue, bounded by its own `queue_mb`, and the task that empties it. Capture and assembly are shared, so a new destination adds only how it sends a row.
+
+The capture keeps what the most generous destination wants: bodies when any destination has `bodies`, cut at the largest `max_body_bytes`. `Exchange::fitted` then gives each destination the row as its own settings would have produced it, without bodies or with them cut further. When the settings match, as with one destination, the row is shared through an `Arc`, not copied. Each destination counts its outcomes in `xolotl.export.rows` under its own `sink`.
+
+## Queue and delivery to ClickHouse
 
 Rows go on an unbounded channel whose size is held under `queue_mb` by a byte count: a row that would pass it is dropped and counted. `Exchange::size` counts every string of the row. `error` is cut at 4 KiB, since an error body without a message becomes the message. One task batches rows by `batch_rows`, 32 MiB or `flush_secs`, whichever comes first, and inserts each batch with `INSERT … FORMAT JSONEachRow` over HTTP. A failed batch is tried three times with backoff (2 s, 4 s), then dropped with a warning. Meanwhile the queue keeps filling, up to its bound.
 
@@ -52,6 +58,30 @@ Options not chosen:
 The client follows no redirects, so credentials go only to the configured `url`. An `https` url signed by a private CA takes `ca_cert`, like the OpenBao client.
 
 A statement with no input, such as `CREATE TABLE`, is sent as the POST body, not as the `query` parameter. ClickHouse refuses a POST without a `Content-Length`, and reqwest sends none for an empty body.
+
+## NATS JetStream
+
+ClickHouse's NATS table engine reads the stream through a durable pull consumer and acknowledges a message only after the views it feeds have inserted it. Rows published while ClickHouse is down wait in the stream, and xolotl runs no loader. Other services will publish to NATS the same way, and other readers can consume the stream without touching xolotl.
+
+Each row is one message on `xolotl.exchanges.<client_id>`, serialized as for the direct export (`JSONEachRow`), so the engine parses it with the same column types. A client id is a policy and key name, which hold no character that NATS reserves in a subject; `nats::subject` replaces any as a guard.
+
+The publisher sends one row at a time and waits for its `PubAck`, so a row counts as `published` only once the stream has stored it. The message ID is the row `id`, and the stream's duplicate window drops a retry of a publish whose ack was lost: the client buffers a publish while it is disconnected, and may deliver it after the publisher has given up waiting and sent it again.
+
+A failed publish is retried without a limit, with a backoff from 0.5 s to 10 s, while new rows wait behind it. The queue's byte bound is the only reason a row is dropped. This differs from the direct export, which drops a batch after three tries, because on a single NATS server a NATS restart is the outage that the stream can't cover: only xolotl's queue holds rows meanwhile. The one failure that is not retried is a message the stream will never take: the server's `max_payload`, or the stream's `max_msg_size`, is smaller than the message.
+
+Before it publishes, `nats::encode` fits the row into the smaller of the server's `max_payload`, read from the server's `INFO` at each publish, and the stream's `max_msg_size`, less room for the headers. A row that is too large has its `response` cut first, because `output` keeps what the response said, and then its `request`, each on a character boundary and measured as escaped JSON, and is marked `*_truncated`. A row that doesn't fit even without them is refused and counted as `refused`.
+
+At startup, `nats::start` connects, reads the stream and checks that one of its subjects covers `xolotl.exchanges.>`. It fails if NATS can't be reached, the stream is missing, or its subjects don't cover the rows, so that a misconfigured stream is found at deploy time, not by a silent gap in the table. Xolotl creates neither the stream nor the consumer nor the tables: their limits, retention and permissions belong to whoever runs NATS and ClickHouse. After startup the client reconnects without a limit.
+
+On shutdown the publisher sends what is queued, within the exporter's ten-second deadline.
+
+Options not chosen:
+
+- **A loader in xolotl that reads the stream and inserts into ClickHouse.** ClickHouse's engine does that with a few lines of DDL, and a loader in xolotl would serve only xolotl.
+- **Vector as the loader.** Its NATS source has no end-to-end acknowledgement, so a crash loses messages it acknowledged but had not written.
+- **Redpanda Connect as the loader.** Its `nats_jetstream` input acknowledges after the write. It is the fallback if the engine causes trouble.
+- **Publishing several rows before waiting for their acks.** One row at a time keeps the order and the retry simple, and a local server acknowledges well within the measured peak request rate.
+- **Creating the stream at startup.** The stream's retention, size and replicas are infrastructure decisions, and a stream created with defaults would keep prompts with no age limit.
 
 ## Table
 

@@ -53,6 +53,17 @@ metrics_interval_secs = 30
 # flush_secs = 5
 # queue_mb = 256
 
+# Publish the same rows to a NATS JetStream stream that ClickHouse loads, so
+# rows wait in the stream while ClickHouse is down. The stream must exist.
+# Credentials are the vault secret `xolotl/nats` (user and password, or creds).
+# [export.nats]
+# url = "nats://nats:4222"         # tls:// requires TLS. Env: XOLOTL_NATS_URL
+# stream = "XOLOTL"
+# ca_cert = "/etc/xolotl/nats-ca.pem"   # TLS with a private CA
+# bodies = true
+# max_body_bytes = 4194304
+# queue_mb = 32                    # rows held while NATS is unreachable
+
 [ui.oidc]
 # Web UI sign-in with OpenID Connect (e.g. Pocket ID). Register a confidential
 # client with this redirect URL; its secret is the vault secret `xolotl/oidc`
