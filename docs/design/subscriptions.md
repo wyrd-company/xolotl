@@ -115,8 +115,8 @@ So xolotl reports usage through headers, and a header set describes **one accoun
 |---|---|
 | Success | The upstream headers of the account that served the request, unchanged |
 | Upstream `429` (every attempt failed) | The upstream headers of the last account tried |
-| Quota error at the start of a `200` stream, no other account left | That account's upstream headers. The body becomes `{"error": {...}}`, the shape Codex parses for a `429` |
-| Every account cooling down (xolotl's own `429`) | The stored windows of the account whose cooldown ends first: the one that serves the next request. The shortest window is `primary`, the next `secondary` |
+| Quota error at the start of a `200` stream, no other account left | That account's upstream headers. The body becomes `{"error": {...}}` with `type: "usage_limit_reached"`, the shape Codex parses for a `429` |
+| Every account cooling down (xolotl's own `429`) | The stored windows of the account that can serve next: its cooldown is over and the caller's policy admits a request on it, the earliest of both. `Retry-After` gives the same time. A window stored without a duration keeps its slot; the others fill `primary` then `secondary`, shortest first |
 
 The pool as a whole is not reported to Codex. A sum or average of percentages across accounts with different plans is not a limit of any account, and Codex attaches reset times and notices to it. Session affinity keeps a conversation's numbers stable. The pool view is in the CLI, the web UI and T3Code hubs.
 

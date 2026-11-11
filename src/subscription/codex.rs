@@ -350,12 +350,20 @@ pub fn windows_from_headers(h: &reqwest::header::HeaderMap) -> Vec<UsageWindow> 
 }
 
 /// The reverse of [`windows_from_headers`]: an account's stored windows as the
-/// `x-codex-*` headers the Codex CLI reads its usage from. The shortest window
-/// is `primary` and the next is `secondary`, as the backend sends them.
+/// `x-codex-*` headers the Codex CLI reads its usage from. A window stored
+/// without a duration keeps the slot it was named after; the others fill the
+/// free slots shortest first, as the backend sends them.
 pub fn rate_limit_headers(windows: &[UsageWindow], out: &mut HeaderMap) {
-    let mut sorted: Vec<&UsageWindow> = windows.iter().filter(|w| w.is_public() && w.used_percent.is_finite()).collect();
-    sorted.sort_by_key(|w| w.window_secs.unwrap_or(i64::MAX));
-    for (which, w) in ["primary", "secondary"].into_iter().zip(sorted) {
+    const SLOTS: [&str; 2] = ["primary", "secondary"];
+    let usable = || windows.iter().filter(|w| w.is_public() && w.used_percent.is_finite());
+    let mut slots: [Option<&UsageWindow>; 2] = SLOTS.map(|slot| usable().find(|w| w.name == slot));
+    let mut rest: Vec<&UsageWindow> = usable().filter(|w| !SLOTS.contains(&w.name.as_str())).collect();
+    rest.sort_by_key(|w| w.window_secs.unwrap_or(i64::MAX));
+    let mut rest = rest.into_iter();
+    for slot in slots.iter_mut().filter(|s| s.is_none()) {
+        *slot = rest.next();
+    }
+    for (which, w) in SLOTS.into_iter().zip(slots).filter_map(|(which, w)| Some((which, w?))) {
         let mut put = |field: &str, value: String| {
             if let (Ok(name), Ok(value)) =
                 (axum::http::HeaderName::from_bytes(format!("x-codex-{which}-{field}").as_bytes()), value.parse())
@@ -375,9 +383,14 @@ pub fn rate_limit_headers(windows: &[UsageWindow], out: &mut HeaderMap) {
 
 /// A quota error found at the start of a `200` stream, as the body of the
 /// HTTP error the client gets instead: `{"error": {...}}`, the shape the
-/// backend uses for a `429`. `None` when the event carries no error object.
-pub fn stream_error_body(event: &Value) -> Option<Value> {
-    let err = event.get("error").or_else(|| event.pointer("/response/error")).filter(|e| e.is_object())?;
+/// backend uses for a `429`. An `exhausted` error gets `type:
+/// "usage_limit_reached"`, which the Codex CLI needs to read the usage
+/// headers. `None` when the event carries no error object.
+pub fn stream_error_body(event: &Value, exhausted: bool) -> Option<Value> {
+    let mut err = event.get("error").or_else(|| event.pointer("/response/error")).filter(|e| e.is_object())?.clone();
+    if exhausted && let Some(obj) = err.as_object_mut() {
+        obj.insert("type".into(), Value::String("usage_limit_reached".into()));
+    }
     Some(json!({ "error": err }))
 }
 
@@ -570,11 +583,49 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_headers_keep_slots_without_durations() {
+        // Upstream sent a primary without a duration and a secondary with one.
+        let mut up = reqwest::header::HeaderMap::new();
+        up.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        up.insert("x-codex-secondary-used-percent", "25".parse().unwrap());
+        up.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
+        let stored = windows_from_headers(&up);
+        let mut h = HeaderMap::new();
+        rate_limit_headers(&stored, &mut h);
+        assert_eq!(h["x-codex-primary-used-percent"], "100");
+        assert!(h.get("x-codex-primary-window-minutes").is_none());
+        assert!(h.get("x-codex-primary-reset-at").is_none());
+        assert_eq!(h["x-codex-secondary-used-percent"], "25");
+        assert_eq!(h["x-codex-secondary-window-minutes"], "10080");
+
+        // And the other way round: a known primary, a secondary without a duration.
+        let windows = vec![
+            UsageWindow { name: "secondary".into(), used_percent: 40.0, resets_at: None, window_secs: None },
+            UsageWindow { name: "5h".into(), used_percent: 10.0, resets_at: None, window_secs: Some(18_000) },
+        ];
+        let mut h = HeaderMap::new();
+        rate_limit_headers(&windows, &mut h);
+        assert_eq!(h["x-codex-primary-used-percent"], "10");
+        assert_eq!(h["x-codex-secondary-used-percent"], "40");
+    }
+
+    #[test]
     fn stream_errors_become_http_error_bodies() {
         let err = json!({"type": "usage_limit_reached", "resets_in_seconds": 60});
-        assert_eq!(stream_error_body(&json!({"type": "error", "error": err})), Some(json!({"error": err})));
-        assert_eq!(stream_error_body(&json!({"type": "response.failed", "response": {"error": err}})), Some(json!({"error": err})));
-        assert_eq!(stream_error_body(&json!({"type": "response.failed", "response": {}})), None);
+        assert_eq!(stream_error_body(&json!({"type": "error", "error": err}), true), Some(json!({"error": err})));
+        assert_eq!(stream_error_body(&json!({"type": "response.failed", "response": {"error": err}}), true), Some(json!({"error": err})));
+        assert_eq!(stream_error_body(&json!({"type": "response.failed", "response": {}}), true), None);
+        // A quota error that names itself only by `code` still gets the type Codex reads.
+        let code_only =
+            json!({"type": "response.failed", "response": {"error": {"code": "usage_limit_reached", "message": "quota reached"}}});
+        assert_eq!(classify(200, &code_only, None), Failure::Exhausted { until: None });
+        assert_eq!(
+            stream_error_body(&code_only, true),
+            Some(json!({"error": {"type": "usage_limit_reached", "code": "usage_limit_reached", "message": "quota reached"}}))
+        );
+        // Other errors keep their own type.
+        let other = json!({"type": "error", "error": {"type": "server_error", "message": "x"}});
+        assert_eq!(stream_error_body(&other, false), Some(json!({"error": {"type": "server_error", "message": "x"}})));
     }
 
     #[test]
