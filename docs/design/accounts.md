@@ -32,7 +32,7 @@ Both vendors attach API access to a service account in two ways:
 - **A service account key** is an API key. It needs nothing beyond the `api-key`/`provider` method.
 - **Workload identity federation** exchanges a JWT from the host's identity provider for a short-lived access token: RFC 7523 `jwt-bearer` at `https://api.anthropic.com/v1/oauth/token`, RFC 8693 token exchange at `https://auth.openai.com/oauth/token`. Neither returns a refresh token; renewal is another exchange.
 
-Workload identity is `workload_identity` on a config-file provider. The gateway reads the JWT file on every exchange, holds the access token until 5 minutes before expiry (80% of a shorter lifetime), and drops it on a 401. A per-provider lock makes concurrent requests wait for one exchange, because an identity token with a `jti` can be exchanged once. Runtime accounts refuse `workload_identity`: setting it through the admin API would let an operator make the server read any file and send it to a token endpoint. OpenAI's X.509 certificate federation is not supported.
+Workload identity is `workload_identity` on a config-file provider. The gateway reads the JWT file on every exchange, holds the access token until 5 minutes before expiry (80% of a shorter lifetime), and drops it when a 401 refuses that token; a 401 for an older token leaves a newer one. Key reloads keep it. A per-provider lock, held in a slot that is never replaced, makes concurrent requests wait for one exchange, because an identity token with a `jti` can be exchanged once. Runtime accounts refuse `workload_identity`: setting it through the admin API would let an operator make the server read any file and send it to a token endpoint. OpenAI's X.509 certificate federation is not supported.
 
 ## Add methods
 
