@@ -21,7 +21,7 @@ opentelemetry = "0.33.1"
 opentelemetry-appender-tracing = "0.33.1"
 opentelemetry-otlp = "0.33.1"
 opentelemetry_sdk = "0.33.1"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 rand = "0.10.3"
 rmcp = { version = "3.5.1", default-features = false, features = ["auth", "client", "server", "reqwest", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 rquickjs = { version = "0.12", features = ["futures"] }
