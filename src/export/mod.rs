@@ -108,43 +108,6 @@ impl Exchange {
         let tools: usize = self.tool_calls.iter().map(|t| t.len() + std::mem::size_of::<String>()).sum();
         strings.iter().map(|s| s.len()).sum::<usize>() + tools + std::mem::size_of::<Self>()
     }
-
-    /// The row as a destination with these settings would have taken it, or
-    /// `None` when it already is. The capture keeps what the most generous
-    /// destination wants.
-    fn fitted(&self, bodies: bool, max_body_bytes: usize) -> Option<Self> {
-        if !bodies {
-            if self.request.is_empty() && self.response.is_empty() && self.output.is_empty() && self.output_text.is_empty() {
-                return None;
-            }
-            return Some(Self {
-                request: String::new(),
-                request_truncated: false,
-                response: String::new(),
-                response_truncated: false,
-                output: String::new(),
-                output_text: String::new(),
-                stop_reason: String::new(),
-                error: String::new(),
-                streamed: false,
-                ..self.clone()
-            });
-        }
-        if self.request.len() <= max_body_bytes && self.response.len() <= max_body_bytes {
-            return None;
-        }
-        let mut row = self.clone();
-        cut(&mut row.request, &mut row.request_truncated, max_body_bytes);
-        cut(&mut row.response, &mut row.response_truncated, max_body_bytes);
-        Some(row)
-    }
-}
-
-/// Keep at most `limit` bytes of `s`, and note in `flag` when that cut it.
-fn cut(s: &mut String, flag: &mut bool, limit: usize) {
-    let (kept, cut) = truncate(std::mem::take(s), limit);
-    *s = kept;
-    *flag |= cut;
 }
 
 /// A response body as the tap saw it.
@@ -163,6 +126,12 @@ impl Captured {
             self.truncated = true;
         }
         self.bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+
+    /// The first `limit` bytes, as if they had been captured with that limit.
+    fn limited(&self, limit: usize) -> Self {
+        let cut = self.bytes.len() > limit;
+        Self { bytes: self.bytes[..self.bytes.len().min(limit)].to_vec(), sse: self.sse, truncated: self.truncated || cut }
     }
 }
 
@@ -225,17 +194,34 @@ impl Capture {
         Pending { capture: self.clone() }
     }
 
-    /// Build the row and queue it.
-    pub fn submit(&self, f: Finished<'_>) {
-        let row = self.exchange(f);
-        self.exporter.enqueue(row);
+    /// Build the row and queue it. A destination that keeps less than the
+    /// capture gets its own row, built from what it keeps, so that its
+    /// `output` is what it would have been on its own. The rows share an `id`.
+    pub fn submit(&self, mut f: Finished<'_>) {
+        let id = uuid::Uuid::now_v7().to_string();
+        let response = f.response.take();
+        let mut rows = Vec::with_capacity(self.exporter.settings.len());
+        for &(bodies, max) in self.exporter.settings.iter().skip(1) {
+            let (request, cut) = if bodies { prefix(&self.request, max) } else { (Bytes::new(), false) };
+            let response = if bodies { response.as_ref().map(|r| r.limited(max)) } else { None };
+            rows.push(Arc::new(self.build(&id, &f, &request, bodies && (self.request_truncated || cut), response)));
+        }
+        // The capture's own row takes the response bytes without a copy.
+        rows.insert(0, Arc::new(self.build(&id, &f, &self.request, self.request_truncated, response)));
+        self.exporter.enqueue(&rows);
     }
 
-    fn exchange(&self, f: Finished<'_>) -> Exchange {
+    #[cfg(test)]
+    fn exchange(&self, mut f: Finished<'_>) -> Exchange {
+        let response = f.response.take();
+        self.build(&uuid::Uuid::now_v7().to_string(), &f, &self.request, self.request_truncated, response)
+    }
+
+    fn build(&self, id: &str, f: &Finished<'_>, request: &Bytes, request_truncated: bool, response: Option<Captured>) -> Exchange {
         let r = f.record;
         let finished = f.started_at + chrono::Duration::milliseconds(r.latency_ms);
         let mut row = Exchange {
-            id: uuid::Uuid::now_v7().to_string(),
+            id: id.to_string(),
             started_at: timestamp(f.started_at),
             finished_at: timestamp(finished),
             trace_id: r.trace_id.clone().unwrap_or_default(),
@@ -258,11 +244,11 @@ impl Capture {
             context_window: r.context_window,
             cost: r.api_equivalent_cost,
             tool_calls: f.tools.to_vec(),
-            request: String::from_utf8_lossy(&self.request).into_owned(),
-            request_truncated: self.request_truncated,
+            request: String::from_utf8_lossy(request).into_owned(),
+            request_truncated,
             ..Default::default()
         };
-        let Some(resp) = f.response else { return row };
+        let Some(resp) = response else { return row };
         row.streamed = resp.sse;
         row.response_truncated = resp.truncated;
         let success = (200..300).contains(&r.status);
@@ -364,6 +350,8 @@ fn prefix(b: &Bytes, limit: usize) -> (Bytes, bool) {
 /// Where rows go: a queue bounded by bytes, and the task that empties it.
 pub struct Sink {
     name: &'static str,
+    /// Which of the exporter's body settings this destination's rows are built with.
+    setting: usize,
     /// Whether the destination takes the request and response bodies.
     bodies: bool,
     max_body_bytes: usize,
@@ -405,6 +393,7 @@ impl Sink {
         let task = tokio::spawn(run(Queue { rx, stop, queued: queued.clone() }));
         Self {
             name,
+            setting: 0,
             bodies,
             max_body_bytes,
             limit: queue_mb.saturating_mul(1024 * 1024),
@@ -415,11 +404,7 @@ impl Sink {
         }
     }
 
-    fn enqueue(&self, row: &Arc<Exchange>) {
-        let row = match row.fitted(self.bodies, self.max_body_bytes) {
-            Some(fitted) => Arc::new(fitted),
-            None => row.clone(),
-        };
+    fn enqueue(&self, row: Arc<Exchange>) {
         let size = row.size();
         let fits = self.queued.fetch_add(size, Ordering::AcqRel) + size <= self.limit;
         if !fits || self.tx.send(row).is_err() {
@@ -446,15 +431,26 @@ pub struct Exporter {
     /// What the capture keeps: what the most generous destination wants.
     bodies: bool,
     max_body_bytes: usize,
+    /// The distinct `(bodies, max_body_bytes)` of the destinations, the
+    /// capture's own first.
+    settings: Vec<(bool, usize)>,
     /// Rows taken but not yet queued ([`Pending`]).
     in_flight: AtomicUsize,
 }
 
 impl Exporter {
-    pub fn new(sinks: Vec<Sink>) -> Arc<Self> {
+    pub fn new(mut sinks: Vec<Sink>) -> Arc<Self> {
         let bodies = sinks.iter().any(|s| s.bodies);
         let max_body_bytes = sinks.iter().filter(|s| s.bodies).map(|s| s.max_body_bytes).max().unwrap_or(0);
-        Arc::new(Self { sinks, bodies, max_body_bytes, in_flight: AtomicUsize::new(0) })
+        let mut settings = vec![(bodies, max_body_bytes)];
+        for sink in &mut sinks {
+            let own = if sink.bodies { (true, sink.max_body_bytes) } else { (false, 0) };
+            sink.setting = settings.iter().position(|s| *s == own).unwrap_or_else(|| {
+                settings.push(own);
+                settings.len() - 1
+            });
+        }
+        Arc::new(Self { sinks, bodies, max_body_bytes, settings, in_flight: AtomicUsize::new(0) })
     }
 
     /// The destinations, in the order they were given.
@@ -469,10 +465,19 @@ impl Exporter {
         Arc::new(Capture { exporter: self.clone(), endpoint: endpoint.to_string(), request, request_truncated })
     }
 
-    fn enqueue(&self, row: Exchange) {
+    /// Queue each destination's row: `rows` follows `settings`.
+    fn enqueue(&self, rows: &[Arc<Exchange>]) {
+        for sink in &self.sinks {
+            sink.enqueue(rows[sink.setting].clone());
+        }
+    }
+
+    /// Queue one row, as built, for every destination.
+    #[cfg(test)]
+    fn enqueue_row(&self, row: Exchange) {
         let row = Arc::new(row);
         for sink in &self.sinks {
-            sink.enqueue(&row);
+            sink.enqueue(row.clone());
         }
     }
 
