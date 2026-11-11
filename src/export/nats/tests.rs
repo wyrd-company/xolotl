@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use async_nats::jetstream::stream;
 use serde_json::json;
 
 use super::*;
-use crate::export::Exporter;
+use crate::export::{Captured, Exporter};
 
 fn row(id: &str) -> Exchange {
     Exchange {
@@ -80,16 +82,64 @@ fn a_large_row_loses_its_response_first() {
     assert_eq!(encode(&r, fixed - 1).unwrap_err(), serde_json::to_vec(&r).unwrap().len());
 }
 
-#[test]
-fn each_destination_gets_its_own_bodies() {
-    let mut r = row("1");
-    r.request = "x".repeat(100);
-    assert!(r.fitted(true, 100).is_none());
-    let cut = r.fitted(true, 10).unwrap();
-    assert_eq!((cut.request.len(), cut.request_truncated, cut.response_truncated), (10, true, true));
-    let bare = r.fitted(false, 0).unwrap();
-    assert!(bare.request.is_empty() && bare.response.is_empty() && bare.output_text.is_empty() && !bare.request_truncated);
-    assert_eq!(bare.session_key, "abc");
+/// A destination that hands its rows to the test.
+fn collecting(bodies: bool, max: usize) -> (Sink, tokio::sync::mpsc::UnboundedReceiver<Exchange>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink = Sink::spawn("test", bodies, max, 64, move |mut q: Queue| async move {
+        while let Some(row) = q.rx.recv().await {
+            q.done(&row);
+            let _ = tx.send(row.as_ref().clone());
+        }
+    });
+    (sink, rx)
+}
+
+#[tokio::test]
+async fn each_destination_gets_the_row_it_would_get_alone() {
+    let record = crate::db::RequestRecord { endpoint: "/v1/chat/completions".into(), status: 200, ..Default::default() };
+    let answer = "a".repeat(2000);
+    let body = json!({"choices": [{"message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}]}).to_string();
+    let request = Bytes::from(format!("{{\"pad\":\"{}\"}}", "p".repeat(3000)));
+    let submit = |exporter: &Arc<Exporter>| {
+        let capture = exporter.capture("/v1/chat/completions", &request);
+        let mut response = Captured::default();
+        if let Some(limit) = capture.response_limit() {
+            response.push(body.as_bytes(), limit);
+        }
+        capture.submit(crate::export::Finished {
+            record: &record,
+            started_at: chrono::Utc::now(),
+            session_key: "abc",
+            session_source: "test",
+            upstream_model: "m",
+            usage: Default::default(),
+            tools: &[],
+            response: capture.response_limit().map(|_| response),
+        });
+    };
+    let alone = |bodies, max| async move {
+        let (sink, mut rx) = collecting(bodies, max);
+        submit(&Exporter::new(vec![sink]));
+        rx.recv().await.unwrap()
+    };
+    let (small, mut small_rx) = collecting(true, 256);
+    let (large, mut large_rx) = collecting(true, 1 << 20);
+    let (bare, mut bare_rx) = collecting(false, 1 << 20);
+    let (same, mut same_rx) = collecting(true, 1 << 20);
+    submit(&Exporter::new(vec![small, large, bare, same]));
+    let together =
+        [small_rx.recv().await.unwrap(), large_rx.recv().await.unwrap(), bare_rx.recv().await.unwrap(), same_rx.recv().await.unwrap()];
+    assert!(together.iter().all(|r| r.id == together[0].id), "one id for every destination");
+    let expected = [alone(true, 256).await, alone(true, 1 << 20).await, alone(false, 1 << 20).await, alone(true, 1 << 20).await];
+    for (got, want) in together.iter().zip(&expected) {
+        assert_eq!(
+            Exchange { id: String::new(), started_at: String::new(), finished_at: String::new(), ..got.clone() },
+            Exchange { id: String::new(), started_at: String::new(), finished_at: String::new(), ..want.clone() }
+        );
+    }
+    assert_eq!((together[0].request.len(), together[0].output_text.len()), (256, 0), "a cut response doesn't assemble");
+    assert_eq!(together[1].output_text, answer);
+    assert!(together[2].request.is_empty() && together[2].output_text.is_empty());
 }
 
 #[tokio::test]
@@ -263,7 +313,7 @@ async fn nats_rows_wait_for_a_restart() {
     docker("stop");
     let ids: Vec<String> = (0..20).map(|_| uuid::Uuid::now_v7().to_string()).collect();
     for id in &ids {
-        exporter.enqueue(row(id));
+        exporter.enqueue_row(row(id));
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(exporter.sinks()[0].queued() > 0, "rows wait while NATS is down");
@@ -337,14 +387,14 @@ async fn nats_rows_reach_clickhouse_after_its_outage() {
         r.session_key = run.clone();
         r.request = format!("{{\"n\":{i},\"text\":\"{}\"}}", "héllo 漢字 🦎 ".repeat(200));
         ids.push(r.id.clone());
-        exporter.enqueue(r);
+        exporter.enqueue_row(r);
     }
     // Too large for the server's 8 MB `max_payload`: cut, not lost.
     let mut big = row(&uuid::Uuid::now_v7().to_string());
     big.session_key = run.clone();
     big.request = "q".repeat(5 << 20);
     big.response = "r".repeat(5 << 20);
-    exporter.enqueue(big.clone());
+    exporter.enqueue_row(big.clone());
     for _ in 0..300 {
         if exporter.sinks()[0].queued() == 0 {
             break;
@@ -372,13 +422,13 @@ async fn nats_rows_reach_clickhouse_after_its_outage() {
     );
     let text = select(q).await.unwrap();
     assert_eq!(text, format!("0\t0\t{}\n", "héllo 漢字 🦎 ".repeat(200)));
-    // `max_body_bytes` cut both bodies to 4 MiB; to fit 8 MB, the response lost more.
+    // To fit 8 MB, the response was cut and the request kept.
     let q = format!(
-        "SELECT toUInt8(request_truncated), toUInt8(response_truncated), length(request), length(response) < 4194304 \
+        "SELECT toUInt8(request_truncated), toUInt8(response_truncated), length(request), length(request) + length(response) <= 8388608 \
          FROM xolotl.exchanges FINAL WHERE id = '{}' FORMAT TSV",
         big.id
     );
-    assert_eq!(select(q).await.unwrap(), "1\t1\t4194304\t1\n");
+    assert_eq!(select(q).await.unwrap(), "0\t1\t5242880\t1\n");
     let errors = select("SELECT count() FROM xolotl.exchanges_errors FORMAT TSV".into()).await.unwrap();
     assert_eq!(errors.trim(), "0");
     exporter.shutdown().await;

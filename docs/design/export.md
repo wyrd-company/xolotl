@@ -33,7 +33,7 @@ Two gaps remain:
 
 `Exporter` takes each row once and hands it to every `Sink`. A sink is one destination: its own queue, bounded by its own `queue_mb`, and the task that empties it. Capture and assembly are shared, so a new destination adds only how it sends a row.
 
-The capture keeps what the most generous destination wants: bodies when any destination has `bodies`, cut at the largest `max_body_bytes`. `Exchange::fitted` then gives each destination the row as its own settings would have produced it, without bodies or with them cut further. When the settings match, as with one destination, the row is shared through an `Arc`, not copied. Each destination counts its outcomes in `xolotl.export.rows` under its own `sink`.
+The capture keeps what the most generous destination wants: bodies when any destination has `bodies`, cut at the largest `max_body_bytes`. `Capture::submit` builds one row for each distinct `(bodies, max_body_bytes)` among the destinations, all with one `id`. A destination that keeps less gets a row built from the request and response cut to its own limit, and assembled from that cut response, so its row is the row it would get on its own. Destinations with the same settings, as with one destination, share a row through an `Arc`. The capture's own row takes the response bytes without a copy. Each destination counts its outcomes in `xolotl.export.rows` under its own `sink`.
 
 ## Queue and delivery to ClickHouse
 
