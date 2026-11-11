@@ -34,35 +34,9 @@ jobs:
           intentional-version: 0.4.1
       - name: Require an Intentional release record
         id: verify
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          refuse() { echo "::error::refusing to deploy ${tag}: $1"; exit 1; }
-
-          [[ "$(git cat-file -t "refs/tags/${tag}")" == "tag" ]] || refuse "not an annotated tag"
-          body="$(git cat-file -p "refs/tags/${tag}" | sed '1,/^$/d')"
-          [[ "$(printf '%s\n' "$body" | head -n1)" == "intentional release record" ]] || refuse "not an Intentional release record"
-          field() { printf '%s\n' "$body" | sed -n "s/^$1: //p" | head -n1; }
-
-          [[ "$(field tag-id)" == "release-unit/xolotl/primary" ]] || refuse "unexpected tag-id $(field tag-id)"
-          [[ "$(field version)" == "$tag" ]] || refuse "record version $(field version) does not match the tag"
-          case "$(field baseline)" in
-            true)
-              echo "::notice::${tag} is a baseline record; nothing to release."
-              echo "release=false" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-            false) ;;
-            *) refuse "record has no baseline field" ;;
-          esac
-          [[ -n "$(field plan-digest)" ]] || refuse "record has no plan digest"
-
-          # The tagged commit must carry the applied release.
-          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          [[ "$version" == "$tag" ]] || refuse "Cargo.toml version $version is not $tag (was intentional apply committed?)"
-          grep -q "^## ${tag}\$" CHANGELOG.md || refuse "CHANGELOG.md has no ${tag} section"
-          echo "release=true" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: .github/scripts/release-tag.sh
 
   test:
     needs: guard
@@ -205,9 +179,11 @@ jobs:
 
   # A release made with GITHUB_TOKEN starts no other workflows, and wyrd.foo
   # reads the GitHub Release of the tag, so the code unit publishes from here,
-  # after the github-release job created the Release.
+  # after the github-release job created the Release. This also publishes the
+  # docs of a docs tag on the same commit: publish-docs.yml leaves them to this
+  # job. The docs do not wait for the image: they name it only as `latest`.
   docs:
-    needs: [guard, github-release, image]
+    needs: [guard, github-release]
     if: needs.guard.outputs.release == 'true'
     uses: wyrd-company/wyrd.foo/.github/workflows/publish-docs.yml@v2
     with:

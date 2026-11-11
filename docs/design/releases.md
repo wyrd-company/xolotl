@@ -46,14 +46,13 @@ Intentional is not checked here. `intentional check` only validates the config, 
 
 ## Release workflow (`.github/workflows/release.yml`)
 
-Triggered by any `X.Y.Z` tag. A `guard` job decides whether the tag is a real release:
+Triggered by any `X.Y.Z` tag. A `guard` job decides whether the tag is a real release. It fetches the annotated tag object explicitly (checkout doesn't reliably fetch it), runs `intentional check`, then runs `.github/scripts/release-tag.sh`, which:
 
-1. Fetch the annotated tag object explicitly (checkout doesn't reliably fetch it) and run `intentional check`.
-2. Refuse (fail) unless the tag:
+1. Refuses (fails) unless the tag:
    - is annotated, and its message starts with `intentional release record`;
    - has `tag-id: release-unit/xolotl/primary` and `version` equal to the tag name.
-3. If the record has `baseline: true`, stop without failing; nothing is released.
-4. Refuse unless the record has a plan digest, `Cargo.toml` has the tag's version, and `CHANGELOG.md` has a `## X.Y.Z` section. Together these prove the applied release was committed.
+2. If the record has `baseline: true`, stops without failing; nothing is released.
+3. Refuses unless the record has a plan digest, `Cargo.toml` has the tag's version, and `CHANGELOG.md` has a `## X.Y.Z` section. Together these prove the applied release was committed.
 
 Only when the guard outputs `release=true` do the other jobs run:
 - tests;
@@ -61,12 +60,16 @@ Only when the guard outputs `release=true` do the other jobs run:
 - a GitHub release with those archives and their `.sha256` files, with notes from the CHANGELOG section;
 - after the GitHub release, the Homebrew formula `Formula/xolotl.rb` in `wyrd-company/homebrew-tools`, written by `.github/scripts/homebrew-formula.sh` and pushed with the org secret `FORMULAE_PUBLISH_KEY`;
 - the GHCR image `ghcr.io/wyrd-company/xolotl` for amd64 and arm64, tagged `X.Y.Z`, `X.Y` and `latest`;
-- after the GitHub release and the image, the code unit is published to wyrd.foo by calling the wyrd.foo v2 reusable workflow (`publish-docs.yml@v2`) with the tag as `ref`.
+- after the GitHub release, the code unit is published to wyrd.foo by calling the wyrd.foo v2 reusable workflow (`publish-docs.yml@v2`) with the tag as `ref`.
 
-The code unit publishes from this workflow, not from the tag push on its own: wyrd.foo reads the GitHub release of the tag, the release is created by the `github-release` job, and a release created with `GITHUB_TOKEN` starts no other workflows. The reusable workflow needs the org secrets `WYRD_TOOLS_DOCS_PUBLISHER_APP_ID` and `WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY`; without them the `docs` job fails after the binaries and the image are released. The `homebrew` and `docs` jobs do not depend on each other.
+The code unit publishes from this workflow, not from the tag push on its own: wyrd.foo reads the GitHub release of the tag, the release is created by the `github-release` job, and a release created with `GITHUB_TOKEN` starts no other workflows. The same run publishes the docs of a docs tag on the same commit (see below). The reusable workflow needs the org secrets `WYRD_TOOLS_DOCS_PUBLISHER_APP_ID` and `WYRD_TOOLS_DOCS_PUBLISHER_PRIVATE_KEY`; without them the `docs` job fails after the binaries are released. The `homebrew`, `image` and `docs` jobs do not depend on each other: the docs name the image only as `latest`, and the publisher does not read it, so the docs do not wait for the image build.
 
-The guard script was tested locally against a baseline tag, a release tag, a hand-made annotated tag and a lightweight tag.
+`release-tag.sh` was tested locally against a baseline tag, a release tag, a hand-made annotated tag and a lightweight tag. `docs-tag.sh` was tested locally against a docs tag with a published code release, one with a missing code release, one with no code tag on its commit, and a failed read.
 
 ## Docs publish workflow (`.github/workflows/publish-docs.yml`)
 
-Calls the same reusable workflow when a docs unit tag (`xolotl-docs@X.Y.Z`) is pushed, and on a manual run. The manual run takes the tag or commit as `ref`, and the optional `feature*` inputs. A push to `main` does not publish. To publish again without a new release, run it by hand: **Actions → Publish to wyrd.foo → Run workflow** with the tag, or `gh workflow run publish-docs.yml -f ref=<tag>`.
+Calls the same reusable workflow when a docs unit tag (`xolotl-docs@X.Y.Z`) is pushed, and on a manual run.
+
+On a docs tag push, a `check` job runs `.github/scripts/docs-tag.sh` first. The publisher reads the GitHub release of the code unit's tag and waits at most 600 s for it, and the release workflow creates that release only after the tests and every binary. So when a code release tag on the docs tag's commit (one that `release-tag.sh` accepts) has no published GitHub release, the check writes a notice and the run publishes nothing; the `docs` job of the release workflow publishes that commit after it creates the release. Every other docs tag publishes. A failed read of a release fails the check, so a missed publication shows as a red run. If the release workflow fails before its `docs` job, run this workflow by hand after the fix.
+
+The manual run takes the tag or commit as `ref`, and the optional `feature*` inputs. A push to `main` does not publish. To publish again without a new release, run it by hand: **Actions → Publish to wyrd.foo → Run workflow** with the tag, or `gh workflow run publish-docs.yml -f ref=<tag>`.
