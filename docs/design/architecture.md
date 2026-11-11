@@ -7,7 +7,7 @@ clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web
         │  client key (Authorization / x-api-key), or a web UI session
         ▼
   axum router ── authorize (keys + policy) ──┬── subscription pools: codex, claude, grok, opencode-go
-        │                                     ├── gateway providers: vercel, mistral, openai-compatible
+        │                                     ├── provider accounts: vercel, mistral, openai-compatible
         │                                     └── /mcp code mode ── upstream MCP servers
         ├── OpenBao (KV v2, AppRole): every secret
         ├── SQLite: runtime state, no secrets
@@ -15,10 +15,12 @@ clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web
         └── ClickHouse (HTTP, optional): session requests and responses
 ```
 
-## Two kinds of upstream
+## Accounts
+
+Every upstream credential is an account of one kind ([Accounts and account kinds](accounts.md)). A kind places its accounts in one of two ways:
 
 - **Subscription pools** (`claude`, `codex`, `grok`, `opencode-go`) hold several accounts per provider. Codex, Claude and Grok accounts use OAuth tokens; OpenCode Go accounts use API keys. A request goes to one account chosen by the pool, and fails over to another on quota, auth or transient errors. See [Subscription accounts](subscriptions.md).
-- **Gateway providers** are configured in the config file under `[gateway.providers.<name>]` with a `kind`: `vercel`, `mistral` or `openai-compatible` (used for llama.cpp). Each has one API key in OpenBao at `providers/<name>`, or `no_auth = true`. Provider names become model prefixes and path prefixes, so names like `v1`, `admin` or `claude` are rejected.
+- **Provider accounts** have a `kind`: `vercel`, `mistral` or `openai-compatible` (used for llama.cpp). Each is a provider of its own, named by the operator, with one API key in OpenBao at `providers/<name>`, or `no_auth`. They come from the config file (`[gateway.providers.<name>]`) or are added at runtime and stored in OpenBao. Provider names become model prefixes and path prefixes, so names like `v1`, `admin` or `claude` are rejected.
 
 ## MCP gateway
 
@@ -41,7 +43,7 @@ One router on one listener (`server.listen`) serves every route: the LLM endpoin
 
 1. `authorize` takes the key from `Authorization` (Bearer or bare), `x-api-key` or `x-management-key`, and resolves it to a principal: client id plus policy. The bootstrap admin token resolves to an unrestricted policy. Without a key, an `/admin` route also accepts a web UI session.
 2. The route checks the scope it needs (`proxy`, `mcp`, `management`, `keys` or `admin`).
-3. LLM endpoints resolve `model` through the policy, count the request against the policy's [rate limits](limits.md) (429 when one is reached) and dispatch to a pool or a gateway provider, translating the request when the provider doesn't speak the endpoint's format ([Routing](routing.md)). Passthroughs check only the provider (and `model`, when the body is JSON).
+3. LLM endpoints resolve `model` through the policy, count the request against the policy's [rate limits](limits.md) (429 when one is reached) and dispatch to a pool or a provider account, translating the request when the provider doesn't speak the endpoint's format ([Routing](routing.md)). Passthroughs check only the provider (and `model`, when the body is JSON).
 4. Responses are relayed as they arrive. `TapStream` (`src/proxy.rs`) reads token usage from the upstream JSON or SSE body on the way through, and `Accounting` writes the request log row and metrics, counts the tokens against the rate limits, and updates the request's session and its key's tool counts, when the response finishes. A translated response is translated after this tap, so usage always comes from what the upstream sent.
 
 ## Background tasks
@@ -50,7 +52,7 @@ Started by `server::spawn_background`:
 
 | Every | Task |
 |---|---|
-| 60 s | Reload client keys, policies and MCP servers from OpenBao; sync accounts (picks up added and removed accounts; keeps the in-memory credentials of accounts it already holds); drop idle rate limit counters |
+| 60 s | Reload client keys, policies, provider accounts and MCP servers from OpenBao; sync accounts (picks up added and removed accounts; keeps the in-memory credentials of accounts it already holds); drop idle rate limit counters |
 | `catalog.refresh_secs` (600 s) | Re-discover models from every provider |
 | `mcp.tools_refresh_secs` (300 s) | Re-read upstream MCP tool lists (only when MCP servers are configured) |
 | 15 s | Retry OpenBao writes of refreshed OAuth credentials that failed: subscription accounts ([details](subscriptions.md#when-the-vault-write-fails)) and MCP server logins |
@@ -80,7 +82,8 @@ On graceful shutdown the server makes one last attempt to save unsaved credentia
 | `src/catalog.rs` | Model catalog, wire formats and routes (native or translated) |
 | `src/keys.rs` | Client keys and policy storage |
 | `src/subscription/` | Account pools: `mod.rs` (selection, failover, refresh), `codex.rs`, `claude.rs`, `opencode_go.rs`, `oauth.rs` (PKCE, token errors) |
-| `src/gateway.rs` | Gateway providers |
+| `src/accounts.rs` | Account kinds: placement and add methods ([Accounts and account kinds](accounts.md)) |
+| `src/gateway.rs` | Provider accounts: config-file and OpenBao sources, requests and passthroughs |
 | `src/mcp/` | MCP gateway: `mod.rs` (servers, policy checks, call log), `upstream.rs` (client connections), `oauth.rs` (OAuth logins and token storage), `codemode.rs` (QuickJS sandbox, TypeScript declarations), `server.rs` (the `/mcp` server) |
 | `src/proxy.rs` | Header filtering, streaming relay, token usage, error shapes |
 | `src/translate/` | Translation between Messages, Responses and Chat: requests, responses and streams |

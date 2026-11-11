@@ -238,12 +238,35 @@ export interface KeyInfo {
   limit_usage?: Consumption;
 }
 
-export interface GatewayProvider {
+/** Every kind of account, as `GET /admin/account-kinds` lists them. */
+export type AccountKind = SubProvider | ProviderKind;
+export type ProviderKind = "vercel" | "mistral" | "openai-compatible";
+export type AddMethod = "device-login" | "browser-login" | "import" | "api-key" | "provider";
+
+export interface AccountKindInfo {
+  kind: AccountKind;
+  label: string;
+  description: string;
+  /** `pool`: one of many accounts of a fixed provider. `provider`: a provider of its own, named by the operator. */
+  placement: "pool" | "provider";
+  /** The provider name of a pool kind. */
+  provider: SubProvider | null;
+  add: AddMethod[];
+  /** Provider kinds: the base URL used when none is given; null means one is required. */
+  default_base_url: string | null;
+}
+
+/** A provider account: an API-key upstream addressed as `<name>/<model>`. */
+export interface ProviderAccount {
   name: string;
-  kind: "vercel" | "mistral" | "openai-compatible";
+  kind: ProviderKind;
+  /** `config`: from the config file, read-only here. `vault`: added at runtime. */
+  source: "config" | "vault";
   enabled: boolean;
   base_url: string | null;
   no_auth: boolean;
+  /** Names of the extra headers sent upstream. */
+  headers: string[];
   secret: string;
   has_key: boolean;
 }

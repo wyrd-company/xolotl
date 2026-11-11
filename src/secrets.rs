@@ -6,7 +6,8 @@
 //! - `telemetry`                    OTLP header values
 //! - `clickhouse`                   `{ password, user? }` for the ClickHouse export
 //! - `nats`                         `{ user, password }` or `{ creds }` for the NATS export
-//! - `providers/<name>`             `{ api_key }` upstream gateway provider keys
+//! - `providers/<name>`             `{ api_key }` of a config-file provider, or a provider account
+//!   added at runtime: `{ kind, base_url?, no_auth?, headers?, enabled?, api_key? }`
 //! - `accounts/<provider>/<id>`     OAuth credentials for subscription accounts
 //! - `mcp/<server>`                 values for an MCP server's `{field}` header placeholders
 //! - `mcp/<server>/oauth`           an MCP server's OAuth client registration and tokens

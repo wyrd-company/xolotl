@@ -6,6 +6,7 @@ These pages describe how xolotl is built and why. For installing, configuring an
 |---|---|
 | [Architecture](architecture.md) | Components, storage split, background tasks, source layout |
 | [Routing and policies](routing.md) | Model catalog, wire formats and translation between them, how a policy turns a model name into a target, passthroughs |
+| [Accounts and account kinds](accounts.md) | The account-kind registry, pool and provider accounts, how accounts are added, provider accounts in OpenBao, adding a kind |
 | [Subscription accounts](subscriptions.md) | Codex, Claude and OpenCode Go accounts: login, token refresh, account selection, failover, usage, T3Code hubs |
 | [Sessions and context](sessions.md) | Session identity, context accounting, the context lock, tool counts |
 | [MCP gateway](mcp.md) | Upstream MCP servers, code mode (`search` / `execute`), the QuickJS sandbox, OAuth logins, MCP policies, call log |

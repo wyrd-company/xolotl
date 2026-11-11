@@ -4,102 +4,34 @@
 // ---
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router";
 import { CatalogRefresh } from "@/components/catalog-refresh";
 
 import { Endpoints, EndpointsLegend } from "@/components/endpoints";
-import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Empty, PageHeader, QueryError } from "@/components/layout";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { get, post, type CatalogRoute, type GatewayProvider } from "@/lib/api";
+import { get, type CatalogRoute } from "@/lib/api";
 import { compact, relative } from "@/lib/format";
-import { useAction } from "@/lib/hooks";
-import { KeyState } from "@/pages/overview";
 
-const KINDS: Record<GatewayProvider["kind"], string> = {
-  vercel: "Vercel AI Gateway",
-  mistral: "Mistral",
-  "openai-compatible": "OpenAI-compatible",
-};
-
-export function ProvidersPage() {
-  const providers = useQuery({ queryKey: ["providers"], queryFn: () => get<GatewayProvider[]>("/admin/providers") });
+export function ModelsPage() {
   const routes = useQuery({ queryKey: ["catalog-routes"], queryFn: () => get<CatalogRoute[]>("/admin/catalog/routes") });
 
   return (
     <>
       <PageHeader
-        title="Providers & models"
-        description="Providers come from the config file; their keys live in OpenBao."
+        title="Models"
+        description={
+          <>
+            The models every account serves. Add providers and their keys on <Link to="/accounts">Accounts</Link>.
+          </>
+        }
       />
-      <QueryError error={providers.error ?? routes.error} />
-
-      <section aria-label="Gateway providers" className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {(providers.data ?? []).map((p) => (
-          <ProviderCard key={p.name} p={p} />
-        ))}
-        {providers.data?.length === 0 && (
-          <p className="text-muted-foreground text-sm">No gateway providers are configured.</p>
-        )}
-      </section>
-
+      <QueryError error={routes.error} />
       <Catalog routes={routes.data ?? []} />
     </>
-  );
-}
-
-function ProviderCard({ p }: { p: GatewayProvider }) {
-  const [key, setKey] = useState("");
-  const save = useAction(() => post(`/admin/providers/${p.name}/key`, { api_key: key.trim() }), {
-    invalidate: [["providers"]],
-    success: `Saved the ${p.name} key`,
-    onSuccess: () => setKey(""),
-  });
-  const id = `key-${p.name}`;
-  return (
-    <Card className="gap-4">
-      <CardHeader>
-        <CardTitle className="font-mono">{p.name}</CardTitle>
-        <CardDescription>{KINDS[p.kind]}</CardDescription>
-        {!p.enabled && (
-          <CardAction>
-            <Badge variant="secondary">disabled</Badge>
-          </CardAction>
-        )}
-      </CardHeader>
-      <CardContent className="flex flex-col gap-3 text-sm">
-        <div>
-          Key: <KeyState provider={p} />
-          {!p.no_auth && (
-            <>
-              {" "}
-              at <Mono>{p.secret}</Mono>
-            </>
-          )}
-        </div>
-        {p.base_url && <Mono className="text-muted-foreground text-xs break-all">{p.base_url}</Mono>}
-        {!p.no_auth && p.enabled && (
-          <form
-            className="flex flex-col gap-2"
-            onSubmit={(e) => {
-              e.preventDefault();
-              save.mutate(undefined);
-            }}
-          >
-            <Label htmlFor={id}>{p.has_key ? "Replace API key" : "Set API key"}</Label>
-            <div className="flex gap-2">
-              <Input id={id} type="password" autoComplete="off" className="font-mono" value={key} onChange={(e) => setKey(e.target.value)} />
-              <Button type="submit" variant="outline" disabled={!key.trim() || save.isPending}>
-                Save
-              </Button>
-            </div>
-          </form>
-        )}
-      </CardContent>
-    </Card>
   );
 }
 
@@ -170,7 +102,7 @@ function Catalog({ routes }: { routes: CatalogRoute[] }) {
           ))}
         </TableBody>
       </Table>
-      {shown.length === 0 && <Empty>{routes.length ? "No model matches." : "The catalog is empty. Add accounts or provider keys, then refresh."}</Empty>}
+      {shown.length === 0 && <Empty>{routes.length ? "No model matches." : "The catalog is empty. Add accounts, then refresh."}</Empty>}
     </Card>
   );
 }

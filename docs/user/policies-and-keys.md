@@ -80,7 +80,7 @@ A model's switch in the editor writes `models`.
 |---|---|
 | `name` | Lowercase letters, digits, `-` and `_`, at most 63 characters |
 | `description` | Free text |
-| `providers` | Providers the key can use: `claude`, `codex`, `grok`, `opencode-go`, gateway provider names, or `*` for all |
+| `providers` | Providers the key can use: `claude`, `codex`, `grok`, `opencode-go`, provider account names, or `*` for all |
 | `accounts` | Per subscription provider, the accounts that serve the keys, or `["*"]` for every account, also accounts added later. See [Accounts](#accounts) |
 | `rules` | Allow and deny globs on `model` or `provider/model`, in order: `{ allow = "…" }` or `{ deny = "…" }`. The first that matches decides. See [Model names](#model-names) |
 | `models` | `provider/model` → `true` or `false`, for models no rule matches |

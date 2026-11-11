@@ -15,7 +15,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { del, get, post, PROVIDER_NAMES, SUB_PROVIDERS, type Account, type Status } from "@/lib/api";
+import { del, get, post, PROVIDER_NAMES, SUB_PROVIDERS, type Account, type AccountKindInfo, type ProviderAccount, type Status } from "@/lib/api";
+import { ProviderAccounts } from "@/pages/provider-accounts";
 import { publicUsageWindows } from "@/lib/usage-windows";
 import { resetCreditsSummary } from "@/lib/reset-credits";
 import { dateTime, relative } from "@/lib/format";
@@ -23,28 +24,39 @@ import { useAction } from "@/lib/hooks";
 
 export function AccountsPage() {
   const [search, setSearch] = useSearchParams();
-  const [filter, setFilter] = useState("all");
+  const [filter, setFilter] = useState(search.get("kind") === "providers" ? "providers" : "all");
   const accounts = useQuery({
     queryKey: ["accounts"],
     queryFn: () => get<Account[]>("/admin/accounts"),
     refetchInterval: 30_000,
   });
+  const providers = useQuery({ queryKey: ["providers"], queryFn: () => get<ProviderAccount[]>("/admin/providers") });
+  const kinds = useQuery({ queryKey: ["account-kinds"], queryFn: () => get<AccountKindInfo[]>("/admin/account-kinds"), staleTime: Infinity });
   const status = useQuery({
     queryKey: ["status"],
     queryFn: () => get<Status>("/admin/status"),
   });
   const all = accounts.data ?? [];
   const shown = filter === "all" ? all : all.filter((a) => a.provider === filter);
+  const providerAccounts = providers.data ?? [];
+  const showPools = filter !== "providers";
+  const showProviders = filter === "all" || filter === "providers";
+  const refreshing =
+    filter === "all"
+      ? [...SUB_PROVIDERS, ...providerAccounts.filter((p) => p.enabled).map((p) => p.name)]
+      : filter === "providers"
+        ? providerAccounts.filter((p) => p.enabled).map((p) => p.name)
+        : [filter];
   const sub = status.data?.subscription;
 
   return (
     <>
       <PageHeader
-        title="Subscription accounts"
+        title="Accounts"
         description={
           sub && (
             <>
-              Strategy: {sub.strategy} · session affinity {Math.round(sub.session_affinity_secs / 60)} min · accounts above{" "}
+              Pools: strategy {sub.strategy} · session affinity {Math.round(sub.session_affinity_secs / 60)} min · accounts above{" "}
               {sub.soft_limit_percent}% are used last
             </>
           )
@@ -54,21 +66,23 @@ export function AccountsPage() {
           <Link to="/accounts/add">Add account</Link>
         </Button>
       </PageHeader>
-      <QueryError error={accounts.error} />
+      <QueryError error={accounts.error ?? providers.error} />
 
       <Tabs value={filter} onValueChange={setFilter}>
-        <TabsList aria-label="Provider">
-          <TabsTrigger value="all">All ({all.length})</TabsTrigger>
+        <TabsList aria-label="Account kind">
+          <TabsTrigger value="all">All ({all.length + providerAccounts.length})</TabsTrigger>
           {SUB_PROVIDERS.map((p) => (
             <TabsTrigger key={p} value={p}>
               {PROVIDER_NAMES[p]} ({all.filter((a) => a.provider === p).length})
             </TabsTrigger>
           ))}
+          <TabsTrigger value="providers">Providers ({providerAccounts.length})</TabsTrigger>
         </TabsList>
       </Tabs>
 
-      <CatalogRefresh providers={filter === "all" ? SUB_PROVIDERS : [filter]} />
+      <CatalogRefresh providers={refreshing} />
 
+      {showPools && (
       <Card className="py-0">
         <Table className="min-w-[960px]">
           <TableHeader>
@@ -97,10 +111,12 @@ export function AccountsPage() {
         </Table>
         {accounts.isSuccess && shown.length === 0 && (
           <Empty>
-            No accounts yet. <Link to="/accounts/add">Add one</Link>.
+            No subscription accounts yet. <Link to="/accounts/add">Add one</Link>.
           </Empty>
         )}
       </Card>
+      )}
+      {showProviders && <ProviderAccounts providers={providerAccounts} kinds={kinds.data} loaded={providers.isSuccess} />}
     </>
   );
 }

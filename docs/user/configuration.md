@@ -172,8 +172,11 @@ for every request. See [Context lock](accounts.md#context-lock).
 
 ## `[gateway.providers.<name>]`
 
-Gateway providers are API-key upstreams. The name is a model prefix
-(`<name>/<model>`) and a path prefix (`/<name>/...`).
+Provider accounts from the config file. A provider account is an API-key
+upstream. The name is a model prefix (`<name>/<model>`) and a path prefix
+(`/<name>/...`). You can also add provider accounts at runtime, without this
+section; see [Provider accounts](accounts.md#provider-accounts). Providers from
+the config file are read-only at runtime, except for their key.
 
 ```toml
 [gateway.providers.vercel]
@@ -198,7 +201,7 @@ no_auth = true
 | `enabled` | `false` turns the provider off |
 
 Without a `[gateway]` section, xolotl configures `vercel` and `mistral`. When
-you add any provider, list every provider you want.
+you add any provider to the file, list every config-file provider you want.
 
 Names are letters, digits, `-` and `_`. These names are refused:
 `claude`, `codex`, `grok`, `opencode-go` (subscription accounts), and `v0`,
@@ -310,7 +313,7 @@ All paths are under `<mount>/<prefix>/`, by default `secret/xolotl/`.
 | `telemetry` | OTLP header values, keyed by header name | you |
 | `clickhouse` | `password` and, optionally, `user` for the [ClickHouse export](clickhouse-export.md) | you |
 | `nats` | `user` and `password`, or `creds` (a `.creds` file), for the [NATS export](nats-export.md) | you |
-| `providers/<name>` | `api_key` of a gateway provider | `xolotl providers set-key` |
+| `providers/<name>` | `api_key` of a config-file provider; a provider account added at runtime, with its `api_key` | `xolotl providers set-key`, `xolotl accounts add-provider` |
 | `accounts/<provider>/<id>` | OAuth tokens or API key of a subscription account | xolotl, at login and on refresh |
 | `policies/<policy>` | a client key policy | `xolotl policies put` |
 | `keys/<policy>/<client>` | a client key record, with `api_key` | `xolotl keys` |
@@ -328,4 +331,4 @@ bao kv put secret/xolotl/telemetry Authorization="Basic ..."
 
 Xolotl reloads policies, keys, accounts and MCP servers from OpenBao every
 60 seconds. `xolotl reload` reloads policies, keys and accounts at once, and
-re-reads gateway provider keys.
+re-reads provider keys.

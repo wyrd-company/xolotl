@@ -116,7 +116,7 @@ impl AccountKind {
             }
             Claude => pool(SubProvider::Claude, "Claude (Pro / Max)", "Claude subscription, used by Claude Code.", &[BrowserLogin, Import]),
             Grok => pool(SubProvider::Grok, "Grok Build (xAI)", "Grok Build subscription.", &[DeviceLogin]),
-            OpencodeGo => pool(SubProvider::OpencodeGo, "OpenCode Go", "OpenCode Go API key.", &[ApiKey]),
+            OpencodeGo => pool(SubProvider::OpencodeGo, "OpenCode Go", "API key from the OpenCode console.", &[ApiKey]),
             Vercel => provider("Vercel AI Gateway", "Vercel AI Gateway API key.", Some(VERCEL_BASE_URL)),
             Mistral => provider("Mistral", "Mistral API key.", Some(MISTRAL_BASE_URL)),
             OpenaiCompatible => provider("OpenAI-compatible", "Any OpenAI-compatible server, such as llama.cpp.", None),

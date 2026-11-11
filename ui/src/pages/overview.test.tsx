@@ -6,7 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { expect, test } from "vitest";
-import type { Account, GatewayProvider, Status } from "@/lib/api";
+import type { Account, ProviderAccount, Status } from "@/lib/api";
 import { OverviewPage } from "./overview";
 
 const account = (change: Partial<Account> = {}): Account => ({
@@ -49,12 +49,14 @@ const status: Status = {
     usage_poll_secs: 60,
   },
 };
-const gateway = (change: Partial<GatewayProvider>): GatewayProvider => ({
+const gateway = (change: Partial<ProviderAccount>): ProviderAccount => ({
   name: "gateway-a",
   kind: "openai-compatible",
+  source: "config",
   enabled: true,
   base_url: null,
   no_auth: false,
+  headers: [],
   secret: "sample",
   has_key: true,
   ...change,
@@ -74,7 +76,7 @@ test("names a stored policy that did not load as needing action", () => {
 
 function render(
   accounts: Account[],
-  providers: GatewayProvider[] = [],
+  providers: ProviderAccount[] = [],
   s = status,
 ) {
   const client = new QueryClient({

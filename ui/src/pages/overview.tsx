@@ -40,7 +40,7 @@ import {
   SUB_PROVIDERS,
   type Account,
   type CatalogRoute,
-  type GatewayProvider,
+  type ProviderAccount,
   type Status,
   type UsageRow,
 } from "@/lib/api";
@@ -70,7 +70,7 @@ export function OverviewPage() {
   });
   const providers = useQuery({
     queryKey: ["providers"],
-    queryFn: () => get<GatewayProvider[]>("/admin/providers"),
+    queryFn: () => get<ProviderAccount[]>("/admin/providers"),
   });
   const routes = useQuery({
     queryKey: ["catalog-routes"],
@@ -263,9 +263,9 @@ export function OverviewPage() {
           )}
           <div className="flex items-center justify-between border-t px-6 py-4">
             <h3 className="text-muted-foreground text-xs font-medium uppercase tracking-wide">
-              Gateway
+              Provider accounts
             </h3>
-            <Link to="/providers" className="text-primary text-sm">
+            <Link to="/accounts?kind=providers" className="text-primary text-sm">
               Manage
             </Link>
           </div>
@@ -313,10 +313,10 @@ export function OverviewPage() {
               </CardContent>
             </>
           )}
-          {providers.isPending && <Empty>Loading gateway providers…</Empty>}
+          {providers.isPending && <Empty>Loading provider accounts…</Empty>}
           {providers.isSuccess && configured.length === 0 && (
             <p className="text-muted-foreground px-6 pb-4 text-sm">
-              No gateway providers set up.
+              No provider accounts set up.
             </p>
           )}
           {accounts.isSuccess &&
@@ -324,16 +324,9 @@ export function OverviewPage() {
             unconfigured.length > 0 && (
               <div className="bg-muted text-muted-foreground flex flex-wrap items-center justify-between gap-2 border-t px-6 py-4 text-sm">
                 <span>Not set up: {unconfigured.join(" · ")}</span>
-                <span className="flex flex-wrap gap-x-3">
-                  <Link to="/providers" className="text-primary">
-                    Set up more providers
-                  </Link>
-                  {pools.some((p) => !p.accounts.length) && (
-                    <Link to="/accounts/add" className="text-primary">
-                      Add subscription account
-                    </Link>
-                  )}
-                </span>
+                <Link to="/accounts/add" className="text-primary">
+                  Add an account
+                </Link>
               </div>
             )}
         </Card>
@@ -608,7 +601,7 @@ function Stat({
   );
 }
 
-export function KeyState({ provider }: { provider: GatewayProvider }) {
+export function KeyState({ provider }: { provider: ProviderAccount }) {
   if (provider.no_auth)
     return <span className="text-muted-foreground">none needed</span>;
   return provider.has_key ? (

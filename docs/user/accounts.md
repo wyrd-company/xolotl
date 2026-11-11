@@ -1,22 +1,35 @@
 ---
-title: Subscription accounts
+title: Accounts
 order: 4
 product: xolotl
 ---
 
-A subscription account is a login to a consumer subscription or an API-key plan.
-Xolotl holds several accounts per provider, as a pool, and sends each request to
-one of them.
+An account is a credential that xolotl uses to send requests upstream. Each
+account has a kind. The kind decides where the account serves requests and how
+you add it:
 
-| Provider | Account | Web UI (**Add account**) | CLI |
-|---|---|---|---|
-| `codex` | ChatGPT subscription (Codex) | **Codex (ChatGPT)**, or **Import a login** | `xolotl auth login codex` |
-| `claude` | Claude subscription (Claude Code) | **Claude (Pro / Max)**, or **Import a login** | `xolotl auth login claude` |
-| `grok` | Grok Build (xAI) subscription | **Grok Build (xAI)** | `xolotl auth login grok` |
-| `opencode-go` | OpenCode Go API key | **OpenCode Go** | `xolotl accounts add-key` |
+- **Pool accounts** are logins to a consumer subscription or an API-key plan.
+  Xolotl holds several accounts per provider, as a pool, and sends each request
+  to one of them.
+- **Provider accounts** are API-key upstreams, such as Vercel AI Gateway,
+  Mistral or a llama.cpp server. You give each one a name, and clients address
+  it by that name: `<name>/<model>` and `/<name>/...`. A provider account is a
+  provider of its own.
+
+| Kind | Placement | Account | Web UI (**Add account**) | CLI |
+|---|---|---|---|---|
+| `codex` | pool `codex` | ChatGPT subscription (Codex) | **Codex (ChatGPT)**, or **Import a login** | `xolotl auth login codex` |
+| `claude` | pool `claude` | Claude subscription (Claude Code) | **Claude (Pro / Max)**, or **Import a login** | `xolotl auth login claude` |
+| `grok` | pool `grok` | Grok Build (xAI) subscription | **Grok Build (xAI)** | `xolotl auth login grok` |
+| `opencode-go` | pool `opencode-go` | OpenCode Go API key | **OpenCode Go** | `xolotl accounts add-key` |
+| `vercel` | provider | Vercel AI Gateway API key | **Provider account**, kind **Vercel AI Gateway** | `xolotl accounts add-provider <name> --kind vercel` |
+| `mistral` | provider | Mistral API key | **Provider account**, kind **Mistral** | `xolotl accounts add-provider <name> --kind mistral` |
+| `openai-compatible` | provider | Any OpenAI-compatible server, such as llama.cpp | **Provider account**, kind **OpenAI-compatible** | `xolotl accounts add-provider <name> --kind openai-compatible --base-url <url>` |
 
 Credentials go straight to OpenBao. Logging in to an account that is already
-in xolotl updates it. It does not add a duplicate.
+in xolotl updates it. It does not add a duplicate. Provider accounts can also
+come from the config file (see
+[`[gateway.providers.<name>]`](configuration.md#gatewayprovidersname)).
 
 ## Add an account
 
@@ -85,6 +98,39 @@ to keep conversations apart. The same ID keeps the session on one account.
 
 The upstream user agent is `xolotl/<version> (<client user agent>)`.
 
+### Provider accounts
+
+```sh
+echo "$MISTRAL_KEY" | xolotl accounts add-provider mistral-team --kind mistral
+xolotl accounts add-provider llama --kind openai-compatible \
+  --base-url http://llama.example.lan:8080 --no-auth
+```
+
+| Option | Meaning |
+|---|---|
+| `--kind` | `vercel`, `mistral` or `openai-compatible` |
+| `--base-url` | Required for `openai-compatible`. Overrides the default URL of the others |
+| `--no-auth` | The server needs no key. Without it, the CLI reads the key from stdin |
+| `--header Name=value` | An extra static header sent upstream. Repeat it for more |
+
+The name is a model prefix and a path prefix, so the
+[same rules](configuration.md#gatewayprovidersname) as for the config file apply.
+A name that the config file uses is refused. Xolotl stores the account, with
+its key and headers, in OpenBao at `providers/<name>`.
+
+If a key is already stored at `providers/<name>`, for example because you moved
+the provider out of the config file, adding the account without a key keeps
+that key.
+
+```sh
+echo "$NEW_KEY" | xolotl providers set-key mistral-team   # replace the key
+xolotl accounts remove-provider mistral-team              # remove the account and its key
+```
+
+A provider account that a policy names in `providers`, `precedence` or
+`winners` can't be removed: change the policy first. You change and remove
+config-file providers in the config file.
+
 ### Import a CLI login
 
 You can move a login from the Codex CLI (`~/.codex/auth.json`) or Claude Code
@@ -121,8 +167,10 @@ xolotl accounts list --provider codex
 xolotl accounts usage <id>    # fetch the usage windows now
 ```
 
-The CLI list shows each account's ID, provider, label, plan, priority, state
-and usage windows (for example `5h 12%, 7d 40%`).
+The CLI list shows each pool account's ID, provider, label, plan, priority,
+state and usage windows (for example `5h 12%, 7d 40%`). Without `--provider`, a
+second table shows the provider accounts: name, kind, where each is defined
+(`config` or `vault`) and whether its key is stored.
 
 | CLI state | Web UI state | Meaning | What to do |
 |---|---|---|---|
@@ -311,7 +359,7 @@ Xolotl does not redeem credits itself. T3 Code can redeem a Codex credit (see
 After you add, import, reset, enable, disable or remove an account, xolotl asks
 the provider for its model list again. `xolotl models --refresh` and the web
 UI's **Refresh models** control do it at once. See
-[Providers and models](web-ui.md#models).
+[Models](web-ui.md#models).
 
 ## T3 Code hubs
 
