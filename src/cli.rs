@@ -262,6 +262,8 @@ pub enum AccountsCmd {
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub enum ProviderKindArg {
+    Anthropic,
+    Openai,
     Vercel,
     Mistral,
     OpenaiCompatible,
@@ -270,6 +272,8 @@ pub enum ProviderKindArg {
 impl From<ProviderKindArg> for crate::accounts::AccountKind {
     fn from(k: ProviderKindArg) -> Self {
         match k {
+            ProviderKindArg::Anthropic => Self::Anthropic,
+            ProviderKindArg::Openai => Self::Openai,
             ProviderKindArg::Vercel => Self::Vercel,
             ProviderKindArg::Mistral => Self::Mistral,
             ProviderKindArg::OpenaiCompatible => Self::OpenaiCompatible,

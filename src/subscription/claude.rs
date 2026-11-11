@@ -13,11 +13,11 @@ use crate::proxy::set_header;
 
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const SCOPES: &str = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
-const OAUTH_BETA: &str = "oauth-2025-04-20";
+pub(crate) const OAUTH_BETA: &str = "oauth-2025-04-20";
 const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
 const DEFAULT_UA: &str = "claude-cli/2.1.280 (external, cli)";
 const IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 pub fn upstream_url(ep: &Endpoints, path: &str) -> Option<String> {
     let base = ep.claude_api.trim_end_matches('/');

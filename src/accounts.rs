@@ -30,6 +30,8 @@ pub enum AccountKind {
     OpencodeGo,
     Vercel,
     Mistral,
+    Anthropic,
+    Openai,
     OpenaiCompatible,
 }
 
@@ -79,11 +81,13 @@ pub struct KindInfo {
 
 impl AccountKind {
     /// In the order the web UI lists them.
-    pub const ALL: [AccountKind; 7] = [
+    pub const ALL: [AccountKind; 9] = [
         AccountKind::Codex,
         AccountKind::Claude,
         AccountKind::Grok,
         AccountKind::OpencodeGo,
+        AccountKind::Anthropic,
+        AccountKind::Openai,
         AccountKind::Vercel,
         AccountKind::Mistral,
         AccountKind::OpenaiCompatible,
@@ -117,6 +121,16 @@ impl AccountKind {
             Claude => pool(SubProvider::Claude, "Claude (Pro / Max)", "Claude subscription, used by Claude Code.", &[BrowserLogin, Import]),
             Grok => pool(SubProvider::Grok, "Grok Build (xAI)", "Grok Build subscription.", &[DeviceLogin]),
             OpencodeGo => pool(SubProvider::OpencodeGo, "OpenCode Go", "API key from the OpenCode console.", &[ApiKey]),
+            Anthropic => provider(
+                "Anthropic API",
+                "Claude Console API key: personal or service account. For a key not scoped to one workspace, add the anthropic-workspace-id header.",
+                Some(ANTHROPIC_BASE_URL),
+            ),
+            Openai => provider(
+                "OpenAI API",
+                "OpenAI Platform API key: project or service account. Add OpenAI-Project or OpenAI-Organization headers to pick one.",
+                Some(OPENAI_BASE_URL),
+            ),
             Vercel => provider("Vercel AI Gateway", "Vercel AI Gateway API key.", Some(VERCEL_BASE_URL)),
             Mistral => provider("Mistral", "Mistral API key.", Some(MISTRAL_BASE_URL)),
             OpenaiCompatible => provider("OpenAI-compatible", "Any OpenAI-compatible server, such as llama.cpp.", None),
@@ -137,6 +151,8 @@ impl AccountKind {
     /// The gateway kind that serves a provider kind's account.
     pub fn provider_kind(self) -> Option<ProviderKind> {
         match self {
+            AccountKind::Anthropic => Some(ProviderKind::Anthropic),
+            AccountKind::Openai => Some(ProviderKind::Openai),
             AccountKind::Vercel => Some(ProviderKind::Vercel),
             AccountKind::Mistral => Some(ProviderKind::Mistral),
             AccountKind::OpenaiCompatible => Some(ProviderKind::OpenaiCompatible),
@@ -151,6 +167,8 @@ impl AccountKind {
             AccountKind::Claude => "claude",
             AccountKind::Grok => "grok",
             AccountKind::OpencodeGo => "opencode-go",
+            AccountKind::Anthropic => "anthropic",
+            AccountKind::Openai => "openai",
             AccountKind::Vercel => "vercel",
             AccountKind::Mistral => "mistral",
             AccountKind::OpenaiCompatible => "openai-compatible",
@@ -165,6 +183,8 @@ impl AccountKind {
 impl From<ProviderKind> for AccountKind {
     fn from(k: ProviderKind) -> Self {
         match k {
+            ProviderKind::Anthropic => AccountKind::Anthropic,
+            ProviderKind::Openai => AccountKind::Openai,
             ProviderKind::Vercel => AccountKind::Vercel,
             ProviderKind::Mistral => AccountKind::Mistral,
             ProviderKind::OpenaiCompatible => AccountKind::OpenaiCompatible,
@@ -185,6 +205,8 @@ impl From<SubProvider> for AccountKind {
 
 pub const VERCEL_BASE_URL: &str = "https://ai-gateway.vercel.sh";
 pub const MISTRAL_BASE_URL: &str = "https://api.mistral.ai";
+pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+pub const OPENAI_BASE_URL: &str = "https://api.openai.com";
 
 pub fn kinds() -> Vec<KindInfo> {
     AccountKind::ALL.iter().map(|k| k.info()).collect()

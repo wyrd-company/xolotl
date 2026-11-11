@@ -1,5 +1,6 @@
-//! AI gateway: API-key upstream providers (Vercel AI Gateway, Mistral, any
-//! OpenAI-compatible server such as llama.cpp), plus a raw passthrough
+//! AI gateway: API-key upstream providers (the Anthropic and OpenAI APIs,
+//! Vercel AI Gateway, Mistral, any OpenAI-compatible server such as
+//! llama.cpp), plus a raw passthrough
 //! (`/<provider>/...`) for provider-specific APIs such as Mistral OCR / batch /
 //! files and Vercel's credits / generation / report endpoints. Model naming,
 //! aliases and fallbacks are handled by client policies.
@@ -323,6 +324,8 @@ impl Gateway {
             (Some(b), _) => b.clone(),
             (None, ProviderKind::Vercel) => crate::accounts::VERCEL_BASE_URL.into(),
             (None, ProviderKind::Mistral) => crate::accounts::MISTRAL_BASE_URL.into(),
+            (None, ProviderKind::Anthropic) => crate::accounts::ANTHROPIC_BASE_URL.into(),
+            (None, ProviderKind::Openai) => crate::accounts::OPENAI_BASE_URL.into(),
             (None, ProviderKind::OpenaiCompatible) => String::new(),
         };
         let base = base.trim_end_matches('/');
@@ -394,10 +397,18 @@ impl Gateway {
         let p = self.get(provider).with_context(|| format!("unknown provider {provider}"))?;
         let (cfg, key) = self.credentials(&p).await?;
         let url = format!("{}{}", Self::base_url(&cfg), path_and_query);
+        if cfg.kind == ProviderKind::Anthropic {
+            anthropic_headers(&mut headers);
+        }
         if let Some(key) = key {
-            set_header(&mut headers, "authorization", &format!("Bearer {key}"));
-            if path_and_query.starts_with("/v1/messages") {
+            if cfg.kind == ProviderKind::Anthropic {
+                // The Anthropic API takes a key in `x-api-key` on every endpoint.
                 set_header(&mut headers, "x-api-key", &key);
+            } else {
+                set_header(&mut headers, "authorization", &format!("Bearer {key}"));
+                if path_and_query.starts_with("/v1/messages") {
+                    set_header(&mut headers, "x-api-key", &key);
+                }
             }
         }
         for (k, v) in &cfg.headers {
@@ -425,7 +436,7 @@ impl Gateway {
         target: &Target,
         method: Method,
         path: &str,
-        headers: HeaderMap,
+        mut headers: HeaderMap,
         mut body: Value,
         client_id: Option<&str>,
         requested_model: &str,
@@ -434,8 +445,10 @@ impl Gateway {
     ) -> Response {
         if let Some(obj) = body.as_object_mut() {
             obj.insert("model".into(), Value::String(target.model.clone()));
-            if self.kind(&target.provider) == Some(ProviderKind::Mistral) {
-                normalize_mistral(path, obj);
+            match self.kind(&target.provider) {
+                Some(ProviderKind::Mistral) => normalize_mistral(path, obj),
+                Some(ProviderKind::Anthropic) => anthropic_body_betas(&mut headers, obj),
+                _ => {}
             }
         }
         let mut accounting = Accounting::new(self.db.clone(), &target.provider, path, client_id, Some(requested_model))
@@ -498,7 +511,9 @@ impl Gateway {
 
     /// The provider's model ids from `GET /v1/models`.
     pub async fn fetch_models(&self, name: &str) -> Result<Vec<String>> {
-        let (resp, _) = self.send(name, Method::GET, "/v1/models", HeaderMap::new(), reqwest::Body::from(Vec::new())).await?;
+        // The Anthropic API pages its list, 20 models by default.
+        let path = if self.kind(name) == Some(ProviderKind::Anthropic) { "/v1/models?limit=1000" } else { "/v1/models" };
+        let (resp, _) = self.send(name, Method::GET, path, HeaderMap::new(), reqwest::Body::from(Vec::new())).await?;
         anyhow::ensure!(resp.status().is_success(), "model list returned {}", resp.status());
         let body: Value = resp.json().await?;
         Ok(body
@@ -522,6 +537,48 @@ fn cas_error(e: anyhow::Error) -> ProviderChangeError {
 fn stored_config(mut data: Map<String, Value>) -> Result<ProviderConfig> {
     data.remove("api_key");
     serde_json::from_value(Value::Object(data)).context("reading the provider account")
+}
+
+/// Headers the Anthropic API needs: an `anthropic-version`, and no OAuth beta
+/// flag, so a client written for a Claude subscription works with a key too.
+fn anthropic_headers(headers: &mut HeaderMap) {
+    if !headers.contains_key("anthropic-version") {
+        set_header(headers, "anthropic-version", crate::subscription::claude::ANTHROPIC_VERSION);
+    }
+    headers.remove("authorization");
+    let betas: Vec<String> = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|b| !b.is_empty() && *b != crate::subscription::claude::OAUTH_BETA)
+        .map(str::to_string)
+        .collect();
+    headers.remove("anthropic-beta");
+    if !betas.is_empty() {
+        set_header(headers, "anthropic-beta", &betas.join(","));
+    }
+}
+
+/// A Messages body's `betas` (an SDK parameter) goes to the `anthropic-beta`
+/// header, as it does for Claude subscription accounts: the API refuses it in
+/// the body.
+fn anthropic_body_betas(headers: &mut HeaderMap, obj: &mut Map<String, Value>) {
+    let Some(Value::Array(extra)) = obj.remove("betas") else { return };
+    let mut betas: Vec<String> = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').map(|b| b.trim().to_string()).filter(|b| !b.is_empty()).collect())
+        .unwrap_or_default();
+    for b in extra.iter().filter_map(Value::as_str) {
+        if !betas.iter().any(|x| x == b) {
+            betas.push(b.to_string());
+        }
+    }
+    if !betas.is_empty() {
+        set_header(headers, "anthropic-beta", &betas.join(","));
+    }
 }
 
 /// Mistral rejects a few OpenAI parameter spellings with a 422.
@@ -696,6 +753,30 @@ mod tests {
         let inserted = clickhouse.received_requests().await.unwrap();
         let row: Value = serde_json::from_slice(&inserted[0].body).unwrap();
         assert_eq!(row["account_kind"], "mistral");
+    }
+
+    #[tokio::test]
+    async fn anthropic_accounts_list_every_model_with_their_key() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(wiremock::matchers::query_param("limit", "1000"))
+            .and(header("x-api-key", "sk-ant"))
+            .and(header("anthropic-version", "2023-06-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "claude-haiku-5-5"}], "has_more": false})))
+            .mount(&s)
+            .await;
+        let g = Gateway::new(
+            &GatewayConfig { providers: BTreeMap::new() },
+            Arc::new(MemoryStore::default()),
+            reqwest::Client::new(),
+            Db::in_memory().await.unwrap(),
+        );
+        let cfg = ProviderConfig { kind: ProviderKind::Anthropic, base_url: Some(s.uri()), ..Default::default() };
+        g.put_provider("anth", cfg, Some("sk-ant".into()), true).await.unwrap();
+        assert_eq!(g.fetch_models("anth").await.unwrap(), vec!["claude-haiku-5-5"]);
+        let sent = &s.received_requests().await.unwrap()[0];
+        assert!(sent.headers.get("authorization").is_none());
     }
 
     #[test]

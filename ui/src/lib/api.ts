@@ -240,7 +240,7 @@ export interface KeyInfo {
 
 /** Every kind of account, as `GET /admin/account-kinds` lists them. */
 export type AccountKind = SubProvider | ProviderKind;
-export type ProviderKind = "vercel" | "mistral" | "openai-compatible";
+export type ProviderKind = "anthropic" | "openai" | "vercel" | "mistral" | "openai-compatible";
 export type AddMethod = "device-login" | "browser-login" | "import" | "api-key" | "provider";
 
 export interface AccountKindInfo {

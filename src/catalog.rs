@@ -384,6 +384,8 @@ impl ModelCatalog {
             }
             other => match self.gateway_kinds.read().get(other) {
                 Some(ProviderKind::Vercel) => vec![Wire::Chat, Wire::Responses, Wire::Messages],
+                Some(ProviderKind::Anthropic) => vec![Wire::Messages],
+                Some(ProviderKind::Openai) => vec![Wire::Responses, Wire::Chat],
                 _ => vec![Wire::Chat],
             },
         }
