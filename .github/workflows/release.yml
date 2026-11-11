@@ -133,7 +133,7 @@ jobs:
           merge-multiple: true
       - name: Release notes from the changelog
         run: awk -v h="## ${GITHUB_REF_NAME}" '$0==h{f=1;next} /^## /{f=0} f' CHANGELOG.md > release-notes.md
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           body_path: release-notes.md
           files: |
