@@ -1761,6 +1761,7 @@ async fn ui_admin_endpoints() {
         json!([{
             "name": "llama", "kind": "openai-compatible", "source": "config", "enabled": true,
             "base_url": format!("{}/llama/v1", h.upstream.uri()), "no_auth": false, "headers": [], "secret": "providers/llama", "has_key": true,
+            "workload_identity": false,
         }])
     );
 

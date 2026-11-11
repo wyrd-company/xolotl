@@ -10,7 +10,7 @@ A client sends a model name. Xolotl turns it into one or more **targets** (`prov
   - The refresh endpoint accepts an optional comma-separated `providers` query to refresh selected providers; omit it to refresh the whole catalog. Eligible providers are the subscription pools and enabled provider accounts.
   - Account views refresh the provider pool; discovery is shared across its accounts. Completed device logins in the web UI trigger refresh through this endpoint.
   - Codex, Claude, Grok and OpenCode Go are asked using one of their accounts. For Codex, `catalog.codex_client_version` is sent, because the backend filters models by client version.
-  - Provider accounts are asked via `GET /v1/models`.
+  - Provider accounts are asked via `GET /v1/models` (`?limit=1000` for Anthropic API accounts, whose list is paged).
 - **Static models** from `[catalog.static_models]` are added on top. Before the first discovery completes, the catalog holds only these, so routing works from the start.
 - If discovery fails for a provider, its previous list is kept.
 
@@ -24,6 +24,8 @@ There are three LLM wire formats: Anthropic Messages (`/v1/messages`), OpenAI Re
 | `codex` | Responses |
 | `grok` | Responses |
 | `opencode-go` | per model: a fixed list speaks Messages, another Responses, the rest Chat |
+| `anthropic` kind | Messages |
+| `openai` kind | Responses, Chat |
 | `vercel` kind | all three |
 | other provider accounts | Chat |
 
@@ -104,7 +106,7 @@ For `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`, `/v1/responses
 3. Keep the targets the endpoint reaches, natively or through translation. If none (`count_tokens`, `compact`, or a Claude subscription account off `/v1/messages`): 400 naming the endpoints the model *is* served on.
 4. Try each target in order. A 429 or 5xx moves on to the next target; the last target's response is returned. A session's [context lock](sessions.md#context-lock) puts its locked target first, and the request moves on only when the lock breaks. A translated target gets the request in its own format, and its response is translated back.
    - **Pool targets:** `model` is rewritten to the provider's name and the request goes to the pool ([Subscription accounts](subscriptions.md)).
-   - **Gateway targets:** the provider's key is injected (Bearer, plus `x-api-key` on `/v1/messages`). For Mistral, a few OpenAI parameter spellings it rejects are rewritten.
+   - **Gateway targets:** the provider's key is injected (Bearer, plus `x-api-key` on `/v1/messages`). Anthropic API accounts get the key in `x-api-key` only, or a bearer token from workload identity federation, and their headers are prepared for the API ([Accounts](accounts.md#anthropic-and-openai-api-accounts)). For Mistral, a few OpenAI parameter spellings it rejects are rewritten.
 
 Errors use the shape of the endpoint that was called: Anthropic-style on `/v1/messages`, OpenAI-style elsewhere. This holds for translated requests too.
 

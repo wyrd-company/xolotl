@@ -9,9 +9,30 @@ A kind's placement decides where its accounts serve requests.
 | Placement | Kinds | Provider name | Accounts per provider | Served by |
 |---|---|---|---|---|
 | `pool` | `codex`, `claude`, `grok`, `opencode-go` | Fixed: the kind's provider | Many: selection, failover, cooldowns | `src/subscription/` ([Subscription accounts](subscriptions.md)) |
-| `provider` | `vercel`, `mistral`, `openai-compatible` | The account's name, chosen by the operator | One: the account is the provider | `src/gateway.rs` |
+| `provider` | `anthropic`, `openai`, `vercel`, `mistral`, `openai-compatible` | The account's name, chosen by the operator | One: the account is the provider | `src/gateway.rs` |
 
 Policies, the catalog and routing see providers, not accounts. A pool is one provider; a provider account is one provider.
+
+### Anthropic and OpenAI API accounts
+
+`anthropic` and `openai` are provider kinds, not pools:
+
+- **Spending is a policy decision.** An API account bills per token; a subscription does not. As a provider of its own, an API account is allowed, denied, ranked and aliased by policies apart from the subscription that serves the same models. In a pool, the pool's selection would spend API money whenever the subscriptions were busy.
+- **Each key has its own scope.** An unscoped Anthropic key needs `anthropic-workspace-id`; an OpenAI key may need `OpenAI-Project`. A provider account carries its own headers and base URL; a pool account has neither.
+- **The names stay free.** A pool takes a fixed provider name, reserved in `RESERVED_PROVIDER_NAMES`. `anthropic` and `openai` are likely names of existing config-file providers, which a reservation would refuse.
+
+Failover between a subscription and an API account, or between several API accounts, is an alias with several targets. A 429 or 5xx moves the request to the next target.
+
+The gateway prepares Anthropic requests as a Claude Code client expects: the key goes in `x-api-key`, `anthropic-version` is added when absent, the subscription's OAuth beta flag is dropped, and a body `betas` list moves to the `anthropic-beta` header. Bodies are otherwise unchanged, so cache breakpoints reach the API as the client set them.
+
+### Service accounts
+
+Both vendors attach API access to a service account in two ways:
+
+- **A service account key** is an API key. It needs nothing beyond the `api-key`/`provider` method.
+- **Workload identity federation** exchanges a JWT from the host's identity provider for a short-lived access token: RFC 7523 `jwt-bearer` at `https://api.anthropic.com/v1/oauth/token`, RFC 8693 token exchange at `https://auth.openai.com/oauth/token`. Neither returns a refresh token; renewal is another exchange.
+
+Workload identity is `workload_identity` on a config-file provider. The gateway reads the JWT file on every exchange, holds the access token until 5 minutes before expiry (80% of a shorter lifetime), and drops it on a 401. A per-provider lock makes concurrent requests wait for one exchange, because an identity token with a `jti` can be exchanged once. Runtime accounts refuse `workload_identity`: setting it through the admin API would let an operator make the server read any file and send it to a token endpoint. OpenAI's X.509 certificate federation is not supported.
 
 ## Add methods
 
@@ -31,7 +52,7 @@ Each kind lists how an operator adds an account of it, in the order the web UI o
 
 Provider accounts come from two places, keyed by name:
 
-- **Config file:** `[gateway.providers.<name>]`. Read-only at runtime, except for the key. The key is at `providers/<name>` (`{ api_key }`), or at the entry's `secret`.
+- **Config file:** `[gateway.providers.<name>]`. Read-only at runtime, except for the key. The key is at `providers/<name>` (`{ api_key }`), or at the entry's `secret`. An `anthropic` or `openai` entry can authenticate with `workload_identity` instead (see [Service accounts](#service-accounts)).
 - **OpenBao:** added with `POST /admin/accounts`, stored at `providers/<name>` as one secret: the provider fields (`kind`, `base_url`, `no_auth`, `headers`, `enabled`) and `api_key`. A secret at `providers/<name>` without `kind` is a config-file provider's key, not an account.
 
 Rules:
