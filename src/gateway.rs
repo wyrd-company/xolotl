@@ -98,7 +98,9 @@ pub struct Gateway {
     /// Access tokens from workload identity federation, one slot per
     /// provider. A slot's lock is held during an exchange, so concurrent
     /// requests wait for one exchange: an identity token with a `jti` can be
-    /// exchanged only once.
+    /// exchanged only once. Slots are never removed, so every request locks
+    /// the same one. Key reloads leave them alone: only the config file sets
+    /// workload identity, and a token is dropped only when it is refused.
     identity_tokens: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<IdentityToken>>>>>,
 }
 
@@ -320,7 +322,6 @@ impl Gateway {
         let mut keys = self.keys.write();
         self.key_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         keys.remove(name);
-        self.identity_tokens.lock().remove(name);
     }
 
     /// Whether the provider's key is stored.
@@ -402,7 +403,16 @@ impl Gateway {
         let mut keys = self.keys.write();
         self.key_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         keys.clear();
-        self.identity_tokens.lock().clear();
+    }
+
+    /// Drop a federated access token the provider refused, unless a newer
+    /// one has replaced it meanwhile.
+    async fn forget_identity_token(&self, name: &str, refused: &str) {
+        let Some(slot) = self.identity_tokens.lock().get(name).cloned() else { return };
+        let mut slot = slot.lock().await;
+        if slot.as_ref().is_some_and(|t| t.token == refused) {
+            *slot = None;
+        }
     }
 
     /// A provider's access token from workload identity federation: the one
@@ -440,17 +450,17 @@ impl Gateway {
         if cfg.kind == ProviderKind::Anthropic {
             anthropic_headers(&mut headers);
         }
-        if let Some(key) = key {
+        if let Some(key) = &key {
             if cfg.kind == ProviderKind::Anthropic && cfg.workload_identity.is_none() {
                 // The Anthropic API takes a key in `x-api-key` on every endpoint.
-                set_header(&mut headers, "x-api-key", &key);
+                set_header(&mut headers, "x-api-key", key);
             } else if cfg.kind == ProviderKind::Anthropic {
                 // A federated access token is a bearer token.
                 set_header(&mut headers, "authorization", &format!("Bearer {key}"));
             } else {
                 set_header(&mut headers, "authorization", &format!("Bearer {key}"));
                 if path_and_query.starts_with("/v1/messages") {
-                    set_header(&mut headers, "x-api-key", &key);
+                    set_header(&mut headers, "x-api-key", key);
                 }
             }
         }
@@ -461,8 +471,11 @@ impl Gateway {
         }
         let resp = self.http.request(method, &url).headers(headers).body(body).send().await?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            // The key may have been rotated in the vault.
+            // The key may have been rotated in the vault, or the access token revoked.
             self.forget_key(provider);
+            if let (Some(_), Some(token)) = (&cfg.workload_identity, &key) {
+                self.forget_identity_token(provider, token).await;
+            }
         }
         Ok((resp, cfg.kind))
     }
@@ -931,6 +944,32 @@ mod tests {
         assert!(models.iter().all(|r| r.headers.get("x-api-key").is_none()));
         assert!(!g.has_key(&g.get("wif").unwrap()).await.unwrap());
         assert!(matches!(g.set_key("wif", "k").await, Err(ProviderChangeError::Invalid(_))));
+        // A key reload keeps the access token: the identity token may be single-use.
+        g.invalidate_keys();
+        g.fetch_models("wif").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_late_refusal_keeps_the_newer_access_token() {
+        let s = MockServer::start().await;
+        let g = identity_gateway(
+            ProviderKind::Openai,
+            WorkloadIdentity {
+                token_file: "/unused".into(),
+                service_account_id: "sa".into(),
+                identity_provider_id: Some("idp".into()),
+                ..Default::default()
+            },
+            &s,
+        )
+        .await;
+        let slot = g.identity_tokens.lock().entry("wif".into()).or_default().clone();
+        *slot.lock().await = Some(IdentityToken { token: "new".into(), renew_at: Instant::now() + Duration::from_secs(60) });
+        g.forget_identity_token("wif", "old").await;
+        assert_eq!(slot.lock().await.as_ref().map(|t| t.token.as_str()), Some("new"));
+        g.forget_identity_token("wif", "new").await;
+        assert!(slot.lock().await.is_none());
+        assert!(Arc::ptr_eq(&slot, &g.identity_tokens.lock()["wif"]), "requests keep sharing one slot");
     }
 
     #[tokio::test]
