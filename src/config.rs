@@ -571,6 +571,10 @@ impl Default for GatewayConfig {
 pub enum ProviderKind {
     Vercel,
     Mistral,
+    /// The Anthropic API (Claude Console): a personal or service account key.
+    Anthropic,
+    /// The OpenAI API (OpenAI Platform): a project or service account key.
+    Openai,
     /// Any OpenAI-compatible server, e.g. llama.cpp.
     #[default]
     OpenaiCompatible,
