@@ -10,7 +10,9 @@ belongs to a policy. The policy decides what the key can do.
 ## Write a policy
 
 1. Open **Policies** in the [web UI](web-ui.md) and select **New policy**.
-2. Enter a **Name** and a **Description**.
+2. Enter a **Name** and a **Description**, and pick the **Scopes**. The default,
+   **proxy**, lets keys use the LLM endpoints. Add **mcp (MCP gateway)** if the
+   keys use MCP servers. See [Scopes](#scopes).
 3. Under **Providers and accounts**, pick the providers the keys can use and,
    for each subscription provider, the accounts that serve them.
 4. Set the models, the MCP servers and the rate limits. Each section folds
