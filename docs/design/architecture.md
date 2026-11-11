@@ -36,6 +36,8 @@ clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web
 
 ## Request path
 
+One router on one listener (`server.listen`) serves every route: the LLM endpoints, the passthroughs, `/mcp`, `/v0/management`, `/admin` and the web UI. Access is split by key scope, not by port.
+
 1. `authorize` takes the key from `Authorization` (Bearer or bare), `x-api-key` or `x-management-key`, and resolves it to a principal: client id plus policy. The bootstrap admin token resolves to an unrestricted policy. Without a key, an `/admin` route also accepts a web UI session.
 2. The route checks the scope it needs (`proxy`, `mcp`, `management`, `keys` or `admin`).
 3. LLM endpoints resolve `model` through the policy, count the request against the policy's [rate limits](limits.md) (429 when one is reached) and dispatch to a pool or a gateway provider, translating the request when the provider doesn't speak the endpoint's format ([Routing](routing.md)). Passthroughs check only the provider (and `model`, when the body is JSON).
