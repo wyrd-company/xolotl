@@ -15,9 +15,11 @@ use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crate::accounts::AccountKind;
 use crate::config::{GatewayConfig, ProviderConfig, ProviderKind};
 use crate::context::RequestSession;
 use crate::db::Db;
+use crate::export::Capture;
 use crate::limits::Limiter;
 use crate::policy::Target;
 use crate::proxy::{self, Accounting, set_header};
@@ -425,6 +427,7 @@ impl Gateway {
         client_id: Option<&str>,
         requested_model: &str,
         session: Option<&RequestSession>,
+        capture: Option<&Arc<Capture>>,
     ) -> Response {
         if let Some(obj) = body.as_object_mut() {
             obj.insert("model".into(), Value::String(target.model.clone()));
@@ -435,7 +438,9 @@ impl Gateway {
         let accounting = Accounting::new(self.db.clone(), &target.provider, path, client_id, Some(requested_model))
             .with_prices(self.catalog.as_ref().map(|c| c.metadata(&target.provider, &target.model).values))
             .with_limiter(&self.limiter)
-            .with_session(session.map(|s| s.track(&target.model, self.window(&target.provider, &target.model))));
+            .with_session(session.map(|s| s.track(&target.model, self.window(&target.provider, &target.model))))
+            .with_capture(capture.cloned())
+            .with_target(self.kind(&target.provider).map(AccountKind::from), &target.model);
         let bytes = serde_json::to_vec(&body).unwrap_or_default();
         match self.send(&target.provider, method, path, headers, reqwest::Body::from(bytes)).await {
             Ok(r) => proxy::relay(r, Some(accounting)),
@@ -459,6 +464,7 @@ impl Gateway {
         client_id: Option<&str>,
         model: Option<&str>,
         session: Option<&RequestSession>,
+        capture: Option<&Arc<Capture>>,
     ) -> Response {
         let endpoint = path_and_query.split('?').next().unwrap_or(path_and_query);
         let prices = self.catalog.as_ref().and_then(|c| {
@@ -469,7 +475,9 @@ impl Gateway {
         let accounting = Accounting::new(self.db.clone(), provider, endpoint, client_id, model)
             .with_limiter(&self.limiter)
             .with_prices(prices)
-            .with_session(session.map(|s| s.track(upstream_model, self.window(provider, upstream_model))));
+            .with_session(session.map(|s| s.track(upstream_model, self.window(provider, upstream_model))))
+            .with_capture(capture.cloned())
+            .with_target(self.kind(provider).map(AccountKind::from), upstream_model);
         match self.send(provider, method, path_and_query, headers, body).await {
             Ok(r) => proxy::relay(r, Some(accounting)),
             Err(e) => {
@@ -562,7 +570,8 @@ mod tests {
             .await;
         let g = gateway("b", &s).await;
         let t = Target { provider: "b".into(), model: "m2".into() };
-        let resp = g.execute(&t, Method::POST, "/v1/chat/completions", HeaderMap::new(), json!({"model": "x"}), None, "x", None).await;
+        let resp =
+            g.execute(&t, Method::POST, "/v1/chat/completions", HeaderMap::new(), json!({"model": "x"}), None, "x", None, None).await;
         assert_eq!(resp.status(), 200);
         assert_eq!(g.fetch_models("b").await.unwrap(), vec!["m2", "m3"]);
     }

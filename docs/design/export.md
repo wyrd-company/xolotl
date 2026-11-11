@@ -1,18 +1,21 @@
 # Exchange export
 
-Each LLM request that has a session becomes a row: its request log fields, the request and response bodies, and the response assembled into one format. Rows go to one or more destinations: `[export.clickhouse]` inserts them into a ClickHouse table, and `[export.nats]` publishes them to a NATS JetStream stream that ClickHouse loads. `src/export/mod.rs` holds the row, the capture and the queues; `src/export/clickhouse.rs` and `src/export/nats.rs` hold the destinations. User documentation: [ClickHouse export](../user/clickhouse-export.md) and [NATS export](../user/nats-export.md).
+Each request that a client key sends to an account becomes a row: its request log fields, the kind of the account, the request and response bodies, and the response assembled into one format. Rows go to one or more destinations: `[export.clickhouse]` inserts them into a ClickHouse table, and `[export.nats]` publishes them to a NATS JetStream stream that ClickHouse loads. `src/export/mod.rs` holds the row, the capture and the queues; `src/export/clickhouse.rs` and `src/export/nats.rs` hold the destinations. User documentation: [ClickHouse export](../user/clickhouse-export.md) and [NATS export](../user/nats-export.md).
 
 ## Capture
 
-The export follows the session ([Sessions and context](sessions.md)), so it covers exactly what has a session: a client key's requests on the three wire formats, including passthroughs, but not `count_tokens` or the bootstrap admin token.
+The export follows `Accounting`, which every account kind shares: the pool (`Subscriptions::execute`) and the gateway (`Gateway::execute`, `Gateway::passthrough`) each build one for each attempt, and it writes the request log row. So the export covers every request of a client key that reaches an account, of any kind, with or without a session ([Sessions and context](sessions.md)): the wire formats, the other `/v1/...` endpoints such as embeddings and OCR, and passthroughs. It leaves out `count_tokens`, which is not an exchange, and the bootstrap admin token, which has no client key. A new kind of account is exported once its requests go through `Accounting` with the capture, with no code of its own in the export.
 
 | Part | Taken by | When |
 |---|---|---|
-| Request | `Exporter::capture`, from `session_for` | Once per request, when its session begins. The client's body, before translation and before `prepare` adds instructions or credentials. It is a slice of the bytes the client sent, cut at `max_body_bytes` on a character boundary, so taking it copies nothing whatever the size. Headers are never taken. |
-| Response | `TapStream`, and `relay_buffered` | As the bytes pass, up to `max_body_bytes`. The upstream's body, before translation. |
+| Request | `Exporter::capture`, from `capture_for` | Once per request, in the handler, before routing. The client's body, before translation and before `prepare` adds instructions or credentials. It is a slice of the bytes the client sent, cut at `max_body_bytes` on a character boundary, so taking it copies nothing whatever the size. A passthrough body that is not JSON streams to the upstream unread, and its row has an empty `request` marked `request_truncated`. Headers are never taken. |
+| Response | `TapStream`, and `relay_buffered` | As the bytes pass, up to `max_body_bytes`. The upstream's body, before translation. A body whose `Content-Type` is not text (audio, images, files) is not kept, and its row has an empty `response` marked `response_truncated`. |
+| Account kind, upstream model | `Accounting::with_target` | When the attempt's `Accounting` is built: the pool's kind, or the gateway provider's kind. |
 | Everything else | `Accounting::finish` | When the response finishes or the client disconnects |
 
-`RequestSession::with_capture` holds the request side, and `SessionTrack` carries it to each attempt's `Accounting`. The request is taken once, in `session_for`, and shared by every target an alias tries. It is copied into a row only in the task that builds the row. `Accounting::finish` builds the row in its spawned task, with the request log write, so that assembling a large stream happens after the response has reached the client.
+The handler passes the capture to the pool or the gateway next to the session, and `Accounting::with_capture` holds it. The request is taken once and shared by every target an alias tries. It is copied into a row only in the task that builds the row. `Accounting::finish` builds the row in its spawned task, with the request log write, so that assembling a large stream happens after the response has reached the client. The session gives the row its `session_key` and `session_source` when there is one; otherwise both are empty.
+
+`account_kind` is the `AccountKind` name of the account that served the attempt ([Accounts and account kinds](accounts.md)). A provider account is its own provider, so its row has the account's name in `provider` and an empty `account_id`; `account_kind` tells a provider account from a pool.
 
 The row's `endpoint` and `response` are the upstream's, and `client_endpoint` and `request` the client's. They differ for a translated request. The request is kept as the client sent it because that is the conversation as the client knows it. The response is kept as the upstream sent it because that is what the tap sees, and it holds what translation drops.
 
@@ -85,7 +88,7 @@ Options not chosen:
 
 ## Table
 
-`create_table` issues `CREATE TABLE IF NOT EXISTS` before the first insert, and again before each later batch until it succeeds. It orders by `(client_id, session_key, started_at)`, so a session's turns are stored together: queries by session read few granules, and the bodies of consecutive turns, which repeat the conversation so far, compress well. Bodies use `ZSTD(3)`. Inserts set `input_format_skip_unknown_fields`, so an operator's own table may leave out columns, for example the bodies.
+`create_table` issues `CREATE TABLE IF NOT EXISTS` before the first insert, and again before each later batch until it succeeds. It does not change a table that exists. It orders by `(client_id, session_key, started_at)`, so a session's turns are stored together: queries by session read few granules, and the bodies of consecutive turns, which repeat the conversation so far, compress well. Bodies use `ZSTD(3)`. Inserts set `input_format_skip_unknown_fields`, so an operator's own table may leave out columns, for example the bodies. The same holds for a table made by an earlier version: a new column, such as `account_kind`, is skipped until the operator adds it with the `ALTER TABLE` in the user documentation. The NATS engine's queue table also skips fields it has no column for. Xolotl does not alter a table, because the documented grants are `CREATE TABLE` and `INSERT`, and an `ALTER` that failed before every batch would hold up the rows.
 
 ## Privacy
 

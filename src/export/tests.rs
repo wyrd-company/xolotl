@@ -40,6 +40,7 @@ fn finished<'a>(record: &'a RequestRecord, tools: &'a [String], response: Option
         started_at: DateTime::parse_from_rfc3339("2026-11-07T10:00:00.250Z").unwrap().with_timezone(&Utc),
         session_key: "abc",
         session_source: "claude-code",
+        account_kind: "claude",
         upstream_model: "claude-sonnet-5-5",
         usage: TokenUsage { input: Some(12), output: Some(7), cached: Some(4), cache_write: None },
         tools,
@@ -98,7 +99,8 @@ fn captured_keeps_the_limit() {
 #[tokio::test]
 async fn assembles_a_streamed_messages_response() {
     let exporter = start(cfg("http://127.0.0.1:9"), None, None).unwrap();
-    let capture = exporter.capture("/v1/messages", &bytes_of(&json!({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})));
+    let capture =
+        exporter.capture("/v1/messages", Some(&bytes_of(&json!({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}))));
     let sse = concat!(
         "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":12}}}\n\n",
         "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
@@ -133,7 +135,7 @@ async fn assembles_a_streamed_messages_response() {
 #[tokio::test]
 async fn records_the_upstream_error() {
     let exporter = start(cfg("http://127.0.0.1:9"), None, None).unwrap();
-    let capture = exporter.capture("/v1/chat/completions", &bytes_of(&json!({"model": "m"})));
+    let capture = exporter.capture("/v1/chat/completions", Some(&bytes_of(&json!({"model": "m"}))));
     let r = record("/v1/responses", 429);
     let body = br#"{"error":{"type":"usage_limit_reached","message":"try later"}}"#;
     let row = capture.exchange(finished(&r, &[], Some(Captured { bytes: body.to_vec(), sse: false, truncated: false })));
@@ -147,7 +149,7 @@ async fn records_the_upstream_error() {
 #[tokio::test]
 async fn without_bodies_keeps_only_the_log_fields() {
     let exporter = start(ClickHouseConfig { bodies: false, ..cfg("http://127.0.0.1:9") }, None, None).unwrap();
-    let capture = exporter.capture("/v1/messages", &bytes_of(&json!({"model": "secret prompt"})));
+    let capture = exporter.capture("/v1/messages", Some(&bytes_of(&json!({"model": "secret prompt"}))));
     assert_eq!(capture.response_limit(), None);
     let row = capture.exchange(finished(&record("/v1/messages", 200), &[], None));
     assert_eq!(row.request, "");
@@ -166,7 +168,7 @@ async fn creates_the_table_then_inserts_batches() {
         .await;
     let exporter =
         start(ClickHouseConfig { batch_rows: 2, ttl_days: 30, ..cfg(&s.uri()) }, Some("xolotl".into()), Some("pw".into())).unwrap();
-    let capture = exporter.capture("/v1/messages", &bytes_of(&json!({"model": "m"})));
+    let capture = exporter.capture("/v1/messages", Some(&bytes_of(&json!({"model": "m"}))));
     for _ in 0..3 {
         capture.submit(finished(&record("/v1/messages", 200), &[], None));
     }
@@ -189,7 +191,7 @@ async fn shutdown_inserts_what_is_queued() {
     let s = MockServer::start().await;
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&s).await;
     let exporter = start(ClickHouseConfig { create_table: false, flush_secs: 3600, ..cfg(&s.uri()) }, None, None).unwrap();
-    let capture = exporter.capture("/v1/messages", &bytes_of(&json!({})));
+    let capture = exporter.capture("/v1/messages", Some(&bytes_of(&json!({}))));
     capture.submit(finished(&record("/v1/messages", 200), &[], None));
     exporter.shutdown().await;
     let queries = received(&s).await;
@@ -202,7 +204,7 @@ async fn a_full_queue_drops_rows() {
     // Nothing listens: inserts fail slowly while the queue fills.
     let exporter = start(ClickHouseConfig { queue_mb: 1, flush_secs: 3600, ..cfg("http://127.0.0.1:9") }, None, None).unwrap();
     let body = json!({"pad": "x".repeat(400 * 1024)});
-    let capture = exporter.capture("/v1/messages", &bytes_of(&body));
+    let capture = exporter.capture("/v1/messages", Some(&bytes_of(&body)));
     for _ in 0..4 {
         capture.submit(finished(&record("/v1/messages", 200), &[], None));
     }
@@ -234,7 +236,8 @@ async fn inserts_into_a_real_clickhouse() {
     let table = format!("test_{}", uuid::Uuid::new_v4().simple());
     let cfg = ClickHouseConfig { url: base.to_string(), table: table.clone(), ttl_days: 7, ..cfg(base.as_str()) };
     let exporter = start(cfg, user.clone(), password.clone()).unwrap();
-    let capture = exporter.capture("/v1/messages", &bytes_of(&json!({"model": "m", "messages": [{"role": "user", "content": "héllo"}]})));
+    let capture =
+        exporter.capture("/v1/messages", Some(&bytes_of(&json!({"model": "m", "messages": [{"role": "user", "content": "héllo"}]}))));
     let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1}}}\n\n\
                event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
                event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n";
@@ -279,7 +282,7 @@ async fn inserts_into_a_real_clickhouse() {
 #[tokio::test]
 async fn a_cut_off_stream_keeps_what_arrived() {
     let exporter = start(cfg("http://127.0.0.1:9"), None, None).unwrap();
-    let capture = exporter.capture("/v1/responses", &bytes_of(&json!({})));
+    let capture = exporter.capture("/v1/responses", Some(&bytes_of(&json!({}))));
     let sse = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n",
@@ -308,7 +311,7 @@ fn prefix_stops_at_the_limit() {
 #[tokio::test]
 async fn row_size_counts_every_field() {
     let exporter = start(ClickHouseConfig { bodies: false, ..cfg("http://127.0.0.1:9") }, None, None).unwrap();
-    let capture = exporter.capture("/v1/chat/completions", &bytes_of(&json!({})));
+    let capture = exporter.capture("/v1/chat/completions", Some(&bytes_of(&json!({}))));
     let tools: Vec<String> = (0..1000).map(|i| format!("tool_{i:04}")).collect();
     let row = capture.exchange(finished(&record("/v1/chat/completions", 200), &tools, None));
     assert!(row.size() > 9 * 1000, "{}", row.size());
@@ -316,15 +319,18 @@ async fn row_size_counts_every_field() {
     let body = "x".repeat(MAX_ERROR_BYTES * 4);
     let r = record("/v1/chat/completions", 500);
     let resp = Captured { bytes: body.into_bytes(), ..Default::default() };
-    let row =
-        start(cfg("http://127.0.0.1:9"), None, None).unwrap().capture("/", &bytes_of(&json!({}))).exchange(finished(&r, &[], Some(resp)));
+    let row = start(cfg("http://127.0.0.1:9"), None, None).unwrap().capture("/", Some(&bytes_of(&json!({})))).exchange(finished(
+        &r,
+        &[],
+        Some(resp),
+    ));
     assert!(row.error.len() <= MAX_ERROR_BYTES && row.error.starts_with("api_error: xxx"), "{}", row.error.len());
 }
 
 #[tokio::test]
 async fn a_passthrough_query_string_still_assembles() {
     let exporter = start(cfg("http://127.0.0.1:9"), None, None).unwrap();
-    let capture = exporter.capture("/v1/chat/completions", &bytes_of(&json!({})));
+    let capture = exporter.capture("/v1/chat/completions", Some(&bytes_of(&json!({}))));
     let body = json!({"choices": [{"message": {"role": "assistant", "content": "yes"}, "finish_reason": "stop"}]}).to_string();
     let r = record("/v1/chat/completions?beta=1", 200);
     let row = capture.exchange(finished(&r, &[], Some(Captured { bytes: body.into_bytes(), ..Default::default() })));
@@ -342,7 +348,7 @@ async fn retries_of_a_batch_carry_one_deduplication_token() {
         .await;
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&s).await;
     let exporter = start(ClickHouseConfig { create_table: false, batch_rows: 1, ..cfg(&s.uri()) }, None, None).unwrap();
-    exporter.capture("/v1/messages", &bytes_of(&json!({}))).submit(finished(&record("/v1/messages", 200), &[], None));
+    exporter.capture("/v1/messages", Some(&bytes_of(&json!({})))).submit(finished(&record("/v1/messages", 200), &[], None));
     exporter.shutdown().await;
     let reqs = s.received_requests().await.unwrap();
     let tokens: Vec<String> = reqs
@@ -370,7 +376,7 @@ async fn shutdown_waits_for_rows_being_built() {
     let s = MockServer::start().await;
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&s).await;
     let exporter = start(ClickHouseConfig { create_table: false, flush_secs: 3600, ..cfg(&s.uri()) }, None, None).unwrap();
-    let pending = exporter.capture("/v1/messages", &bytes_of(&json!({}))).pending();
+    let pending = exporter.capture("/v1/messages", Some(&bytes_of(&json!({})))).pending();
     let late = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(200)).await;
         pending.submit(finished(&record("/v1/messages", 200), &[], None));

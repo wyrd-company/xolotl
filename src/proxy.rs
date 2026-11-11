@@ -15,10 +15,11 @@ use futures::Stream;
 use opentelemetry::KeyValue;
 use serde_json::Value;
 
+use crate::accounts::AccountKind;
 use crate::context::SessionTrack;
 use crate::context::tools::{ToolCalls, mentions_tool};
 use crate::db::{Db, RequestRecord};
-use crate::export::{Captured, Finished};
+use crate::export::{Capture, Captured, Finished};
 use crate::limits::Limiter;
 use crate::telemetry::metrics;
 
@@ -155,6 +156,12 @@ pub struct Accounting {
     limiter: Option<Arc<Limiter>>,
     prices: Option<crate::metadata::Metadata>,
     session: Option<SessionTrack>,
+    /// The request's export, when exporting is on and the request has a client key.
+    capture: Option<Arc<Capture>>,
+    /// The kind of the account that serves the request.
+    account_kind: Option<AccountKind>,
+    /// The model the upstream is asked for.
+    upstream_model: String,
     /// Tool calls the response named.
     tools: Vec<String>,
     /// The response body, when the request is exported with its bodies.
@@ -179,6 +186,9 @@ impl Accounting {
             limiter: None,
             prices: None,
             session: None,
+            capture: None,
+            account_kind: None,
+            upstream_model: String::new(),
             tools: Vec::new(),
             response: None,
         }
@@ -199,10 +209,23 @@ impl Accounting {
         self
     }
 
+    /// Export the request and its response ([`crate::export`]).
+    pub fn with_capture(mut self, capture: Option<Arc<Capture>>) -> Self {
+        self.capture = capture;
+        self
+    }
+
+    /// The kind of the account and the upstream model that serve the request.
+    pub fn with_target(mut self, kind: Option<AccountKind>, upstream_model: &str) -> Self {
+        self.account_kind = kind;
+        self.upstream_model = upstream_model.to_string();
+        self
+    }
+
     /// The most response bytes to keep for the export, or `None` when the
     /// request isn't exported with its bodies.
     pub fn capture_limit(&self) -> Option<usize> {
-        self.session.as_ref()?.capture()?.response_limit()
+        self.capture.as_ref()?.response_limit()
     }
 
     pub fn finish(mut self, status: u16, usage: TokenUsage) {
@@ -268,18 +291,21 @@ impl Accounting {
         }
         let record = self.record;
         let db = self.db;
-        let export =
-            self.session.as_ref().and_then(|s| Some((s.capture()?.pending(), s.key().to_string(), s.source(), s.model().to_string())));
+        let export = self.capture.as_ref().map(|c| {
+            let (key, source) = self.session.as_ref().map(|s| (s.key().to_string(), s.source())).unwrap_or_default();
+            (c.pending(), key, source, self.account_kind.map(AccountKind::as_str).unwrap_or_default(), self.upstream_model)
+        });
         let session = self.session.filter(|_| success);
         let tools = if success { self.tools } else { Vec::new() };
         let (started_at, response) = (self.started_at, self.response);
         tokio::spawn(async move {
-            if let Some((pending, key, source, model)) = export {
+            if let Some((pending, key, source, kind, model)) = export {
                 pending.submit(Finished {
                     record: &record,
                     started_at,
                     session_key: &key,
                     session_source: source,
+                    account_kind: kind,
                     upstream_model: &model,
                     usage,
                     tools: &tools,
@@ -353,6 +379,13 @@ impl<S> TapStream<S> {
             status,
             capture,
             accounting,
+        }
+    }
+
+    /// Export the response without its body: the row says it was cut.
+    fn keep_no_body(&mut self) {
+        if let Some((_, limit)) = &mut self.capture {
+            *limit = 0;
         }
     }
 
@@ -444,12 +477,25 @@ pub fn is_sse(headers: &reqwest::header::HeaderMap) -> bool {
     headers.get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.starts_with("text/event-stream"))
 }
 
+/// Whether a body is text, as its `Content-Type` says. A body without one
+/// counts as text.
+fn is_text(headers: &reqwest::header::HeaderMap) -> bool {
+    let Some(ct) = headers.get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) else { return true };
+    let ct = ct.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+    ct.starts_with("text/") || ct.ends_with("json") || ct.ends_with("xml") || ct.is_empty()
+}
+
 /// Relay an upstream response to the client, streaming the body.
 pub fn relay(resp: reqwest::Response, accounting: Option<Accounting>) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let headers = forward_response_headers(resp.headers());
     let sse = is_sse(resp.headers());
-    let stream = TapStream::new(Box::pin(resp.bytes_stream()), sse, status.as_u16(), accounting);
+    let text = is_text(resp.headers());
+    let mut stream = TapStream::new(Box::pin(resp.bytes_stream()), sse, status.as_u16(), accounting);
+    if !text {
+        // Audio, images and files: the export keeps none of it, and says so.
+        stream.keep_no_body();
+    }
     let mut out = Response::new(Body::from_stream(stream));
     *out.status_mut() = status;
     *out.headers_mut() = headers;

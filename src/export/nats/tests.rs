@@ -101,7 +101,7 @@ async fn each_destination_gets_the_row_it_would_get_alone() {
     let body = json!({"choices": [{"message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}]}).to_string();
     let request = Bytes::from(format!("{{\"pad\":\"{}\"}}", "p".repeat(3000)));
     let submit = |exporter: &Arc<Exporter>| {
-        let capture = exporter.capture("/v1/chat/completions", &request);
+        let capture = exporter.capture("/v1/chat/completions", Some(&request));
         let mut response = Captured::default();
         if let Some(limit) = capture.response_limit() {
             response.push(body.as_bytes(), limit);
@@ -111,6 +111,7 @@ async fn each_destination_gets_the_row_it_would_get_alone() {
             started_at: chrono::Utc::now(),
             session_key: "abc",
             session_source: "test",
+            account_kind: "codex",
             upstream_model: "m",
             usage: Default::default(),
             tools: &[],
@@ -146,11 +147,11 @@ async fn each_destination_gets_the_row_it_would_get_alone() {
 async fn the_capture_keeps_what_the_most_generous_destination_wants() {
     let spawn = |bodies, max| Sink::spawn("test", bodies, max, 1, |q: Queue| async move { drop(q) });
     let exporter = Exporter::new(vec![spawn(false, 0), spawn(true, 10), spawn(true, 20)]);
-    let capture = exporter.capture("/v1/messages", &Bytes::from("y".repeat(30)));
+    let capture = exporter.capture("/v1/messages", Some(&Bytes::from("y".repeat(30))));
     assert_eq!(capture.response_limit(), Some(20));
     assert_eq!(capture.request.len(), 20);
     let exporter = Exporter::new(vec![spawn(false, 4096)]);
-    assert_eq!(exporter.capture("/", &Bytes::from_static(b"{}")).response_limit(), None);
+    assert_eq!(exporter.capture("/", Some(&Bytes::from_static(b"{}"))).response_limit(), None);
 }
 
 // Against a real server with JetStream: `XOLOTL_TEST_NATS=nats://host:4222 cargo test -- --ignored nats`.
@@ -268,7 +269,7 @@ async fn nats_export_sends_what_is_queued_on_shutdown() {
     let _turn = SERVER.lock().await;
     let Some(s) = Server::new(&[SUBJECTS], -1).await else { return };
     let exporter = Exporter::new(vec![start(s.cfg(), None).await.unwrap()]);
-    let capture = exporter.capture("/v1/messages", &Bytes::from_static(b"{\"model\":\"m\"}"));
+    let capture = exporter.capture("/v1/messages", Some(&Bytes::from_static(b"{\"model\":\"m\"}")));
     let record = crate::db::RequestRecord {
         client_id: Some("team/laptop".into()),
         provider: "claude".into(),
@@ -282,6 +283,7 @@ async fn nats_export_sends_what_is_queued_on_shutdown() {
             started_at: chrono::Utc::now(),
             session_key: "abc",
             session_source: "test",
+            account_kind: "codex",
             upstream_model: "m",
             usage: Default::default(),
             tools: &[],

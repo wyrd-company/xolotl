@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 use crate::config::{Strategy, SubscriptionConfig};
 use crate::context::{self, AccountPin, RequestSession};
 use crate::db::{AccountRow, AccountUsage, Db, UsageWindow, now};
+use crate::export::Capture;
 use crate::keys::Principal;
 use crate::limits::{Charge, Exceeded, Limiter, Meter};
 use crate::proxy::{self, Accounting};
@@ -891,6 +892,7 @@ impl Subscriptions {
         model: Option<&str>,
         charge: &mut Charge<'_>,
         tracked: Option<&RequestSession>,
+        capture: Option<&Arc<Capture>>,
     ) -> Response {
         let client_id = principal.and_then(Principal::client_id);
         let ep = &self.cfg.endpoints;
@@ -917,7 +919,9 @@ impl Subscriptions {
         let mut accounting = Accounting::new(self.db.clone(), provider.as_str(), path, client_id, model)
             .with_limiter(&self.limiter)
             .with_prices(prices)
-            .with_session(tracked.map(|s| s.track(&upstream_model, window)));
+            .with_session(tracked.map(|s| s.track(&upstream_model, window)))
+            .with_capture(capture.cloned())
+            .with_target(Some(provider.into()), &upstream_model);
         let mut tried = HashSet::new();
         // Last failed upstream response, returned if every attempt fails.
         let mut last: Option<(u16, reqwest::header::HeaderMap, Bytes, String)> = None;

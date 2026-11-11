@@ -78,6 +78,7 @@ CREATE TABLE xolotl.exchanges (
     session_source LowCardinality(String),
     provider LowCardinality(String),
     account_id LowCardinality(String),
+    account_kind LowCardinality(String),
     model LowCardinality(String),
     upstream_model LowCardinality(String),
     client_endpoint LowCardinality(String),
@@ -116,6 +117,7 @@ CREATE TABLE xolotl.exchanges_queue (
     session_source String,
     provider String,
     account_id String,
+    account_kind String,
     model String,
     upstream_model String,
     client_endpoint String,
@@ -302,6 +304,19 @@ The durable consumer keeps its place, so the stream holds rows while you work:
 1. Drop the views and the queue table.
 2. Alter the target table.
 3. Create the queue table and the views again, with the new columns.
+
+The queue table ignores fields it has no column for, so rows with a new field
+load into the old tables, without it, until you make the change.
+
+Tables made from an earlier version of this page have no `account_kind`. Add
+it with the steps above, and in step 2:
+
+```sql
+ALTER TABLE xolotl.exchanges ADD COLUMN IF NOT EXISTS account_kind LowCardinality(String) AFTER account_id;
+```
+
+In step 3, the queue table has `account_kind String` after `account_id`, as in
+[ClickHouse tables](#clickhouse-tables).
 
 ### Replay
 

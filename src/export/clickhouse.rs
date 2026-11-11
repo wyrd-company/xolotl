@@ -99,6 +99,7 @@ pub fn create_table_sql(cfg: &ClickHouseConfig) -> String {
     session_source LowCardinality(String),
     provider LowCardinality(String),
     account_id LowCardinality(String),
+    account_kind LowCardinality(String),
     model LowCardinality(String),
     upstream_model LowCardinality(String),
     client_endpoint LowCardinality(String),

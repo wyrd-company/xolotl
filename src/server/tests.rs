@@ -3406,6 +3406,7 @@ async fn session_exchanges_are_exported_to_clickhouse() {
     assert_eq!(row["client_endpoint"], "/v1/messages");
     assert_eq!(row["endpoint"], "/v1/chat/completions");
     assert_eq!(row["provider"], "llama");
+    assert_eq!(row["account_kind"], "openai-compatible");
     assert_eq!(row["upstream_model"], "qwen3");
     assert_eq!(row["streamed"], true);
     assert_eq!(row["input_tokens"], 9);
@@ -3414,4 +3415,94 @@ async fn session_exchanges_are_exported_to_clickhouse() {
     let request: Value = serde_json::from_str(row["request"].as_str().unwrap()).unwrap();
     assert_eq!(request["messages"][0]["content"], "hello");
     assert_eq!(row["response"], sse);
+}
+
+#[tokio::test]
+async fn every_account_kind_is_exported_with_or_without_a_session() {
+    let mut h = harness().await;
+    let clickhouse = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&clickhouse).await;
+    let cfg = crate::config::ClickHouseConfig { url: clickhouse.uri(), create_table: false, flush_secs: 3600, ..Default::default() };
+    let export = crate::export::Exporter::new(vec![crate::export::clickhouse::start(cfg, None, None).unwrap()]);
+    h.state.export = Some(export.clone());
+    let account = h.codex_account().await;
+    let completed =
+        json!({"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 3, "output_tokens": 1}}});
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(format!("data: {completed}\n\n"), "text/event-stream"))
+        .mount(&h.upstream)
+        .await;
+    let embedding = json!({"object": "list", "data": [{"embedding": [0.5]}], "usage": {"prompt_tokens": 2}});
+    Mock::given(method("POST"))
+        .and(path("/llama/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(embedding.clone()))
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/llama/v1/audio/speech"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(vec![0xff, 0xfb, 0x90, 0x00], "audio/mpeg"))
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/llama/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": "hello"})))
+        .mount(&h.upstream)
+        .await;
+    let key = h.key(policy("p")).await;
+    let auth = format!("Bearer {key}");
+    let headers = [("authorization", auth.as_str())];
+
+    // A pool account, in a session.
+    let body = json!({"model": "gpt-6-codex", "stream": true, "instructions": "sys", "input": "hi"});
+    assert_eq!(h.call_with("POST", "/v1/responses", &headers, Some(body)).await.0, 200);
+    // A provider account, on an endpoint with no session.
+    let body = json!({"model": "llama/qwen3", "input": "a sample"});
+    assert_eq!(h.call_with("POST", "/v1/embeddings", &headers, Some(body)).await.0, 200);
+    // A passthrough whose response is audio.
+    let body = json!({"model": "qwen3", "input": "a sample"});
+    assert_eq!(h.call_with("POST", "/llama/v1/audio/speech", &headers, Some(body)).await.0, 200);
+    // A passthrough whose request streams to the upstream unread.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/llama/v1/audio/transcriptions")
+        .header("authorization", &auth)
+        .header("content-type", "multipart/form-data; boundary=x")
+        .body(Body::from("--x\r\n\r\nbytes\r\n--x--\r\n"))
+        .unwrap();
+    let resp = router(h.state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    export.shutdown().await;
+
+    let inserts: Vec<String> =
+        clickhouse.received_requests().await.unwrap().iter().map(|r| String::from_utf8_lossy(&r.body).into_owned()).collect();
+    let rows: Vec<Value> =
+        inserts.iter().flat_map(|b| b.lines().map(|l| serde_json::from_str(l).unwrap()).collect::<Vec<Value>>()).collect();
+    let row = |endpoint: &str| rows.iter().find(|r| r["client_endpoint"] == endpoint).unwrap_or_else(|| panic!("{endpoint}: {rows:?}"));
+    assert_eq!(rows.len(), 4, "{rows:?}");
+
+    let pool = row("/v1/responses");
+    assert_eq!((pool["account_kind"].as_str(), pool["account_id"].as_str()), (Some("codex"), Some(account.as_str())));
+    assert_eq!(pool["upstream_model"], "gpt-6-codex");
+    assert_ne!(pool["session_key"], "");
+
+    let embeddings = row("/v1/embeddings");
+    assert_eq!(embeddings["account_kind"], "openai-compatible");
+    assert_eq!(embeddings["provider"], "llama");
+    assert_eq!((embeddings["session_key"].as_str(), embeddings["session_source"].as_str()), (Some(""), Some("")));
+    assert_eq!(embeddings["upstream_model"], "qwen3");
+    assert_eq!(embeddings["input_tokens"], 2);
+    assert_eq!(serde_json::from_str::<Value>(embeddings["request"].as_str().unwrap()).unwrap()["input"], "a sample");
+    assert_eq!(serde_json::from_str::<Value>(embeddings["response"].as_str().unwrap()).unwrap(), embedding);
+
+    let speech = row("/v1/audio/speech");
+    assert_eq!(speech["account_kind"], "openai-compatible");
+    assert_eq!((speech["response"].as_str(), speech["response_truncated"].as_bool()), (Some(""), Some(true)));
+    assert_eq!(speech["request_truncated"], false);
+
+    let transcription = row("/v1/audio/transcriptions");
+    assert_eq!((transcription["request"].as_str(), transcription["request_truncated"].as_bool()), (Some(""), Some(true)));
+    assert_eq!(transcription["response"], r#"{"text":"hello"}"#);
 }

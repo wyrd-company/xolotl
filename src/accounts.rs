@@ -144,6 +144,19 @@ impl AccountKind {
         }
     }
 
+    /// The kind's name, as the admin API and the config file spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccountKind::Codex => "codex",
+            AccountKind::Claude => "claude",
+            AccountKind::Grok => "grok",
+            AccountKind::OpencodeGo => "opencode-go",
+            AccountKind::Vercel => "vercel",
+            AccountKind::Mistral => "mistral",
+            AccountKind::OpenaiCompatible => "openai-compatible",
+        }
+    }
+
     pub fn can_add(self, method: AddMethod) -> bool {
         self.info().add.contains(&method)
     }
@@ -204,6 +217,7 @@ mod tests {
     fn kinds_use_the_config_names() {
         for k in AccountKind::ALL {
             let name = serde_json::to_value(k).unwrap();
+            assert_eq!(name, k.as_str());
             if let Some(p) = k.sub_provider() {
                 assert_eq!(name, p.as_str());
             }

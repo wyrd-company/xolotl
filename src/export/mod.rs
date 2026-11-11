@@ -1,5 +1,5 @@
-//! Export of LLM exchanges for analysis: each session request and its
-//! response becomes a row, sent to one or more destinations. [`clickhouse`]
+//! Export of LLM exchanges for analysis: each request a client key sends to
+//! an account, of any kind, and its response becomes a row, sent to one or more destinations. [`clickhouse`]
 //! inserts rows into a ClickHouse table in batches; [`nats`] publishes each
 //! row to a NATS JetStream stream that ClickHouse loads. Exporting never holds
 //! up or fails a request: each destination has its own queue bounded by bytes,
@@ -48,6 +48,8 @@ pub struct Exchange {
     pub session_source: String,
     pub provider: String,
     pub account_id: String,
+    /// The kind of the account that served the request ([`crate::accounts::AccountKind`]).
+    pub account_kind: String,
     /// The model name the client asked for.
     pub model: String,
     pub upstream_model: String,
@@ -94,6 +96,7 @@ impl Exchange {
             &self.session_source,
             &self.provider,
             &self.account_id,
+            &self.account_kind,
             &self.model,
             &self.upstream_model,
             &self.client_endpoint,
@@ -135,7 +138,7 @@ impl Captured {
     }
 }
 
-/// The request side of an exchange, taken when the request's session begins.
+/// The request side of an exchange, taken when the request arrives.
 pub struct Capture {
     exporter: Arc<Exporter>,
     endpoint: String,
@@ -173,8 +176,10 @@ impl Drop for Pending {
 pub struct Finished<'a> {
     pub record: &'a RequestRecord,
     pub started_at: DateTime<Utc>,
+    /// Empty for a request without a session.
     pub session_key: &'a str,
     pub session_source: &'a str,
+    pub account_kind: &'a str,
     pub upstream_model: &'a str,
     pub usage: TokenUsage,
     pub tools: &'a [String],
@@ -230,6 +235,7 @@ impl Capture {
             session_source: f.session_source.to_string(),
             provider: r.provider.clone(),
             account_id: r.account_id.clone().unwrap_or_default(),
+            account_kind: f.account_kind.to_string(),
             model: r.model.clone().unwrap_or_default(),
             upstream_model: f.upstream_model.to_string(),
             client_endpoint: self.endpoint.clone(),
@@ -425,7 +431,7 @@ pub fn count(sink: &'static str, outcome: &'static str, n: usize) {
     metrics().export_rows.add(n as u64, &[KeyValue::new("sink", sink), KeyValue::new("outcome", outcome)]);
 }
 
-/// Takes the rows of session exchanges and hands each to every destination.
+/// Takes the rows of exchanges and hands each to every destination.
 pub struct Exporter {
     sinks: Vec<Sink>,
     /// What the capture keeps: what the most generous destination wants.
@@ -460,8 +466,14 @@ impl Exporter {
 
     /// The request side of an exchange on `endpoint`. `body` is the request
     /// as the client sent it; the capture shares its buffer and copies nothing.
-    pub fn capture(self: &Arc<Self>, endpoint: &str, body: &Bytes) -> Arc<Capture> {
-        let (request, request_truncated) = if self.bodies { prefix(body, self.max_body_bytes) } else { (Bytes::new(), false) };
+    /// `None` is a body that streamed to the upstream unread: its row has no
+    /// request and says it is cut.
+    pub fn capture(self: &Arc<Self>, endpoint: &str, body: Option<&Bytes>) -> Arc<Capture> {
+        let (request, request_truncated) = match body {
+            _ if !self.bodies => (Bytes::new(), false),
+            Some(body) => prefix(body, self.max_body_bytes),
+            None => (Bytes::new(), true),
+        };
         Arc::new(Capture { exporter: self.clone(), endpoint: endpoint.to_string(), request, request_truncated })
     }
 
