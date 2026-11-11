@@ -44,9 +44,11 @@ async fn anthropic_api_accounts_serve_the_claude_code_path() {
     // The subscription is at its limit, so the alias moves on to the API account.
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "60").set_body_json(
-            json!({"type": "error", "error": {"type": "rate_limit_error", "message": "limit"}}),
-        ))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "60")
+                .set_body_json(json!({"type": "error", "error": {"type": "rate_limit_error", "message": "limit"}})),
+        )
         .mount(&h.upstream)
         .await;
     Mock::given(method("POST"))

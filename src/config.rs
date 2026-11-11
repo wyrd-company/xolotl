@@ -593,6 +593,67 @@ pub struct ProviderConfig {
     pub no_auth: bool,
     /// Extra static headers sent upstream.
     pub headers: BTreeMap<String, String>,
+    /// Anthropic and OpenAI accounts: authenticate as a service account with
+    /// workload identity federation instead of a stored key. Config file only.
+    pub workload_identity: Option<WorkloadIdentity>,
+}
+
+/// Workload identity federation: xolotl exchanges a JWT from the identity
+/// provider of the host it runs on (a Kubernetes projected token, a cloud
+/// metadata token written to a file) for a short-lived access token of a
+/// service account, and exchanges again before that token expires.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkloadIdentity {
+    /// The file that holds the identity provider's JWT. It is read again for
+    /// every exchange, so a token rotated on disk is picked up.
+    pub token_file: String,
+    /// The service account to act as: `svac_...` (Anthropic) or the OpenAI
+    /// project service account's ID.
+    pub service_account_id: String,
+    /// Anthropic: the federation rule (`fdrl_...`).
+    pub federation_rule_id: Option<String>,
+    /// Anthropic: the organization's UUID.
+    pub organization_id: Option<String>,
+    /// Anthropic: the workspace (`wrkspc_...`) to scope the token to, when the
+    /// rule is enabled for more than one.
+    pub workspace_id: Option<String>,
+    /// OpenAI: the Workload Identity Provider's ID.
+    pub identity_provider_id: Option<String>,
+    /// The token endpoint, when it is not the vendor's default.
+    pub token_url: Option<String>,
+}
+
+impl WorkloadIdentity {
+    fn validate(&self, name: &str, kind: ProviderKind) -> Result<()> {
+        let set = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.trim().is_empty());
+        anyhow::ensure!(!self.token_file.trim().is_empty(), "provider {name:?}: workload_identity needs token_file");
+        anyhow::ensure!(!self.service_account_id.trim().is_empty(), "provider {name:?}: workload_identity needs service_account_id");
+        match kind {
+            ProviderKind::Anthropic => {
+                anyhow::ensure!(
+                    set(&self.federation_rule_id) && set(&self.organization_id),
+                    "provider {name:?}: Anthropic workload identity needs federation_rule_id and organization_id"
+                );
+                anyhow::ensure!(self.identity_provider_id.is_none(), "provider {name:?}: identity_provider_id is for OpenAI accounts");
+            }
+            ProviderKind::Openai => {
+                anyhow::ensure!(set(&self.identity_provider_id), "provider {name:?}: OpenAI workload identity needs identity_provider_id");
+                anyhow::ensure!(
+                    self.federation_rule_id.is_none() && self.organization_id.is_none() && self.workspace_id.is_none(),
+                    "provider {name:?}: federation_rule_id, organization_id and workspace_id are for Anthropic accounts"
+                );
+            }
+            _ => anyhow::bail!("provider {name:?}: workload_identity is for anthropic and openai accounts"),
+        }
+        if let Some(url) = &self.token_url {
+            anyhow::ensure!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "provider {name:?}: token_url must start with http:// or https://"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl ProviderConfig {
@@ -606,6 +667,10 @@ impl ProviderConfig {
         if self.kind == ProviderKind::OpenaiCompatible {
             anyhow::ensure!(self.base_url.is_some(), "provider {name:?}: openai-compatible providers need base_url");
         }
+        if let Some(w) = &self.workload_identity {
+            anyhow::ensure!(!self.no_auth, "provider {name:?}: no_auth and workload_identity can't both be set");
+            w.validate(name, self.kind)?;
+        }
         Ok(())
     }
 
@@ -614,6 +679,10 @@ impl ProviderConfig {
     pub fn validate_account(&self, name: &str) -> Result<()> {
         self.validate(name)?;
         anyhow::ensure!(self.secret.is_none(), "provider {name:?}: a provider account keeps its key with it; secret can't be set");
+        anyhow::ensure!(
+            self.workload_identity.is_none(),
+            "provider {name:?}: workload identity reads a file on the server; set it in the config file"
+        );
         if let Some(url) = &self.base_url {
             anyhow::ensure!(
                 url.starts_with("http://") || url.starts_with("https://"),

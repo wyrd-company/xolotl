@@ -73,6 +73,7 @@ const provider = (change: Partial<ProviderAccount>): ProviderAccount => ({
   headers: [],
   secret: "providers/sample",
   has_key: true,
+  workload_identity: false,
   ...change,
 });
 

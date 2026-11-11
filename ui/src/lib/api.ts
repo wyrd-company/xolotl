@@ -269,6 +269,13 @@ export interface ProviderAccount {
   headers: string[];
   secret: string;
   has_key: boolean;
+  /** Authenticates with workload identity federation (config file only): no key. */
+  workload_identity: boolean;
+}
+
+/** Whether a provider account can authenticate: a key, workload identity, or none needed. */
+export function hasCredential(p: { has_key: boolean; no_auth: boolean; workload_identity?: boolean }): boolean {
+  return p.has_key || p.no_auth || p.workload_identity === true;
 }
 
 export interface ModelMetadata {
