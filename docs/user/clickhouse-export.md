@@ -107,7 +107,7 @@ Queued rows are held in memory, up to `queue_mb`. The container image sets
 glibc keeps freed bodies in per-thread arenas and memory grows under load.
 
 `xolotl.export.rows` counts rows by `outcome`: `inserted`, `dropped` or
-`failed`. See [Telemetry](telemetry).
+`failed`. See [Telemetry](telemetry.md).
 
 ## The table
 
