@@ -8,50 +8,68 @@ A subscription account is a login to a consumer subscription or an API-key plan.
 Xolotl holds several accounts per provider, as a pool, and sends each request to
 one of them.
 
-| Provider | Account | How to add it |
-|---|---|---|
-| `codex` | ChatGPT subscription (Codex) | `xolotl auth login codex`, or import `~/.codex/auth.json` |
-| `claude` | Claude subscription (Claude Code) | `xolotl auth login claude`, or import `~/.claude/.credentials.json` |
-| `grok` | Grok Build (xAI) subscription | `xolotl auth login grok` |
-| `opencode-go` | OpenCode Go API key | `xolotl accounts add-key` |
+| Provider | Account | Web UI (**Add account**) | CLI |
+|---|---|---|---|
+| `codex` | ChatGPT subscription (Codex) | **Codex (ChatGPT)**, or **Import a login** | `xolotl auth login codex` |
+| `claude` | Claude subscription (Claude Code) | **Claude (Pro / Max)**, or **Import a login** | `xolotl auth login claude` |
+| `grok` | Grok Build (xAI) subscription | **Grok Build (xAI)** | `xolotl auth login grok` |
+| `opencode-go` | OpenCode Go API key | **OpenCode Go** | `xolotl accounts add-key` |
 
-You can also add accounts on the web UI's **Add account** screen.
+Credentials go straight to OpenBao. Logging in to an account that is already
+in xolotl updates it. It does not add a duplicate.
 
 ## Add an account
 
+Open **Accounts** in the [web UI](web-ui.md) and select **Add account**. The
+screen has one section per provider.
+
 ### Codex
 
+1. Under **Codex (ChatGPT)**, select **Start device login**.
+2. Open the sign-in page it links, sign in to ChatGPT and enter the code it
+   shows. You can do this on any device.
+3. The screen updates when you finish. The account is saved.
+
+**Use browser sign-in instead** starts the browser flow: approve, then paste
+the `http://localhost:1455/…` URL the browser ends on into the form, and select
+**Finish login**.
+
+With the CLI:
+
 ```sh
-xolotl auth login codex
+xolotl auth login codex             # device code
+xolotl auth login codex --browser   # browser flow: paste the URL the browser ends on
 ```
-
-The CLI prints a URL and a code. Open the URL, enter the code and approve.
-Xolotl waits for the approval and saves the account.
-
-Add `--browser` to use the browser flow instead: open the URL, approve, then
-paste the URL the browser ends on back into the CLI.
 
 ### Claude
 
-```sh
-xolotl auth login claude
-```
+1. Under **Claude (Pro / Max)**, select **Start Claude login**.
+2. Select **Open claude.ai authorization** and approve.
+3. claude.ai shows a code in the form `CODE#STATE`. Paste it into
+   **Authorization code** and select **Finish login**.
 
-Open the URL on claude.ai and approve. The page shows a code in the form
-`CODE#STATE`. Paste it into the CLI.
+With the CLI, `xolotl auth login claude` prints the URL and asks for the code.
 
 Claude subscription accounts serve only the Claude Code API path,
 `/v1/messages`. Xolotl does not translate requests to them from other formats.
 
 ### Grok Build
 
-```sh
-xolotl auth login grok
-```
+1. Under **Grok Build (xAI)**, select **Start device login**.
+2. Open the page it links, sign in to your xAI account and confirm the code.
+3. The screen updates when you finish.
 
-Open the URL, enter the code and approve. You can't import Grok logins.
+With the CLI: `xolotl auth login grok`. You can't import Grok logins.
 
 ### OpenCode Go
+
+1. Under **OpenCode Go**, enter a **Label** (optional) and the **API key**
+   from the OpenCode console.
+2. Select **Add key**.
+
+Add several keys to spread load and limits.
+
+With the CLI:
 
 ```sh
 echo "$OPENCODE_GO_KEY" | xolotl accounts add-key --label personal
@@ -69,6 +87,14 @@ The upstream user agent is `xolotl/<version> (<client user agent>)`.
 
 ### Import a CLI login
 
+You can move a login from the Codex CLI (`~/.codex/auth.json`) or Claude Code
+(`~/.claude/.credentials.json`) into xolotl.
+
+1. Under **Import a login**, pick the **Provider**.
+2. Choose the **Credential file** and select **Import**.
+
+With the CLI:
+
 ```sh
 xolotl accounts import codex ~/.codex/auth.json
 xolotl accounts import claude ~/.claude/.credentials.json --label work
@@ -79,17 +105,24 @@ xolotl accounts import claude ~/.claude/.credentials.json --label work
 > machine stops working, and if the local CLI refreshes first, the account in
 > xolotl stops working.
 
-Logging in to the same account again updates it. It does not add a duplicate.
-
 ## See your accounts
+
+The **Accounts** screen lists the accounts by provider, with their plan, state,
+usage windows, priority and last use. **Refresh usage** fetches the usage
+windows from the provider now. The details button at the end of a row shows
+the label, cooldown reason, last error, token expiry, reset credits and
+OpenBao path.
+
+With the CLI:
 
 ```sh
 xolotl accounts list
 xolotl accounts list --provider codex
+xolotl accounts usage <id>    # fetch the usage windows now
 ```
 
-The list shows each account's ID, provider, label, plan, priority, state and
-usage windows (for example `5h 12%, 7d 40%`).
+The CLI list shows each account's ID, provider, label, plan, priority, state
+and usage windows (for example `5h 12%, 7d 40%`).
 
 | CLI state | Web UI state | Meaning | What to do |
 |---|---|---|---|
@@ -99,11 +132,18 @@ usage windows (for example `5h 12%, 7d 40%`).
 | `re-login` | Key rejected | An API-key account whose key the provider refused with a 401. It is out of rotation | Replace the key |
 | `re-login` | Refused | An API-key account whose last recorded error is another 4xx | Read the last error. Replace the key, or **Retry** |
 | `UNSAVED` | | A refreshed token could not be written to OpenBao. Xolotl serves from memory and retries every 15 seconds | Fix OpenBao. Do not restart xolotl until the state clears, or the token is lost |
-| `disabled` | Disabled | You disabled it | `xolotl accounts enable <id>` |
-
-`xolotl accounts usage <id>` fetches the usage windows from the provider now.
+| `disabled` | Disabled | You disabled it | **Enable** (`xolotl accounts enable <id>`) |
 
 ## Manage accounts
+
+On the **Accounts** screen:
+
+- **Disable** and **Enable** on a row take the account out of rotation and put
+  it back.
+- In the account's details, set **Priority (higher is used first)**, select
+  **Retry** to clear a cooldown or re-login state, or **Remove** the account.
+
+With the CLI:
 
 ```sh
 xolotl accounts priority <id> 10   # higher priority is used first
