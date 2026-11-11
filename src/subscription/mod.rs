@@ -679,7 +679,14 @@ impl Subscriptions {
                 continue;
             }
             if r.cooling_down(t) {
-                let u = r.cooldown_until.unwrap_or(t);
+                // The account serves again when its cooldown ends and the
+                // caller's policy admits a request on it, whichever is later.
+                let mut u = r.cooldown_until.unwrap_or(t);
+                if let Some((client, policy)) = limiter
+                    && let Err(e) = self.limiter.check(client, policy, &with_account(&r.id, &pending), t)
+                {
+                    u = u.max(t + e.retry_after);
+                }
                 if earliest.as_ref().is_none_or(|(e, _)| u < *e) {
                     earliest = Some((u, r.id.clone()));
                 }
@@ -1039,17 +1046,13 @@ impl Subscriptions {
                                 // If no other account serves the request, the client gets
                                 // this as an HTTP error: in the backend's error shape, with
                                 // the account's `x-codex-*` usage headers kept.
-                                let body = Bytes::from(codex::stream_error_body(&ev).unwrap_or(ev).to_string());
+                                let exhausted = matches!(failure, Failure::Exhausted { .. });
+                                let body = Bytes::from(codex::stream_error_body(&ev, exhausted).unwrap_or(ev).to_string());
                                 let mut error_headers = resp_headers.clone();
                                 error_headers.remove(reqwest::header::CONTENT_LENGTH);
                                 error_headers
                                     .insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
-                                last = Some((
-                                    if matches!(failure, Failure::Exhausted { .. }) { 429 } else { 502 },
-                                    error_headers,
-                                    body,
-                                    account.id.clone(),
-                                ));
+                                last = Some((if exhausted { 429 } else { 502 }, error_headers, body, account.id.clone()));
                                 if self.stays_on_lock(tracked, pin.as_ref(), &failure, status).await {
                                     break 'accounts;
                                 }

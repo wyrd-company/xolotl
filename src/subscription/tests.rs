@@ -271,6 +271,45 @@ async fn all_codex_accounts_cooling_report_the_first_to_reset() {
     assert_eq!(body["error"]["type"], "usage_limit_reached");
 }
 
+/// The account reported as next is the one that can serve next: a cooling
+/// account whose policy limit outlasts its cooldown comes back later.
+#[tokio::test]
+async fn all_codex_accounts_cooling_respect_policy_limits() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::RoundRobin).await;
+    let limiter = Arc::new(crate::limits::Limiter::default());
+    let subs = Arc::try_unwrap(subs).ok().unwrap().with_limiter(limiter.clone());
+    let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
+    let b = subs.save_account(codex_cred("acct-b", "tok-b")).await.unwrap();
+    subs.db.set_cooldown(&a.id, now() + 10, "quota exhausted").await.unwrap();
+    subs.db.set_cooldown(&b.id, now() + 20, "quota exhausted").await.unwrap();
+    let window = |used: f64| UsageWindow { name: "5h".into(), used_percent: used, resets_at: None, window_secs: Some(18_000) };
+    subs.record_usage(&a.id, SubProvider::Codex, vec![window(100.0)], None).await;
+    subs.record_usage(&b.id, SubProvider::Codex, vec![window(80.0)], None).await;
+    let mut p = any_policy();
+    p.limits.accounts.insert(a.id.clone(), crate::limits::Allowance { requests_per_day: Some(1), ..Default::default() });
+    let key = principal(p);
+    limiter.admit("p/client", &key.policy, &[crate::limits::Meter::Account(&a.id)], now()).unwrap();
+
+    let resp = subs
+        .execute(
+            SubProvider::Codex,
+            Method::POST,
+            "/v1/responses",
+            HeaderMap::new(),
+            responses_body(),
+            Some(&key),
+            None,
+            &mut Charge::default(),
+            None,
+        )
+        .await;
+    assert_eq!(resp.status(), 429);
+    assert_eq!(resp.headers()["x-codex-primary-used-percent"], "80", "b serves next, not a");
+    let ra: i64 = resp.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!((15..=20).contains(&ra), "{ra}");
+}
+
 /// A quota error at the start of a `200` stream on the last account reaches a
 /// Codex client as a 429 in the backend's error shape, with the account's
 /// usage headers.
