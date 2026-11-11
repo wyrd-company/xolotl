@@ -1,5 +1,6 @@
 //! Xolotl: an LLM subscription proxy and AI gateway backed by OpenBao.
 
+pub mod accounts;
 pub mod catalog;
 pub mod cli;
 pub mod config;

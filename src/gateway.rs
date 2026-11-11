@@ -12,7 +12,8 @@ use anyhow::{Context, Result};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use parking_lot::RwLock;
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::{Map, Value, json};
 
 use crate::config::{GatewayConfig, ProviderConfig, ProviderKind};
 use crate::context::RequestSession;
@@ -24,8 +25,56 @@ use crate::secrets::Secrets;
 
 const KEY_TTL: Duration = Duration::from_secs(300);
 
+/// Where provider accounts added at runtime are stored, one secret per
+/// account: the provider fields and `api_key`. The config file's providers
+/// keep only their key here (`{ api_key }`), by default.
+pub const PROVIDERS_PREFIX: &str = "providers";
+
+/// Where a provider account is defined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderSource {
+    /// `[gateway.providers.<name>]` in the config file; read-only at runtime.
+    Config,
+    /// Added through the admin API; stored in the vault.
+    Vault,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderEntry {
+    pub name: String,
+    pub cfg: ProviderConfig,
+    pub source: ProviderSource,
+}
+
+impl ProviderEntry {
+    /// The vault secret that holds the provider's `api_key`.
+    pub fn secret(&self) -> String {
+        self.cfg.secret.clone().unwrap_or_else(|| format!("{PROVIDERS_PREFIX}/{}", self.name))
+    }
+}
+
+/// Why adding, changing or removing a provider account failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderChangeError {
+    #[error("no provider account named {0}")]
+    NotFound(String),
+    /// The name is taken, comes from the config file, or changed concurrently.
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0:#}")]
+    Invalid(anyhow::Error),
+    #[error("{0:#}")]
+    Store(anyhow::Error),
+}
+
 pub struct Gateway {
-    providers: BTreeMap<String, ProviderConfig>,
+    /// The config file's providers, disabled ones included.
+    config: BTreeMap<String, ProviderConfig>,
+    /// Config-file and vault providers, disabled ones included.
+    providers: RwLock<BTreeMap<String, Arc<ProviderEntry>>>,
+    /// Serializes changes to the vault providers (reload, put, remove).
+    changes: tokio::sync::Mutex<()>,
     secrets: Secrets,
     http: reqwest::Client,
     db: Db,
@@ -35,13 +84,30 @@ pub struct Gateway {
 }
 
 impl Gateway {
+    /// A gateway with the config file's providers. [`Gateway::reload`] adds the vault's.
     pub fn new(cfg: &GatewayConfig, secrets: Secrets, http: reqwest::Client, db: Db) -> Self {
-        let providers = cfg.providers.iter().filter(|(_, p)| p.is_enabled()).map(|(k, v)| (k.clone(), v.clone())).collect();
-        Self { providers, secrets, http, db, keys: RwLock::new(HashMap::new()), catalog: None, limiter: Default::default() }
+        let providers = cfg
+            .providers
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::new(ProviderEntry { name: k.clone(), cfg: v.clone(), source: ProviderSource::Config })))
+            .collect();
+        Self {
+            config: cfg.providers.clone(),
+            providers: RwLock::new(providers),
+            changes: Default::default(),
+            secrets,
+            http,
+            db,
+            keys: RwLock::new(HashMap::new()),
+            catalog: None,
+            limiter: Default::default(),
+        }
     }
 
-    /// Snapshot model prices with each request.
+    /// Snapshot model prices with each request, and keep the catalog's
+    /// provider list in step with the gateway's.
     pub fn with_catalog(mut self, catalog: Arc<crate::catalog::ModelCatalog>) -> Self {
+        catalog.set_gateway_kinds(self.kinds());
         self.catalog = Some(catalog);
         self
     }
@@ -52,40 +118,195 @@ impl Gateway {
         self
     }
 
+    /// An enabled provider.
+    fn get(&self, name: &str) -> Option<Arc<ProviderEntry>> {
+        self.providers.read().get(name).filter(|p| p.cfg.is_enabled()).cloned()
+    }
+
+    /// Every provider account, disabled ones included.
+    pub fn entries(&self) -> Vec<Arc<ProviderEntry>> {
+        self.providers.read().values().cloned().collect()
+    }
+
     pub fn has_provider(&self, name: &str) -> bool {
-        self.providers.contains_key(name)
+        self.get(name).is_some()
     }
 
     pub fn kind(&self, name: &str) -> Option<ProviderKind> {
-        self.providers.get(name).map(|p| p.kind)
+        self.get(name).map(|p| p.cfg.kind)
     }
 
+    /// The enabled providers and their kinds.
     pub fn kinds(&self) -> BTreeMap<String, ProviderKind> {
-        self.providers.iter().map(|(k, v)| (k.clone(), v.kind)).collect()
+        self.providers.read().iter().filter(|(_, p)| p.cfg.is_enabled()).map(|(k, v)| (k.clone(), v.cfg.kind)).collect()
+    }
+
+    // ---- provider accounts stored in the vault
+
+    /// Read the provider accounts stored in the vault and apply them. A secret
+    /// without `kind` is a config-file provider's key, not an account. Invalid
+    /// accounts, and names the config file already uses, are skipped.
+    pub async fn reload(&self) -> Result<usize> {
+        let _changes = self.changes.lock().await;
+        self.reload_locked().await
+    }
+
+    async fn reload_locked(&self) -> Result<usize> {
+        let mut next: BTreeMap<String, Arc<ProviderEntry>> =
+            self.providers.read().iter().filter(|(_, p)| p.source == ProviderSource::Config).map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut n = 0;
+        for name in self.secrets.list(PROVIDERS_PREFIX).await? {
+            if name.ends_with('/') {
+                continue;
+            }
+            let Some(data) = self.secrets.get(&format!("{PROVIDERS_PREFIX}/{name}")).await? else { continue };
+            if !data.contains_key("kind") {
+                continue;
+            }
+            if self.config.contains_key(&name) {
+                tracing::warn!(provider = %name, "provider account in the vault ignored: the config file defines one with that name");
+                continue;
+            }
+            match stored_config(data).and_then(|cfg| cfg.validate_account(&name).map(|()| cfg)) {
+                Ok(cfg) => {
+                    n += 1;
+                    next.insert(name.clone(), Arc::new(ProviderEntry { name, cfg, source: ProviderSource::Vault }));
+                }
+                Err(e) => tracing::warn!(provider = %name, error = %format!("{e:#}"), "invalid provider account in the vault ignored"),
+            }
+        }
+        let gone: Vec<String> = self.providers.read().keys().filter(|k| !next.contains_key(*k)).cloned().collect();
+        *self.providers.write() = next;
+        {
+            let mut keys = self.keys.write();
+            for name in gone {
+                keys.remove(&name);
+            }
+        }
+        if let Some(c) = &self.catalog {
+            c.set_gateway_kinds(self.kinds());
+        }
+        Ok(n)
+    }
+
+    /// Add (`create`) or change a provider account stored in the vault. A
+    /// change without `api_key` keeps the stored key. Adding a name whose key
+    /// is already stored (a provider moved out of the config file) keeps that
+    /// key too.
+    pub async fn put_provider(
+        &self,
+        name: &str,
+        cfg: ProviderConfig,
+        api_key: Option<String>,
+        create: bool,
+    ) -> Result<(), ProviderChangeError> {
+        if self.config.contains_key(name) {
+            return Err(ProviderChangeError::Conflict(format!("provider {name} is defined in the config file")));
+        }
+        cfg.validate_account(name).map_err(ProviderChangeError::Invalid)?;
+        let api_key = api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+        let _changes = self.changes.lock().await;
+        let path = format!("{PROVIDERS_PREFIX}/{name}");
+        let (current, version) = self.secrets.get_versioned(&path).await.map_err(ProviderChangeError::Store)?;
+        let exists = current.as_ref().is_some_and(|d| d.contains_key("kind"));
+        if create && exists {
+            return Err(ProviderChangeError::Conflict(format!("a provider account named {name} already exists")));
+        }
+        if !create && !exists {
+            return Err(ProviderChangeError::NotFound(name.to_string()));
+        }
+        let kept = current.as_ref().and_then(|d| d.get("api_key")).and_then(Value::as_str).filter(|k| !k.is_empty()).map(str::to_string);
+        let key = api_key.or(kept);
+        if create && !cfg.no_auth && key.is_none() {
+            return Err(ProviderChangeError::Invalid(anyhow::anyhow!("provider {name}: give an API key, or set no_auth")));
+        }
+        let mut data = match serde_json::to_value(&cfg).map_err(|e| ProviderChangeError::Store(e.into()))? {
+            Value::Object(m) => m,
+            _ => unreachable!("a provider config is an object"),
+        };
+        data.retain(|_, v| !v.is_null());
+        if let Some(k) = key {
+            data.insert("api_key".into(), Value::String(k));
+        }
+        self.secrets.put_cas(&path, data, version).await.map_err(|e| match e.downcast::<crate::secrets::Conflict>() {
+            Ok(c) => ProviderChangeError::Conflict(c.to_string()),
+            Err(e) => ProviderChangeError::Store(e),
+        })?;
+        self.keys.write().remove(name);
+        self.reload_locked().await.map_err(ProviderChangeError::Store)?;
+        Ok(())
+    }
+
+    /// Remove a provider account stored in the vault, with its key.
+    pub async fn remove_provider(&self, name: &str) -> Result<(), ProviderChangeError> {
+        if self.config.contains_key(name) {
+            return Err(ProviderChangeError::Conflict(format!("provider {name} is defined in the config file; remove it there")));
+        }
+        let _changes = self.changes.lock().await;
+        if self.providers.read().get(name).is_none_or(|p| p.source != ProviderSource::Vault) {
+            return Err(ProviderChangeError::NotFound(name.to_string()));
+        }
+        self.secrets.delete(&format!("{PROVIDERS_PREFIX}/{name}")).await.map_err(ProviderChangeError::Store)?;
+        self.keys.write().remove(name);
+        self.reload_locked().await.map_err(ProviderChangeError::Store)?;
+        Ok(())
+    }
+
+    /// Store a provider's API key, in config-file and vault providers alike.
+    /// Other fields of the secret are kept.
+    pub async fn set_key(&self, name: &str, api_key: &str) -> Result<(), ProviderChangeError> {
+        let entry = self.providers.read().get(name).cloned().ok_or_else(|| ProviderChangeError::NotFound(name.to_string()))?;
+        let api_key = api_key.trim();
+        if api_key.is_empty() {
+            return Err(ProviderChangeError::Invalid(anyhow::anyhow!("the API key is empty")));
+        }
+        let _changes = self.changes.lock().await;
+        let path = entry.secret();
+        let (current, version) = self.secrets.get_versioned(&path).await.map_err(ProviderChangeError::Store)?;
+        let mut data = current.unwrap_or_default();
+        data.insert("api_key".into(), Value::String(api_key.to_string()));
+        self.secrets.put_cas(&path, data, version).await.map_err(|e| match e.downcast::<crate::secrets::Conflict>() {
+            Ok(c) => ProviderChangeError::Conflict(c.to_string()),
+            Err(e) => ProviderChangeError::Store(e),
+        })?;
+        self.keys.write().remove(name);
+        Ok(())
+    }
+
+    /// Whether the provider's key is stored.
+    pub async fn has_key(&self, entry: &ProviderEntry) -> Result<bool> {
+        if entry.cfg.no_auth {
+            return Ok(false);
+        }
+        Ok(self
+            .secrets
+            .get(&entry.secret())
+            .await?
+            .is_some_and(|m| m.get("api_key").and_then(Value::as_str).is_some_and(|k| !k.is_empty())))
     }
 
     fn base_url(p: &ProviderConfig) -> String {
         let base = match (&p.base_url, p.kind) {
             (Some(b), _) => b.clone(),
-            (None, ProviderKind::Vercel) => "https://ai-gateway.vercel.sh".into(),
-            (None, ProviderKind::Mistral) => "https://api.mistral.ai".into(),
+            (None, ProviderKind::Vercel) => crate::accounts::VERCEL_BASE_URL.into(),
+            (None, ProviderKind::Mistral) => crate::accounts::MISTRAL_BASE_URL.into(),
             (None, ProviderKind::OpenaiCompatible) => String::new(),
         };
         let base = base.trim_end_matches('/');
         base.strip_suffix("/v1").unwrap_or(base).to_string()
     }
 
-    async fn api_key(&self, name: &str) -> Result<Option<String>> {
-        let p = self.providers.get(name).with_context(|| format!("unknown provider {name}"))?;
-        if p.no_auth {
+    async fn api_key(&self, p: &ProviderEntry) -> Result<Option<String>> {
+        if p.cfg.no_auth {
             return Ok(None);
         }
+        let name = &p.name;
         if let Some((k, at)) = self.keys.read().get(name)
             && at.elapsed() < KEY_TTL
         {
             return Ok(k.clone());
         }
-        let path = p.secret.clone().unwrap_or_else(|| format!("providers/{name}"));
+        let path = p.secret();
         let key = self
             .secrets
             .get(&path)
@@ -108,15 +329,15 @@ impl Gateway {
         mut headers: HeaderMap,
         body: reqwest::Body,
     ) -> Result<reqwest::Response> {
-        let p = self.providers.get(provider).with_context(|| format!("unknown provider {provider}"))?;
-        let url = format!("{}{}", Self::base_url(p), path_and_query);
-        if let Some(key) = self.api_key(provider).await? {
+        let p = self.get(provider).with_context(|| format!("unknown provider {provider}"))?;
+        let url = format!("{}{}", Self::base_url(&p.cfg), path_and_query);
+        if let Some(key) = self.api_key(&p).await? {
             set_header(&mut headers, "authorization", &format!("Bearer {key}"));
             if path_and_query.starts_with("/v1/messages") {
                 set_header(&mut headers, "x-api-key", &key);
             }
         }
-        for (k, v) in &p.headers {
+        for (k, v) in &p.cfg.headers {
             if let (Ok(name), Ok(val)) = (k.parse::<axum::http::HeaderName>(), v.parse::<axum::http::HeaderValue>()) {
                 headers.insert(name, val);
             }
@@ -149,7 +370,7 @@ impl Gateway {
     ) -> Response {
         if let Some(obj) = body.as_object_mut() {
             obj.insert("model".into(), Value::String(target.model.clone()));
-            if self.providers.get(&target.provider).is_some_and(|p| p.kind == ProviderKind::Mistral) {
+            if self.kind(&target.provider) == Some(ProviderKind::Mistral) {
                 normalize_mistral(path, obj);
             }
         }
@@ -215,6 +436,12 @@ impl Gateway {
     }
 }
 
+/// A stored provider account's fields, without its key.
+fn stored_config(mut data: Map<String, Value>) -> Result<ProviderConfig> {
+    data.remove("api_key");
+    serde_json::from_value(Value::Object(data)).context("reading the provider account")
+}
+
 /// Mistral rejects a few OpenAI parameter spellings with a 422.
 fn normalize_mistral(path: &str, obj: &mut serde_json::Map<String, Value>) {
     if path != "/v1/chat/completions" {
@@ -273,6 +500,23 @@ mod tests {
         let resp = g.execute(&t, Method::POST, "/v1/chat/completions", HeaderMap::new(), json!({"model": "x"}), None, "x", None).await;
         assert_eq!(resp.status(), 200);
         assert_eq!(g.fetch_models("b").await.unwrap(), vec!["m2", "m3"]);
+    }
+
+    #[tokio::test]
+    async fn set_key_writes_the_configured_secret() {
+        let secrets: Secrets = Arc::new(MemoryStore::default());
+        secrets.put("team/llm", json!({"api_key": "old", "note": "kept"}).as_object().unwrap().clone()).await.unwrap();
+        let mut cfg = GatewayConfig { providers: BTreeMap::new() };
+        cfg.providers.insert(
+            "local".into(),
+            ProviderConfig { base_url: Some("http://x".into()), secret: Some("team/llm".into()), ..Default::default() },
+        );
+        let g = Gateway::new(&cfg, secrets.clone(), reqwest::Client::new(), Db::in_memory().await.unwrap());
+        g.set_key("local", " new ").await.unwrap();
+        let stored = secrets.get("team/llm").await.unwrap().unwrap();
+        assert_eq!((stored["api_key"].as_str(), stored["note"].as_str()), (Some("new"), Some("kept")));
+        assert!(secrets.get("providers/local").await.unwrap().is_none());
+        assert!(matches!(g.set_key("nope", "k").await, Err(ProviderChangeError::NotFound(_))));
     }
 
     #[test]

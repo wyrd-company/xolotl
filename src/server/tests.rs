@@ -735,6 +735,149 @@ async fn passthroughs_swap_credentials() {
 }
 
 #[tokio::test]
+async fn provider_accounts_are_added_changed_and_removed_at_runtime() {
+    let h = harness().await;
+    let admin = Some(h.admin.as_str());
+    let uri = h.upstream.uri();
+    Mock::given(method("GET"))
+        .and(path("/local/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "m1"}]})))
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/local/v1/props"))
+        .and(header("authorization", "Bearer local-key"))
+        .and(header("x-team", "blue"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&h.upstream)
+        .await;
+
+    let (status, kinds) = h.call("GET", "/admin/account-kinds", admin, None).await;
+    assert_eq!(status, 200, "{kinds}");
+    let kind = |k: &str| kinds.as_array().unwrap().iter().find(|i| i["kind"] == k).unwrap().clone();
+    assert_eq!(kind("codex")["placement"], "pool");
+    assert_eq!(kind("codex")["provider"], "codex");
+    assert_eq!(kind("opencode-go")["add"], json!(["api-key"]));
+    assert_eq!(kind("openai-compatible")["placement"], "provider");
+    assert_eq!(kind("openai-compatible")["default_base_url"], Value::Null);
+    assert_eq!(kind("vercel")["default_base_url"], "https://ai-gateway.vercel.sh");
+
+    let local = json!({
+        "kind": "openai-compatible", "name": "local", "base_url": format!("{uri}/local/v1"),
+        "api_key": "local-key", "headers": {"x-team": "blue"},
+    });
+    let (status, added) = h.call("POST", "/admin/accounts", admin, Some(local.clone())).await;
+    assert_eq!(status, 200, "{added}");
+    assert_eq!(added["source"], "vault");
+    assert_eq!(added["has_key"], true);
+    assert_eq!(added["headers"], json!(["x-team"]));
+    assert_eq!(added["catalog_refresh"]["models"], 1, "{added}");
+    let stored = h.state.secrets.get("providers/local").await.unwrap().unwrap();
+    assert_eq!(stored["kind"], "openai-compatible");
+    assert_eq!(stored["api_key"], "local-key");
+
+    // It serves like a config-file provider.
+    let key = h.key(policy("p")).await;
+    let (status, body) = h.call("GET", "/local/v1/props", Some(&key), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(h.state.catalog.models()["local"].contains("m1"));
+
+    // Refusals.
+    assert_eq!(h.call("POST", "/admin/accounts", admin, Some(local.clone())).await.0, 409, "a duplicate");
+    let mut taken = local.clone();
+    taken["name"] = json!("llama");
+    let (status, body) = h.call("POST", "/admin/accounts", admin, Some(taken)).await;
+    assert_eq!(status, 409, "a config-file name: {body}");
+    let mut reserved = local.clone();
+    reserved["name"] = json!("codex");
+    assert_eq!(h.call("POST", "/admin/accounts", admin, Some(reserved)).await.0, 400, "a pool name");
+    let (status, body) = h.call("POST", "/admin/accounts", admin, Some(json!({"kind": "mistral", "name": "nokey"}))).await;
+    assert_eq!(status, 400, "no key: {body}");
+    let (status, _) =
+        h.call("POST", "/admin/accounts", admin, Some(json!({"kind": "openai-compatible", "name": "nourl", "api_key": "k"}))).await;
+    assert_eq!(status, 400, "openai-compatible without base_url");
+    assert_eq!(h.call("POST", "/admin/accounts", admin, Some(json!({"kind": "codex", "api_key": "k"}))).await.0, 400, "an OAuth kind");
+    assert_eq!(h.call("POST", "/admin/accounts", admin, Some(json!({"kind": "vercel", "name": "v", "api_key": "k", "x": 1}))).await.0, 422);
+
+    // A change keeps the key; a new key keeps the fields.
+    let change = json!({"kind": "openai-compatible", "base_url": format!("{uri}/local/v1"), "headers": {"x-team": "blue"}});
+    let (status, body) = h.call("PUT", "/admin/providers/local", admin, Some(change)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(h.state.secrets.get("providers/local").await.unwrap().unwrap()["api_key"], "local-key");
+    let (status, body) = h.call("POST", "/admin/providers/local/key", admin, Some(json!({"api_key": "next"}))).await;
+    assert_eq!(status, 200, "{body}");
+    let stored = h.state.secrets.get("providers/local").await.unwrap().unwrap();
+    assert_eq!((stored["api_key"].as_str(), stored["kind"].as_str()), (Some("next"), Some("openai-compatible")));
+    assert_eq!(h.call("PUT", "/admin/providers/llama", admin, Some(json!({"kind": "openai-compatible"}))).await.0, 409);
+
+    // A policy that names the provider keeps it.
+    h.state
+        .keys
+        .put_policy(
+            Policy { name: "named".into(), providers: vec!["local".into()], ..Default::default() },
+            &h.state.catalog.known_providers(),
+            &h.state.mcp.server_names(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = h.call("DELETE", "/admin/providers/local", admin, None).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(h.call("DELETE", "/admin/policies/named", admin, None).await.0, 200);
+    assert_eq!(h.call("DELETE", "/admin/providers/llama", admin, None).await.0, 409, "config-file providers stay");
+    let (status, body) = h.call("DELETE", "/admin/providers/local", admin, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(h.state.secrets.get("providers/local").await.unwrap().is_none());
+    assert!(!h.state.catalog.models().contains_key("local"));
+    assert_eq!(h.call("GET", "/local/v1/props", Some(&key), None).await.0, 404);
+    assert_eq!(h.call("DELETE", "/admin/providers/local", admin, None).await.0, 404);
+}
+
+#[tokio::test]
+async fn provider_accounts_load_from_the_vault() {
+    let secrets: Secrets = Arc::new(MemoryStore::default());
+    let put = |k: &'static str, v: Value| {
+        let s = secrets.clone();
+        async move { s.put(k, v.as_object().unwrap().clone()).await.unwrap() }
+    };
+    put("providers/stored", json!({"kind": "mistral", "api_key": "k"})).await;
+    put("providers/orphan", json!({"api_key": "left over"})).await;
+    put("providers/broken", json!({"kind": "openai-compatible", "api_key": "k"})).await;
+    let h = harness_with_secrets(|_| {}, secrets.clone()).await;
+    assert_eq!(h.state.gateway.reload().await.unwrap(), 1);
+    assert_eq!(h.state.gateway.kind("stored"), Some(ProviderKind::Mistral));
+    assert!(!h.state.gateway.has_provider("orphan") && !h.state.gateway.has_provider("broken"));
+    assert!(h.state.catalog.known_providers().contains("stored"));
+
+    // A vault account with a config-file name is ignored; the config's key stays.
+    put("providers/llama", json!({"kind": "mistral", "api_key": "llama-key"})).await;
+    h.state.gateway.reload().await.unwrap();
+    assert_eq!(h.state.gateway.kind("llama"), Some(ProviderKind::OpenaiCompatible));
+
+    // Another instance removed it.
+    secrets.delete("providers/stored").await.unwrap();
+    assert_eq!(h.state.gateway.reload().await.unwrap(), 0);
+    assert!(!h.state.catalog.known_providers().contains("stored"));
+
+    // Adding a name whose key is already stored keeps the key.
+    let (status, body) = h.call("POST", "/admin/accounts", Some(&h.admin), Some(json!({"kind": "vercel", "name": "orphan"}))).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["has_key"], true);
+}
+
+#[tokio::test]
+async fn pool_api_key_accounts_are_added_by_kind() {
+    let h = harness().await;
+    let body = json!({"kind": "opencode-go", "api_key": "ocg-key", "label": "team"});
+    let (status, row) = h.call("POST", "/admin/accounts", Some(&h.admin), Some(body)).await;
+    assert_eq!(status, 200, "{row}");
+    assert_eq!(row["provider"], "opencode-go");
+    assert_eq!(row["label"], "team");
+    let body = json!({"kind": "opencode-go", "api_key": "k2", "base_url": "http://x"});
+    assert_eq!(h.call("POST", "/admin/accounts", Some(&h.admin), Some(body)).await.0, 400);
+    assert_eq!(h.call("POST", "/admin/accounts", Some(&h.admin), Some(json!({"kind": "opencode-go"}))).await.0, 400);
+}
+
+#[tokio::test]
 async fn client_credentials_never_reach_upstream() {
     let h = harness().await;
     Mock::given(method("GET")).and(path("/llama/v1/props")).respond_with(ResponseTemplate::new(200)).mount(&h.upstream).await;
@@ -1607,8 +1750,8 @@ async fn ui_admin_endpoints() {
     assert_eq!(
         providers,
         json!([{
-            "name": "llama", "kind": "openai-compatible", "enabled": true, "base_url": format!("{}/llama/v1", h.upstream.uri()),
-            "no_auth": false, "secret": "providers/llama", "has_key": true,
+            "name": "llama", "kind": "openai-compatible", "source": "config", "enabled": true,
+            "base_url": format!("{}/llama/v1", h.upstream.uri()), "no_auth": false, "headers": [], "secret": "providers/llama", "has_key": true,
         }])
     );
 

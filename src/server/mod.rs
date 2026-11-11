@@ -186,6 +186,9 @@ pub fn spawn_background(state: AppState) {
             if let Err(e) = s.subs.sync().await {
                 tracing::warn!(error = %e, "account sync failed");
             }
+            if let Err(e) = s.gateway.reload().await {
+                tracing::warn!(error = %e, "provider account reload failed");
+            }
             if let Err(e) = s.mcp.reload().await {
                 tracing::warn!(error = %e, "MCP server reload failed");
             }

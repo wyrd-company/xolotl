@@ -595,6 +595,51 @@ impl ProviderConfig {
     pub fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
     }
+
+    /// Check a provider and the name it is addressed by.
+    pub fn validate(&self, name: &str) -> Result<()> {
+        validate_provider_name(name)?;
+        if self.kind == ProviderKind::OpenaiCompatible {
+            anyhow::ensure!(self.base_url.is_some(), "provider {name:?}: openai-compatible providers need base_url");
+        }
+        Ok(())
+    }
+
+    /// [`Self::validate`], plus the checks for a provider account added at
+    /// runtime: the config file keeps its looser rules so existing files load.
+    pub fn validate_account(&self, name: &str) -> Result<()> {
+        self.validate(name)?;
+        anyhow::ensure!(self.secret.is_none(), "provider {name:?}: a provider account keeps its key with it; secret can't be set");
+        if let Some(url) = &self.base_url {
+            anyhow::ensure!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "provider {name:?}: base_url must start with http:// or https://"
+            );
+        }
+        for (k, v) in &self.headers {
+            anyhow::ensure!(k.parse::<axum::http::HeaderName>().is_ok(), "provider {name:?}: {k:?} is not a header name");
+            anyhow::ensure!(v.parse::<axum::http::HeaderValue>().is_ok(), "provider {name:?}: header {k:?} has an invalid value");
+        }
+        Ok(())
+    }
+}
+
+/// Provider names are model prefixes and path prefixes, so they can't take
+/// the subscription pools' names or a built-in route's.
+pub fn validate_provider_name(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "provider name {name:?} must be alphanumeric, '-' or '_'"
+    );
+    anyhow::ensure!(
+        !crate::subscription::RESERVED_PROVIDER_NAMES.contains(&name),
+        "provider name {name:?} is reserved for subscription accounts"
+    );
+    anyhow::ensure!(
+        !["v0", "v1", "admin", "ui", "assets", "backend-api", "healthz", "readyz", "mcp"].contains(&name),
+        "provider name {name:?} collides with a built-in route"
+    );
+    Ok(())
 }
 
 impl Config {
@@ -669,21 +714,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         for (name, p) in &self.gateway.providers {
-            anyhow::ensure!(
-                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-                "provider name {name:?} must be alphanumeric, '-' or '_'"
-            );
-            anyhow::ensure!(
-                !crate::subscription::RESERVED_PROVIDER_NAMES.contains(&name.as_str()),
-                "provider name {name:?} is reserved for subscription accounts"
-            );
-            anyhow::ensure!(
-                !["v0", "v1", "admin", "ui", "assets", "backend-api", "healthz", "readyz", "mcp"].contains(&name.as_str()),
-                "provider name {name:?} collides with a built-in route"
-            );
-            if p.kind == ProviderKind::OpenaiCompatible {
-                anyhow::ensure!(p.base_url.is_some(), "provider {name:?}: openai-compatible providers need base_url");
-            }
+            p.validate(name)?;
         }
         for (key, entry) in &self.catalog.metadata {
             anyhow::ensure!(
