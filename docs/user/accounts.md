@@ -276,8 +276,9 @@ UI's **Refresh models** control do it at once. See
 ## T3 Code hubs
 
 T3 Code can show your accounts' usage. Add a CLIProxyAPI usage source with the
-URL of xolotl and a client key whose policy has the `management` scope. T3 Code
-shows the Codex and Claude accounts, and the Codex reset credits.
+base URL of xolotl, the same URL your other clients use, and a client key
+whose policy has the `management` scope. T3 Code shows the Codex and Claude
+accounts, and the Codex reset credits.
 
 To redeem a Codex reset credit, T3 Code sends the redemption request to Codex
 through xolotl, which adds the account's token. Then T3 Code asks xolotl to

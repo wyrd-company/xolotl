@@ -47,6 +47,10 @@ upstream_timeout_secs = 600    # maximum idle time while reading an upstream res
 # public_url = "https://xolotl.example.lan"
 ```
 
+`listen` is the only address xolotl serves on. The LLM endpoints, the
+passthroughs, `/mcp`, the T3 Code hubs endpoints (`/v0/management/...`), the
+admin API and the web UI all use it. Port 8317 is only the default.
+
 Set `public_url` to the URL where browsers reach xolotl. Then MCP OAuth logins
 come back to xolotl and finish without a pasted URL.
 

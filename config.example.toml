@@ -1,7 +1,7 @@
 # Xolotl example configuration. Every section is optional; defaults shown.
 
 [server]
-listen = "0.0.0.0:8317"
+listen = "0.0.0.0:8317"        # the only listener: LLM endpoints, MCP, T3 Code hubs, admin API, web UI
 max_body_bytes = 67108864      # 64 MiB (OCR / batch uploads)
 upstream_timeout_secs = 600    # max idle time while reading an upstream response
 # public_url = "https://xolotl.example.lan"   # where browsers reach xolotl; lets OAuth logins finish by themselves

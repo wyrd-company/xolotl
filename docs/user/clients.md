@@ -108,8 +108,11 @@ See [MCP gateway](mcp-gateway).
 
 ## T3 Code
 
-Add a CLIProxyAPI usage source with URL `http://xolotl:8317` and a key whose
-policy has the `management` scope. T3 Code then shows the usage of your Codex
+Add a CLIProxyAPI usage source with xolotl's base URL, the same URL your other
+clients use (here `http://xolotl:8317`), and a key whose policy has the
+`management` scope. The hubs endpoints are under `/v0/management/` on the same
+port as everything else. A reverse proxy in front of xolotl must forward that
+path too. T3 Code then shows the usage of your Codex
 and Claude accounts, and the Codex reset credits.
 
 T3 Code redeems a Codex reset credit itself: it sends the redemption request to
