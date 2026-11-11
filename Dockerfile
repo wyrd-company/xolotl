@@ -2,8 +2,9 @@
 # The web UI is plain static files, so build it once on the build platform.
 FROM --platform=$BUILDPLATFORM node:26-slim AS ui
 WORKDIR /ui
-RUN corepack enable
 COPY ui/package.json ui/pnpm-lock.yaml ./
+# Node.js 25+ ships without corepack. Install the pnpm that package.json pins.
+RUN npm install -g "$(node -p 'require("./package.json").packageManager.split("+")[0]')"
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm install --frozen-lockfile
 COPY ui ./
 RUN pnpm build
