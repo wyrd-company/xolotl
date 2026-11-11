@@ -222,6 +222,12 @@ impl Accounting {
         self
     }
 
+    /// The kind of the account that served the request, once it is known
+    /// for certain: a gateway provider's kind as of the config it was sent with.
+    pub fn set_account_kind(&mut self, kind: AccountKind) {
+        self.account_kind = Some(kind);
+    }
+
     /// The most response bytes to keep for the export, or `None` when the
     /// request isn't exported with its bodies.
     pub fn capture_limit(&self) -> Option<usize> {
