@@ -2,7 +2,14 @@ use serde_json::json;
 use wiremock::matchers::{header, method, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
+use super::clickhouse::{Client, create_table_sql};
 use super::*;
+use crate::config::ClickHouseConfig;
+
+/// An exporter with ClickHouse as its one destination.
+fn start(cfg: ClickHouseConfig, user: Option<String>, password: Option<String>) -> anyhow::Result<Arc<Exporter>> {
+    Ok(Exporter::new(vec![clickhouse::start(cfg, user, password)?]))
+}
 
 fn bytes_of(v: &Value) -> Bytes {
     Bytes::from(serde_json::to_vec(v).unwrap())
@@ -90,7 +97,7 @@ fn captured_keeps_the_limit() {
 
 #[tokio::test]
 async fn assembles_a_streamed_messages_response() {
-    let exporter = Exporter::start(cfg("http://127.0.0.1:9"), None, None).unwrap();
+    let exporter = start(cfg("http://127.0.0.1:9"), None, None).unwrap();
     let capture = exporter.capture("/v1/messages", &bytes_of(&json!({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})));
     let sse = concat!(
         "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":12}}}\n\n",
@@ -125,7 +132,7 @@ async fn assembles_a_streamed_messages_response() {
 
 #[tokio::test]
 async fn records_the_upstream_error() {
-    let exporter = Exporter::start(cfg("http://127.0.0.1:9"), None, None).unwrap();
+    let exporter = start(cfg("http://127.0.0.1:9"), None, None).unwrap();
     let capture = exporter.capture("/v1/chat/completions", &bytes_of(&json!({"model": "m"})));
     let r = record("/v1/responses", 429);
     let body = br#"{"error":{"type":"usage_limit_reached","message":"try later"}}"#;
@@ -139,7 +146,7 @@ async fn records_the_upstream_error() {
 
 #[tokio::test]
 async fn without_bodies_keeps_only_the_log_fields() {
-    let exporter = Exporter::start(ClickHouseConfig { bodies: false, ..cfg("http://127.0.0.1:9") }, None, None).unwrap();
+    let exporter = start(ClickHouseConfig { bodies: false, ..cfg("http://127.0.0.1:9") }, None, None).unwrap();
     let capture = exporter.capture("/v1/messages", &bytes_of(&json!({"model": "secret prompt"})));
     assert_eq!(capture.response_limit(), None);
     let row = capture.exchange(finished(&record("/v1/messages", 200), &[], None));
@@ -158,8 +165,7 @@ async fn creates_the_table_then_inserts_batches() {
         .mount(&s)
         .await;
     let exporter =
-        Exporter::start(ClickHouseConfig { batch_rows: 2, ttl_days: 30, ..cfg(&s.uri()) }, Some("xolotl".into()), Some("pw".into()))
-            .unwrap();
+        start(ClickHouseConfig { batch_rows: 2, ttl_days: 30, ..cfg(&s.uri()) }, Some("xolotl".into()), Some("pw".into())).unwrap();
     let capture = exporter.capture("/v1/messages", &bytes_of(&json!({"model": "m"})));
     for _ in 0..3 {
         capture.submit(finished(&record("/v1/messages", 200), &[], None));
@@ -175,14 +181,14 @@ async fn creates_the_table_then_inserts_batches() {
     // Two rows filled a batch at once; the third went on the timer.
     assert_eq!(queries.iter().filter(|(q, _)| q == "INSERT INTO xolotl.llm_exchanges FORMAT JSONEachRow").count(), 2);
     exporter.shutdown().await;
-    assert_eq!(exporter.queued.load(Ordering::Acquire), 0);
+    assert_eq!(exporter.sinks()[0].queued(), 0);
 }
 
 #[tokio::test]
 async fn shutdown_inserts_what_is_queued() {
     let s = MockServer::start().await;
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&s).await;
-    let exporter = Exporter::start(ClickHouseConfig { create_table: false, flush_secs: 3600, ..cfg(&s.uri()) }, None, None).unwrap();
+    let exporter = start(ClickHouseConfig { create_table: false, flush_secs: 3600, ..cfg(&s.uri()) }, None, None).unwrap();
     let capture = exporter.capture("/v1/messages", &bytes_of(&json!({})));
     capture.submit(finished(&record("/v1/messages", 200), &[], None));
     exporter.shutdown().await;
@@ -194,13 +200,13 @@ async fn shutdown_inserts_what_is_queued() {
 #[tokio::test]
 async fn a_full_queue_drops_rows() {
     // Nothing listens: inserts fail slowly while the queue fills.
-    let exporter = Exporter::start(ClickHouseConfig { queue_mb: 1, flush_secs: 3600, ..cfg("http://127.0.0.1:9") }, None, None).unwrap();
+    let exporter = start(ClickHouseConfig { queue_mb: 1, flush_secs: 3600, ..cfg("http://127.0.0.1:9") }, None, None).unwrap();
     let body = json!({"pad": "x".repeat(400 * 1024)});
     let capture = exporter.capture("/v1/messages", &bytes_of(&body));
     for _ in 0..4 {
         capture.submit(finished(&record("/v1/messages", 200), &[], None));
     }
-    let queued = exporter.queued.load(Ordering::Acquire);
+    let queued = exporter.sinks()[0].queued();
     assert!(queued <= 1024 * 1024 && queued > 400 * 1024, "{queued}");
 }
 
@@ -227,7 +233,7 @@ async fn inserts_into_a_real_clickhouse() {
     base.set_password(None).unwrap();
     let table = format!("test_{}", uuid::Uuid::new_v4().simple());
     let cfg = ClickHouseConfig { url: base.to_string(), table: table.clone(), ttl_days: 7, ..cfg(base.as_str()) };
-    let exporter = Exporter::start(cfg, user.clone(), password.clone()).unwrap();
+    let exporter = start(cfg, user.clone(), password.clone()).unwrap();
     let capture = exporter.capture("/v1/messages", &bytes_of(&json!({"model": "m", "messages": [{"role": "user", "content": "héllo"}]})));
     let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1}}}\n\n\
                event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
@@ -272,7 +278,7 @@ async fn inserts_into_a_real_clickhouse() {
 
 #[tokio::test]
 async fn a_cut_off_stream_keeps_what_arrived() {
-    let exporter = Exporter::start(cfg("http://127.0.0.1:9"), None, None).unwrap();
+    let exporter = start(cfg("http://127.0.0.1:9"), None, None).unwrap();
     let capture = exporter.capture("/v1/responses", &bytes_of(&json!({})));
     let sse = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
@@ -301,7 +307,7 @@ fn prefix_stops_at_the_limit() {
 
 #[tokio::test]
 async fn row_size_counts_every_field() {
-    let exporter = Exporter::start(ClickHouseConfig { bodies: false, ..cfg("http://127.0.0.1:9") }, None, None).unwrap();
+    let exporter = start(ClickHouseConfig { bodies: false, ..cfg("http://127.0.0.1:9") }, None, None).unwrap();
     let capture = exporter.capture("/v1/chat/completions", &bytes_of(&json!({})));
     let tools: Vec<String> = (0..1000).map(|i| format!("tool_{i:04}")).collect();
     let row = capture.exchange(finished(&record("/v1/chat/completions", 200), &tools, None));
@@ -310,17 +316,14 @@ async fn row_size_counts_every_field() {
     let body = "x".repeat(MAX_ERROR_BYTES * 4);
     let r = record("/v1/chat/completions", 500);
     let resp = Captured { bytes: body.into_bytes(), ..Default::default() };
-    let row = Exporter::start(cfg("http://127.0.0.1:9"), None, None).unwrap().capture("/", &bytes_of(&json!({}))).exchange(finished(
-        &r,
-        &[],
-        Some(resp),
-    ));
+    let row =
+        start(cfg("http://127.0.0.1:9"), None, None).unwrap().capture("/", &bytes_of(&json!({}))).exchange(finished(&r, &[], Some(resp)));
     assert!(row.error.len() <= MAX_ERROR_BYTES && row.error.starts_with("api_error: xxx"), "{}", row.error.len());
 }
 
 #[tokio::test]
 async fn a_passthrough_query_string_still_assembles() {
-    let exporter = Exporter::start(cfg("http://127.0.0.1:9"), None, None).unwrap();
+    let exporter = start(cfg("http://127.0.0.1:9"), None, None).unwrap();
     let capture = exporter.capture("/v1/chat/completions", &bytes_of(&json!({})));
     let body = json!({"choices": [{"message": {"role": "assistant", "content": "yes"}, "finish_reason": "stop"}]}).to_string();
     let r = record("/v1/chat/completions?beta=1", 200);
@@ -338,7 +341,7 @@ async fn retries_of_a_batch_carry_one_deduplication_token() {
         .mount(&s)
         .await;
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&s).await;
-    let exporter = Exporter::start(ClickHouseConfig { create_table: false, batch_rows: 1, ..cfg(&s.uri()) }, None, None).unwrap();
+    let exporter = start(ClickHouseConfig { create_table: false, batch_rows: 1, ..cfg(&s.uri()) }, None, None).unwrap();
     exporter.capture("/v1/messages", &bytes_of(&json!({}))).submit(finished(&record("/v1/messages", 200), &[], None));
     exporter.shutdown().await;
     let reqs = s.received_requests().await.unwrap();
@@ -366,7 +369,7 @@ async fn an_exception_after_a_200_is_a_failure() {
 async fn shutdown_waits_for_rows_being_built() {
     let s = MockServer::start().await;
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&s).await;
-    let exporter = Exporter::start(ClickHouseConfig { create_table: false, flush_secs: 3600, ..cfg(&s.uri()) }, None, None).unwrap();
+    let exporter = start(ClickHouseConfig { create_table: false, flush_secs: 3600, ..cfg(&s.uri()) }, None, None).unwrap();
     let pending = exporter.capture("/v1/messages", &bytes_of(&json!({}))).pending();
     let late = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -380,12 +383,12 @@ async fn shutdown_waits_for_rows_being_built() {
 #[tokio::test]
 async fn a_ca_bundle_that_cant_be_read_stops_startup() {
     let missing = ClickHouseConfig { ca_cert: Some("/nonexistent/ca.pem".into()), ..cfg("https://127.0.0.1:9") };
-    let err = Exporter::start(missing, None, None).err().expect("a missing CA bundle is an error");
+    let err = start(missing, None, None).err().expect("a missing CA bundle is an error");
     assert!(format!("{err:#}").contains("reading ClickHouse CA /nonexistent/ca.pem"), "{err:#}");
 
     let dir = tempfile::tempdir().unwrap();
     let garbage = dir.path().join("ca.pem");
     std::fs::write(&garbage, "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n").unwrap();
     let bad = ClickHouseConfig { ca_cert: Some(garbage), ..cfg("https://127.0.0.1:9") };
-    assert!(Exporter::start(bad, None, None).is_err(), "an unparseable CA bundle is an error");
+    assert!(start(bad, None, None).is_err(), "an unparseable CA bundle is an error");
 }

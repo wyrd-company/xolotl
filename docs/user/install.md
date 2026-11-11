@@ -64,7 +64,7 @@ To use it as the CLI of a server on another machine, set `XOLOTL_URL` and
 
 ## Build from source
 
-You need Rust 1.88 or later, and Node 22 with pnpm for the web UI.
+You need Rust 1.89 or later, and Node 22 with pnpm for the web UI.
 
 ```sh
 git clone https://github.com/wyrd-company/xolotl.git && cd xolotl

@@ -5,6 +5,7 @@
 //! - `admin`                        `{ token }` bootstrap admin / management token
 //! - `telemetry`                    OTLP header values
 //! - `clickhouse`                   `{ password, user? }` for the ClickHouse export
+//! - `nats`                         `{ user, password }` or `{ creds }` for the NATS export
 //! - `providers/<name>`             `{ api_key }` upstream gateway provider keys
 //! - `accounts/<provider>/<id>`     OAuth credentials for subscription accounts
 //! - `mcp/<server>`                 values for an MCP server's `{field}` header placeholders

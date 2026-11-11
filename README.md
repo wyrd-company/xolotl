@@ -75,6 +75,7 @@ User documentation is on [wyrd.foo](https://wyrd.foo/docs/xolotl/). Its source i
 | [CLI reference](docs/user/cli.md) | Every `xolotl` command |
 | [Telemetry](docs/user/telemetry.md) | OTLP export, logs, metrics |
 | [ClickHouse export](docs/user/clickhouse-export.md) | Session requests and responses in a ClickHouse table for analysis |
+| [NATS export](docs/user/nats-export.md) | The same rows through NATS JetStream, so they survive ClickHouse maintenance |
 | [Known limitations](docs/user/limitations.md) | What isn't done yet |
 
 Design notes (architecture, routing, accounts, keys, MCP, web UI, releases) are in [`docs/design/`](docs/design/README.md).

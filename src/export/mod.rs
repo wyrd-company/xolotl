@@ -1,8 +1,9 @@
 //! Export of LLM exchanges for analysis: each session request and its
-//! response becomes a row in a ClickHouse table, inserted in batches through
-//! the HTTP interface. Exporting never holds up or fails a request: rows wait
-//! in a queue bounded by bytes, and are dropped and counted when it is full or
-//! ClickHouse keeps refusing them.
+//! response becomes a row, sent to one or more destinations. [`clickhouse`]
+//! inserts rows into a ClickHouse table in batches; [`nats`] publishes each
+//! row to a NATS JetStream stream that ClickHouse loads. Exporting never holds
+//! up or fails a request: each destination has its own queue bounded by bytes,
+//! and a row that doesn't fit is dropped and counted.
 // ---
 // relationships:
 //   implements: ../docs/design/export.md
@@ -12,7 +13,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use opentelemetry::KeyValue;
@@ -22,23 +22,22 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::catalog::Wire;
-use crate::config::ClickHouseConfig;
 use crate::db::RequestRecord;
 use crate::proxy::TokenUsage;
 use crate::telemetry::metrics;
 use crate::translate::{self, ir};
 
-/// A batch is inserted once it holds this many bytes, whatever `batch_rows` is.
-const MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
+pub mod clickhouse;
+pub mod nats;
+
 /// Longer `error` values are cut.
 const MAX_ERROR_BYTES: usize = 4096;
-/// Attempts at inserting one batch before it is dropped.
-const INSERT_ATTEMPTS: u32 = 3;
-/// How long shutdown waits for the last insert.
+/// How long shutdown waits for the last rows.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 
 /// One request and its response: a row of the exchange table.
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub struct Exchange {
     pub id: String,
     pub started_at: String,
@@ -109,6 +108,43 @@ impl Exchange {
         let tools: usize = self.tool_calls.iter().map(|t| t.len() + std::mem::size_of::<String>()).sum();
         strings.iter().map(|s| s.len()).sum::<usize>() + tools + std::mem::size_of::<Self>()
     }
+
+    /// The row as a destination with these settings would have taken it, or
+    /// `None` when it already is. The capture keeps what the most generous
+    /// destination wants.
+    fn fitted(&self, bodies: bool, max_body_bytes: usize) -> Option<Self> {
+        if !bodies {
+            if self.request.is_empty() && self.response.is_empty() && self.output.is_empty() && self.output_text.is_empty() {
+                return None;
+            }
+            return Some(Self {
+                request: String::new(),
+                request_truncated: false,
+                response: String::new(),
+                response_truncated: false,
+                output: String::new(),
+                output_text: String::new(),
+                stop_reason: String::new(),
+                error: String::new(),
+                streamed: false,
+                ..self.clone()
+            });
+        }
+        if self.request.len() <= max_body_bytes && self.response.len() <= max_body_bytes {
+            return None;
+        }
+        let mut row = self.clone();
+        cut(&mut row.request, &mut row.request_truncated, max_body_bytes);
+        cut(&mut row.response, &mut row.response_truncated, max_body_bytes);
+        Some(row)
+    }
+}
+
+/// Keep at most `limit` bytes of `s`, and note in `flag` when that cut it.
+fn cut(s: &mut String, flag: &mut bool, limit: usize) {
+    let (kept, cut) = truncate(std::mem::take(s), limit);
+    *s = kept;
+    *flag |= cut;
 }
 
 /// A response body as the tap saw it.
@@ -179,11 +215,11 @@ pub struct Finished<'a> {
 impl Capture {
     /// The most response bytes to keep, or `None` when bodies are not exported.
     pub fn response_limit(&self) -> Option<usize> {
-        self.exporter.cfg.bodies.then_some(self.exporter.cfg.max_body_bytes)
+        self.exporter.bodies.then_some(self.exporter.max_body_bytes)
     }
 
     /// Hold the exporter open for a row that is being built: shutdown waits
-    /// for it before it inserts what is queued.
+    /// for it before the destinations send what is queued.
     pub fn pending(self: &Arc<Self>) -> Pending {
         self.exporter.in_flight.fetch_add(1, Ordering::AcqRel);
         Pending { capture: self.clone() }
@@ -325,266 +361,142 @@ fn prefix(b: &Bytes, limit: usize) -> (Bytes, bool) {
     (b.slice(..end), true)
 }
 
-/// The ClickHouse HTTP interface.
-#[derive(Clone)]
-struct Client {
-    http: reqwest::Client,
-    url: String,
-    user: Option<String>,
-    password: Option<String>,
-}
-
-impl Client {
-    /// Run `query` with `data` as its input. A query without input is sent as
-    /// the body: ClickHouse refuses a POST without a `Content-Length`, which
-    /// an empty body doesn't get.
-    async fn query(&self, query: &str, data: Bytes, settings: &[(&str, &str)]) -> Result<()> {
-        let mut url = url::Url::parse(&self.url)?;
-        let body = if data.is_empty() {
-            Bytes::copy_from_slice(query.as_bytes())
-        } else {
-            url.query_pairs_mut().append_pair("query", query);
-            data
-        };
-        // `wait_end_of_query`: the status says how the query ended, not how it began.
-        url.query_pairs_mut()
-            .append_pair("input_format_skip_unknown_fields", "1")
-            .append_pair("date_time_input_format", "best_effort")
-            .append_pair("wait_end_of_query", "1")
-            .extend_pairs(settings);
-        let mut req = self.http.post(url);
-        if let Some(u) = &self.user {
-            req = req.header("X-ClickHouse-User", u);
-        }
-        if let Some(p) = &self.password {
-            req = req.header("X-ClickHouse-Key", p);
-        }
-        let resp = req.body(body).send().await.context("sending to ClickHouse")?;
-        let status = resp.status();
-        let failed = resp.headers().contains_key("x-clickhouse-exception-code");
-        let text = resp.text().await.context("reading ClickHouse's answer")?;
-        if !status.is_success() || failed || text.contains("DB::Exception") {
-            anyhow::bail!("ClickHouse returned {status}: {}", text.trim().chars().take(500).collect::<String>());
-        }
-        Ok(())
-    }
-}
-
-/// The table xolotl creates when `create_table` is on.
-pub fn create_table_sql(cfg: &ClickHouseConfig) -> String {
-    let ttl = if cfg.ttl_days > 0 { format!("\nTTL toDateTime(started_at) + INTERVAL {} DAY", cfg.ttl_days) } else { String::new() };
-    format!(
-        "CREATE TABLE IF NOT EXISTS {db}.{table} (
-    id UUID,
-    started_at DateTime64(3, 'UTC'),
-    finished_at DateTime64(3, 'UTC'),
-    trace_id String,
-    client_id LowCardinality(String),
-    session_key String,
-    session_source LowCardinality(String),
-    provider LowCardinality(String),
-    account_id LowCardinality(String),
-    model LowCardinality(String),
-    upstream_model LowCardinality(String),
-    client_endpoint LowCardinality(String),
-    endpoint LowCardinality(String),
-    status UInt16,
-    latency_ms UInt64,
-    streamed Bool,
-    input_tokens Nullable(Int64),
-    output_tokens Nullable(Int64),
-    cached_tokens Nullable(Int64),
-    cache_write_tokens Nullable(Int64),
-    context_tokens Nullable(Int64),
-    context_window Nullable(Int64),
-    cost Nullable(Float64),
-    tool_calls Array(LowCardinality(String)),
-    stop_reason LowCardinality(String),
-    error String,
-    request String CODEC(ZSTD(3)),
-    request_truncated Bool,
-    response String CODEC(ZSTD(3)),
-    response_truncated Bool,
-    output String CODEC(ZSTD(3)),
-    output_text String CODEC(ZSTD(3))
-)
-ENGINE = MergeTree
-PARTITION BY toYYYYMM(started_at)
-ORDER BY (client_id, session_key, started_at){ttl}
-SETTINGS non_replicated_deduplication_window = 1000",
-        db = cfg.database,
-        table = cfg.table,
-    )
-}
-
-/// Queues exchanges and inserts them into ClickHouse in the background.
-pub struct Exporter {
-    cfg: ClickHouseConfig,
-    tx: mpsc::UnboundedSender<Exchange>,
-    /// Bytes of rows queued or being inserted.
+/// Where rows go: a queue bounded by bytes, and the task that empties it.
+pub struct Sink {
+    name: &'static str,
+    /// Whether the destination takes the request and response bodies.
+    bodies: bool,
+    max_body_bytes: usize,
+    /// Most bytes of rows the queue holds.
+    limit: usize,
+    tx: mpsc::UnboundedSender<Arc<Exchange>>,
+    /// Bytes of rows queued or being sent.
     queued: Arc<AtomicUsize>,
-    /// Rows taken but not yet queued ([`Pending`]).
-    in_flight: AtomicUsize,
     stop: Mutex<Option<oneshot::Sender<()>>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-impl Exporter {
-    /// Start the exporter. `user` and `password` come from the vault; the
-    /// vault's user wins over the configured one.
-    pub fn start(cfg: ClickHouseConfig, user: Option<String>, password: Option<String>) -> Result<Arc<Self>> {
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::none());
-        if let Some(ca) = &cfg.ca_cert {
-            let pem = std::fs::read(ca).with_context(|| format!("reading ClickHouse CA {}", ca.display()))?;
-            for cert in reqwest::Certificate::from_pem_bundle(&pem).context("parsing ClickHouse CA bundle")? {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-        let http = builder.build()?;
-        let client = Client { http, url: cfg.url.clone(), user: user.or_else(|| cfg.user.clone()), password };
+/// The receiving end of a sink's queue, for its task.
+pub struct Queue {
+    pub rx: mpsc::UnboundedReceiver<Arc<Exchange>>,
+    /// Fires when the exporter shuts down: send what is queued, then stop.
+    pub stop: oneshot::Receiver<()>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Queue {
+    /// `row` has left the queue: sent, refused or dropped.
+    pub fn done(&self, row: &Exchange) {
+        self.queued.fetch_sub(row.size(), Ordering::AcqRel);
+    }
+}
+
+impl Sink {
+    /// Start the task that empties the queue. `bodies` and `max_body_bytes`
+    /// are what the destination keeps of each row; `queue_mb` bounds the queue.
+    pub fn spawn<F, Fut>(name: &'static str, bodies: bool, max_body_bytes: usize, queue_mb: usize, run: F) -> Self
+    where
+        F: FnOnce(Queue) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let (tx, rx) = mpsc::unbounded_channel();
-        let (stop_tx, stop_rx) = oneshot::channel();
+        let (stop_tx, stop) = oneshot::channel();
         let queued = Arc::new(AtomicUsize::new(0));
-        let worker = Worker { cfg: cfg.clone(), client, queued: queued.clone(), table_ready: !cfg.create_table };
-        let task = tokio::spawn(worker.run(rx, stop_rx));
-        tracing::info!(url = %cfg.url, database = %cfg.database, table = %cfg.table, bodies = cfg.bodies, "ClickHouse export enabled");
-        Ok(Arc::new(Self {
-            cfg,
+        let task = tokio::spawn(run(Queue { rx, stop, queued: queued.clone() }));
+        Self {
+            name,
+            bodies,
+            max_body_bytes,
+            limit: queue_mb.saturating_mul(1024 * 1024),
             tx,
             queued,
-            in_flight: AtomicUsize::new(0),
             stop: Mutex::new(Some(stop_tx)),
             task: Mutex::new(Some(task)),
-        }))
+        }
+    }
+
+    fn enqueue(&self, row: &Arc<Exchange>) {
+        let row = match row.fitted(self.bodies, self.max_body_bytes) {
+            Some(fitted) => Arc::new(fitted),
+            None => row.clone(),
+        };
+        let size = row.size();
+        let fits = self.queued.fetch_add(size, Ordering::AcqRel) + size <= self.limit;
+        if !fits || self.tx.send(row).is_err() {
+            self.queued.fetch_sub(size, Ordering::AcqRel);
+            count(self.name, "dropped", 1);
+            tracing::debug!(sink = self.name, "export queue full; row dropped");
+        }
+    }
+
+    /// Bytes of rows queued or being sent.
+    pub fn queued(&self) -> usize {
+        self.queued.load(Ordering::Acquire)
+    }
+}
+
+/// Count rows that reached an outcome at a destination, in `xolotl.export.rows`.
+pub fn count(sink: &'static str, outcome: &'static str, n: usize) {
+    metrics().export_rows.add(n as u64, &[KeyValue::new("sink", sink), KeyValue::new("outcome", outcome)]);
+}
+
+/// Takes the rows of session exchanges and hands each to every destination.
+pub struct Exporter {
+    sinks: Vec<Sink>,
+    /// What the capture keeps: what the most generous destination wants.
+    bodies: bool,
+    max_body_bytes: usize,
+    /// Rows taken but not yet queued ([`Pending`]).
+    in_flight: AtomicUsize,
+}
+
+impl Exporter {
+    pub fn new(sinks: Vec<Sink>) -> Arc<Self> {
+        let bodies = sinks.iter().any(|s| s.bodies);
+        let max_body_bytes = sinks.iter().filter(|s| s.bodies).map(|s| s.max_body_bytes).max().unwrap_or(0);
+        Arc::new(Self { sinks, bodies, max_body_bytes, in_flight: AtomicUsize::new(0) })
+    }
+
+    /// The destinations, in the order they were given.
+    pub fn sinks(&self) -> &[Sink] {
+        &self.sinks
     }
 
     /// The request side of an exchange on `endpoint`. `body` is the request
     /// as the client sent it; the capture shares its buffer and copies nothing.
     pub fn capture(self: &Arc<Self>, endpoint: &str, body: &Bytes) -> Arc<Capture> {
-        let (request, request_truncated) = if self.cfg.bodies { prefix(body, self.cfg.max_body_bytes) } else { (Bytes::new(), false) };
+        let (request, request_truncated) = if self.bodies { prefix(body, self.max_body_bytes) } else { (Bytes::new(), false) };
         Arc::new(Capture { exporter: self.clone(), endpoint: endpoint.to_string(), request, request_truncated })
     }
 
     fn enqueue(&self, row: Exchange) {
-        let size = row.size();
-        let limit = self.cfg.queue_mb.saturating_mul(1024 * 1024);
-        let fits = self.queued.fetch_add(size, Ordering::AcqRel) + size <= limit;
-        if !fits || self.tx.send(row).is_err() {
-            self.queued.fetch_sub(size, Ordering::AcqRel);
-            count("dropped", 1);
-            tracing::debug!("ClickHouse export queue full; row dropped");
+        let row = Arc::new(row);
+        for sink in &self.sinks {
+            sink.enqueue(&row);
         }
     }
 
-    /// Wait for the rows being built, insert what is queued, and stop.
+    /// Wait for the rows being built, have each destination send what is
+    /// queued, and stop.
     pub async fn shutdown(&self) {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
         while self.in_flight.load(Ordering::Acquire) > 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if let Some(stop) = self.stop.lock().take() {
-            let _ = stop.send(());
-        }
-        let task = self.task.lock().take();
-        if let Some(task) = task
-            && tokio::time::timeout_at(deadline, task).await.is_err()
-        {
-            tracing::warn!("ClickHouse export did not finish before shutdown; queued rows are lost");
-        }
-    }
-}
-
-fn count(outcome: &'static str, n: usize) {
-    metrics().export_rows.add(n as u64, &[KeyValue::new("sink", "clickhouse"), KeyValue::new("outcome", outcome)]);
-}
-
-struct Worker {
-    cfg: ClickHouseConfig,
-    client: Client,
-    queued: Arc<AtomicUsize>,
-    table_ready: bool,
-}
-
-impl Worker {
-    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Exchange>, mut stop: oneshot::Receiver<()>) {
-        let mut tick = tokio::time::interval(Duration::from_secs(self.cfg.flush_secs.max(1)));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut batch = Vec::new();
-        let mut bytes = 0;
-        loop {
-            tokio::select! {
-                row = rx.recv() => {
-                    let Some(row) = row else { break };
-                    bytes += row.size();
-                    batch.push(row);
-                    if batch.len() >= self.cfg.batch_rows || bytes >= MAX_BATCH_BYTES {
-                        self.flush(&mut batch, &mut bytes).await;
-                    }
-                }
-                _ = tick.tick() => self.flush(&mut batch, &mut bytes).await,
-                _ = &mut stop => break,
+        for sink in &self.sinks {
+            if let Some(stop) = sink.stop.lock().take() {
+                let _ = stop.send(());
             }
         }
-        rx.close();
-        while let Ok(row) = rx.try_recv() {
-            batch.push(row);
-        }
-        while !batch.is_empty() {
-            let rest = batch.split_off(batch.len().min(self.cfg.batch_rows));
-            let mut size = batch.iter().map(Exchange::size).sum();
-            self.flush(&mut batch, &mut size).await;
-            batch = rest;
-        }
-    }
-
-    async fn flush(&mut self, batch: &mut Vec<Exchange>, bytes: &mut usize) {
-        if batch.is_empty() {
-            return;
-        }
-        let rows = std::mem::take(batch);
-        let size = std::mem::take(bytes);
-        let mut body = Vec::with_capacity(size);
-        for row in &rows {
-            if serde_json::to_writer(&mut body, row).is_ok() {
-                body.push(b'\n');
-            }
-        }
-        // Shared by every try, not copied.
-        let body = Bytes::from(body);
-        let query = format!("INSERT INTO {}.{} FORMAT JSONEachRow", self.cfg.database, self.cfg.table);
-        // A retry of an insert that landed but wasn't acknowledged is dropped by ClickHouse.
-        let token = uuid::Uuid::now_v7().to_string();
-        let mut result = Ok(());
-        for attempt in 0..INSERT_ATTEMPTS {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
-            }
-            result = self.insert(&query, body.clone(), &token).await;
-            if result.is_ok() {
-                break;
-            }
-        }
-        self.queued.fetch_sub(rows.iter().map(Exchange::size).sum(), Ordering::AcqRel);
-        match result {
-            Ok(()) => count("inserted", rows.len()),
-            Err(e) => {
-                count("failed", rows.len());
-                tracing::warn!(error = %format!("{e:#}"), rows = rows.len(), "ClickHouse export insert failed; rows dropped");
+        for sink in &self.sinks {
+            let task = sink.task.lock().take();
+            if let Some(task) = task
+                && tokio::time::timeout_at(deadline, task).await.is_err()
+            {
+                tracing::warn!(sink = sink.name, "export did not finish before shutdown; queued rows are lost");
             }
         }
     }
-
-    async fn insert(&mut self, query: &str, body: Bytes, token: &str) -> Result<()> {
-        if !self.table_ready {
-            self.client.query(&create_table_sql(&self.cfg), Bytes::new(), &[]).await.context("creating the export table")?;
-            self.table_ready = true;
-        }
-        self.client.query(query, body, &[("insert_deduplication_token", token)]).await
-    }
 }
-
 #[cfg(test)]
 mod tests;

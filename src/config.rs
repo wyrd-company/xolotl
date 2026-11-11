@@ -30,6 +30,39 @@ pub struct Config {
 pub struct ExportConfig {
     /// Each session request and its response as a row in a ClickHouse table.
     pub clickhouse: Option<ClickHouseConfig>,
+    /// The same rows, published to a NATS JetStream stream that ClickHouse loads.
+    pub nats: Option<NatsConfig>,
+}
+
+/// A NATS JetStream stream. Each row is published to `xolotl.exchanges.<client_id>`.
+/// Credentials are the vault secret `nats`: `user` and `password`, or `creds`
+/// (the contents of a `.creds` file).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NatsConfig {
+    /// Server URL, e.g. `nats://nats:4222`, or `tls://` to require TLS.
+    /// Several servers of one cluster are separated by commas.
+    pub url: String,
+    /// The stream that stores the rows. It must exist, and its subjects must
+    /// cover `xolotl.exchanges.>`; xolotl checks both at startup.
+    pub stream: String,
+    /// PEM CA bundle for a privately signed NATS certificate.
+    pub ca_cert: Option<PathBuf>,
+    /// Include the request and response bodies. Without them a row holds the
+    /// request log fields only.
+    pub bodies: bool,
+    /// Longer request and response bodies are cut, and the row says so. A row
+    /// larger than the server's `max_payload` is cut further.
+    pub max_body_bytes: usize,
+    /// Megabytes of rows waiting to be published. Rows wait while NATS is
+    /// unreachable; rows past it are dropped and counted.
+    pub queue_mb: usize,
+}
+
+impl Default for NatsConfig {
+    fn default() -> Self {
+        Self { url: String::new(), stream: "XOLOTL".into(), ca_cert: None, bodies: true, max_body_bytes: 4 * 1024 * 1024, queue_mb: 32 }
+    }
 }
 
 /// A ClickHouse table, written through the HTTP interface. The password is
@@ -629,6 +662,9 @@ impl Config {
         if let Some(v) = env("XOLOTL_CLICKHOUSE_URL") {
             self.export.clickhouse.get_or_insert_with(Default::default).url = v;
         }
+        if let Some(v) = env("XOLOTL_NATS_URL") {
+            self.export.nats.get_or_insert_with(Default::default).url = v;
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -709,6 +745,23 @@ impl Config {
             anyhow::ensure!(ch.batch_rows >= 1, "export.clickhouse.batch_rows must be >= 1");
             anyhow::ensure!(ch.queue_mb >= 1, "export.clickhouse.queue_mb must be >= 1");
         }
+        if let Some(n) = &self.export.nats {
+            anyhow::ensure!(!n.url.trim().is_empty(), "export.nats.url must be set");
+            for server in n.url.split(',') {
+                let url = url::Url::parse(server.trim()).context("export.nats.url: invalid url")?;
+                anyhow::ensure!(matches!(url.scheme(), "nats" | "tls"), "export.nats.url must be nats:// or tls://");
+                // The url is logged.
+                anyhow::ensure!(
+                    url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none(),
+                    "export.nats.url must not hold credentials or a query string; put credentials in the vault secret `nats`"
+                );
+            }
+            anyhow::ensure!(
+                !n.stream.is_empty() && n.stream.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "export.nats.stream must be alphanumeric, '-' or '_'"
+            );
+            anyhow::ensure!(n.queue_mb >= 1, "export.nats.queue_mb must be >= 1");
+        }
         anyhow::ensure!(self.subscription.max_attempts >= 1, "subscription.max_attempts must be >= 1");
         anyhow::ensure!(matches!(self.telemetry.log_format.as_str(), "pretty" | "json"), "telemetry.log_format must be pretty or json");
         Ok(())
@@ -757,6 +810,24 @@ mod tests {
             "url = \"http://ch:8123/?\"",
         ] {
             let cfg: Config = toml::from_str(&format!("[export.clickhouse]\n{bad}\n")).unwrap();
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn nats_export_is_validated() {
+        let cfg: Config = toml::from_str("[export.nats]\nurl = \"nats://n1:4222, nats://n2:4222\"\n").unwrap();
+        cfg.validate().unwrap();
+        let n = cfg.export.nats.unwrap();
+        assert_eq!((n.stream.as_str(), n.bodies, n.queue_mb), ("XOLOTL", true, 32));
+        for bad in [
+            "url = \"\"",
+            "url = \"http://n:4222\"",
+            "url = \"nats://u:p@n:4222\"",
+            "url = \"nats://n:4222\"\nstream = \"a.b\"",
+            "url = \"nats://n:4222\"\nqueue_mb = 0",
+        ] {
+            let cfg: Config = toml::from_str(&format!("[export.nats]\n{bad}\n")).unwrap();
             assert!(cfg.validate().is_err(), "{bad}");
         }
     }

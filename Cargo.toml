@@ -3,12 +3,13 @@ name = "xolotl"
 version = "0.6.0"
 description = "LLM subscription proxy and AI gateway backed by OpenBao"
 license = "Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.89"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
+async-nats = { version = "0.52.0", default-features = false, features = ["aws-lc-rs", "jetstream", "nkeys", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
 axum = { version = "0.8.9", features = ["macros"] }
 base64 = "0.23.1"
 bytes = "1.12.1"

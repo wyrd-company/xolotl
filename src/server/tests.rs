@@ -3216,7 +3216,7 @@ async fn session_exchanges_are_exported_to_clickhouse() {
     let clickhouse = MockServer::start().await;
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&clickhouse).await;
     let cfg = crate::config::ClickHouseConfig { url: clickhouse.uri(), create_table: false, flush_secs: 3600, ..Default::default() };
-    let export = crate::export::Exporter::start(cfg, None, None).unwrap();
+    let export = crate::export::Exporter::new(vec![crate::export::clickhouse::start(cfg, None, None).unwrap()]);
     h.state.export = Some(export.clone());
     // A Messages client on a Chat-only provider: the request is translated and streamed back.
     let sse = concat!(
