@@ -59,6 +59,7 @@ const gateway = (change: Partial<ProviderAccount>): ProviderAccount => ({
   headers: [],
   secret: "sample",
   has_key: true,
+  workload_identity: false,
   ...change,
 });
 test("names a stored policy that did not load as needing action", () => {

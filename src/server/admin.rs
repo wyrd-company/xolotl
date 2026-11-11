@@ -656,6 +656,7 @@ async fn provider_view(s: &AppState, p: &ProviderEntry) -> anyhow::Result<Value>
         "headers": p.cfg.headers.keys().collect::<Vec<_>>(),
         "secret": p.secret(),
         "has_key": s.gateway.has_key(p).await?,
+        "workload_identity": p.cfg.workload_identity.is_some(),
     }))
 }
 
@@ -684,7 +685,7 @@ fn provider_config(
     headers: BTreeMap<String, String>,
 ) -> ProviderConfig {
     let base_url = base_url.map(|u| u.trim().to_string()).filter(|u| !u.is_empty());
-    ProviderConfig { kind, enabled, base_url, secret: None, no_auth, headers }
+    ProviderConfig { kind, enabled, base_url, secret: None, no_auth, headers, workload_identity: None }
 }
 
 #[derive(Deserialize)]

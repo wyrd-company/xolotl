@@ -36,6 +36,7 @@ import {
 } from "@/components/ui/table";
 import {
   get,
+  hasCredential,
   PROVIDER_NAMES,
   SUB_PROVIDERS,
   type Account,
@@ -85,7 +86,7 @@ export function OverviewPage() {
   const s = status.data;
   const accts = accounts.data ?? [];
   const configured = (providers.data ?? []).filter(
-    (p) => p.has_key || p.no_auth,
+    (p) => hasCredential(p),
   );
   const pools = SUB_PROVIDERS.map((p) => ({
     provider: p,
@@ -96,7 +97,7 @@ export function OverviewPage() {
       .filter((p) => !p.accounts.length)
       .map((p) => PROVIDER_NAMES[p.provider]),
     ...(providers.data ?? [])
-      .filter((p) => !p.has_key && !p.no_auth)
+      .filter((p) => !hasCredential(p))
       .map((p) => `${p.name} (no key)`),
   ];
   const failed = accts.filter((a) => a.enabled && a.auth_failed);
@@ -604,6 +605,8 @@ function Stat({
 export function KeyState({ provider }: { provider: ProviderAccount }) {
   if (provider.no_auth)
     return <span className="text-muted-foreground">none needed</span>;
+  if (provider.workload_identity)
+    return <span className="text-success">workload identity</span>;
   return provider.has_key ? (
     <span className="text-success">in vault</span>
   ) : (

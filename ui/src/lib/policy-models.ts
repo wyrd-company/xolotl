@@ -1,6 +1,8 @@
 // The policy editor's model list: ordered rules, per-model switches,
 // sorting, aliases, and provider health.
 
+import { hasCredential } from "./api";
+
 /** A catalog model of an allowed provider (`Policy::candidates`). */
 export interface Candidate {
   provider: string;
@@ -136,7 +138,7 @@ export function providerHealth(
   provider: string,
   pools: readonly string[],
   accounts: { id: string; provider: string; available: boolean }[],
-  gateway: { name: string; has_key: boolean; no_auth: boolean }[],
+  gateway: { name: string; has_key: boolean; no_auth: boolean; workload_identity?: boolean }[],
   /** The policy's `accounts`; without it, every account counts. */
   policyAccounts?: Record<string, string[]>,
 ): Health {
@@ -145,7 +147,7 @@ export function providerHealth(
     return { kind: "pool", total: mine.length, available: mine.filter((a) => a.available).length };
   }
   const g = gateway.find((p) => p.name === provider);
-  return g ? { kind: "gateway", ready: g.has_key || g.no_auth } : { kind: "unknown" };
+  return g ? { kind: "gateway", ready: hasCredential(g) } : { kind: "unknown" };
 }
 
 /** Whether requests can reach the provider right now. */

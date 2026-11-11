@@ -82,7 +82,7 @@ function ProviderRow({ p, kind }: { p: ProviderAccount; kind: string }) {
       <TableCell className="text-sm">{p.source === "config" ? "Config file" : "Added here"}</TableCell>
       <TableCell>
         <div className="flex justify-end gap-2">
-          {!p.no_auth && p.enabled && <ReplaceKey p={p} />}
+          {!p.no_auth && !p.workload_identity && p.enabled && <ReplaceKey p={p} />}
           {p.source === "vault" && (
             <Confirm
               title={`Remove ${p.name}?`}

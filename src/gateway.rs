@@ -17,7 +17,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::accounts::AccountKind;
-use crate::config::{GatewayConfig, ProviderConfig, ProviderKind};
+use crate::config::{GatewayConfig, ProviderConfig, ProviderKind, WorkloadIdentity};
 use crate::context::RequestSession;
 use crate::db::Db;
 use crate::export::Capture;
@@ -95,6 +95,17 @@ pub struct Gateway {
     key_generation: std::sync::atomic::AtomicU64,
     limiter: Arc<Limiter>,
     catalog: Option<Arc<crate::catalog::ModelCatalog>>,
+    /// Access tokens from workload identity federation, one slot per
+    /// provider. A slot's lock is held during an exchange, so concurrent
+    /// requests wait for one exchange: an identity token with a `jti` can be
+    /// exchanged only once.
+    identity_tokens: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<IdentityToken>>>>>,
+}
+
+struct IdentityToken {
+    token: String,
+    /// When to exchange again: before the token expires.
+    renew_at: Instant,
 }
 
 impl Gateway {
@@ -116,6 +127,7 @@ impl Gateway {
             key_generation: Default::default(),
             catalog: None,
             limiter: Default::default(),
+            identity_tokens: Default::default(),
         }
     }
 
@@ -281,6 +293,9 @@ impl Gateway {
     /// Other fields of the secret are kept.
     pub async fn set_key(&self, name: &str, api_key: &str) -> Result<(), ProviderChangeError> {
         let api_key = api_key.trim();
+        if self.providers.read().get(name).is_some_and(|p| p.cfg.workload_identity.is_some()) {
+            return Err(ProviderChangeError::Invalid(anyhow::anyhow!("provider {name} uses workload identity; it has no key")));
+        }
         if api_key.is_empty() {
             return Err(ProviderChangeError::Invalid(anyhow::anyhow!("the API key is empty")));
         }
@@ -305,11 +320,12 @@ impl Gateway {
         let mut keys = self.keys.write();
         self.key_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         keys.remove(name);
+        self.identity_tokens.lock().remove(name);
     }
 
     /// Whether the provider's key is stored.
     pub async fn has_key(&self, entry: &ProviderEntry) -> Result<bool> {
-        if entry.cfg.no_auth {
+        if entry.cfg.no_auth || entry.cfg.workload_identity.is_some() {
             return Ok(false);
         }
         Ok(self
@@ -339,6 +355,11 @@ impl Gateway {
     async fn credentials(&self, p: &ProviderEntry) -> Result<(ProviderConfig, Option<String>)> {
         if p.cfg.no_auth && p.source == ProviderSource::Config {
             return Ok((p.cfg.clone(), None));
+        }
+        // Only the config file sets workload identity, so the config can't change under it.
+        if let (Some(identity), ProviderSource::Config) = (&p.cfg.workload_identity, p.source) {
+            let token = self.identity_token(&p.name, p.cfg.kind, identity).await?;
+            return Ok((p.cfg.clone(), Some(token)));
         }
         let name = &p.name;
         if let Some(c) = self.keys.read().get(name)
@@ -381,6 +402,25 @@ impl Gateway {
         let mut keys = self.keys.write();
         self.key_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         keys.clear();
+        self.identity_tokens.lock().clear();
+    }
+
+    /// A provider's access token from workload identity federation: the one
+    /// held, or a new exchange when it is due for renewal.
+    async fn identity_token(&self, name: &str, kind: ProviderKind, identity: &WorkloadIdentity) -> Result<String> {
+        let slot = self.identity_tokens.lock().entry(name.to_string()).or_default().clone();
+        let mut slot = slot.lock().await;
+        if let Some(t) = slot.as_ref()
+            && Instant::now() < t.renew_at
+        {
+            return Ok(t.token.clone());
+        }
+        let (token, lifetime) =
+            exchange_identity(&self.http, kind, identity).await.with_context(|| format!("provider {name}: workload identity exchange"))?;
+        // Renew 5 minutes before expiry, or at 80% of a shorter lifetime.
+        let renew_in = lifetime.saturating_sub((lifetime / 5).min(Duration::from_secs(300)));
+        *slot = Some(IdentityToken { token: token.clone(), renew_at: Instant::now() + renew_in });
+        Ok(token)
     }
 
     /// Send with the provider's current config and key. Returns the kind of
@@ -401,9 +441,12 @@ impl Gateway {
             anthropic_headers(&mut headers);
         }
         if let Some(key) = key {
-            if cfg.kind == ProviderKind::Anthropic {
+            if cfg.kind == ProviderKind::Anthropic && cfg.workload_identity.is_none() {
                 // The Anthropic API takes a key in `x-api-key` on every endpoint.
                 set_header(&mut headers, "x-api-key", &key);
+            } else if cfg.kind == ProviderKind::Anthropic {
+                // A federated access token is a bearer token.
+                set_header(&mut headers, "authorization", &format!("Bearer {key}"));
             } else {
                 set_header(&mut headers, "authorization", &format!("Bearer {key}"));
                 if path_and_query.starts_with("/v1/messages") {
@@ -524,6 +567,64 @@ impl Gateway {
             .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
             .collect())
     }
+}
+
+pub const ANTHROPIC_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
+pub const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+
+/// Exchange the identity provider's JWT for an access token: RFC 7523
+/// `jwt-bearer` at Anthropic, RFC 8693 token exchange at OpenAI. Returns the
+/// token and its lifetime. Neither answer carries a refresh token.
+async fn exchange_identity(http: &reqwest::Client, kind: ProviderKind, identity: &WorkloadIdentity) -> Result<(String, Duration)> {
+    let jwt = tokio::fs::read_to_string(&identity.token_file)
+        .await
+        .with_context(|| format!("reading the identity token file {}", identity.token_file))?;
+    let jwt = jwt.trim();
+    anyhow::ensure!(!jwt.is_empty(), "the identity token file {} is empty", identity.token_file);
+    let (default_url, mut body) = match kind {
+        ProviderKind::Anthropic => (
+            ANTHROPIC_TOKEN_URL,
+            json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jwt,
+                "federation_rule_id": identity.federation_rule_id,
+                "organization_id": identity.organization_id,
+                "service_account_id": identity.service_account_id,
+            }),
+        ),
+        ProviderKind::Openai => (
+            OPENAI_TOKEN_URL,
+            json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "subject_token": jwt,
+                "identity_provider_id": identity.identity_provider_id,
+                "service_account_id": identity.service_account_id,
+            }),
+        ),
+        other => anyhow::bail!("{other:?} accounts have no workload identity"),
+    };
+    if let Some(ws) = &identity.workspace_id {
+        body["workspace_id"] = Value::String(ws.clone());
+    }
+    let url = identity.token_url.as_deref().unwrap_or(default_url);
+    let resp = http.post(url).json(&body).send().await.with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        let reason = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| {
+                let e = v.get("error")?;
+                e.get("message").or(v.get("error_description")).or(Some(e)).map(|m| m.as_str().map(str::to_string).unwrap_or(m.to_string()))
+            })
+            .unwrap_or_default();
+        anyhow::bail!("{url} answered {status} {}", reason.chars().take(300).collect::<String>());
+    }
+    let v: Value = resp.json().await.context("reading the token response")?;
+    let token = v.get("access_token").and_then(Value::as_str).filter(|t| !t.is_empty()).context("no access_token in the token response")?;
+    let lifetime = v.get("expires_in").and_then(Value::as_u64).unwrap_or(3600);
+    Ok((token.to_string(), Duration::from_secs(lifetime)))
 }
 
 fn cas_error(e: anyhow::Error) -> ProviderChangeError {
@@ -777,6 +878,108 @@ mod tests {
         assert_eq!(g.fetch_models("anth").await.unwrap(), vec!["claude-haiku-5-5"]);
         let sent = &s.received_requests().await.unwrap()[0];
         assert!(sent.headers.get("authorization").is_none());
+    }
+
+    /// A config-file account named `wif` that federates against the mock server.
+    async fn identity_gateway(kind: ProviderKind, identity: WorkloadIdentity, s: &MockServer) -> Gateway {
+        let mut cfg = GatewayConfig { providers: BTreeMap::new() };
+        let provider = ProviderConfig { kind, base_url: Some(s.uri()), workload_identity: Some(identity), ..Default::default() };
+        provider.validate("wif").unwrap();
+        cfg.providers.insert("wif".into(), provider);
+        Gateway::new(&cfg, Arc::new(MemoryStore::default()), reqwest::Client::new(), Db::in_memory().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn anthropic_workload_identity_exchanges_the_token_file_once() {
+        let s = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("token");
+        std::fs::write(&file, "header.claims.sig\n").unwrap();
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/token"))
+            .and(body_partial_json(json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": "header.claims.sig",
+                "federation_rule_id": "fdrl_1", "organization_id": "org-1", "service_account_id": "svac_1", "workspace_id": "wrkspc_1",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token": "sk-ant-oat01-x", "token_type": "Bearer", "expires_in": 3600})),
+            )
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer sk-ant-oat01-x"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "claude-haiku-5-5"}]})))
+            .mount(&s)
+            .await;
+        let identity = WorkloadIdentity {
+            token_file: file.display().to_string(),
+            service_account_id: "svac_1".into(),
+            federation_rule_id: Some("fdrl_1".into()),
+            organization_id: Some("org-1".into()),
+            workspace_id: Some("wrkspc_1".into()),
+            token_url: Some(format!("{}/v1/oauth/token", s.uri())),
+            ..Default::default()
+        };
+        let g = Arc::new(identity_gateway(ProviderKind::Anthropic, identity, &s).await);
+        // Concurrent requests share one exchange.
+        let (a, b) = tokio::join!(g.fetch_models("wif"), g.fetch_models("wif"));
+        assert_eq!((a.unwrap(), b.unwrap()), (vec!["claude-haiku-5-5".to_string()], vec!["claude-haiku-5-5".to_string()]));
+        let models = s.received_requests().await.unwrap().into_iter().filter(|r| r.url.path() == "/v1/models").collect::<Vec<_>>();
+        assert!(models.iter().all(|r| r.headers.get("x-api-key").is_none()));
+        assert!(!g.has_key(&g.get("wif").unwrap()).await.unwrap());
+        assert!(matches!(g.set_key("wif", "k").await, Err(ProviderChangeError::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn openai_workload_identity_reports_a_refused_exchange() {
+        let s = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("token");
+        std::fs::write(&file, "jwt").unwrap();
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(body_partial_json(json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt", "subject_token": "jwt",
+                "identity_provider_id": "idp_1", "service_account_id": "sa_1",
+            })))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant", "error_description": "no mapping matches"})),
+            )
+            .mount(&s)
+            .await;
+        let identity = WorkloadIdentity {
+            token_file: file.display().to_string(),
+            service_account_id: "sa_1".into(),
+            identity_provider_id: Some("idp_1".into()),
+            token_url: Some(format!("{}/oauth/token", s.uri())),
+            ..Default::default()
+        };
+        let g = identity_gateway(ProviderKind::Openai, identity, &s).await;
+        let err = format!("{:#}", g.fetch_models("wif").await.unwrap_err());
+        assert!(err.contains("400") && err.contains("no mapping matches") && !err.contains("jwt\""), "{err}");
+    }
+
+    #[test]
+    fn workload_identity_is_checked_and_kept_out_of_runtime_accounts() {
+        let anthropic = WorkloadIdentity {
+            token_file: "/t".into(),
+            service_account_id: "svac_1".into(),
+            federation_rule_id: Some("fdrl_1".into()),
+            organization_id: Some("org".into()),
+            ..Default::default()
+        };
+        let cfg =
+            |kind, identity: &WorkloadIdentity| ProviderConfig { kind, workload_identity: Some(identity.clone()), ..Default::default() };
+        cfg(ProviderKind::Anthropic, &anthropic).validate("a").unwrap();
+        assert!(cfg(ProviderKind::Openai, &anthropic).validate("a").is_err(), "OpenAI needs identity_provider_id");
+        assert!(cfg(ProviderKind::Vercel, &anthropic).validate("a").is_err());
+        assert!(cfg(ProviderKind::Anthropic, &WorkloadIdentity { organization_id: None, ..anthropic.clone() }).validate("a").is_err());
+        let err = cfg(ProviderKind::Anthropic, &anthropic).validate_account("a").unwrap_err().to_string();
+        assert!(err.contains("config file"), "{err}");
     }
 
     #[test]
