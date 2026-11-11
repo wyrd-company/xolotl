@@ -15,11 +15,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{AppState, authorize, json_error};
+use crate::accounts::{AccountKind, AddMethod};
+use crate::catalog::DiscoveryStatus;
+use crate::config::{ProviderConfig, ProviderKind};
 use crate::db::{UsageFilter, now};
+use crate::gateway::{ProviderChangeError, ProviderEntry};
 use crate::keys::{InvalidIssue, IssueRequest, Issued, NotPermitted, Principal, Revoked, Scope};
 use crate::limits::Meter;
 use crate::policy::Policy;
-use crate::secrets::{Conflict, SecretStore};
+use crate::secrets::Conflict;
 use crate::subscription::SubProvider;
 
 pub fn router() -> Router<AppState> {
@@ -38,7 +42,8 @@ pub fn router() -> Router<AppState> {
         .route("/keys/{policy}/{name}/rotate", post(rotate_key))
         .route("/keys/{policy}/{name}/enable", post(|s, h, p| set_key_disabled(s, h, p, false)))
         .route("/keys/{policy}/{name}/disable", post(|s, h, p| set_key_disabled(s, h, p, true)))
-        .route("/accounts", get(list_accounts))
+        .route("/account-kinds", get(account_kinds))
+        .route("/accounts", get(list_accounts).post(add_account))
         .route("/accounts/import", post(import_account))
         .route("/accounts/{id}", delete(remove_account))
         .route("/accounts/{id}/enable", post(|s, h, p| set_account_enabled(s, h, p, true)))
@@ -52,6 +57,7 @@ pub fn router() -> Router<AppState> {
         .route("/auth/flows/{id}", get(flow_status))
         .route("/auth/flows/{id}/complete", post(complete_login))
         .route("/providers", get(list_providers))
+        .route("/providers/{name}", axum::routing::put(update_provider).delete(remove_provider))
         .route("/providers/{name}/key", post(set_provider_key))
         .route("/usage", get(usage))
         .route("/sessions", get(sessions))
@@ -434,6 +440,67 @@ async fn list_accounts(State(s): State<AppState>, h: HeaderMap, Query(q): Query<
     ok(s.subs.accounts(q.provider).await.map_err(internal)?)
 }
 
+async fn account_kinds(State(s): State<AppState>, h: HeaderMap) -> Res {
+    admin(&s, &h).await?;
+    ok(crate::accounts::kinds())
+}
+
+/// Add an account of any kind that is added with a request: an API key for
+/// a pool, or a named provider. OAuth kinds log in through `/admin/auth`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddAccountReq {
+    kind: AccountKind,
+    /// Provider kinds: the provider name clients address.
+    #[serde(default)]
+    name: Option<String>,
+    /// Pool kinds: a label for the account.
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    /// Provider kinds: the provider fields.
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    no_auth: bool,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+async fn add_account(State(s): State<AppState>, h: HeaderMap, Json(req): Json<AddAccountReq>) -> Res {
+    admin(&s, &h).await?;
+    let unsupported = || json_error(StatusCode::BAD_REQUEST, format!("{} accounts are not added this way", req.kind.info().label));
+    if let Some(kind) = req.kind.provider_kind() {
+        let name = req.name.clone().map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+        let name = name.ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "a provider account needs a name"))?;
+        if req.label.is_some() {
+            return Err(json_error(StatusCode::BAD_REQUEST, "a provider account has no label; its name is its label"));
+        }
+        let cfg = provider_config(kind, req.enabled, req.base_url, req.no_auth, req.headers);
+        s.gateway.put_provider(&name, cfg, req.api_key, true).await.map_err(provider_change_error)?;
+        tracing::info!(provider = %name, kind = ?req.kind, "added provider account");
+        return provider_saved(&s, &name).await;
+    }
+    let provider = req.kind.sub_provider().ok_or_else(unsupported)?;
+    if !req.kind.can_add(AddMethod::ApiKey) {
+        return Err(unsupported());
+    }
+    if req.name.is_some() || req.enabled.is_some() || req.base_url.is_some() || req.no_auth || !req.headers.is_empty() {
+        return Err(json_error(StatusCode::BAD_REQUEST, "a pool account takes only api_key and label"));
+    }
+    let key = req.api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    let key = key.ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "api_key is required"))?;
+    let row = s.subs.import(provider, &json!({"api_key": key}), req.label).await.map_err(bad)?;
+    tracing::info!(account = %row.id, "added account");
+    let discovery = account_models(&s, provider).await;
+    let mut response = serde_json::to_value(row).map_err(|e| internal(e.into()))?;
+    response["catalog_refresh"] = discovery;
+    ok(response)
+}
+
 #[derive(Deserialize)]
 struct ImportReq {
     provider: SubProvider,
@@ -567,45 +634,121 @@ struct ProviderKeyReq {
     api_key: String,
 }
 
-/// Gateway providers from the config file, and whether each has a key in the vault.
+/// Provider accounts, from the config file and the vault, and whether each
+/// has a key in the vault.
 async fn list_providers(State(s): State<AppState>, h: HeaderMap) -> Res {
     admin(&s, &h).await?;
     let mut out = Vec::new();
-    for (name, p) in &s.cfg.gateway.providers {
-        let secret = p.secret.clone().unwrap_or_else(|| format!("providers/{name}"));
-        let has_key = if p.no_auth {
-            false
-        } else {
-            s.secrets
-                .get(&secret)
-                .await
-                .map_err(internal)?
-                .is_some_and(|m| m.get("api_key").is_some_and(|k| k.as_str().is_some_and(|k| !k.is_empty())))
-        };
-        out.push(json!({
-            "name": name,
-            "kind": p.kind,
-            "enabled": p.is_enabled(),
-            "base_url": p.base_url,
-            "no_auth": p.no_auth,
-            "secret": secret,
-            "has_key": has_key,
-        }));
+    for p in s.gateway.entries() {
+        out.push(provider_view(&s, &p).await.map_err(internal)?);
     }
     ok(out)
 }
 
+async fn provider_view(s: &AppState, p: &ProviderEntry) -> anyhow::Result<Value> {
+    Ok(json!({
+        "name": p.name,
+        "kind": p.cfg.kind,
+        "source": p.source,
+        "enabled": p.cfg.is_enabled(),
+        "base_url": p.cfg.base_url,
+        "no_auth": p.cfg.no_auth,
+        "headers": p.cfg.headers.keys().collect::<Vec<_>>(),
+        "secret": p.secret(),
+        "has_key": s.gateway.has_key(p).await?,
+    }))
+}
+
+fn provider_change_error(e: ProviderChangeError) -> Response {
+    match e {
+        ProviderChangeError::NotFound(_) => json_error(StatusCode::NOT_FOUND, e.to_string()),
+        ProviderChangeError::Conflict(_) => json_error(StatusCode::CONFLICT, e.to_string()),
+        ProviderChangeError::Invalid(_) => json_error(StatusCode::BAD_REQUEST, e.to_string()),
+        ProviderChangeError::Store(e) => internal(e),
+    }
+}
+
 async fn set_provider_key(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>, Json(req): Json<ProviderKeyReq>) -> Res {
     admin(&s, &h).await?;
-    if !s.gateway.has_provider(&name) {
-        return Err(json_error(StatusCode::NOT_FOUND, "provider is not configured"));
+    s.gateway.set_key(&name, &req.api_key).await.map_err(provider_change_error)?;
+    tracing::info!(provider = %name, "stored provider key");
+    ok(json!({"provider": name, "stored": true, "catalog_refresh": provider_models(&s, &name).await}))
+}
+
+/// A provider account's fields, as the admin API takes them.
+fn provider_config(
+    kind: ProviderKind,
+    enabled: Option<bool>,
+    base_url: Option<String>,
+    no_auth: bool,
+    headers: BTreeMap<String, String>,
+) -> ProviderConfig {
+    let base_url = base_url.map(|u| u.trim().to_string()).filter(|u| !u.is_empty());
+    ProviderConfig { kind, enabled, base_url, secret: None, no_auth, headers }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateProviderReq {
+    kind: AccountKind,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    no_auth: bool,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+/// Change a provider account stored in the vault. Without `api_key`, the key is kept.
+async fn update_provider(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>, Json(req): Json<UpdateProviderReq>) -> Res {
+    admin(&s, &h).await?;
+    let kind =
+        req.kind.provider_kind().ok_or_else(|| json_error(StatusCode::BAD_REQUEST, format!("{:?} is not a provider kind", req.kind)))?;
+    let cfg = provider_config(kind, req.enabled, req.base_url, req.no_auth, req.headers);
+    s.gateway.put_provider(&name, cfg, req.api_key, false).await.map_err(provider_change_error)?;
+    tracing::info!(provider = %name, "changed provider account");
+    provider_saved(&s, &name).await
+}
+
+async fn remove_provider(State(s): State<AppState>, h: HeaderMap, Path(name): Path<String>) -> Res {
+    admin(&s, &h).await?;
+    if let Some(p) = s.keys.policies().iter().find(|p| p.names_provider(&name)) {
+        return Err(json_error(StatusCode::CONFLICT, format!("policy {} names provider {name}; change the policy first", p.name)));
     }
-    let data = json!({"api_key": req.api_key}).as_object().cloned().unwrap_or_default();
-    let secrets: &dyn SecretStore = &*s.secrets;
-    secrets.put(&format!("providers/{name}"), data).await.map_err(internal)?;
-    s.gateway.invalidate_keys();
-    refresh_catalog_later(&s);
-    ok(json!({"provider": name, "stored": true}))
+    s.gateway.remove_provider(&name).await.map_err(provider_change_error)?;
+    tracing::info!(provider = %name, "removed provider account");
+    ok(json!({"removed": name}))
+}
+
+async fn provider_saved(s: &AppState, name: &str) -> Res {
+    let entry = s
+        .gateway
+        .entries()
+        .into_iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| internal(anyhow::anyhow!("saved provider {name} did not load")))?;
+    let mut view = provider_view(s, &entry).await.map_err(internal)?;
+    view["catalog_refresh"] = provider_models(s, name).await;
+    ok(view)
+}
+
+/// Discover a provider's models now. Discovery failure must not hide a
+/// successful write.
+async fn provider_models(s: &AppState, name: &str) -> Value {
+    if !s.gateway.has_provider(name) {
+        return Value::Null;
+    }
+    let providers = [name.to_string()].into_iter().collect();
+    s.catalog.refresh_providers(&s.subs, &s.gateway, &providers).await;
+    match s.catalog.discovery_status().remove(name) {
+        Some(DiscoveryStatus { error: Some(error), .. }) => json!({"provider": name, "error": error}),
+        Some(status) => json!({"provider": name, "models": status.models}),
+        None => Value::Null,
+    }
 }
 
 #[derive(Deserialize)]
@@ -949,7 +1092,8 @@ async fn reload(State(s): State<AppState>, h: HeaderMap) -> Res {
     admin(&s, &h).await?;
     let (policies, keys) = s.keys.reload().await.map_err(internal)?;
     let accounts = s.subs.sync().await.map_err(internal)?;
+    let providers = s.gateway.reload().await.map_err(internal)?;
     s.gateway.invalidate_keys();
     refresh_catalog_later(&s);
-    ok(json!({"policies": policies, "keys": keys, "accounts": accounts}))
+    ok(json!({"policies": policies, "keys": keys, "accounts": accounts, "provider_accounts": providers}))
 }

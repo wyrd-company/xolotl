@@ -348,6 +348,12 @@ impl Policy {
 
     /// `known` lists every provider name the server knows, `mcp` every
     /// configured MCP server.
+    /// Whether the policy names the provider: in `providers`, `precedence` or
+    /// a winner. Such a provider can't be removed while the policy exists.
+    pub fn names_provider(&self, provider: &str) -> bool {
+        self.providers.iter().chain(&self.precedence).chain(self.winners.values()).any(|p| p == provider)
+    }
+
     pub fn validate(&self, known: &BTreeSet<String>, mcp: &BTreeSet<String>) -> Result<()> {
         anyhow::ensure!(valid_name(&self.name), "policy name must be lowercase letters, digits, '-' or '_' (max 63)");
         anyhow::ensure!(

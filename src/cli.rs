@@ -237,6 +237,51 @@ pub enum AccountsCmd {
         #[arg(long)]
         label: Option<String>,
     },
+    /// Add a provider account: an API-key upstream that clients address as
+    /// `<name>/<model>` and `/<name>/...`. Reads the key from stdin.
+    AddProvider {
+        name: String,
+        #[arg(long, value_enum)]
+        kind: ProviderKindArg,
+        /// Required for openai-compatible.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// The server needs no key.
+        #[arg(long)]
+        no_auth: bool,
+        /// Extra static header sent upstream, as `Name=value`. Repeatable.
+        #[arg(long = "header", value_parser = parse_header)]
+        headers: Vec<(String, String)>,
+    },
+    /// Remove a provider account added at runtime, with its key. Refused
+    /// while a policy names the provider.
+    RemoveProvider {
+        name: String,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum ProviderKindArg {
+    Vercel,
+    Mistral,
+    OpenaiCompatible,
+}
+
+impl From<ProviderKindArg> for crate::accounts::AccountKind {
+    fn from(k: ProviderKindArg) -> Self {
+        match k {
+            ProviderKindArg::Vercel => Self::Vercel,
+            ProviderKindArg::Mistral => Self::Mistral,
+            ProviderKindArg::OpenaiCompatible => Self::OpenaiCompatible,
+        }
+    }
+}
+
+fn parse_header(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(k, v)| (k.trim().to_string(), v.to_string()))
+        .filter(|(k, _)| !k.is_empty())
+        .ok_or_else(|| "expected Name=value".into())
 }
 
 #[derive(Subcommand)]
@@ -406,6 +451,8 @@ async fn serve(config: Option<PathBuf>) -> Result<()> {
     tracing::debug!(rows = n, "loaded rate limit counters");
     limiter.register_metrics();
     let gateway = Gateway::new(&cfg.gateway, secrets.clone(), http.clone(), db.clone()).with_limiter(limiter.clone());
+    let n = gateway.reload().await.context("loading provider accounts from the vault")?;
+    tracing::info!(config = cfg.gateway.providers.len(), vault = n, "loaded provider accounts");
     let catalog = Arc::new(ModelCatalog::new(cfg.catalog.clone(), gateway.kinds()).with_db(db.clone()).await);
     let gateway = Arc::new(gateway.with_catalog(catalog.clone()));
     let subs = Arc::new(
@@ -826,6 +873,28 @@ async fn accounts(c: Client, cmd: AccountsCmd) -> Result<()> {
                     usage
                 );
             }
+            if provider.is_none() {
+                let providers = c.get("/admin/providers").await?;
+                println!("\n{:<24} {:<18} {:<8} STATE", "PROVIDER ACCOUNT", "KIND", "SOURCE");
+                for p in providers.as_array().into_iter().flatten() {
+                    let state = if !p["enabled"].as_bool().unwrap_or(true) {
+                        "disabled"
+                    } else if p["no_auth"].as_bool().unwrap_or(false) {
+                        "ok (no key needed)"
+                    } else if p["has_key"].as_bool().unwrap_or(false) {
+                        "ok"
+                    } else {
+                        "no key"
+                    };
+                    println!(
+                        "{:<24} {:<18} {:<8} {}",
+                        p["name"].as_str().unwrap_or(""),
+                        p["kind"].as_str().unwrap_or(""),
+                        p["source"].as_str().unwrap_or(""),
+                        state
+                    );
+                }
+            }
             Ok(())
         }
         AccountsCmd::Enable { id } => c.print(c.post(&format!("/admin/accounts/{id}/enable"), json!({})).await?),
@@ -845,6 +914,15 @@ async fn accounts(c: Client, cmd: AccountsCmd) -> Result<()> {
             let key = read_secret(&format!("{provider} API key: "))?;
             c.print(c.post("/admin/accounts/import", json!({"provider": provider, "data": {"api_key": key}, "label": label})).await?)
         }
+        AccountsCmd::AddProvider { name, kind, base_url, no_auth, headers } => {
+            let api_key = if no_auth { None } else { Some(read_secret(&format!("API key for {name}: "))?) };
+            let headers: serde_json::Map<String, Value> = headers.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
+            let kind = crate::accounts::AccountKind::from(kind);
+            let body =
+                json!({"kind": kind, "name": name, "api_key": api_key, "base_url": base_url, "no_auth": no_auth, "headers": headers});
+            c.print(c.post("/admin/accounts", body).await?)
+        }
+        AccountsCmd::RemoveProvider { name } => c.print(c.delete(&format!("/admin/providers/{name}")).await?),
     }
 }
 

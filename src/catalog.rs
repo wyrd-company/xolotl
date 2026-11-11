@@ -87,7 +87,7 @@ pub struct ModelCatalog {
     refresh_lock: tokio::sync::Mutex<()>,
     cfg: CatalogConfig,
     /// Gateway provider name -> kind.
-    gateway_kinds: BTreeMap<String, ProviderKind>,
+    gateway_kinds: RwLock<BTreeMap<String, ProviderKind>>,
     snapshot: RwLock<Arc<Snapshot>>,
     metadata: RwLock<crate::metadata::Registry>,
     codex_entries: RwLock<BTreeMap<String, serde_json::Value>>,
@@ -99,7 +99,7 @@ impl ModelCatalog {
         let me = Self {
             refresh_lock: tokio::sync::Mutex::new(()),
             cfg,
-            gateway_kinds,
+            gateway_kinds: RwLock::new(gateway_kinds),
             metadata: Default::default(),
             codex_entries: Default::default(),
             db: None,
@@ -163,7 +163,31 @@ impl ModelCatalog {
 
     /// Every provider name: subscription pools and gateway providers.
     pub fn known_providers(&self) -> BTreeSet<String> {
-        SubProvider::ALL.iter().map(|p| p.as_str().to_string()).chain(self.gateway_kinds.keys().cloned()).collect()
+        SubProvider::ALL.iter().map(|p| p.as_str().to_string()).chain(self.gateway_kinds.read().keys().cloned()).collect()
+    }
+
+    /// Follow the gateway's providers as provider accounts come and go. A
+    /// removed provider's models leave the catalog; a new one is listed with
+    /// its static models until discovery runs.
+    pub fn set_gateway_kinds(&self, kinds: BTreeMap<String, ProviderKind>) {
+        let removed: Vec<String> = {
+            let mut current = self.gateway_kinds.write();
+            if *current == kinds {
+                return;
+            }
+            let removed = current.keys().filter(|k| !kinds.contains_key(*k)).cloned().collect();
+            *current = kinds;
+            removed
+        };
+        let mut snapshot = self.snapshot.write();
+        let mut models = snapshot.models.clone();
+        let mut discovery = snapshot.discovery.clone();
+        for name in &removed {
+            models.remove(name);
+            discovery.remove(name);
+        }
+        let models = self.with_static(models);
+        *snapshot = Arc::new(Snapshot { models, refreshed: snapshot.refreshed, discovery });
     }
 
     pub fn models(&self) -> Catalog {
@@ -240,6 +264,10 @@ impl ModelCatalog {
             };
             discovery.insert(name.clone(), DiscoveryStatus { refreshed_at: Some(crate::db::now()), error, models: 0 });
         }
+        // A provider account removed during the refresh stays removed.
+        let known = self.known_providers();
+        fresh.retain(|p, _| known.contains(p) || self.cfg.static_models.contains_key(p));
+        discovery.retain(|p, _| known.contains(p));
         let models = self.with_static(fresh);
         let total: usize = models.values().map(BTreeSet::len).sum();
         tracing::info!(models = total, "model catalog refreshed");
@@ -350,7 +378,7 @@ impl ModelCatalog {
                     vec![Wire::Chat]
                 }
             }
-            other => match self.gateway_kinds.get(other) {
+            other => match self.gateway_kinds.read().get(other) {
                 Some(ProviderKind::Vercel) => vec![Wire::Chat, Wire::Responses, Wire::Messages],
                 _ => vec![Wire::Chat],
             },
