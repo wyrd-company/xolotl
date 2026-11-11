@@ -12,7 +12,7 @@ import { LoginPage } from "@/pages/login";
 import { McpPage } from "@/pages/mcp";
 import { OverviewPage } from "@/pages/overview";
 import { PoliciesPage } from "@/pages/policies";
-import { ProvidersPage } from "@/pages/providers";
+import { ModelsPage } from "@/pages/models";
 import { UsagePage } from "@/pages/usage";
 
 const queryClient = new QueryClient({
@@ -30,7 +30,8 @@ const router = createHashRouter([
       { path: "policies", element: <PoliciesPage /> },
       { path: "policies/:name", element: <PoliciesPage /> },
       { path: "keys", element: <KeysPage /> },
-      { path: "providers", element: <ProvidersPage /> },
+      { path: "models", element: <ModelsPage /> },
+      { path: "providers", element: <Navigate to="/models" replace /> },
       { path: "mcp", element: <McpPage /> },
       { path: "usage", element: <UsagePage /> },
       { path: "*", element: <Navigate to="/" replace /> },

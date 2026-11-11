@@ -3,34 +3,85 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router";
 import { toast } from "sonner";
 
-import { PageHeader } from "@/components/layout";
+import { PageHeader, QueryError } from "@/components/layout";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { get, post, type Account, type FlowStart, type FlowStatus } from "@/lib/api";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  get,
+  post,
+  type Account,
+  type AccountKind,
+  type AccountKindInfo,
+  type FlowStart,
+  type FlowStatus,
+  type ProviderAccount,
+} from "@/lib/api";
 import { useAction } from "@/lib/hooks";
+import { PROVIDER_QUERIES } from "@/pages/provider-accounts";
 
+/** The forms of the kinds that log in with OAuth. Each takes its own flow. */
+const LOGIN_FORMS: Partial<Record<AccountKind, () => ReactNode>> = {
+  codex: () => <CodexLogin />,
+  claude: () => <ClaudeLogin />,
+  grok: () => <GrokLogin />,
+};
+
+/** Kinds are listed by the server. A pool kind gets its login or key form; provider kinds share one form. */
 export function AddAccountPage() {
+  const kinds = useQuery({ queryKey: ["account-kinds"], queryFn: () => get<AccountKindInfo[]>("/admin/account-kinds"), staleTime: Infinity });
+  const all = kinds.data ?? [];
+  const pools = all.filter((k) => k.placement === "pool");
+  const providers = all.filter((k) => k.placement === "provider");
+  const imports = pools.filter((k) => k.add.includes("import"));
   return (
     <>
       <Link to="/accounts" className="text-primary text-sm">
         Back to accounts
       </Link>
       <PageHeader
-        title="Add a subscription account"
+        title="Add an account"
         description="Credentials go straight to OpenBao. Logging in to an account that already exists replaces its tokens instead of adding a duplicate."
       />
-      <div className="grid gap-4 lg:grid-cols-2">
-        <CodexLogin />
-        <ClaudeLogin />
-        <GrokLogin />
-        <OpencodeGoKey />
-        <ImportLogin />
-      </div>
+      <QueryError error={kinds.error} />
+      <section aria-labelledby="add-pools" className="flex flex-col gap-3">
+        <h2 id="add-pools" className="font-medium">
+          Subscriptions
+        </h2>
+        <p className="text-muted-foreground text-sm">Accounts of a pool share its provider name. Add several to spread load and limits.</p>
+        <div className="grid gap-4 lg:grid-cols-2">
+          {pools.map((k) => (
+            <PoolForm key={k.kind} info={k} />
+          ))}
+          {imports.length > 0 && <ImportLogin kinds={imports} />}
+        </div>
+      </section>
+      {providers.length > 0 && (
+        <section aria-labelledby="add-providers" className="flex flex-col gap-3">
+          <h2 id="add-providers" className="font-medium">
+            Providers
+          </h2>
+          <p className="text-muted-foreground text-sm">
+            A provider account is a provider of its own. Clients address it by the name you give it.
+          </p>
+          <div className="grid gap-4 lg:grid-cols-2">
+            <ProviderAccountForm kinds={providers} />
+          </div>
+        </section>
+      )}
     </>
   );
+}
+
+function PoolForm({ info }: { info: AccountKindInfo }) {
+  const login = LOGIN_FORMS[info.kind];
+  if (login) return <>{login()}</>;
+  if (info.add.includes("api-key")) return <ApiKeyAccount info={info} />;
+  return null;
 }
 
 export function AccountLogin({ provider }: { provider: "codex" | "claude" | "grok" }) {
@@ -229,37 +280,43 @@ function GrokLogin() {
   );
 }
 
-function OpencodeGoKey() {
+interface CatalogRefreshResult {
+  provider: string;
+  models?: number;
+  error?: string;
+}
+
+function reportModels(r: { catalog_refresh?: CatalogRefreshResult | null }) {
+  const c = r.catalog_refresh;
+  if (!c) return;
+  if (c.error) toast.error(c.error);
+  else toast.success(`${c.provider}: ${c.models} models found`);
+}
+
+/** A pool account added with an API key. */
+function ApiKeyAccount({ info }: { info: AccountKindInfo }) {
   const [label, setLabel] = useState("");
   const [key, setKey] = useState("");
   const loggedIn = useLoggedIn();
   const add = useAction(
     () =>
-      post<
-        Account & {
-          catalog_refresh: {
-            provider: string;
-            models?: number;
-            error?: string;
-          };
-        }
-      >("/admin/accounts/import", {
-        provider: "opencode-go",
-        data: { api_key: key.trim() },
+      post<Account & { catalog_refresh: CatalogRefreshResult }>("/admin/accounts", {
+        kind: info.kind,
+        api_key: key.trim(),
         label: label.trim() || null,
       }),
     {
       onSuccess: (r) => {
         loggedIn();
-        if (r.catalog_refresh.error) toast.error(r.catalog_refresh.error);
-        else toast.success(`${r.catalog_refresh.provider}: ${r.catalog_refresh.models} models found`);
+        reportModels(r);
         setKey("");
         setLabel("");
       },
     },
   );
+  const id = `add-${info.kind}`;
   return (
-    <Section title="OpenCode Go" description="API key from the OpenCode console. Add several to spread load and limits.">
+    <Section title={info.label} description={info.description}>
       <form
         className="flex flex-col gap-4"
         onSubmit={(e) => {
@@ -268,13 +325,13 @@ function OpencodeGoKey() {
         }}
       >
         <div className="flex flex-col gap-2">
-          <Label htmlFor="ocg-label">Label</Label>
-          <Input id="ocg-label" placeholder="go-main" value={label} onChange={(e) => setLabel(e.target.value)} />
+          <Label htmlFor={`${id}-label`}>Label</Label>
+          <Input id={`${id}-label`} placeholder="main" value={label} onChange={(e) => setLabel(e.target.value)} />
         </div>
         <div className="flex flex-col gap-2">
-          <Label htmlFor="ocg-key">API key</Label>
+          <Label htmlFor={`${id}-key`}>API key</Label>
           <Input
-            id="ocg-key"
+            id={`${id}-key`}
             type="password"
             autoComplete="off"
             className="font-mono"
@@ -290,8 +347,148 @@ function OpencodeGoKey() {
   );
 }
 
-function ImportLogin() {
-  const [provider, setProvider] = useState<"codex" | "claude">("codex");
+/** `Name: value` lines to a header map. */
+export function parseHeaders(text: string): Record<string, string> | string {
+  const out: Record<string, string> = {};
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    const at = line.indexOf(":");
+    if (at <= 0) return `"${line.trim()}" is not "Name: value"`;
+    out[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+  }
+  return out;
+}
+
+/** A provider account: a kind, the name clients address it by, and its key. */
+function ProviderAccountForm({ kinds }: { kinds: AccountKindInfo[] }) {
+  const qc = useQueryClient();
+  const [kind, setKind] = useState(kinds[0].kind);
+  const [name, setName] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [key, setKey] = useState("");
+  const [noAuth, setNoAuth] = useState(false);
+  const [headers, setHeaders] = useState("");
+  const info = kinds.find((k) => k.kind === kind) ?? kinds[0];
+  const parsed = parseHeaders(headers);
+  const needsUrl = info.default_base_url === null && !baseUrl.trim();
+  const add = useAction(
+    () =>
+      post<ProviderAccount & { catalog_refresh: CatalogRefreshResult | null }>("/admin/accounts", {
+        kind,
+        name: name.trim(),
+        base_url: baseUrl.trim() || null,
+        api_key: noAuth ? null : key.trim(),
+        no_auth: noAuth,
+        headers: typeof parsed === "string" ? {} : parsed,
+      }),
+    {
+      invalidate: PROVIDER_QUERIES,
+      onSuccess: (r) => {
+        toast.success(`Added ${r.name}`);
+        reportModels(r);
+        qc.invalidateQueries({ queryKey: ["accounts"] });
+        setName("");
+        setBaseUrl("");
+        setKey("");
+        setHeaders("");
+      },
+    },
+  );
+  return (
+    <Section title="Provider account" description={info.description}>
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          add.mutate(undefined);
+        }}
+      >
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="provider-kind">Kind</Label>
+          <Select value={kind} onValueChange={(v) => setKind(v as AccountKind)}>
+            <SelectTrigger id="provider-kind" className="w-64">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {kinds.map((k) => (
+                <SelectItem key={k.kind} value={k.kind}>
+                  {k.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="provider-name">Name</Label>
+          <Input
+            id="provider-name"
+            className="font-mono"
+            placeholder="local"
+            aria-describedby="provider-name-help"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+          <p id="provider-name-help" className="text-muted-foreground text-xs">
+            Letters, digits, - and _. Clients use it as the model prefix: <span className="font-mono">{name.trim() || "name"}/model</span>.
+          </p>
+        </div>
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="provider-url">Base URL{info.default_base_url === null ? "" : " (optional)"}</Label>
+          <Input
+            id="provider-url"
+            className="font-mono"
+            placeholder={info.default_base_url ?? "http://llama.example.lan:8080"}
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+          />
+        </div>
+        <div className="flex items-center gap-2">
+          <Checkbox id="provider-no-auth" checked={noAuth} onCheckedChange={(v) => setNoAuth(v === true)} />
+          <Label htmlFor="provider-no-auth">The server needs no key</Label>
+        </div>
+        {!noAuth && (
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="provider-key">API key</Label>
+            <Input
+              id="provider-key"
+              type="password"
+              autoComplete="off"
+              className="font-mono"
+              value={key}
+              onChange={(e) => setKey(e.target.value)}
+            />
+          </div>
+        )}
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="provider-headers">Extra headers (optional)</Label>
+          <Textarea
+            id="provider-headers"
+            className="font-mono"
+            rows={2}
+            placeholder="X-Team: blue"
+            aria-describedby="provider-headers-help"
+            aria-invalid={typeof parsed === "string"}
+            value={headers}
+            onChange={(e) => setHeaders(e.target.value)}
+          />
+          <p id="provider-headers-help" className={typeof parsed === "string" ? "text-destructive text-xs" : "text-muted-foreground text-xs"}>
+            {typeof parsed === "string" ? parsed : "One Name: value per line, sent upstream with every request. Stored in OpenBao."}
+          </p>
+        </div>
+        <Button
+          type="submit"
+          className="self-start"
+          disabled={!name.trim() || needsUrl || (!noAuth && !key.trim()) || typeof parsed === "string" || add.isPending}
+        >
+          Add provider
+        </Button>
+      </form>
+    </Section>
+  );
+}
+
+function ImportLogin({ kinds }: { kinds: AccountKindInfo[] }) {
+  const [provider, setProvider] = useState(kinds[0].kind);
   const [file, setFile] = useState<File | null>(null);
   const [inputKey, setInputKey] = useState(0);
   const loggedIn = useLoggedIn();
@@ -333,13 +530,16 @@ function ImportLogin() {
       >
         <div className="flex flex-col gap-2">
           <Label htmlFor="import-provider">Provider</Label>
-          <Select value={provider} onValueChange={(v) => setProvider(v as "codex" | "claude")}>
+          <Select value={provider} onValueChange={(v) => setProvider(v as AccountKind)}>
             <SelectTrigger id="import-provider" className="w-48">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="codex">Codex</SelectItem>
-              <SelectItem value="claude">Claude</SelectItem>
+              {kinds.map((k) => (
+                <SelectItem key={k.kind} value={k.kind}>
+                  {k.label}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
         </div>

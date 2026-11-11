@@ -54,13 +54,13 @@ server log has the details.
 
 | Screen | What you can do |
 |---|---|
-| Overview | Fixable failures with **Replace key** or **Log in again** links, OpenBao and SQLite health, configured account pools with state bars and usage windows, Claude and Codex reset credit totals, traffic and provider split for the last 24 hours, configured gateway providers, recent failed requests |
-| Accounts | Accounts by provider with their state and cooldown reason: refresh usage, refresh models, enable or disable. Details: set priority, **Retry**, log in again (OAuth accounts) or replace the key (API-key accounts), remove, last error, Claude and Codex reset credits |
-| [Add account](accounts.md#add-an-account) | Codex device or browser login, Claude login, OpenCode Go key, import of a CLI credential file |
+| Overview | Fixable failures with **Replace key** or **Log in again** links, OpenBao and SQLite health, configured account pools with state bars and usage windows, Claude and Codex reset credit totals, traffic and provider split for the last 24 hours, provider accounts, recent failed requests |
+| [Accounts](accounts.md) | Pool accounts by provider with their state and cooldown reason: refresh usage, refresh models, enable or disable. Details: set priority, **Retry**, log in again (OAuth accounts) or replace the key (API-key accounts), remove, last error, Claude and Codex reset credits. Provider accounts with their kind, key state and base URL: set or replace the key, remove the ones added here. The **Providers** tab shows only provider accounts |
+| [Add account](accounts.md#add-an-account) | Every account kind. Subscriptions: Codex device or browser login, Claude login, OpenCode Go key, import of a CLI credential file. Providers: kind, name, base URL, API key or no key, extra headers |
 | [Policies](policies-and-keys.md#write-a-policy) | Providers and the accounts of each subscription provider, scopes (with `key_policies` under the `keys` scope), MCP access, rate limits (in total, per provider and per account) with the policy's consumption, and the model list (below). Each section folds away |
 | [Client keys](policies-and-keys.md#issue-a-client-key) | Issue, rotate with a grace period, enable or disable, revoke. Consumption against the policy's rate limits. Shows the OpenBao path, the `bao` command and the OpenBao policy the client needs. Never shows the key |
 | [MCP servers](mcp-gateway.md#in-the-web-ui) | Upstream servers: add, edit and remove runtime servers, set header secrets, OAuth sign-in, tools, recent tool calls |
-| Providers & models | Gateway providers and their key state, set a key, the model catalog with each model's endpoints |
+| [Models](#models) | The model catalog with each model's endpoints |
 | Usage | The request log grouped by client, account, provider or model, sessions, the tools each key called, and a link to `telemetry.dashboard_url` |
 
 Every member of the admin group has full access.
@@ -79,7 +79,7 @@ open that account's details. See
 Cooling accounts and credentials waiting to save appear under **Health**;
 xolotl retries saving refreshed credentials.
 
-Health shows subscription providers with accounts and gateway providers with a
+Health shows subscription providers with accounts and provider accounts with a
 saved key or no authentication requirement. Disabled providers remain visible
 with their state. Each account has a state bar that opens its details. Quota
 windows come from the least-used available account with reported usage.

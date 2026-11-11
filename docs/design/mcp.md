@@ -66,7 +66,7 @@ headers = { Authorization = "Bearer {token}" }
   - Remove them with `xolotl mcp unset-secret`.
   - Changing a secret drops the connection, so the next call reconnects with the new value.
   - Fields are merged with check-and-set and retried on a conflict, so concurrent updates of different fields all survive.
-- **Names:** lowercase, starting with a letter. In code a name becomes a JavaScript identifier with `-` replaced by `_`, so `github-work` is `github_work`. Names that collide after that replacement are rejected. `mcp` is also reserved as a gateway provider name.
+- **Names:** lowercase, starting with a letter. In code a name becomes a JavaScript identifier with `-` replaced by `_`, so `github-work` is `github_work`. Names that collide after that replacement are rejected. `mcp` is also reserved as a provider account name.
 - **Connections:** opened on first use. A transport failure drops the connection and the next call reconnects. Redirects are never followed, so the headers only reach the configured origin. Each tool call is limited by `timeout_secs` (default 60).
 - **Tool lists:** read at startup, every `mcp.tools_refresh_secs` (300), on `xolotl mcp refresh`, and the first time a policy needs a server that hasn't been listed yet. If a refresh fails, the previous list is kept. `list_changed` notifications are not subscribed to.
 

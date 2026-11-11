@@ -33,7 +33,7 @@ Metrics carry provider and model, never the session key, so that their cardinali
 
 ## Context lock
 
-A successful request whose session has reached `sessions.lock_tokens` (default 60 000, 0 disables) forms a lock on what served it: the requested name, the provider and model, and the account when there is one. Passthroughs to a gateway provider are counted but not locked, as nothing routes them.
+A successful request whose session has reached `sessions.lock_tokens` (default 60 000, 0 disables) forms a lock on what served it: the requested name, the provider and model, and the account when there is one. Passthroughs to a provider account are counted but not locked, as nothing routes them.
 
 While the lock holds, a request for the locked name goes to the locked target and account, ahead of alias order, session affinity, `soft_limit_percent` and the strategy. It breaks, with the reason recorded on the session, as a metric and in the log, when:
 

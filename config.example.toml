@@ -86,8 +86,10 @@ session_affinity_secs = 3600
 [sessions]
 lock_tokens = 60000        # pin a session to its account and model at this prompt size; 0 disables
 
-# Gateway providers are addressed as <name>/<model> and passthrough /<name>/...
-# API keys come from the vault secret providers/<name> (field api_key).
+# Provider accounts from the config file, addressed as <name>/<model> and
+# passthrough /<name>/... API keys come from the vault secret providers/<name>
+# (field api_key). Provider accounts can also be added at runtime
+# (`xolotl accounts add-provider`, or the web UI's Add account screen).
 [gateway.providers.vercel]
 kind = "vercel"
 

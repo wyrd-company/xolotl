@@ -26,7 +26,7 @@ import {
   put,
   SUB_PROVIDERS,
   type Account,
-  type GatewayProvider,
+  type ProviderAccount,
   type KeyInfo,
   type Limits,
   type McpServer,
@@ -255,7 +255,7 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
   const [draft, setDraft] = useState<Draft>(() => toDraft(initial));
   const set: SetDraft = (k, v) => setDraft((d) => ({ ...d, [k]: v }));
 
-  const gateway = useQuery({ queryKey: ["providers"], queryFn: () => get<GatewayProvider[]>("/admin/providers") });
+  const gateway = useQuery({ queryKey: ["providers"], queryFn: () => get<ProviderAccount[]>("/admin/providers") });
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: () => get<Account[]>("/admin/accounts"), refetchInterval: 30_000 });
   const known = [...SUB_PROVIDERS, ...(gateway.data ?? []).filter((p) => p.enabled).map((p) => p.name)];
   const health = (p: string) => providerHealth(p, SUB_PROVIDERS, accounts.data ?? [], gateway.data ?? [], draft.accounts);

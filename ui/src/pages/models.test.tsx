@@ -1,20 +1,19 @@
 // ---
 // relationships:
-//   tests: providers
+//   tests: models
 // ---
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { expect, test } from "vitest";
 import type { CatalogRoute } from "@/lib/api";
-import { ProvidersPage } from "./providers";
+import { ModelsPage } from "./models";
 
 function render(metadata: CatalogRoute["metadata"]) {
   const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
-  client.setQueryData(["providers"], []);
   client.setQueryData(["catalog-status"], {});
   client.setQueryData(["catalog-routes"], [{provider: "sample", model: "model-a", endpoints: ["/v1/chat/completions"], translated_endpoints: [], metadata}]);
-  return renderToStaticMarkup(<QueryClientProvider client={client}><MemoryRouter><ProvidersPage /></MemoryRouter></QueryClientProvider>);
+  return renderToStaticMarkup(<QueryClientProvider client={client}><MemoryRouter><ModelsPage /></MemoryRouter></QueryClientProvider>);
 }
 
 test("catalog exposes limits, USD prices, cache rates, source and stale data", () => {

@@ -40,7 +40,7 @@ Claude Code, Codex CLI, Grok CLI, SDKs, MCP clients, T3 Code
         │  client key
         ▼
      xolotl ── policy ──┬── subscription accounts: codex, claude, grok, opencode-go
-        │               ├── gateway providers: vercel, mistral, openai-compatible
+        │               ├── provider accounts: vercel, mistral, openai-compatible
         │               └── /mcp ── upstream MCP servers
         ├── OpenBao: every secret
         ├── SQLite: runtime state, no secrets
@@ -53,7 +53,7 @@ Claude Code, Codex CLI, Grok CLI, SDKs, MCP clients, T3 Code
 2. [Configure](configuration.md) the server.
 3. Set up [sign-in to the web UI](web-ui.md#set-up-sign-in). You do the next
    steps on its screens. Each page also gives the CLI commands.
-4. Add [subscription accounts](accounts.md) or gateway provider keys.
+4. Add [accounts](accounts.md): subscriptions, or API-key providers.
 5. Write a [policy and issue a client key](policies-and-keys.md).
 6. [Connect your clients](clients.md).
 

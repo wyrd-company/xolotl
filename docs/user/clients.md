@@ -143,7 +143,7 @@ clears that account's cooldown and last error and polls its usage again.
 | `POST /v1/messages`, `/v1/responses`, `/v1/chat/completions`, other `POST /v1/*` | The target the policy gives for `model` |
 | `GET /backend-api/codex/models` | Policy-filtered Codex-native metadata |
 | `GET /v1/models` | The policy's model names and their endpoints |
-| `/<provider>/<path>` | Passthrough to a gateway provider, with its key |
+| `/<provider>/<path>` | Passthrough to a provider account, with its key |
 | `/opencode-go/<path>` | Passthrough to OpenCode Go through the account pool |
 | `/mcp` | The MCP gateway |
 | `/v0/management/...` | T3 Code hubs |
@@ -181,7 +181,7 @@ the response, streams included.
 | `codex`, `grok` | Responses |
 | `opencode-go` | Messages, Responses or Chat, depending on the model |
 | `vercel` kind | All three |
-| Other gateway providers | Chat |
+| Other provider accounts | Chat |
 
 Change this with [`[catalog.wires]`](configuration.md#catalog).
 
