@@ -68,6 +68,13 @@ pub enum ProviderChangeError {
     Store(anyhow::Error),
 }
 
+struct CachedKey {
+    /// `None` for an account that needs no key.
+    key: Option<String>,
+    at: Instant,
+    cfg: ProviderConfig,
+}
+
 pub struct Gateway {
     /// The config file's providers, disabled ones included.
     config: BTreeMap<String, ProviderConfig>,
@@ -78,7 +85,8 @@ pub struct Gateway {
     secrets: Secrets,
     http: reqwest::Client,
     db: Db,
-    keys: RwLock<HashMap<String, (Option<String>, Instant)>>,
+    /// Cached keys, each with the provider config it was read with.
+    keys: RwLock<HashMap<String, CachedKey>>,
     /// Bumped whenever cached keys are dropped, so a vault read that started
     /// before a key change can't put the old key back in the cache.
     key_generation: std::sync::atomic::AtomicU64,
@@ -319,29 +327,49 @@ impl Gateway {
         base.strip_suffix("/v1").unwrap_or(base).to_string()
     }
 
-    async fn api_key(&self, p: &ProviderEntry) -> Result<Option<String>> {
-        if p.cfg.no_auth {
-            return Ok(None);
+    /// The config and key a request uses. They belong to one revision of the
+    /// account: an account stored in the vault is read in one go, so a change
+    /// made meanwhile can't send its new key to the old endpoint, or the old
+    /// key to the new one.
+    async fn credentials(&self, p: &ProviderEntry) -> Result<(ProviderConfig, Option<String>)> {
+        if p.cfg.no_auth && p.source == ProviderSource::Config {
+            return Ok((p.cfg.clone(), None));
         }
         let name = &p.name;
-        if let Some((k, at)) = self.keys.read().get(name)
-            && at.elapsed() < KEY_TTL
+        if let Some(c) = self.keys.read().get(name)
+            && c.at.elapsed() < KEY_TTL
+            && c.cfg == p.cfg
         {
-            return Ok(k.clone());
+            return Ok((c.cfg.clone(), c.key.clone()));
         }
         let path = p.secret();
         let generation = self.key_generation.load(std::sync::atomic::Ordering::SeqCst);
-        let key = self
-            .secrets
-            .get(&path)
-            .await?
-            .and_then(|m| m.get("api_key").and_then(Value::as_str).map(str::to_string))
-            .with_context(|| format!("no api_key in vault secret {path} for provider {name}"))?;
+        let data = self.secrets.get(&path).await?.unwrap_or_default();
+        let cfg = match p.source {
+            ProviderSource::Config => p.cfg.clone(),
+            ProviderSource::Vault => {
+                anyhow::ensure!(data.contains_key("kind"), "provider account {name} was removed");
+                let cfg = stored_config(data.clone())?;
+                cfg.validate_account(name)?;
+                cfg
+            }
+        };
+        let key = if cfg.no_auth {
+            None
+        } else {
+            Some(
+                data.get("api_key")
+                    .and_then(Value::as_str)
+                    .filter(|k| !k.is_empty())
+                    .map(str::to_string)
+                    .with_context(|| format!("no api_key in vault secret {path} for provider {name}"))?,
+            )
+        };
         let mut keys = self.keys.write();
         if self.key_generation.load(std::sync::atomic::Ordering::SeqCst) == generation {
-            keys.insert(name.to_string(), (Some(key.clone()), Instant::now()));
+            keys.insert(name.to_string(), CachedKey { key: key.clone(), at: Instant::now(), cfg: cfg.clone() });
         }
-        Ok(Some(key))
+        Ok((cfg, key))
     }
 
     pub fn invalidate_keys(&self) {
@@ -359,14 +387,15 @@ impl Gateway {
         body: reqwest::Body,
     ) -> Result<reqwest::Response> {
         let p = self.get(provider).with_context(|| format!("unknown provider {provider}"))?;
-        let url = format!("{}{}", Self::base_url(&p.cfg), path_and_query);
-        if let Some(key) = self.api_key(&p).await? {
+        let (cfg, key) = self.credentials(&p).await?;
+        let url = format!("{}{}", Self::base_url(&cfg), path_and_query);
+        if let Some(key) = key {
             set_header(&mut headers, "authorization", &format!("Bearer {key}"));
             if path_and_query.starts_with("/v1/messages") {
                 set_header(&mut headers, "x-api-key", &key);
             }
         }
-        for (k, v) in &p.cfg.headers {
+        for (k, v) in &cfg.headers {
             if let (Ok(name), Ok(val)) = (k.parse::<axum::http::HeaderName>(), v.parse::<axum::http::HeaderValue>()) {
                 headers.insert(name, val);
             }
@@ -587,6 +616,35 @@ mod tests {
         secrets.put("providers/p", Map::new()).await.unwrap();
         assert!(matches!(g.set_key("p", "k").await, Err(ProviderChangeError::NotFound(_))));
         assert_eq!(secrets.get("providers/p").await.unwrap(), Some(Map::new()));
+    }
+
+    #[tokio::test]
+    async fn a_request_uses_one_revision_of_the_account() {
+        let (a, b) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer key-b"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "m"}]})))
+            .mount(&b)
+            .await;
+        let secrets: Secrets = Arc::new(MemoryStore::default());
+        let g = Gateway::new(
+            &GatewayConfig { providers: BTreeMap::new() },
+            secrets.clone(),
+            reqwest::Client::new(),
+            Db::in_memory().await.unwrap(),
+        );
+        g.put_provider("p", ProviderConfig { base_url: Some(a.uri()), ..Default::default() }, Some("key-a".into()), true).await.unwrap();
+        // A request that looked the account up before another instance moved it.
+        let before = g.get("p").unwrap();
+        let moved = json!({"kind": "openai-compatible", "base_url": b.uri(), "api_key": "key-b"});
+        secrets.put("providers/p", moved.as_object().unwrap().clone()).await.unwrap();
+        let (cfg, key) = g.credentials(&before).await.unwrap();
+        assert_eq!((cfg.base_url.as_deref(), key.as_deref()), (Some(b.uri().as_str()), Some("key-b")));
+        // Removed meanwhile: nothing is sent.
+        secrets.put("providers/p", Map::new()).await.unwrap();
+        assert!(g.credentials(&before).await.is_err());
+        assert!(a.received_requests().await.unwrap().is_empty());
     }
 
     #[test]
