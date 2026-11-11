@@ -3,8 +3,9 @@ name: Publish to wyrd.foo
 # Publishes docs/user and the release data to wyrd.foo when a docs unit tag
 # (xolotl-docs@{version}) is pushed, and on a manual run. A plain push to main
 # does not publish. The code unit tag publishes from release.yml, after the
-# binary and the image: that is when the GitHub Release the publisher reads
-# exists.
+# GitHub Release the publisher reads exists. A docs tag on the commit of a
+# code release tag whose Release is not published yet does not publish: the
+# docs job of release.yml publishes that commit when it has created the Release.
 on:
   push:
     tags:
@@ -32,7 +33,33 @@ permissions:
   contents: read
 
 jobs:
+  check:
+    name: Check the docs tag
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      # Checkout does not reliably fetch annotated tag objects.
+      - name: Fetch the annotated tag objects
+        run: git fetch --force --tags origin
+      - id: check
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: .github/scripts/docs-tag.sh
+
   publish:
+    needs: check
+    if: >-
+      ${{ !cancelled() && needs.check.result != 'failure' &&
+      (github.event_name == 'workflow_dispatch' || needs.check.outputs.publish == 'true') }}
     uses: wyrd-company/wyrd.foo/.github/workflows/publish-docs.yml@v2
     with:
       ref: ${{ inputs.ref || github.ref_name }}
