@@ -52,7 +52,7 @@ products:
           - group: Introduction
             pages: [overview]
           - group: Set up
-            pages: [install, configuration]
+            pages: [install, configuration, web-ui]
       - section: Use xolotl
         groups:
           - group: Providers and keys
@@ -62,6 +62,6 @@ products:
       - section: Operate
         groups:
           - group: Administer
-            pages: [web-ui, cli]
+            pages: [cli]
           - group: Monitor and limits
             pages: [telemetry, clickhouse-export, limitations]
