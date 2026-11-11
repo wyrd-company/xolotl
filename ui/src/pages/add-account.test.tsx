@@ -96,6 +96,16 @@ test("accounts lists provider accounts next to pool accounts", () => {
   expect(html.match(/>Remove</g)?.length).toBe(1);
 });
 
+test("a workload identity account needs no key", () => {
+  const html = render(<AccountsPage />, [
+    [["accounts"], []],
+    [["providers"], [provider({ name: "federated", kind: "anthropic", source: "config", has_key: false, workload_identity: true })]],
+  ], "/accounts?kind=providers");
+  expect(html).toContain("workload identity");
+  expect(html).not.toContain("missing");
+  expect(html).not.toContain("Set key");
+});
+
 test("the providers tab shows only provider accounts", () => {
   const html = render(<AccountsPage />, [
     [["accounts"], []],
