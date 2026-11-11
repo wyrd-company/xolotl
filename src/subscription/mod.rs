@@ -217,6 +217,8 @@ enum SelectError {
     NotAllowed,
     AllCooling {
         until: i64,
+        /// The account whose cooldown ends first: the one to serve next.
+        account: String,
     },
     /// Every usable account reached a limit of the caller's policy; the one
     /// that admits a request soonest.
@@ -666,7 +668,7 @@ impl Subscriptions {
         let pending = charge.pending().to_vec();
         let t = now();
         let loaded: HashSet<String> = self.creds.read().keys().cloned().collect();
-        let mut earliest: Option<i64> = None;
+        let mut earliest: Option<(i64, String)> = None;
         let mut limited: Option<Exceeded> = None;
         let mut candidates = Vec::new();
         for r in rows {
@@ -678,7 +680,9 @@ impl Subscriptions {
             }
             if r.cooling_down(t) {
                 let u = r.cooldown_until.unwrap_or(t);
-                earliest = Some(earliest.map_or(u, |e| e.min(u)));
+                if earliest.as_ref().is_none_or(|(e, _)| u < *e) {
+                    earliest = Some((u, r.id.clone()));
+                }
                 continue;
             }
             if let Some((client, policy)) = limiter
@@ -700,9 +704,9 @@ impl Subscriptions {
         match self.admit_one(provider, session, pinned, principal, candidates, charge, &mut limited) {
             Ok(Some(chosen)) => Ok(chosen),
             Ok(None) => Err(match (limited, earliest) {
-                (Some(e), Some(until)) if until - t < e.retry_after => SelectError::AllCooling { until },
+                (Some(e), Some((until, account))) if until - t < e.retry_after => SelectError::AllCooling { until, account },
                 (Some(e), _) => SelectError::Limited(e),
-                (None, Some(until)) => SelectError::AllCooling { until },
+                (None, Some((until, account))) => SelectError::AllCooling { until, account },
                 (None, None) => SelectError::NoAccounts,
             }),
             Err(e) => Err(SelectError::Limited(e)),
@@ -959,9 +963,9 @@ impl Subscriptions {
                         &format!("no usable {provider} accounts (log in with `xolotl auth login {provider}`)"),
                     );
                 }
-                Err(SelectError::AllCooling { until }) => {
+                Err(SelectError::AllCooling { until, account }) => {
                     accounting.finish(429, Default::default());
-                    return self.all_cooling(provider, path, until);
+                    return self.all_cooling(provider, path, until, &account).await;
                 }
             };
             tried.insert(account.id.clone());
@@ -1032,10 +1036,17 @@ impl Subscriptions {
                             let failure = codex::classify(200, &ev, None);
                             if failure != Failure::Fatal {
                                 self.handle_failure(&account, provider, &failure, status).await;
-                                let body = Bytes::from(ev.to_string());
+                                // If no other account serves the request, the client gets
+                                // this as an HTTP error: in the backend's error shape, with
+                                // the account's `x-codex-*` usage headers kept.
+                                let body = Bytes::from(codex::stream_error_body(&ev).unwrap_or(ev).to_string());
+                                let mut error_headers = resp_headers.clone();
+                                error_headers.remove(reqwest::header::CONTENT_LENGTH);
+                                error_headers
+                                    .insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
                                 last = Some((
                                     if matches!(failure, Failure::Exhausted { .. }) { 429 } else { 502 },
-                                    Default::default(),
+                                    error_headers,
                                     body,
                                     account.id.clone(),
                                 ));
@@ -1122,7 +1133,10 @@ impl Subscriptions {
         }
     }
 
-    fn all_cooling(&self, provider: SubProvider, path: &str, until: i64) -> Response {
+    /// Every account is cooling down. A Codex client also gets the usage of
+    /// `account`, the one whose cooldown ends first, so it can show the limit
+    /// it reached.
+    async fn all_cooling(&self, provider: SubProvider, path: &str, until: i64, account: &str) -> Response {
         let wait = (until - now()).max(1);
         let msg = format!("all {provider} accounts are rate limited; next reset in {wait}s");
         let mut resp = if provider == SubProvider::Codex {
@@ -1134,6 +1148,11 @@ impl Subscriptions {
         };
         if let Ok(v) = wait.to_string().parse() {
             resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+        }
+        if provider == SubProvider::Codex
+            && let Ok(Some(usage)) = self.db.get_usage(account).await
+        {
+            codex::rate_limit_headers(&usage.windows, resp.headers_mut());
         }
         resp
     }

@@ -65,6 +65,21 @@ The helper prints the client key. Codex sends provider authentication when it
 fetches `model_catalog_url`; no public catalog is required. See the
 [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 
+### Usage limits in Codex
+
+Codex reads its usage limits from the headers of each reply. Through xolotl,
+`/status` and the status line show the limits of the pool account that served
+the last turn. Session affinity keeps a conversation on one account, so the
+numbers change only when xolotl moves the conversation to another account.
+When every account is cooling down, Codex shows "You've hit your usage limit"
+with the limits of the account that comes back first.
+
+Before the first turn, `/status` shows "data not available yet". Codex reads
+account usage at startup only from ChatGPT, with a ChatGPT login, so that read
+does not go through xolotl. For the same reason, T3 Code's Codex usage needs a
+[T3 Code hub](#t3-code). `xolotl accounts list` and the web UI show every
+account in the pool.
+
 ## Grok CLI
 
 The Grok CLI runs `auth_provider_command` and sends what it prints as the bearer

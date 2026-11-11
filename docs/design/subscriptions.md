@@ -102,6 +102,24 @@ The internal `iguana_necktie` bucket is excluded from parsing, stored-snapshot r
 
 Windows are stored per account in SQLite, shown by `xolotl accounts list` / `usage`, exported as `xolotl.account.usage_percent`, and used by selection (soft limit, least-used).
 
+### What a Codex client sees
+
+The Codex CLI reads usage from two places:
+
+- **`x-codex-*` response headers** on `/responses` and on a `429 usage_limit_reached`. Codex turns them into the limits that `/status`, the status line and its usage notices show.
+- **`GET {chatgpt_base_url}/wham/usage`**, read at startup, on `/status` and by T3 Code (`account/rateLimits/read`). Codex sends it only with a ChatGPT login and only to `chatgpt_base_url`; with xolotl as a custom provider (`requires_openai_auth = false`) it refuses before sending anything. Xolotl cannot serve this read.
+
+So xolotl reports usage through headers, and a header set describes **one account**: its windows and reset times come from one account, as Codex expects. Which account:
+
+| Response | Usage headers |
+|---|---|
+| Success | The upstream headers of the account that served the request, unchanged |
+| Upstream `429` (every attempt failed) | The upstream headers of the last account tried |
+| Quota error at the start of a `200` stream, no other account left | That account's upstream headers. The body becomes `{"error": {...}}`, the shape Codex parses for a `429` |
+| Every account cooling down (xolotl's own `429`) | The stored windows of the account whose cooldown ends first: the one that serves the next request. The shortest window is `primary`, the next `secondary` |
+
+The pool as a whole is not reported to Codex. A sum or average of percentages across accounts with different plans is not a limit of any account, and Codex attaches reset times and notices to it. Session affinity keeps a conversation's numbers stable. The pool view is in the CLI, the web UI and T3Code hubs.
+
 ### Available resets
 
 Each Codex usage poll also reads `/wham/rate-limit-reset-credits` with the account's credentials. The count includes only credits with `status: "available"`, `reset_type: "codex_rate_limits"`, and either no expiry (`expires_at` absent or `null`) or a future `expires_at`. Credits with invalid expiry values are skipped.

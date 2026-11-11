@@ -228,6 +228,90 @@ async fn all_accounts_cooling_returns_429_with_retry_after() {
     assert!((295..=300).contains(&ra));
 }
 
+/// A Codex client reads its usage from `x-codex-*` headers. When the whole
+/// pool is cooling down, the 429 carries the stored usage of the account that
+/// comes back first, in the shape the Codex CLI parses.
+#[tokio::test]
+async fn all_codex_accounts_cooling_report_the_first_to_reset() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::RoundRobin).await;
+    let a = subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
+    let b = subs.save_account(codex_cred("acct-b", "tok-b")).await.unwrap();
+    subs.db.set_cooldown(&a.id, now() + 900, "quota exhausted").await.unwrap();
+    subs.db.set_cooldown(&b.id, now() + 300, "quota exhausted").await.unwrap();
+    let window = |name: &str, used: f64, secs: i64| UsageWindow {
+        name: name.into(),
+        used_percent: used,
+        resets_at: Some(now() + secs / 10),
+        window_secs: Some(secs),
+    };
+    subs.record_usage(&a.id, SubProvider::Codex, vec![window("5h", 100.0, 18_000), window("7d", 90.0, 604_800)], None).await;
+    subs.record_usage(&b.id, SubProvider::Codex, vec![window("7d", 35.0, 604_800), window("5h", 100.0, 18_000)], None).await;
+
+    let resp = subs
+        .execute(
+            SubProvider::Codex,
+            Method::POST,
+            "/v1/responses",
+            HeaderMap::new(),
+            responses_body(),
+            Some(&principal(any_policy())),
+            None,
+            &mut Charge::default(),
+            None,
+        )
+        .await;
+    assert_eq!(resp.status(), 429);
+    let h = resp.headers().clone();
+    assert_eq!(h["x-codex-primary-used-percent"], "100");
+    assert_eq!(h["x-codex-primary-window-minutes"], "300");
+    assert_eq!(h["x-codex-secondary-used-percent"], "35", "account b resets first");
+    assert_eq!(h["x-codex-secondary-window-minutes"], "10080");
+    let body: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "usage_limit_reached");
+}
+
+/// A quota error at the start of a `200` stream on the last account reaches a
+/// Codex client as a 429 in the backend's error shape, with the account's
+/// usage headers.
+#[tokio::test]
+async fn codex_stream_quota_error_keeps_usage_headers() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    subs.save_account(codex_cred("acct-a", "tok-a")).await.unwrap();
+    let failed = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"usage_limit_reached\",\"resets_in_seconds\":120}}}\n\n";
+    Mock::given(header("authorization", "Bearer tok-a"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-primary-used-percent", "100")
+                .insert_header("x-codex-primary-window-minutes", "300")
+                .insert_header("x-codex-primary-reset-at", "1790000000")
+                .set_body_raw(failed, "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let resp = subs
+        .execute(
+            SubProvider::Codex,
+            Method::POST,
+            "/v1/responses",
+            HeaderMap::new(),
+            responses_body(),
+            Some(&principal(any_policy())),
+            None,
+            &mut Charge::default(),
+            None,
+        )
+        .await;
+    assert_eq!(resp.status(), 429);
+    let h = resp.headers().clone();
+    assert_eq!(h["x-codex-primary-used-percent"], "100");
+    assert_eq!(h["x-codex-primary-reset-at"], "1790000000");
+    assert_eq!(h["content-type"], "application/json");
+    let body: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body, json!({"error": {"type": "usage_limit_reached", "resets_in_seconds": 120}}));
+}
+
 #[tokio::test]
 async fn claude_round_robin_with_session_affinity() {
     let server = MockServer::start().await;

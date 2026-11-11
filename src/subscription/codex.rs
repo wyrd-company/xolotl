@@ -349,6 +349,38 @@ pub fn windows_from_headers(h: &reqwest::header::HeaderMap) -> Vec<UsageWindow> 
     out
 }
 
+/// The reverse of [`windows_from_headers`]: an account's stored windows as the
+/// `x-codex-*` headers the Codex CLI reads its usage from. The shortest window
+/// is `primary` and the next is `secondary`, as the backend sends them.
+pub fn rate_limit_headers(windows: &[UsageWindow], out: &mut HeaderMap) {
+    let mut sorted: Vec<&UsageWindow> = windows.iter().filter(|w| w.is_public() && w.used_percent.is_finite()).collect();
+    sorted.sort_by_key(|w| w.window_secs.unwrap_or(i64::MAX));
+    for (which, w) in ["primary", "secondary"].into_iter().zip(sorted) {
+        let mut put = |field: &str, value: String| {
+            if let (Ok(name), Ok(value)) =
+                (axum::http::HeaderName::from_bytes(format!("x-codex-{which}-{field}").as_bytes()), value.parse())
+            {
+                out.insert(name, value);
+            }
+        };
+        put("used-percent", w.used_percent.to_string());
+        if let Some(secs) = w.window_secs {
+            put("window-minutes", (secs / 60).to_string());
+        }
+        if let Some(at) = w.resets_at {
+            put("reset-at", at.to_string());
+        }
+    }
+}
+
+/// A quota error found at the start of a `200` stream, as the body of the
+/// HTTP error the client gets instead: `{"error": {...}}`, the shape the
+/// backend uses for a `429`. `None` when the event carries no error object.
+pub fn stream_error_body(event: &Value) -> Option<Value> {
+    let err = event.get("error").or_else(|| event.pointer("/response/error")).filter(|e| e.is_object())?;
+    Some(json!({ "error": err }))
+}
+
 /// Classify an error body (HTTP error or an `error` / `response.failed`
 /// event at the start of a 200 stream).
 pub fn classify(status: u16, body: &Value, retry_after: Option<i64>) -> Failure {
@@ -515,6 +547,34 @@ mod tests {
         let w = windows_from_headers(&h);
         assert_eq!(w[0].name, "5h");
         assert_eq!(w[0].window_secs, Some(18000));
+    }
+
+    #[test]
+    fn rate_limit_headers_round_trip() {
+        let windows = vec![
+            UsageWindow { name: "7d".into(), used_percent: 12.0, resets_at: Some(1_790_500_000), window_secs: Some(604_800) },
+            UsageWindow { name: "iguana_necktie".into(), used_percent: 99.0, resets_at: None, window_secs: Some(60) },
+            UsageWindow { name: "5h".into(), used_percent: 100.0, resets_at: Some(1_790_000_000), window_secs: Some(18_000) },
+        ];
+        let mut h = HeaderMap::new();
+        rate_limit_headers(&windows, &mut h);
+        // The shortest public window is primary, as the backend sends it.
+        assert_eq!(h["x-codex-primary-used-percent"], "100");
+        assert_eq!(h["x-codex-primary-window-minutes"], "300");
+        assert_eq!(h["x-codex-primary-reset-at"], "1790000000");
+        assert_eq!(h["x-codex-secondary-used-percent"], "12");
+        assert_eq!(h["x-codex-secondary-window-minutes"], "10080");
+        let back = windows_from_headers(&h);
+        assert_eq!(back.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["5h", "7d"]);
+        assert_eq!(back[0].used_percent, 100.0);
+    }
+
+    #[test]
+    fn stream_errors_become_http_error_bodies() {
+        let err = json!({"type": "usage_limit_reached", "resets_in_seconds": 60});
+        assert_eq!(stream_error_body(&json!({"type": "error", "error": err})), Some(json!({"error": err})));
+        assert_eq!(stream_error_body(&json!({"type": "response.failed", "response": {"error": err}})), Some(json!({"error": err})));
+        assert_eq!(stream_error_body(&json!({"type": "response.failed", "response": {}})), None);
     }
 
     #[test]
