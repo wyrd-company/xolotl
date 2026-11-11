@@ -42,7 +42,7 @@ Rules:
 - Writes and removals use check-and-set, so two instances can't overwrite each other's change. A key set for an account another instance removed is refused.
 - `PUT /admin/providers/<name>` changes an account and keeps its key when none is given; an account that needs a key must keep one. `POST /admin/providers/<name>/key` sets the key of either source and keeps the secret's other fields.
 - `DELETE /admin/providers/<name>` empties the secret with check-and-set and destroys the versions that held the key. The empty secret is not an account, and adding the name again reuses it. Removal is refused for config-file providers and while a policy names the provider in `providers`, `precedence` or `winners`.
-- Changes apply at once. Other instances pick them up in the 60-second sync. A changed or removed account drops its cached key, and a vault read already in flight can't cache a key that a change replaced.
+- Changes apply at once. Other instances pick them up in the 60-second sync. A changed or removed account drops its cached key, and a vault read already in flight can't cache a key that a change replaced. A request to an account in OpenBao takes its base URL, headers and key from one read of the secret, and a cached key is used only with the config it was read with, so a key never goes to another revision's endpoint.
 - The catalog follows: a removed provider's models leave it, also when a refresh was running, and a new provider's models are discovered when it is saved.
 
 ## Adding a kind
