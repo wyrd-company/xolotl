@@ -7,7 +7,7 @@ product: xolotl
 Clients use xolotl like a provider API. They send their client key and a model
 name the key's policy exposes. The examples use `http://xolotl:8317` as the
 xolotl URL and `XOLOTL_API_KEY` for the client key (see
-[Issue a client key](policies-and-keys#issue-a-client-key)).
+[Issue a client key](policies-and-keys.md#issue-a-client-key)).
 
 Xolotl accepts the key in `Authorization` (Bearer or bare), `x-api-key` or
 `x-management-key`.
@@ -104,7 +104,7 @@ claude mcp add --transport http xolotl http://xolotl:8317/mcp \
   --header "Authorization: Bearer $XOLOTL_API_KEY"
 ```
 
-See [MCP gateway](mcp-gateway).
+See [MCP gateway](mcp-gateway.md).
 
 ## T3 Code
 
@@ -168,7 +168,7 @@ the response, streams included.
 | `vercel` kind | All three |
 | Other gateway providers | Chat |
 
-Change this with [`[catalog.wires]`](configuration#catalog).
+Change this with [`[catalog.wires]`](configuration.md#catalog).
 
 Exceptions:
 
@@ -185,7 +185,7 @@ Exceptions:
 
 Translation drops what has no match in the other format: hosted tools such as
 web search, and attachments that are not images. See
-[Known limitations](limitations).
+[Known limitations](limitations.md).
 
 ## Errors
 
@@ -198,4 +198,4 @@ Errors have the shape of the endpoint you called: Anthropic-style on
 | 403 | The key lacks the scope, or a passthrough's provider or model is not allowed |
 | 404 | The policy exposes no such model name |
 | 400 | The model is not served on this endpoint |
-| 429 | Every account is cooling down, or the key is over a [rate limit](policies-and-keys#rate-limits). `Retry-After` gives the seconds to wait |
+| 429 | Every account is cooling down, or the key is over a [rate limit](policies-and-keys.md#rate-limits). `Retry-After` gives the seconds to wait |
