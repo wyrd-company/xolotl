@@ -380,6 +380,9 @@ impl Gateway {
         keys.clear();
     }
 
+    /// Send with the provider's current config and key. Returns the kind of
+    /// that config, which a change on another instance can have made newer
+    /// than [`Self::kind`].
     async fn send(
         &self,
         provider: &str,
@@ -387,7 +390,7 @@ impl Gateway {
         path_and_query: &str,
         mut headers: HeaderMap,
         body: reqwest::Body,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<(reqwest::Response, ProviderKind)> {
         let p = self.get(provider).with_context(|| format!("unknown provider {provider}"))?;
         let (cfg, key) = self.credentials(&p).await?;
         let url = format!("{}{}", Self::base_url(&cfg), path_and_query);
@@ -407,7 +410,7 @@ impl Gateway {
             // The key may have been rotated in the vault.
             self.forget_key(provider);
         }
-        Ok(resp)
+        Ok((resp, cfg.kind))
     }
 
     fn window(&self, provider: &str, model: &str) -> Option<u64> {
@@ -435,7 +438,7 @@ impl Gateway {
                 normalize_mistral(path, obj);
             }
         }
-        let accounting = Accounting::new(self.db.clone(), &target.provider, path, client_id, Some(requested_model))
+        let mut accounting = Accounting::new(self.db.clone(), &target.provider, path, client_id, Some(requested_model))
             .with_prices(self.catalog.as_ref().map(|c| c.metadata(&target.provider, &target.model).values))
             .with_limiter(&self.limiter)
             .with_session(session.map(|s| s.track(&target.model, self.window(&target.provider, &target.model))))
@@ -443,7 +446,10 @@ impl Gateway {
             .with_target(self.kind(&target.provider).map(AccountKind::from), &target.model);
         let bytes = serde_json::to_vec(&body).unwrap_or_default();
         match self.send(&target.provider, method, path, headers, reqwest::Body::from(bytes)).await {
-            Ok(r) => proxy::relay(r, Some(accounting)),
+            Ok((r, kind)) => {
+                accounting.set_account_kind(kind.into());
+                proxy::relay(r, Some(accounting))
+            }
             Err(e) => {
                 tracing::warn!(provider = %target.provider, error = %e, "gateway upstream request failed");
                 accounting.finish(502, Default::default());
@@ -472,14 +478,17 @@ impl Gateway {
             Some(c.metadata(provider, model).values)
         });
         let upstream_model = model.map(|m| m.strip_prefix(&format!("{provider}/")).unwrap_or(m)).unwrap_or_default();
-        let accounting = Accounting::new(self.db.clone(), provider, endpoint, client_id, model)
+        let mut accounting = Accounting::new(self.db.clone(), provider, endpoint, client_id, model)
             .with_limiter(&self.limiter)
             .with_prices(prices)
             .with_session(session.map(|s| s.track(upstream_model, self.window(provider, upstream_model))))
             .with_capture(capture.cloned())
             .with_target(self.kind(provider).map(AccountKind::from), upstream_model);
         match self.send(provider, method, path_and_query, headers, body).await {
-            Ok(r) => proxy::relay(r, Some(accounting)),
+            Ok((r, kind)) => {
+                accounting.set_account_kind(kind.into());
+                proxy::relay(r, Some(accounting))
+            }
             Err(e) => {
                 accounting.finish(502, Default::default());
                 proxy::error_response(StatusCode::BAD_GATEWAY, "api_error", format!("{provider}: {e:#}"))
@@ -489,7 +498,7 @@ impl Gateway {
 
     /// The provider's model ids from `GET /v1/models`.
     pub async fn fetch_models(&self, name: &str) -> Result<Vec<String>> {
-        let resp = self.send(name, Method::GET, "/v1/models", HeaderMap::new(), reqwest::Body::from(Vec::new())).await?;
+        let (resp, _) = self.send(name, Method::GET, "/v1/models", HeaderMap::new(), reqwest::Body::from(Vec::new())).await?;
         anyhow::ensure!(resp.status().is_success(), "model list returned {}", resp.status());
         let body: Value = resp.json().await?;
         Ok(body
@@ -654,6 +663,39 @@ mod tests {
         secrets.put("providers/p", Map::new()).await.unwrap();
         assert!(g.credentials(&before).await.is_err());
         assert!(a.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_export_names_the_kind_the_request_was_sent_with() {
+        let (upstream, clickhouse) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []}))).mount(&upstream).await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&clickhouse).await;
+        let cfg = crate::config::ClickHouseConfig { url: clickhouse.uri(), create_table: false, flush_secs: 3600, ..Default::default() };
+        let export = crate::export::Exporter::new(vec![crate::export::clickhouse::start(cfg, None, None).unwrap()]);
+        let secrets: Secrets = Arc::new(MemoryStore::default());
+        let g = Gateway::new(
+            &GatewayConfig { providers: BTreeMap::new() },
+            secrets.clone(),
+            reqwest::Client::new(),
+            Db::in_memory().await.unwrap(),
+        );
+        let cfg = ProviderConfig { base_url: Some(upstream.uri()), ..Default::default() };
+        g.put_provider("p", cfg, Some("k".into()), true).await.unwrap();
+        // Another instance changed the account's kind; this one has not synced yet.
+        let changed = json!({"kind": "mistral", "base_url": upstream.uri(), "api_key": "k"});
+        secrets.put("providers/p", changed.as_object().unwrap().clone()).await.unwrap();
+        assert_eq!(g.kind("p"), Some(ProviderKind::OpenaiCompatible));
+        let body = bytes::Bytes::from_static(b"{\"model\":\"m\",\"input\":\"a\"}");
+        let capture = export.capture("/v1/embeddings", Some(&body));
+        let resp = g
+            .passthrough("p", Method::POST, "/v1/embeddings", HeaderMap::new(), body.into(), Some("c"), Some("p/m"), None, Some(&capture))
+            .await;
+        axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        export.shutdown().await;
+        let inserted = clickhouse.received_requests().await.unwrap();
+        let row: Value = serde_json::from_slice(&inserted[0].body).unwrap();
+        assert_eq!(row["account_kind"], "mistral");
     }
 
     #[test]
