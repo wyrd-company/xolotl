@@ -191,7 +191,9 @@ Names are letters, digits, `-` and `_`. These names are refused:
 `v1`, `admin`, `ui`, `assets`, `backend-api`, `healthz`, `readyz`, `mcp`
 (built-in routes).
 
-Store a provider's key with:
+Store a provider's key on the web UI's **Providers & models** screen: enter it
+under **Set API key** (**Replace API key** when one is stored) and save it.
+With the CLI:
 
 ```sh
 echo "$VERCEL_KEY" | xolotl providers set-key vercel
