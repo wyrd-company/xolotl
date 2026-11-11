@@ -185,9 +185,10 @@ fn html_links_are_read_from_attributes() {
         "<img SRC=\"a.png\"> <a href = 'b.md'>b</a> <img src=c.png alt=x>\n\n",
         "<!-- <a href=\"hidden.md\"> -->\n\n",
         "<div>\n<!--\n<img src=\"hidden.png\">\n-->\n<a data-href=\"no.md\" href=\"d.md?x=1&amp;y=2\">d</a>\n</div>\n",
+        "<img alt=\"a > b\" src=\"e.png\"> <a href=\"f&#46;md#&#x67;\">f</a>\n",
     ));
     let targets: Vec<_> = doc.links.iter().map(|l| l.target.as_str()).collect();
-    assert_eq!(targets, ["a.png", "b.md", "c.png", "d.md?x=1&y=2"]);
+    assert_eq!(targets, ["a.png", "b.md", "c.png", "d.md?x=1&y=2", "e.png", "f.md#g"]);
 }
 
 #[test]
@@ -224,6 +225,7 @@ fn page_links_are_checked_against_the_published_set() {
         "/docs/xolotl/two",
         "assets/other.png",
         "assets/gone.png",
+        "assets/demo%2Egif",
         "CHANGELOG.md",
         "https://github.com/wyrd-company/xolotl/blob/main/docs/design/x.md",
         "https://wyrd.foo/docs/xolotl/four",
@@ -282,6 +284,10 @@ fn page_link_problem(site: &Site, rel: &str, target: &str) -> Option<String> {
     }
     let exists = Path::new(ROOT).join(DOCS).join(&within).is_file();
     if site.assets.contains(&within) {
+        if percent_decode(path) != path {
+            // The publisher picks the assets a page uses by their literal path in its text.
+            return Some(format!("write the path as {within}, without percent-encoding, so wyrd.foo publishes the asset"));
+        }
         return match (exists, anchor) {
             (false, _) => Some(format!("docs.yml lists {within}, but {DOCS}/{within} does not exist")),
             (true, Some(_)) => Some("an asset has no headings".into()),
@@ -500,7 +506,7 @@ impl HtmlScanner {
                 self.in_comment = true;
                 continue;
             }
-            let end = rest.find('>').unwrap_or(rest.len());
+            let end = tag_end(rest);
             targets.extend(tag_targets(&rest[1..end]));
             rest = &rest[end..];
             if rest.is_empty() {
@@ -558,8 +564,59 @@ fn tag_targets(tag: &str) -> Vec<String> {
     targets
 }
 
+/// The offset of the `>` that closes the tag at the start of `html`, outside
+/// quoted attribute values.
+fn tag_end(html: &str) -> usize {
+    let mut quote = None;
+    for (i, c) in html.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, '>') => return i,
+            _ => {}
+        }
+    }
+    html.len()
+}
+
+/// Named entities that can appear in a URL, and numeric references.
 fn decode_entities(value: &str) -> String {
-    value.replace("&quot;", "\"").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let decoded = rest.find(';').and_then(|end| {
+            let name = &rest[1..end];
+            let c = match name {
+                "amp" => Some('&'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                _ => name
+                    .strip_prefix("#x")
+                    .or_else(|| name.strip_prefix("#X"))
+                    .map(|hex| u32::from_str_radix(hex, 16))
+                    .or_else(|| name.strip_prefix('#').map(str::parse::<u32>))
+                    .and_then(Result::ok)
+                    .and_then(char::from_u32),
+            };
+            c.map(|c| (c, end))
+        });
+        match decoded {
+            Some((c, end)) => {
+                out.push(c);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A heading's anchor, as github-slugger makes it (wyrd.foo and GitHub use
