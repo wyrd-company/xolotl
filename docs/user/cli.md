@@ -45,7 +45,7 @@ Durations are a number with `s`, `m`, `h`, `d` or `w`, for example `90d`.
 | `xolotl accounts usage <id>` | Fetch the usage windows from the provider now |
 | `xolotl accounts remove <id>` | Remove the account |
 
-See [Subscription accounts](accounts).
+See [Subscription accounts](accounts.md).
 
 ## Gateway providers and models
 
@@ -69,7 +69,7 @@ See [Subscription accounts](accounts).
 | `xolotl keys enable\|disable <p>/<n>` | Turn a key on or off |
 | `xolotl keys revoke <p>/<n>` | Revoke the key and destroy its earlier versions. Safe to repeat on a key that is already revoked or gone |
 
-See [Policies and client keys](policies-and-keys).
+See [Policies and client keys](policies-and-keys.md).
 
 ## MCP gateway
 
@@ -86,7 +86,7 @@ See [Policies and client keys](policies-and-keys).
 | `xolotl mcp logout <server>` | Forget the server's OAuth tokens |
 | `xolotl mcp usage [--group-by server\|tool\|client] [--since 24h]` | Tool calls, errors and average latency |
 
-See [MCP gateway](mcp-gateway).
+See [MCP gateway](mcp-gateway.md).
 
 ## Usage
 
