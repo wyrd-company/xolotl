@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # The web UI is plain static files, so build it once on the build platform.
-FROM --platform=$BUILDPLATFORM node:22-slim AS ui
+FROM --platform=$BUILDPLATFORM node:26-slim AS ui
 WORKDIR /ui
 RUN corepack enable
 COPY ui/package.json ui/pnpm-lock.yaml ./
