@@ -38,7 +38,7 @@ metrics_interval_secs = 30
 [telemetry.otlp_headers]
 # Authorization = "Basic ..."   # prefer the vault secret instead
 
-# Copy each session's requests and responses to ClickHouse for analysis.
+# Copy each request to an account, and its response, to ClickHouse for analysis.
 # The password is the vault secret `xolotl/clickhouse` (fields password, user).
 # [export.clickhouse]
 # url = "http://clickhouse:8123"   # Env: XOLOTL_CLICKHOUSE_URL

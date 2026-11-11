@@ -12,7 +12,7 @@ clients (Claude Code, Codex CLI, SDKs, MCP clients, T3Code hubs, xolotl CLI, web
         ├── OpenBao (KV v2, AppRole): every secret
         ├── SQLite: runtime state, no secrets
         ├── OpenTelemetry (OTLP/HTTP): traces, logs, metrics
-        └── ClickHouse (HTTP, optional): session requests and responses
+        └── ClickHouse (HTTP, optional): requests to accounts and their responses
 ```
 
 ## Accounts
@@ -31,7 +31,7 @@ Every upstream credential is an account of one kind ([Accounts and account kinds
 | Store | Holds | Why |
 |---|---|---|
 | OpenBao, KV v2 under `secret/xolotl/` | admin token, telemetry headers, provider keys, account credentials, MCP servers added at runtime and their secrets, policies, client key records | Secrets stay off disk and out of env vars. Writes that can race use check-and-set. |
-| ClickHouse (`export.clickhouse`, optional) | a row for each session request: request log fields, request and response bodies, the assembled output | Analysis of conversations. Off by default; see [Exchange export](export.md). |
+| ClickHouse (`export.clickhouse`, optional) | a row for each request of a client key to an account, of any kind: request log fields, the account kind, request and response bodies, the assembled output | Analysis of conversations. Off by default; see [Exchange export](export.md). |
 | NATS JetStream (`export.nats`, optional) | the same rows, one message each, until ClickHouse loads them and the stream's age limit removes them | Rows survive ClickHouse maintenance, and other readers can consume them. Off by default; see [Exchange export](export.md). |
 | SQLite (`database.path`) | accounts index, cooldowns, usage snapshots, request log and MCP call log, sessions and tool counts (pruned after `retention_days`, default 90) | Cheap, frequently changing state. Holds no secrets and is rebuilt from OpenBao if lost. Rate limit counters are rebuilt from the request log at startup. |
 
@@ -90,4 +90,4 @@ On graceful shutdown the server makes one last attempt to save unsaved credentia
 | `src/db.rs`, `migrations/` | SQLite |
 | `src/vault.rs`, `src/secrets.rs` | OpenBao client and the `SecretStore` trait |
 | `src/telemetry.rs` | OpenTelemetry setup and metrics |
-| `src/export/` | Export of session exchanges to ClickHouse and NATS JetStream ([Exchange export](export.md)) |
+| `src/export/` | Export of exchanges with accounts to ClickHouse and NATS JetStream ([Exchange export](export.md)) |

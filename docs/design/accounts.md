@@ -51,6 +51,7 @@ Rules:
 2. **Serving:**
    - A **pool kind** with a new provider name needs a `SubProvider` variant and a module in `src/subscription/` (request preparation, failure classification, usage), plus its name in `RESERVED_PROVIDER_NAMES`. A new credential type for an existing pool, such as a service account, is a new `AddMethod` for that kind and a new way to obtain the `Credential`.
    - A **provider kind** needs a `ProviderKind` variant in `src/config.rs`, its default base URL, and any request rewriting in `src/gateway.rs` (like `normalize_mistral`). Wire formats for the catalog are in `ModelCatalog::wires`.
+   - Either way, the requests go through `Accounting`, built with `with_capture` and `with_target`, so that the request log and the [exchange export](export.md) cover them. The kind's `as_str` is its `account_kind` in the export.
 3. **Adding:** the existing `api-key` and `provider` methods need no new route. `add_account` in `src/server/admin.rs` dispatches on the kind. A new method needs a route and an `AddMethod` variant.
 4. **Web UI:** `api-key` and `provider` kinds appear on **Add account** from the registry. An OAuth kind needs a component in `LOGIN_FORMS`; a new method needs a form. `AccountKind` and `ProviderKind` in `ui/src/lib/api.ts` list the names.
 5. **CLI:** `ProviderKindArg` in `src/cli.rs` lists provider kinds for `xolotl accounts add-provider`.

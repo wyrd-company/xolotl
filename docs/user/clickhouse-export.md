@@ -4,8 +4,8 @@ order: 11
 product: xolotl
 ---
 
-Xolotl can copy each session's requests and responses to a ClickHouse table,
-so you can query what your agents asked and what the models answered. It is
+Xolotl can copy each request to an account, and its response, to a ClickHouse
+table, so you can query what your agents asked and what the models answered. It is
 off until you add `[export.clickhouse]`.
 
 The rows hold prompts and answers as the clients and upstreams sent them.
@@ -14,18 +14,26 @@ to keep only the request log fields.
 
 ## What is exported
 
-One row for each LLM request that belongs to a session: a request with a client
-key to `/v1/messages`, `/v1/responses` or `/v1/chat/completions`, directly or
-through a passthrough. `count_tokens` and requests with the bootstrap admin
-token have no session and are not exported. A request that moves to the next
-target of an alias gives one row per target, like the request log.
+One row for each request with a client key that xolotl sends to an account, of
+any kind: subscription pools, provider accounts and API key accounts alike. That
+is the LLM endpoints (`/v1/messages`, `/v1/responses`, `/v1/chat/completions`),
+the other `/v1/...` endpoints such as embeddings and OCR, and passthroughs. Two
+kinds of request are not exported: `count_tokens`, which is not an exchange, and
+requests with the bootstrap admin token, which have no client key. A request
+that moves to the next target of an alias gives one row per target, like the
+request log.
 
 Each row has:
 
 - the request log fields: client, provider, account, model, endpoint, status,
   latency, tokens, cost, context size and trace id;
+- `account_kind`: the kind of the account that served the request, as on the
+  **Accounts** screen, such as `claude`, `opencode-go` or `mistral`. For a
+  provider account, `provider` is the account's name and `account_id` is empty;
 - the session's `session_key`, the same digest as in the request log and at
-  `GET /admin/sessions`, and `session_source`, what it was read from;
+  `GET /admin/sessions`, and `session_source`, what it was read from. Both are
+  empty for a request without a session: one on an endpoint that is not an
+  LLM conversation, such as embeddings;
 - `request`: the body the client sent, before translation and before xolotl
   adds anything for the upstream. Headers, and so credentials, are never exported;
 - `response`: the body the upstream sent, as JSON or as the SSE stream;
@@ -43,6 +51,10 @@ Some responses are not read whole, and their rows have less:
 
 - When an alias moves on from a target that answered 429 or 5xx, xolotl drops
   that answer unread. Its row has the status but no `response` or `error`.
+- A response that is not text, such as audio or an image, is not kept: its
+  `response` is empty and `response_truncated` is true.
+- A passthrough request body that is not JSON, such as a file upload, streams
+  to the upstream unread: its `request` is empty and `request_truncated` is true.
 - A Chat Completions stream cut short while a tool call's arguments arrive
   loses that tool call from `output`. Text before it is kept.
 
@@ -122,6 +134,7 @@ CREATE TABLE xolotl.llm_exchanges (
     session_source LowCardinality(String),
     provider LowCardinality(String),
     account_id LowCardinality(String),
+    account_kind LowCardinality(String),
     model LowCardinality(String),           -- the name the client asked for
     upstream_model LowCardinality(String),
     client_endpoint LowCardinality(String),
@@ -155,6 +168,18 @@ SETTINGS non_replicated_deduplication_window = 1000
 To make the table yourself, set `create_table = false`. Xolotl inserts with
 `input_format_skip_unknown_fields`, so a table may leave out columns.
 
+### Upgrade a table
+
+Xolotl creates a table only when it is missing, so a table made by an earlier
+version has no `account_kind` column. Inserts into it go on working, without
+the column. To add it:
+
+```sql
+ALTER TABLE xolotl.llm_exchanges ADD COLUMN IF NOT EXISTS account_kind LowCardinality(String) AFTER account_id;
+```
+
+Rows inserted before the change have an empty `account_kind`.
+
 ## Example queries
 
 The turns of one session, in order:
@@ -185,6 +210,16 @@ SELECT upstream_model, tool, count() AS calls
 FROM xolotl.llm_exchanges ARRAY JOIN tool_calls AS tool
 GROUP BY upstream_model, tool
 ORDER BY calls DESC;
+```
+
+Requests and tokens by account kind:
+
+```sql
+SELECT account_kind, provider, count() AS requests, sum(input_tokens) AS input, sum(output_tokens) AS output
+FROM xolotl.llm_exchanges
+WHERE started_at > now() - INTERVAL 7 DAY
+GROUP BY account_kind, provider
+ORDER BY requests DESC;
 ```
 
 The system prompt of a Messages request:

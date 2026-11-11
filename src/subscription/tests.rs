@@ -79,7 +79,8 @@ async fn run_as(
     headers: HeaderMap,
     body: Bytes,
 ) -> (Option<String>, (u16, String)) {
-    let resp = subs.execute(provider, Method::POST, path, headers, body, Some(principal), Some("m"), &mut Charge::default(), None).await;
+    let resp =
+        subs.execute(provider, Method::POST, path, headers, body, Some(principal), Some("m"), &mut Charge::default(), None, None).await;
     let status = resp.status().as_u16();
     let retry = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_string);
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -221,6 +222,7 @@ async fn all_accounts_cooling_returns_429_with_retry_after() {
             None,
             &mut Charge::default(),
             None,
+            None,
         )
         .await;
     assert_eq!(resp.status(), 429);
@@ -258,6 +260,7 @@ async fn all_codex_accounts_cooling_report_the_first_to_reset() {
             Some(&principal(any_policy())),
             None,
             &mut Charge::default(),
+            None,
             None,
         )
         .await;
@@ -305,6 +308,7 @@ async fn all_codex_accounts_cooling_respect_policy_limits() {
             None,
             &mut Charge::default(),
             None,
+            None,
         )
         .await;
     assert_eq!(resp.status(), 429);
@@ -342,6 +346,7 @@ async fn codex_stream_quota_error_keeps_usage_headers() {
             Some(&principal(any_policy())),
             None,
             &mut Charge::default(),
+            None,
             None,
         )
         .await;
@@ -765,6 +770,7 @@ async fn codex_headerless_stream_is_accounted() {
             None,
             None,
             &mut Charge::default(),
+            None,
             None,
         )
         .await;
@@ -1466,6 +1472,7 @@ async fn served_by(subs: &Subscriptions, principal: &Principal) -> (u16, Option<
             None,
             &mut Charge::default(),
             None,
+            None,
         )
         .await;
     let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -1631,14 +1638,36 @@ async fn a_restart_counts_pool_requests_as_admission_did() {
     let mut charge = Charge::new(&[Meter::Total]);
     // Admitted, then the account's credential fails: counted.
     let resp = subs
-        .execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), Some(&key), None, &mut charge, None)
+        .execute(
+            SubProvider::Codex,
+            Method::POST,
+            "/v1/responses",
+            HeaderMap::new(),
+            responses_body(),
+            Some(&key),
+            None,
+            &mut charge,
+            None,
+            None,
+        )
         .await;
     assert_eq!(resp.status(), 503);
     assert!(charge.is_settled());
     // The account now needs a login: refused before any account, not counted.
     let mut charge = Charge::new(&[Meter::Total]);
     let resp = subs
-        .execute(SubProvider::Codex, Method::POST, "/v1/responses", HeaderMap::new(), responses_body(), Some(&key), None, &mut charge, None)
+        .execute(
+            SubProvider::Codex,
+            Method::POST,
+            "/v1/responses",
+            HeaderMap::new(),
+            responses_body(),
+            Some(&key),
+            None,
+            &mut charge,
+            None,
+            None,
+        )
         .await;
     assert_eq!(resp.status(), 503);
     assert!(!charge.is_settled());

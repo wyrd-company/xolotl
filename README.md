@@ -74,7 +74,7 @@ User documentation is on [wyrd.foo](https://wyrd.foo/docs/xolotl/). Its source i
 | [MCP gateway](docs/user/mcp-gateway.md) | Upstream MCP servers, OAuth logins, code mode, MCP policies |
 | [CLI reference](docs/user/cli.md) | Every `xolotl` command |
 | [Telemetry](docs/user/telemetry.md) | OTLP export, logs, metrics |
-| [ClickHouse export](docs/user/clickhouse-export.md) | Session requests and responses in a ClickHouse table for analysis |
+| [ClickHouse export](docs/user/clickhouse-export.md) | Requests to every kind of account, and their responses, in a ClickHouse table for analysis |
 | [NATS export](docs/user/nats-export.md) | The same rows through NATS JetStream, so they survive ClickHouse maintenance |
 | [Known limitations](docs/user/limitations.md) | What isn't done yet |
 

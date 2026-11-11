@@ -25,6 +25,7 @@ use crate::catalog::{ModelCatalog, Route, Wire};
 use crate::config::Config;
 use crate::context::{RequestSession, reason};
 use crate::db::Db;
+use crate::export::Capture;
 use crate::gateway::Gateway;
 use crate::keys::{KeyManager, Principal, Scope};
 use crate::limits::{Charge, Exceeded, Limiter, Meter};
@@ -390,7 +391,8 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             .unwrap_or_default();
         return err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("model {model:?} is not available on {path}{hint}"));
     }
-    let session = session_for(state, &principal, path, &headers, &json, &body, &model, true).await;
+    let session = session_for(state, &principal, path, &headers, &json, &model, true).await;
+    let capture = capture_for(state, &principal, path, Some(&body));
     let mut usable = usable;
     if let Some(s) = session.as_ref().filter(|s| s.locks_requested_name())
         && let Some(lock) = s.lock()
@@ -455,12 +457,25 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
                     &model,
                     &mut charge,
                     session.as_ref(),
+                    capture.as_ref(),
                 )
                 .await;
                 (resp, Some(t))
             }
             _ => {
-                let resp = send(state, target, path, fwd.clone(), json.clone(), &principal, &model, &mut charge, session.as_ref()).await;
+                let resp = send(
+                    state,
+                    target,
+                    path,
+                    fwd.clone(),
+                    json.clone(),
+                    &principal,
+                    &model,
+                    &mut charge,
+                    session.as_ref(),
+                    capture.as_ref(),
+                )
+                .await;
                 let streams = json.get("stream").and_then(Value::as_bool).unwrap_or(false);
                 let grok = pool(&target.provider) == Some(SubProvider::Grok);
                 let resp = if grok && wire == Some(Wire::Responses) && !streams { collect_grok(resp).await } else { resp };
@@ -538,16 +553,25 @@ async fn session_for(
     path: &str,
     headers: &HeaderMap,
     body: &Value,
-    raw: &Bytes,
     requested: &str,
     lockable: bool,
 ) -> Option<RequestSession> {
     if Wire::for_path(path).is_none() || path == "/v1/messages/count_tokens" {
         return None;
     }
-    let session = RequestSession::begin(&state.db, &state.cfg, principal.client_id()?, headers, body, requested, lockable).await?;
-    // `raw`, not `body`: the bytes the client sent, without serializing them again.
-    Some(session.with_capture(state.export.as_ref().map(|e| e.capture(path, raw))))
+    RequestSession::begin(&state.db, &state.cfg, principal.client_id()?, headers, body, requested, lockable).await
+}
+
+/// The export of a request ([`crate::export`]): every request of a client key
+/// to an account, of any kind, with or without a session. Counting tokens is
+/// not an exchange. `body` is the bytes the client sent, without serializing
+/// them again, or `None` for a body that streams to the upstream unread.
+fn capture_for(state: &AppState, principal: &Principal, path: &str, body: Option<&Bytes>) -> Option<Arc<Capture>> {
+    if path == "/v1/messages/count_tokens" {
+        return None;
+    }
+    principal.client_id()?;
+    Some(state.export.as_ref()?.capture(path, body))
 }
 
 /// The session of a passthrough request, whose body is only parsed here.
@@ -565,7 +589,7 @@ async fn passthrough_session(
     let raw = body?;
     let json: Value = serde_json::from_slice(raw).ok()?;
     let requested = label.unwrap_or_default();
-    session_for(state, principal, &path, headers, &json, raw, requested, lockable && label.is_some()).await
+    session_for(state, principal, &path, headers, &json, requested, lockable && label.is_some()).await
 }
 
 /// Send a JSON request to one target: a subscription pool or a gateway provider.
@@ -580,6 +604,7 @@ async fn send(
     model: &str,
     charge: &mut Charge<'_>,
     session: Option<&RequestSession>,
+    capture: Option<&Arc<Capture>>,
 ) -> Response {
     let client_id = principal.client_id();
     // Mistral and Grok drop `stream_options`; they report usage anyway.
@@ -588,9 +613,9 @@ async fn send(
         Some(p) => {
             body["model"] = Value::String(target.model.clone());
             let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
-            state.subs.execute(p, Method::POST, path, headers, bytes, Some(principal), Some(model), charge, session).await
+            state.subs.execute(p, Method::POST, path, headers, bytes, Some(principal), Some(model), charge, session, capture).await
         }
-        None => state.gateway.execute(target, Method::POST, path, headers, body, client_id, model, session).await,
+        None => state.gateway.execute(target, Method::POST, path, headers, body, client_id, model, session, capture).await,
     }
 }
 
@@ -790,6 +815,7 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
     let label = model.map(|m| format!("{provider}/{m}"));
     // Nothing routes a passthrough, so there is nothing for a lock to pin.
     let session = passthrough_session(&state, &principal, &rest, &parts.headers, bytes.as_ref(), label.as_deref(), false).await;
+    let capture = capture_for(&state, &principal, &format!("/{rest}"), bytes.as_ref());
     let upstream = match (bytes, stream) {
         (Some(b), _) => reqwest::Body::from(b),
         (None, Some(s)) => reqwest::Body::wrap_stream(s.into_data_stream()),
@@ -797,7 +823,17 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
     };
     state
         .gateway
-        .passthrough(&provider, parts.method, &path, fwd, upstream, principal.client_id(), label.as_deref(), session.as_ref())
+        .passthrough(
+            &provider,
+            parts.method,
+            &path,
+            fwd,
+            upstream,
+            principal.client_id(),
+            label.as_deref(),
+            session.as_ref(),
+            capture.as_ref(),
+        )
         .await
 }
 
@@ -835,6 +871,7 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
     }
     let mut charge = Charge::new(&meters);
     let session = passthrough_session(&state, &principal, &rest, &parts.headers, Some(&bytes), label.as_deref(), true).await;
+    let capture = capture_for(&state, &principal, &format!("/{rest}"), Some(&bytes));
     state
         .subs
         .execute(
@@ -847,6 +884,7 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
             label.as_deref(),
             &mut charge,
             session.as_ref(),
+            capture.as_ref(),
         )
         .await
 }
