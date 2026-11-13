@@ -9,7 +9,7 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm install --froze
 COPY ui ./
 RUN pnpm build
 
-FROM rust:1.99-slim-bookworm AS build
+FROM rust:1.100-slim-bookworm AS build
 ARG TARGETARCH
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
