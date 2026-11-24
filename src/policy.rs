@@ -361,8 +361,11 @@ impl Policy {
     pub fn validate(&self, known: &BTreeSet<String>, mcp: &BTreeSet<String>) -> Result<()> {
         anyhow::ensure!(valid_name(&self.name), "policy name must be lowercase letters, digits, '-' or '_' (max 63)");
         anyhow::ensure!(
-            !self.providers.is_empty() || !self.mcp_servers.is_empty() || !self.key_policies.is_empty(),
-            "policy must allow at least one provider or MCP server (use * for all), or list key_policies"
+            !self.providers.is_empty()
+                || !self.mcp_servers.is_empty()
+                || !self.key_policies.is_empty()
+                || (!self.scopes.is_empty() && self.scopes.iter().all(|s| *s == Scope::Management)),
+            "policy must allow at least one provider or MCP server (use * for all), list key_policies, or use only the management scope"
         );
         anyhow::ensure!(self.key_policies.is_empty() || self.has_scope(Scope::Keys), "key_policies needs the keys scope");
         anyhow::ensure!(!self.scopes.contains(&Scope::Keys) || !self.key_policies.is_empty(), "the keys scope needs key_policies");
@@ -1143,6 +1146,43 @@ rules = [{ deny = "*-preview" }, { allow = " x " }, { allow = " " }]"#,
         assert!(p.validate(&known(), &mcp).unwrap_err().to_string().contains("mcp scope"));
         p.mcp_servers.clear();
         assert!(p.validate(&known(), &mcp).is_err(), "nothing allowed");
+    }
+
+    #[test]
+    fn management_only_needs_no_access_entries_but_keeps_other_validation() {
+        let mut p: Policy = toml::from_str("name = \"hub\"\nscopes = [\"management\"]").unwrap();
+        p.normalize();
+        let none = BTreeSet::new();
+        p.validate(&none, &none).unwrap();
+        assert!(p.providers.is_empty() && p.mcp_servers.is_empty() && p.key_policies.is_empty());
+        assert!(p.has_scope(Scope::Management));
+        for scope in [Scope::Proxy, Scope::Mcp, Scope::Keys, Scope::Admin] {
+            assert!(!p.has_scope(scope));
+            let mut mixed = p.clone();
+            mixed.scopes.push(scope);
+            assert!(mixed.validate(&none, &none).is_err(), "management with {scope:?} still needs access entries");
+            mixed.scopes = vec![scope];
+            assert!(mixed.validate(&none, &none).is_err(), "{scope:?} still needs access entries");
+        }
+        for (field, value, why) in [
+            ("name", json!("Bad/name"), "policy name"),
+            ("providers", json!(["unknown"]), "unknown provider"),
+            ("mcp_servers", json!(["unknown"]), "unknown MCP server"),
+            ("key_policies", json!(["dev"]), "needs the keys scope"),
+            ("accounts", json!({"codex": ["*"]}), "does not allow provider"),
+            ("aliases", json!({"fast": "codex/gpt"}), "does not allow"),
+            ("limits", json!({"requests_per_minute": 0}), "at least 1"),
+        ] {
+            let mut value_of_policy = serde_json::to_value(&p).unwrap();
+            value_of_policy[field] = value;
+            let bad: Policy = serde_json::from_value(value_of_policy).unwrap();
+            let err = bad.validate(&known(), &none).unwrap_err().to_string();
+            assert!(err.contains(why), "{field}: {err}");
+        }
+        p.scopes.clear();
+        p.normalize();
+        assert_eq!(p.scopes, vec![Scope::Proxy]);
+        assert!(p.validate(&none, &none).is_err());
     }
 
     #[test]

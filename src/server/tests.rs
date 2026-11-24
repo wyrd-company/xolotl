@@ -1183,8 +1183,7 @@ async fn chat_streams_report_usage_for_token_limits() {
 async fn t3code_management_endpoints() {
     let h = harness().await;
     let id = h.codex_account().await;
-    let mgmt =
-        h.key(Policy { name: "t3".into(), providers: vec!["codex".into()], scopes: vec![Scope::Management], ..Default::default() }).await;
+    let mgmt = h.key(Policy { name: "t3".into(), scopes: vec![Scope::Management], ..Default::default() }).await;
 
     let (status, body) = h.call("GET", "/v0/management/auth-files", Some(&mgmt), None).await;
     assert_eq!(status, 200);
@@ -1228,6 +1227,42 @@ async fn t3code_management_endpoints() {
     assert!(!h.state.db.get_account(&id).await.unwrap().unwrap().cooling_down(now()));
     let (status, _) = h.call("POST", "/v0/management/reset-quota", Some(&mgmt), Some(json!({"auth_index": "nope"}))).await;
     assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn management_only_policy_saves_reloads_and_cannot_cross_authorization_boundaries() {
+    let h = harness().await;
+    let p: Policy = toml::from_str("name = \"hub\"\nscopes = [\"management\"]").unwrap();
+    let (status, saved) = h.call("PUT", "/admin/policies/hub", Some(&h.admin), Some(serde_json::to_value(p).unwrap())).await;
+    assert_eq!(status, 200, "{saved}");
+    assert_eq!(saved["providers"], json!([]));
+    assert_eq!(saved["scopes"], json!(["management"]));
+    let (status, issued) = h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "hub", "name": "t3"}))).await;
+    assert_eq!(status, 201, "{issued}");
+    let rec = h.state.secrets.get("keys/hub/t3").await.unwrap().unwrap();
+    let key = rec["api_key"].as_str().unwrap();
+    h.state.keys.reload().await.unwrap();
+    let (status, loaded) = h.call("GET", "/admin/policies/hub", Some(&h.admin), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(saved, loaded);
+    assert_eq!(h.call("GET", "/v0/management/auth-files", Some(key), None).await.0, 200);
+    for (method, route, body) in [
+        ("GET", "/v1/models", None),
+        ("POST", "/v1/chat/completions", Some(json!({"model": "llama/qwen3", "messages": []}))),
+        ("POST", "/v1/messages", Some(json!({"model": "claude/claude-opus-5", "messages": []}))),
+        ("POST", "/v1/responses", Some(json!({"model": "codex/gpt-6-codex", "input": "hi"}))),
+        ("POST", "/llama/v1/chat/completions", Some(json!({"model": "qwen3", "messages": []}))),
+        ("POST", "/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))),
+        ("GET", "/admin/keys", None),
+        ("POST", "/admin/keys", Some(json!({"policy": "hub", "name": "forbidden"}))),
+        ("POST", "/admin/keys/hub/t3/rotate", Some(json!({}))),
+        ("DELETE", "/admin/keys/hub/t3", None),
+        ("GET", "/admin/status", None),
+        ("PUT", "/admin/policies/hub", Some(saved)),
+    ] {
+        let (status, body) = h.call(method, route, Some(key), body).await;
+        assert_eq!(status, 403, "{method} {route}: {body}");
+    }
 }
 
 #[tokio::test]
