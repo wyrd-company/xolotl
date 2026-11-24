@@ -99,6 +99,25 @@ async fn a_session_active_on_another_model_keeps_the_one_it_used_before_through_
 }
 
 #[tokio::test]
+async fn a_turn_through_an_alias_keeps_the_session_active_through_retention() {
+    let h = answering().await;
+    let mut p = policy("p");
+    p.aliases.insert("fast".into(), AliasTargets::One("llama/busy".into()));
+    p.rules = vec![Rule::Deny("llama/busy".into())];
+    let key = h.key(p.clone()).await;
+    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
+    let old = crate::db::now() - 2 * 86_400;
+    sqlx::query("UPDATE session_models SET last_used = ?").bind(old).execute(&h.state.db.pool).await.unwrap();
+    // The session goes on through an alias whose target the policy doesn't allow by name.
+    assert_eq!(chat_in(&h, &key, "s", later("fast", "hello")).await, 200);
+    h.state.db.prune(1).await.unwrap();
+    p.rules.insert(0, Rule::Deny("llama/qwen3".into()));
+    put(&h, p).await;
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200, "the session is still active, so it keeps qwen3");
+    assert_eq!(chat_in(&h, &key, "s", later("llama/busy", "hello")).await, 404, "and the alias's target isn't kept");
+}
+
+#[tokio::test]
 async fn a_model_the_session_never_used_stays_refused() {
     let h = answering().await;
     let key = h.key(policy("p")).await;

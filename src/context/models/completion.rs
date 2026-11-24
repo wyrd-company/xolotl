@@ -138,9 +138,12 @@ impl SessionModels {
     /// Record that the session used `target` once `resp` has answered: a
     /// 2xx response whose body completes ([`Outcome`]). A failed stream, or
     /// a client that leaves before the end, records nothing. `None` for a
-    /// target the session can't keep, one only an alias reaches.
+    /// target the session can't keep, one only an alias reaches: the turn
+    /// still keeps the session active ([`SessionModels::record`]).
     pub fn uses(self, target: Option<Target>, resp: Response) -> Response {
-        let Some(target) = target.filter(|_| resp.status().is_success()) else { return resp };
+        if !resp.status().is_success() {
+            return resp;
+        }
         let sse =
             resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.starts_with("text/event-stream"));
         let (parts, body) = resp.into_parts();
@@ -156,11 +159,16 @@ struct Relay<S> {
     /// not a stream, its last chunk), held until the use is written.
     held: Vec<Bytes>,
     ready: VecDeque<Result<Bytes, axum::Error>>,
-    uses: Option<(SessionModels, Target)>,
+    uses: Option<(SessionModels, Option<Target>)>,
     done: bool,
 }
 
-fn completion<S>(inner: S, outcome: Outcome, session: SessionModels, target: Target) -> impl Stream<Item = Result<Bytes, axum::Error>>
+fn completion<S>(
+    inner: S,
+    outcome: Outcome,
+    session: SessionModels,
+    target: Option<Target>,
+) -> impl Stream<Item = Result<Bytes, axum::Error>>
 where
     S: Stream<Item = Result<Bytes, axum::Error>> + Unpin + Send + 'static,
 {
@@ -195,7 +203,7 @@ where
                     if r.outcome.succeeded()
                         && let Some((session, target)) = r.uses.take()
                     {
-                        session.record(&target).await;
+                        session.record(target.as_ref()).await;
                     }
                     r.ready.extend(r.held.drain(..).map(Ok));
                 }
@@ -289,7 +297,7 @@ mod tests {
         let target = Target { provider: "llama".into(), model: "busy".into() };
         let chunks = ["{\"choices\":[{\"message\":", "{\"content\":\"hi\"}}]}"];
         let upstream = futures::stream::iter(chunks.map(|c| Ok(Bytes::from(c))));
-        let mut relayed = Box::pin(completion(upstream, Outcome::new(false), session(), target.clone()));
+        let mut relayed = Box::pin(completion(upstream, Outcome::new(false), session(), Some(target.clone())));
         assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[0]);
         assert!(session().kept().await.is_empty());
         assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[1], "the last chunk");
@@ -314,7 +322,7 @@ mod tests {
             "data: [DONE]\n\n",
         ];
         let upstream = futures::stream::iter(chunks.map(|c| Ok(Bytes::from(c))));
-        let mut relayed = Box::pin(completion(upstream, Outcome::new(true), session(), target.clone()));
+        let mut relayed = Box::pin(completion(upstream, Outcome::new(true), session(), Some(target.clone())));
         assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[0]);
         assert!(session().kept().await.is_empty());
         assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[1], "the final event");

@@ -68,16 +68,16 @@ fn pairs(targets: &[(&str, &str)]) -> Vec<(String, String)> {
 async fn a_session_keeps_every_model_it_has_used() {
     let db = Db::in_memory().await.unwrap();
     assert_eq!(kept(&db).await, vec![]);
-    in_session(&db, &later("hello")).record(&target(QWEN)).await;
-    in_session(&db, &later("hello")).record(&target(BUSY)).await;
-    in_session(&db, &later("hello")).record(&target(QWEN)).await;
+    in_session(&db, &later("hello")).record(Some(&target(QWEN))).await;
+    in_session(&db, &later("hello")).record(Some(&target(BUSY))).await;
+    in_session(&db, &later("hello")).record(Some(&target(QWEN))).await;
     assert_eq!(kept(&db).await, pairs(&[BUSY, QWEN]), "both, after a switch away and back");
 }
 
 #[tokio::test]
 async fn every_request_of_a_named_session_reads_it_and_a_guessed_one_needs_earlier_output() {
     let db = Db::in_memory().await.unwrap();
-    in_session(&db, &later("hello")).record(&target(QWEN)).await;
+    in_session(&db, &later("hello")).record(Some(&target(QWEN))).await;
     let start = json!({"messages": [{"role": "user", "content": "a new subagent"}]});
     assert_eq!(in_session(&db, &start).kept().await, vec![target(QWEN)], "a new conversation of the session");
 
@@ -86,7 +86,7 @@ async fn every_request_of_a_named_session_reads_it_and_a_guessed_one_needs_earli
     let continued =
         json!([{"role": "system", "content": "s"}, {"role": "user", "content": "hello"}, {"role": "assistant", "content": "a"}]);
     let guessed = |messages: &Value| SessionModels::of(&db, "p/k", issued(0), &HeaderMap::new(), &json!({"messages": messages})).unwrap();
-    guessed(&opening).record(&target(QWEN)).await;
+    guessed(&opening).record(Some(&target(QWEN))).await;
     assert_eq!(guessed(&opening).kept().await, vec![], "a one-shot request again");
     assert_eq!(guessed(&continued).kept().await, vec![target(QWEN)], "the conversation going on");
 }
@@ -94,7 +94,7 @@ async fn every_request_of_a_named_session_reads_it_and_a_guessed_one_needs_earli
 #[tokio::test]
 async fn a_key_issued_again_does_not_inherit_and_other_sessions_and_keys_share_nothing() {
     let db = Db::in_memory().await.unwrap();
-    in_session(&db, &later("a")).record(&target(QWEN)).await;
+    in_session(&db, &later("a")).record(Some(&target(QWEN))).await;
     let again = SessionModels::of(&db, "p/k", issued(1), &session("s"), &later("a")).unwrap();
     assert_eq!(again.kept().await, vec![], "a key issued again under the name");
     let other_key = SessionModels::of(&db, "p/other", issued(0), &session("s"), &later("a")).unwrap();
@@ -106,10 +106,27 @@ async fn a_key_issued_again_does_not_inherit_and_other_sessions_and_keys_share_n
 }
 
 #[tokio::test]
+async fn a_turn_through_an_alias_keeps_only_its_own_session_and_issuance_active() {
+    let db = Db::in_memory().await.unwrap();
+    in_session(&db, &later("a")).record(Some(&target(QWEN))).await;
+    let other_session = SessionModels::of(&db, "p/k", issued(0), &session("t"), &later("a")).unwrap();
+    other_session.record(Some(&target(BUSY))).await;
+    sqlx::query("UPDATE session_models SET last_used = ?").bind(now() - 2 * 86_400).execute(&db.pool).await.unwrap();
+
+    // A turn whose target only an alias reaches: it keeps nothing new.
+    in_session(&db, &later("a")).record(None).await;
+    SessionModels::of(&db, "p/k", issued(1), &session("t"), &later("a")).unwrap().record(None).await;
+    assert_eq!(kept(&db).await, pairs(&[QWEN]), "it added no model");
+    assert_eq!(db.prune(1).await.unwrap(), 1, "the other session, whose own issuance had no turn, goes");
+    assert_eq!(kept(&db).await, pairs(&[QWEN]), "this session is still active");
+    assert_eq!(other_session.kept().await, vec![]);
+}
+
+#[tokio::test]
 async fn the_models_of_a_session_are_pruned_with_it_and_not_before() {
     let db = Db::in_memory().await.unwrap();
-    in_session(&db, &later("a")).record(&target(QWEN)).await;
-    in_session(&db, &later("a")).record(&target(BUSY)).await;
+    in_session(&db, &later("a")).record(Some(&target(QWEN))).await;
+    in_session(&db, &later("a")).record(Some(&target(BUSY))).await;
     let old = now() - 2 * 86_400;
     sqlx::query("UPDATE session_models SET last_used = ? WHERE model = 'qwen3'").bind(old).execute(&db.pool).await.unwrap();
     assert_eq!(db.prune(1).await.unwrap(), 0, "the session is still active, on busy");

@@ -58,10 +58,17 @@ impl SessionModels {
         })
     }
 
-    /// Record that the session has used `target`. [`SessionModels::uses`]
-    /// calls it once the answer has completed, before the client sees its end.
-    pub async fn record(&self, target: &Target) {
-        if let Err(e) = self.db.use_model(self, target).await {
+    /// Record a completed turn of the session: it has used `target`, and is
+    /// active, so its models stay past retention. `None` for a target it
+    /// can't keep, one only an alias reaches, which keeps the session active
+    /// without keeping that target. [`SessionModels::uses`] calls it once the
+    /// answer has completed, before the client sees its end.
+    pub async fn record(&self, target: Option<&Target>) {
+        let recorded = match target {
+            Some(target) => self.db.use_model(self, target).await,
+            None => self.db.touch_session_models(self).await,
+        };
+        if let Err(e) = recorded {
             tracing::warn!(error = %e, "failed to record a model of a session");
         }
     }
@@ -90,6 +97,17 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(provider, model)| Target { provider, model }).collect())
+    }
+
+    async fn touch_session_models(&self, s: &SessionModels) -> Result<()> {
+        sqlx::query("UPDATE session_models SET last_used = ? WHERE client_id = ? AND key_issued = ? AND session_key = ?")
+            .bind(now())
+            .bind(&s.client)
+            .bind(&s.issued)
+            .bind(&s.session)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn use_model(&self, s: &SessionModels, target: &Target) -> Result<()> {
