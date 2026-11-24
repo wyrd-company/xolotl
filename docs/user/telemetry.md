@@ -44,7 +44,7 @@ The OpenBao values win over `[telemetry.otlp_headers]`.
 | `xolotl.account.available` | account, provider | 1 when the account can take requests |
 | `xolotl.upstream.errors` | provider, status or kind | Upstream errors of subscription accounts |
 | `xolotl.pricing.refreshes` | result | Model pricing refresh attempts: `success`, `fetch_error` or `validation_error` (see below) |
-| `xolotl.pricing.misses` | provider, model, reason | Requests whose cost is unknown because pricing is missing: `model_not_found` or `missing_rate` (see below) |
+| `xolotl.pricing.misses` | provider, model, reason | Requests with missing model pricing: `model_not_found` or `missing_rate` (see below) |
 | `xolotl.oauth.refreshes` | provider, result | OAuth token refreshes. `result=uncertain`: the provider may have used the refresh token, but no usable answer came back |
 | `xolotl.vault.unsaved_credentials` | | Refreshed tokens not yet written to OpenBao. Alert when this stays above 0 |
 | `xolotl.mcp.tool_calls` | server, tool, status | MCP tool calls |
@@ -71,18 +71,18 @@ registry. An empty `catalog.metadata_url` disables downloads and records no atte
   object, or contained no usable model metadata. The last usable prices remain
   available.
 
-Pricing misses count once per completed request with both input and output token
-usage available and an unknown cost:
+Pricing misses count once per completed request:
 
 - `model_not_found`: no registry entry or configured metadata override matched
-  the served model.
-- `missing_rate`: metadata matched, but a rate needed for the request's nonzero
-  input, output, cache-read or cache-write tokens was missing.
+  the served model. This counts even when token usage is absent.
+- `missing_rate`: metadata matched, but observed token usage proves a rate is
+  required and missing. Input, output, cache-read and cache-write categories are
+  checked independently, so partial usage can establish a miss.
 
 A zero-token category needs no rate, and a zero price is valid. Missing input or
-output token usage does not count as a pricing miss. The `provider` and `model`
-attributes use the same request identity as `xolotl.requests`, including a requested
-alias where applicable. Registry keys, URLs and error messages are not attributes.
+output usage alone does not count as a pricing miss or imply a required rate.
+The `provider` and `model` attributes use the same request identity as
+`xolotl.requests`, including a requested alias where applicable. Registry keys, URLs and error messages are not attributes.
 
 ## Request log
 

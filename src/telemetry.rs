@@ -160,7 +160,7 @@ pub fn metrics() -> &'static Metrics {
                 .build(),
             pricing_misses: meter
                 .u64_counter("xolotl.pricing.misses")
-                .with_description("Requests with complete token usage but missing model pricing, by reason")
+                .with_description("Requests with missing model pricing, by reason")
                 .build(),
             unsaved_credentials: meter
                 .u64_gauge("xolotl.vault.unsaved_credentials")

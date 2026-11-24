@@ -107,6 +107,7 @@ async fn pricing_metrics_report_refresh_outcomes_and_request_miss_reasons() {
         "output-only":{"output_cost_per_token":0.2},
         "context-only":{"max_input_tokens":1000},
         "free":{"input_cost_per_token":0,"output_cost_per_token":0},
+        "cache-only":{"cache_read_input_token_cost":0.3,"cache_creation_input_token_cost":0.4},
         "empty":{}, "malformed":42
     });
     let mut outcomes = Counts::new();
@@ -155,11 +156,27 @@ async fn pricing_metrics_report_refresh_outcomes_and_request_miss_reasons() {
             ("input-only", json!({"prompt_tokens":10,"completion_tokens":0}), None),
             ("override-only", json!({"prompt_tokens":10,"completion_tokens":0}), None),
             ("output-only", json!({"prompt_tokens":0,"completion_tokens":2}), None),
-            ("unknown", json!({"prompt_tokens":0,"completion_tokens":0}), None),
+            ("unknown", json!({"prompt_tokens":0,"completion_tokens":0}), Some("model_not_found")),
             ("priced", Value::Null, None),
             ("priced", json!({"prompt_tokens":10}), None),
             ("priced", json!({"completion_tokens":2}), None),
-            ("unknown", Value::Null, None),
+            ("unknown", Value::Null, Some("model_not_found")),
+            ("unknown", json!({"prompt_tokens":10}), Some("model_not_found")),
+            ("unknown", json!({"completion_tokens":2}), Some("model_not_found")),
+            ("input-only", json!({"completion_tokens":2}), Some("missing_rate")),
+            ("output-only", json!({"prompt_tokens":10}), Some("missing_rate")),
+            ("context-only", json!({"completion_tokens":2}), Some("missing_rate")),
+            ("priced", json!({"prompt_tokens_details":{"cached_tokens":4}}), Some("missing_rate")),
+            ("priced", json!({"cache_creation_input_tokens":4}), Some("missing_rate")),
+            ("priced", json!({"prompt_tokens_details":{"cached_tokens":0},"cache_creation_input_tokens":0}), None),
+            ("input-only", json!({"prompt_tokens":10}), None),
+            ("output-only", json!({"completion_tokens":2}), None),
+            ("context-only", Value::Null, None),
+            ("empty", Value::Null, None),
+            ("cache-only", json!({"prompt_tokens_details":{"cached_tokens":4}}), None),
+            ("cache-only", json!({"cache_creation_input_tokens":4}), None),
+            ("cache-only", json!({"prompt_tokens":4,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":4}}), None),
+            ("context-only", json!({"prompt_tokens":-1,"completion_tokens":-1}), None),
         ] {
             request(&server, &gateway, model, usage, stream).await;
             if let Some(reason) = reason {

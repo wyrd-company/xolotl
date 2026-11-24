@@ -260,13 +260,17 @@ impl Accounting {
         ];
         let m = metrics();
         m.requests.add(1, &attrs);
-        let complete_usage = usage.input.is_some() && usage.output.is_some();
-        if complete_usage
-            && self.record.api_equivalent_cost.is_none()
-            && let Some(prices) = &self.prices
-        {
-            let reason = if prices.source.is_some() { "missing_rate" } else { "model_not_found" };
-            m.pricing_misses.add(1, &[attrs[0].clone(), attrs[1].clone(), KeyValue::new("reason", reason)]);
+        if let Some(prices) = &self.prices {
+            let reason = if prices.source.is_none() {
+                Some("model_not_found")
+            } else if prices.values.has_missing_rate(usage) {
+                Some("missing_rate")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                m.pricing_misses.add(1, &[attrs[0].clone(), attrs[1].clone(), KeyValue::new("reason", reason)]);
+            }
         }
         m.duration.record(self.started.elapsed().as_secs_f64(), &attrs[..3]);
         for (dir, n) in [("input", usage.input), ("output", usage.output), ("cached", usage.cached)] {
