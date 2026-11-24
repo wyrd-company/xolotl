@@ -328,7 +328,7 @@ function KeyRow({ k, requests, onRevoked }: { k: KeyInfo; requests: number | nul
         <Mono className="font-medium whitespace-nowrap">{k.client_id}</Mono>
         <div className="text-muted-foreground text-sm">{k.description}</div>
       </TableCell>
-      <TableCell className="text-sm whitespace-nowrap">
+      <TableCell className="min-w-56 max-w-64 text-sm">
         <Badge variant={state.variant}>{state.label}</Badge>
         {grace && <div>Grace ends {timestamp(k.previous_expires_at)}</div>}
         <div>Created {timestamp(k.created_at)}</div>
