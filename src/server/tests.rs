@@ -2523,6 +2523,30 @@ mod mcp_gateway {
             assert!(whoami(hub).await.unwrap_err().contains("sign-in needed (signed out)"));
         }
 
+        #[tokio::test(flavor = "multi_thread")]
+        async fn refused_callback_reports_failure_to_polling_page() {
+            let a = auth_server().await;
+            let h = oauth_harness(&a, |_| {}).await;
+            let start = h.state.mcp.login_start("cloud").await.unwrap();
+            let auth = url::Url::parse(&start.url).unwrap();
+            let state = auth.query_pairs().find(|(key, _)| key == "state").unwrap().1.into_owned();
+            // An unknown state must not end another login.
+            let path = "/admin/mcp/oauth/callback?state=unknown&error=access_denied";
+            assert_eq!(h.call("GET", path, None, None).await.0, 400);
+            let status_path = format!("/admin/mcp/oauth/flows/{}", start.flow_id);
+            assert_eq!(h.call("GET", &status_path, Some(&h.admin), None).await.1["status"], "pending");
+            let path = format!("/admin/mcp/oauth/callback?state={state}&error=access_denied&error_description=%3Cdenied%3E");
+            let (status, page) = h.call("GET", &path, None, None).await;
+            assert_eq!(status, 400);
+            assert!(page.as_str().unwrap().contains("&lt;denied&gt;"), "callback text is escaped");
+            let (status, body) = h.call("GET", &status_path, Some(&h.admin), None).await;
+            assert_eq!(status, 200);
+            assert_eq!(body["status"], "failed");
+            assert_eq!(body["error"], "access_denied: <denied>");
+            let redirect = a.authorize(&start.url, Some(&a.base));
+            assert!(h.state.mcp.login_complete(&start.flow_id, &redirect).await.is_err(), "refused flow cannot be reused");
+        }
+
         async fn login(hub: &McpHub, a: &Auth) {
             login_to(hub, a, "cloud").await;
         }

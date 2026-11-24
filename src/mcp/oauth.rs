@@ -548,6 +548,16 @@ impl Flows {
         self.flows.lock().get(id).filter(|f| f.started.elapsed() < FLOW_TTL).map(|f| (f.server.clone(), f.status.clone()))
     }
 
+    /// End a pending browser login when the authorization server refuses consent.
+    pub fn fail(&self, id: &str, error: String) {
+        if let Some(flow) = self.flows.lock().get_mut(id)
+            && matches!(flow.status, FlowStatus::Pending)
+        {
+            flow.session = None;
+            flow.status = FlowStatus::Failed { error };
+        }
+    }
+
     /// Cancel a server's logins in progress (sign-out, removal, replacement).
     pub fn cancel_server(&self, server: &str) {
         self.flows.lock().retain(|_, f| f.server != server);

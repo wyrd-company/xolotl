@@ -969,6 +969,8 @@ async fn mcp_login_complete(State(s): State<AppState>, h: HeaderMap, Path(id): P
 struct CallbackQuery {
     state: Option<String>,
     code: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
 }
 
 /// The browser lands here after consent when `server.public_url` is set. The
@@ -994,7 +996,13 @@ async fn mcp_login_callback(State(s): State<AppState>, uri: axum::http::Uri, Que
         );
     };
     if q.code.is_none() {
-        return page(StatusCode::BAD_REQUEST, "Sign-in refused", "The authorization server did not grant access. Start again from xolotl.");
+        let reason = match (q.error, q.error_description) {
+            (Some(error), Some(description)) => format!("{error}: {description}"),
+            (Some(error), None) => error,
+            _ => "The authorization server did not grant access".into(),
+        };
+        s.mcp.flows.fail(&id, reason.clone());
+        return page(StatusCode::BAD_REQUEST, "Sign-in refused", &html_escape(&format!("{reason}. Start again from xolotl.")));
     }
     // The redirect URL as the authorization server built it, so `iss` and `state` are checked as sent.
     let url = format!("http://callback{}", uri.path_and_query().map(|p| p.as_str()).unwrap_or(""));

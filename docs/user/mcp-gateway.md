@@ -125,7 +125,7 @@ Xolotl gets a client ID in this order: `oauth.client_id`; a Client ID Metadata
 Document, when `server.public_url` is HTTPS or `mcp.oauth.client_metadata_url`
 is set; Dynamic Client Registration.
 
-Xolotl refreshes the tokens itself. **Sign out** on the card, or `xolotl mcp
+Xolotl refreshes the tokens itself. **Forget tokens** on the card, or `xolotl mcp
 logout linear`, forgets them. When the server refuses the tokens, the card
 shows **Sign-in needed** (`SIGN-IN` in `xolotl mcp servers`), and calls fail
 until you sign in again.
