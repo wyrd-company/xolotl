@@ -5,9 +5,29 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
-import { expect, test } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 import type { Account, ProviderAccount, Status } from "@/lib/api";
 import { OverviewPage } from "./overview";
+
+const reloadMock = vi.hoisted(() => ({
+  state: {} as Record<string, unknown>,
+  options: {} as { mutationFn: () => Promise<unknown>; onSettled: () => void },
+}));
+vi.mock("@tanstack/react-query", async (original) => {
+  const actual = await original<typeof import("@tanstack/react-query")>();
+  return {
+    ...actual,
+    useMutation: (options: Parameters<typeof actual.useMutation>[0]) => {
+      if (options.mutationKey?.[0] !== "deployment-reload") return actual.useMutation(options);
+      reloadMock.options = options as typeof reloadMock.options;
+      return { mutate: vi.fn(), ...reloadMock.state };
+    },
+  };
+});
+beforeEach(() => {
+  reloadMock.state = {};
+  vi.unstubAllGlobals();
+});
 
 const account = (change: Partial<Account> = {}): Account => ({
   id: "account-a",
@@ -79,10 +99,10 @@ function render(
   accounts: Account[],
   providers: ProviderAccount[] = [],
   s = status,
-) {
-  const client = new QueryClient({
+  client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
-  });
+  }),
+) {
   client.setQueryData(["status"], s);
   client.setQueryData(["accounts"], accounts);
   client.setQueryData(["providers"], providers);
@@ -243,4 +263,59 @@ test("traffic includes failed count and provider split, with a real errors-only 
   expect(html).toContain("Requests by provider");
   expect(html).toContain('href="/usage?errors=true"');
   expect(html).toContain("Nothing needs action");
+});
+
+
+test("reload posts to the admin endpoint and refreshes cached views after either result", async () => {
+  const client = new QueryClient();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  const counts = { policies: 3, keys: 8, accounts: 4, provider_accounts: 2 };
+  const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(counts)));
+  vi.stubGlobal("fetch", fetch);
+  render([], [], status, client);
+  await expect(reloadMock.options.mutationFn()).resolves.toEqual(counts);
+  expect(fetch).toHaveBeenCalledWith("/admin/reload", expect.objectContaining({ method: "POST" }));
+  reloadMock.options.onSettled();
+  expect(invalidate).toHaveBeenCalledWith();
+  fetch.mockResolvedValue(new Response(JSON.stringify({ error: { message: "OpenBao permission denied" } }), { status: 500 }));
+  await expect(reloadMock.options.mutationFn()).rejects.toThrow("OpenBao permission denied");
+  reloadMock.options.onSettled();
+  expect(invalidate).toHaveBeenCalledTimes(2);
+});
+
+test("reload completion shows each returned count, including zero, separately from discovery", () => {
+  for (const counts of [
+    { policies: 3, keys: 8, accounts: 4, provider_accounts: 2 },
+    { policies: 0, keys: 0, accounts: 0, provider_accounts: 0 },
+  ]) {
+    reloadMock.state = { isSuccess: true, data: counts };
+    const html = render([]);
+    expect(html).toContain("Reload completed");
+    expect(html).toContain(`${counts.policies} policies · ${counts.keys} client keys · ${counts.accounts} pool accounts · ${counts.provider_accounts} provider accounts`);
+    expect(html).toContain("Model discovery runs separately in the background");
+    // Discovery stays available even without any configured provider accounts.
+    expect(html).toContain('aria-label="Model discovery"');
+    expect(html).toContain("Refresh models");
+  }
+});
+
+test("pending reload disables another submission and hides previous counts", () => {
+  reloadMock.state = { isPending: true, data: { policies: 99 } };
+  const html = render([]);
+  expect(html).toMatch(/<button[^>]*disabled[^>]*>.*?Reloading from OpenBao…/);
+  expect(html).toContain("Waiting for the server result");
+  expect(html).not.toContain("Reload completed");
+  expect(html).not.toContain("99 policies");
+});
+
+test("reload failure preserves underlying error and offers retry without claiming completion", () => {
+  reloadMock.state = { isError: true, error: new Error("OpenBao read failed: permission denied") };
+  const html = render([]);
+  expect(html).toContain('role="alert"');
+  expect(html).toContain("Reload failed");
+  expect(html).toContain("OpenBao read failed: permission denied");
+  expect(html).toContain("then retry");
+  expect(html).toContain("Some changes may already have loaded");
+  expect(html).toContain("Reload from OpenBao");
+  expect(html).not.toContain("Reload completed");
 });

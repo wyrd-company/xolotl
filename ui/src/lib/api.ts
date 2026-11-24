@@ -71,6 +71,13 @@ export interface Session {
   configured?: boolean;
 }
 
+export interface ReloadResponse {
+  policies: number;
+  keys: number;
+  accounts: number;
+  provider_accounts: number;
+}
+
 export interface Health {
   ok: boolean;
   error?: string;

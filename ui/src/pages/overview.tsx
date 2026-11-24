@@ -3,8 +3,8 @@
 //   implements: ../../../docs/user/web-ui.md
 // ---
 import type { ReactNode } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { AlertTriangle, RefreshCw } from "lucide-react";
 import { Link } from "react-router";
 
 import { ApiEquivalentCost } from "@/components/api-equivalent-cost";
@@ -36,12 +36,14 @@ import {
 } from "@/components/ui/table";
 import {
   get,
+  post,
   hasCredential,
   PROVIDER_NAMES,
   SUB_PROVIDERS,
   type Account,
   type CatalogRoute,
   type ProviderAccount,
+  type ReloadResponse,
   type Status,
   type UsageRow,
 } from "@/lib/api";
@@ -59,6 +61,16 @@ const STATE_COLORS = {
 };
 
 export function OverviewPage() {
+  const qc = useQueryClient();
+  const reload = useMutation({
+    mutationKey: ["deployment-reload"],
+    mutationFn: () => post<ReloadResponse>("/admin/reload"),
+    // A failed reload may already have applied some changes. Refresh every
+    // cached admin view without making its queries part of the reload result.
+    onSettled: () => {
+      void qc.invalidateQueries();
+    },
+  });
   const status = useQuery({
     queryKey: ["status"],
     queryFn: () => get<Status>("/admin/status"),
@@ -123,6 +135,58 @@ export function OverviewPage() {
           status.error ?? accounts.error ?? providers.error ?? routes.error
         }
       />
+      <Card aria-label="Deployment">
+        <CardHeader>
+          <CardTitle>Deployment</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col items-start gap-3 text-sm">
+          <p className="text-muted-foreground">
+            Reload policies, client keys and accounts from OpenBao.
+          </p>
+          <Button
+            type="button"
+            disabled={reload.isPending}
+            onClick={() => reload.mutate()}
+          >
+            <RefreshCw
+              className={reload.isPending ? "animate-spin motion-reduce:animate-none" : undefined}
+            />
+            {reload.isPending ? "Reloading from OpenBao…" : "Reload from OpenBao"}
+          </Button>
+          <div role="status" className="flex flex-col gap-1">
+            {reload.isPending ? (
+              <p>Waiting for the server result. Model discovery follows the reload.</p>
+            ) : reload.isSuccess ? (
+              <>
+                <p className="text-success font-medium">Reload completed</p>
+                <p>
+                  {num(reload.data.policies)} policies · {num(reload.data.keys)} client keys ·{" "}
+                  {num(reload.data.accounts)} pool accounts ·{" "}
+                  {num(reload.data.provider_accounts)} provider accounts
+                </p>
+                <p className="text-muted-foreground">
+                  Model discovery runs separately in the background. Its latest result appears below.
+                </p>
+              </>
+            ) : null}
+          </div>
+          {reload.isError && (
+            <div role="alert" className="text-destructive flex flex-col gap-1 break-words">
+              <p className="font-medium">Reload failed</p>
+              <p>{reload.error.message}</p>
+              <p>Check the deployment’s OpenBao access, then retry. Some changes may already have loaded.</p>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+      <Card aria-label="Model discovery">
+        <CardHeader>
+          <CardTitle>Model discovery</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <CatalogRefresh />
+        </CardContent>
+      </Card>
       {actionCount > 0 ? (
         <Card
           className="border-warning-border gap-0 overflow-hidden py-0"
@@ -305,13 +369,6 @@ export function OverviewPage() {
                   ))}
                 </TableBody>
               </Table>
-              <CardContent className="py-4">
-                <CatalogRefresh
-                  providers={configured
-                    .filter((p) => p.enabled)
-                    .map((p) => p.name)}
-                />
-              </CardContent>
             </>
           )}
           {providers.isPending && <Empty>Loading provider accounts…</Empty>}
