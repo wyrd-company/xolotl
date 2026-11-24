@@ -46,7 +46,6 @@ export function McpPage() {
   const servers = useQuery({ queryKey: ["mcp-servers"], queryFn: () => get<McpServer[]>("/admin/mcp/servers"), refetchInterval: 30_000 });
   const refresh = useAction(() => post<McpServer[]>("/admin/mcp/refresh"), {
     invalidate: [["mcp-servers"], ["mcp-tools"], ["policy-view"]],
-    success: "Tool lists refreshed",
   });
   const list = servers.data ?? [];
   const [adding, setAdding] = useState(false);
@@ -71,6 +70,9 @@ export function McpPage() {
         </Button>
       </PageHeader>
       <QueryError error={servers.error} />
+      <QueryError error={refresh.error} />
+      {refresh.isPending && <p role="status">Refreshing tool lists…</p>}
+      {refresh.isSuccess && <RefreshResult servers={refresh.data} />}
 
       <section aria-label="MCP servers" className="flex flex-col gap-4">
         {adding && <ServerForm initial={null} onDone={() => setAdding(false)} />}
@@ -88,6 +90,22 @@ export function McpPage() {
 
       {list.length > 0 && <Calls />}
     </>
+  );
+}
+
+export function RefreshResult({ servers }: { servers: McpServer[] }) {
+  const failed = servers.filter((s) => s.last_error).length;
+  return (
+    <div role="status" className={`rounded-md border p-3 text-sm ${failed ? "bg-warning-muted" : "bg-muted/40"}`}>
+      <p className="font-medium">Refresh finished · {failed} {failed === 1 ? "server failed" : "servers failed"}</p>
+      <ul className="mt-2 list-inside list-disc">
+        {servers.map((s) => (
+          <li key={s.name}>
+            <Mono>{s.name}</Mono>: {s.last_error ? `${s.last_error}. Previous tool list retained (${s.tools} tools).` : `${s.tools} tools`}
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
@@ -177,16 +195,14 @@ function ServerView({ s, onEdit }: { s: McpServer; onEdit: () => void }) {
           <p className="bg-danger-muted text-destructive rounded-md px-3 py-2 break-words">{s.last_error}</p>
         )}
         {s.oauth && <OAuthLogin server={s.name} oauth={s.oauth} />}
-        {fields.length > 0 && (
-          <div className="flex flex-col gap-3">
-            <h3 className="font-medium">
-              Secret <Mono className="text-muted-foreground font-normal">{s.secret}</Mono>
-            </h3>
-            {fields.map(([field, set]) => (
-              <SecretField key={field} server={s.name} field={field} set={set} />
-            ))}
-          </div>
-        )}
+        <div className="flex flex-col gap-3">
+          <h3 className="font-medium">Secrets <Mono className="text-muted-foreground font-normal">{s.secret}</Mono></h3>
+          <p className="text-muted-foreground">Surrounding whitespace is removed from secret values. Stored values are never shown.</p>
+          {fields.map(([field, set]) => (
+            <SecretField key={field} server={s.name} field={field} set={set} />
+          ))}
+          <SecretField server={s.name} />
+        </div>
         <div>
           <Button variant="ghost" size="sm" className="-ml-2" aria-expanded={open} onClick={() => setOpen(!open)}>
             {open ? <ChevronDown /> : <ChevronRight />}
@@ -394,7 +410,7 @@ const REGISTRATIONS: Record<NonNullable<McpOAuthStatus["registration"]>, string>
   dynamic: "dynamic registration",
 };
 
-function OAuthLogin({ server, oauth }: { server: string; oauth: McpOAuthStatus }) {
+export function OAuthLogin({ server, oauth }: { server: string; oauth: McpOAuthStatus }) {
   const [flow, setFlow] = useState<McpLoginStart | null>(null);
   const start = useAction(() => post<McpLoginStart>(`/admin/mcp/servers/${server}/oauth/start`), {
     onSuccess: (f) => {
@@ -404,7 +420,7 @@ function OAuthLogin({ server, oauth }: { server: string; oauth: McpOAuthStatus }
   });
   const signOut = useAction(() => del(`/admin/mcp/servers/${server}/oauth`), {
     invalidate: [["mcp-servers"]],
-    success: `Signed out of ${server}`,
+    success: `Forgot OAuth tokens for ${server}`,
   });
 
   return (
@@ -454,31 +470,32 @@ function OAuthLogin({ server, oauth }: { server: string; oauth: McpOAuthStatus }
             <LogIn />
             {oauth.needs_login ? "Sign in" : "Sign in again"}
           </Button>
-          {!oauth.needs_login && (
-            <Confirm
-              title={`Sign out of ${server}?`}
-              description="xolotl forgets the tokens; tool calls fail until someone signs in again."
-              action="Sign out"
-              onConfirm={() => signOut.mutate(undefined)}
-            >
-              <Button variant="ghost" size="sm" disabled={signOut.isPending}>
-                Sign out
-              </Button>
-            </Confirm>
-          )}
+          <Confirm
+            title={`Forget OAuth tokens for ${server}?`}
+            description="Stored OAuth tokens are deleted. Sign in again to resume authorized tool calls."
+            action="Forget tokens"
+            onConfirm={() => signOut.mutate(undefined)}
+          >
+            <Button variant="ghost" size="sm" disabled={signOut.isPending}>
+              Forget tokens
+            </Button>
+          </Confirm>
         </div>
       )}
+      <QueryError error={start.error ?? signOut.error} />
     </div>
   );
 }
 
-function LoginFlow({ flow, onDone }: { flow: McpLoginStart; onDone: () => void }) {
+export function LoginFlow({ flow, onDone }: { flow: McpLoginStart; onDone: () => void }) {
   const [pasted, setPasted] = useState("");
   const status = useQuery({
     queryKey: ["mcp-login", flow.flow_id],
     queryFn: () => get<McpLoginStatus>(`/admin/mcp/oauth/flows/${flow.flow_id}`),
     enabled: flow.callback,
-    refetchInterval: (q) => (q.state.data?.status === "pending" || !q.state.data ? 2000 : false),
+    retry: false,
+    retryOnMount: false,
+    refetchInterval: (q) => (!q.state.error && (q.state.data?.status === "pending" || !q.state.data) ? 2000 : false),
   });
   const complete = useAction(() => post(`/admin/mcp/oauth/flows/${flow.flow_id}/complete`, { redirect_url: pasted.trim() }), {
     invalidate: [["mcp-servers"], ["mcp-tools", flow.server], ["policy-view"]],
@@ -505,8 +522,14 @@ function LoginFlow({ flow, onDone }: { flow: McpLoginStart; onDone: () => void }
         </a>
       </p>
       {flow.callback ? (
-        status.data?.status === "failed" ? (
-          <p className="text-destructive">{status.data.error}</p>
+        status.error ? (
+          <div role="alert" className="text-destructive">
+            <p>Could not check sign-in status: {status.error.message}. Sign-in has not been confirmed.</p>
+            <Button variant="outline" size="sm" disabled={status.isFetching} onClick={() => status.refetch()}>Retry status</Button>
+            <p>Cancel and start a new sign-in if this login has expired.</p>
+          </div>
+        ) : status.data?.status === "failed" ? (
+          <p role="alert" className="text-destructive">Sign-in failed: {status.data.error}. Cancel and start a new sign-in.</p>
         ) : (
           <p className="text-muted-foreground">Waiting for the browser to come back to xolotl…</p>
         )
@@ -538,6 +561,7 @@ function LoginFlow({ flow, onDone }: { flow: McpLoginStart; onDone: () => void }
           </div>
         </form>
       )}
+      <QueryError error={complete.error} />
       <Button variant="ghost" size="sm" className="self-start" onClick={onDone}>
         Cancel
       </Button>
@@ -545,40 +569,53 @@ function LoginFlow({ flow, onDone }: { flow: McpLoginStart; onDone: () => void }
   );
 }
 
-function SecretField({ server, field, set }: { server: string; field: string; set: boolean }) {
+export function SecretField({ server, field, set }: { server: string; field?: string; set?: boolean }) {
+  const [name, setName] = useState("");
   const [value, setValue] = useState("");
-  const save = useAction(() => put(`/admin/mcp/servers/${server}/secret`, { fields: { [field]: value.trim() } }), {
+  const [result, setResult] = useState("");
+  const target = field ?? name.trim();
+  const save = useAction(() => put(`/admin/mcp/servers/${server}/secret`, { fields: { [target]: value.trim() } }), {
     invalidate: [["mcp-servers"]],
-    success: `Saved ${field} for ${server}`,
-    onSuccess: () => setValue(""),
+    onSuccess: () => { setValue(""); setResult(`Saved ${target}. Stored value is hidden.`); },
   });
-  const id = `secret-${server}-${field}`;
+  const remove = useAction(() => put(`/admin/mcp/servers/${server}/secret`, { fields: { [target]: null } }), {
+    invalidate: [["mcp-servers"]],
+    onSuccess: () => { setValue(""); setResult(`Removed ${target}. ${target} is not set.`); },
+  });
+  const id = `secret-${server}-${field ? `field-${field}` : "custom"}`;
+  const pending = save.isPending || remove.isPending;
   return (
-    <form
-      className="flex flex-col gap-2"
-      onSubmit={(e) => {
-        e.preventDefault();
-        save.mutate(undefined);
-      }}
-    >
-      <Label htmlFor={id} className="flex items-center gap-2">
-        <Mono>{`{${field}}`}</Mono>
-        {set ? <Badge variant="success">set</Badge> : <Badge variant="warning">not set</Badge>}
-      </Label>
-      <div className="flex max-w-xl gap-2">
-        <Input
-          id={id}
-          type="password"
-          autoComplete="off"
-          className="font-mono"
-          placeholder={set ? "Replace value" : "Value"}
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-        />
-        <Button type="submit" variant="outline" disabled={!value.trim() || save.isPending}>
-          Save
-        </Button>
+    <form className="flex flex-col gap-2" onSubmit={(e) => {
+      e.preventDefault();
+      remove.reset();
+      setResult("");
+      save.mutate(undefined);
+    }}>
+      {field ? (
+        <Label htmlFor={id} className="flex items-center gap-2">
+          <Mono>{`{${field}}`}</Mono>
+          {set ? <Badge variant="success">set</Badge> : <Badge variant="warning">not set</Badge>}
+        </Label>
+      ) : (
+        <>
+          <Label htmlFor={`${id}-name`}>Other secret field name</Label>
+          <Input id={`${id}-name`} className="max-w-xl font-mono" disabled={pending} value={name} onChange={(e) => { setName(e.target.value); setResult(""); }} />
+          <Label htmlFor={id}>Secret value</Label>
+        </>
+      )}
+      <div className="flex max-w-xl flex-wrap gap-2">
+        <Input id={id} type="password" autoComplete="off" className="min-w-40 flex-1 font-mono" placeholder={set ? "Replace value" : "Value"}
+          disabled={pending} value={value} onChange={(e) => setValue(e.target.value)} />
+        <Button type="submit" variant="outline" disabled={!target || !value.trim() || pending}>Save secret</Button>
+        <Confirm title={`Remove stored ${target || "secret field"}?`}
+          description={`The stored field ${target} is deleted. Headers that use it will have no value.`}
+          action="Remove secret" onConfirm={() => { save.reset(); setResult(""); remove.mutate(undefined); }}>
+          <Button type="button" variant="outline" disabled={!target || set === false || pending}>Remove secret…</Button>
+        </Confirm>
       </div>
+      {pending && <p role="status">Updating secret…</p>}
+      {result && <p role="status">{result}</p>}
+      <QueryError error={save.error ?? remove.error} />
     </form>
   );
 }
@@ -612,13 +649,25 @@ function Tools({ server }: { server: string }) {
                   </Badge>
                 )}
               </TableCell>
-              <TableCell className="text-muted-foreground text-xs whitespace-normal">{t.description?.split("\n")[0] ?? ""}</TableCell>
+              <TableCell className="text-muted-foreground text-xs whitespace-normal">
+                <p className="whitespace-pre-wrap">{t.description ?? ""}</p>
+                <ToolDefinition tool={t} />
+              </TableCell>
             </TableRow>
           ))}
         </TableBody>
       </Table>
       {tools.isSuccess && list.length === 0 && <Empty>No tools listed yet. Refresh to ask the server.</Empty>}
     </div>
+  );
+}
+
+export function ToolDefinition({ tool }: { tool: McpTool }) {
+  return (
+    <details className="mt-2">
+      <summary className="cursor-pointer">{tool.name} · full tool definition</summary>
+      <pre className="bg-muted/40 mt-2 max-h-96 overflow-auto rounded-md p-3 text-xs">{JSON.stringify(tool, null, 2)}</pre>
+    </details>
   );
 }
 

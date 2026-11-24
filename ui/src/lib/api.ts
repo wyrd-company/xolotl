@@ -416,6 +416,8 @@ export interface McpLoginStart {
 export type McpLoginStatus = { server: string } & ({ status: "pending" } | { status: "complete" } | { status: "failed"; error: string });
 
 export interface McpTool {
+  /** Preserve extension fields returned by the upstream server in the inspector. */
+  [key: string]: unknown;
   name: string;
   title?: string;
   description?: string;
