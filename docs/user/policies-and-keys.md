@@ -255,8 +255,11 @@ request doesn't.
 - A key you rotate keeps its sessions. A key you revoke and issue again under
   the same name starts with none, which stops a model for all of that key's
   sessions at once.
-- A session keeps a model until it goes `database.retention_days`
-  ([configuration](configuration.md#database)) without using it.
+- A session keeps the models it used until it goes `database.retention_days`
+  ([configuration](configuration.md#database)) without using any of them.
+- A session that was running when you upgraded xolotl keeps a model only from
+  its first completed answer from that model after the upgrade. If you
+  exclude the model before then, that session is refused it.
 - Removing a provider from `providers`, or an account from `accounts`, applies
   to every session at once.
 

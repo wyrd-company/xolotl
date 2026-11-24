@@ -96,11 +96,13 @@ A body is a stream when its `Content-Type` says so, or when it doesn't start as 
 - A model the catalog no longer lists loses its plain name whatever the session keeps. Xolotl can't keep a model working that its provider stops serving.
 - When the models can't be read, the policy decides alone. When a use can't be written, the session doesn't keep that model.
 
-Rows go at `retention_days` after their last use, like the sessions.
+A session's rows go together at `retention_days` after its last use of any of them, like the sessions. A session still active on one model keeps the others it used.
+
+Upgrading to this version starts `session_models` empty. A session that was running before the upgrade keeps a model only from its first completed request on it after the upgrade. Excluding the model in between refuses the session. The `sessions` table has the session's last model but not the key issuance that used it, so prior use can't be recovered without inheriting another issuance's history.
 
 ### Clients
 
-Measured on 2026-11-24 with each client in a clean container against a mock provider, over several turns, a model switch and a compaction. `src/server/tests/context/models/clients.rs` replays what xolotl reads from each.
+Measured on 2026-11-24 with each client in a clean container against a mock provider, over several turns, a model switch and a compaction. `src/server/tests/context/models/clients.rs` replays what xolotl reads from each. Claude Code, Codex and Grok also compacted, switched and came back in a live run through xolotl. OpenCode's compaction was captured only against the mock, forced with a tiny context limit; its live run through xolotl switched and came back without compacting, so its compaction is covered by the router replay alone.
 
 | Client | Session | Other requests in the session | After a compaction |
 |---|---|---|---|
