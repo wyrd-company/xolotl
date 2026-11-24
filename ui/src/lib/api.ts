@@ -132,6 +132,8 @@ export interface Account {
   plan: string | null;
   enabled: boolean;
   priority: number;
+  /** Exact signed 64-bit value; use this for browser display and editing. */
+  priority_decimal: string;
   cooldown_until: number | null;
   cooldown_reason: string | null;
   auth_failed: boolean;

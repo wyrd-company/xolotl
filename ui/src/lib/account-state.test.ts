@@ -16,6 +16,7 @@ test("recovery labels distinguish API key rejection from OAuth login", () => {
     plan: null,
     enabled: true,
     priority: 0,
+    priority_decimal: "0",
     cooldown_until: null,
     cooldown_reason: null,
     auth_failed: true,

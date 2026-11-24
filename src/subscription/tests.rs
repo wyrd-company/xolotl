@@ -1791,3 +1791,16 @@ async fn cached_internal_window_does_not_affect_selection_or_account_output() {
             .collect::<Vec<_>>()
     );
 }
+
+#[tokio::test]
+async fn priority_selection_handles_signed_extremes() {
+    let server = MockServer::start().await;
+    let (subs, _) = setup(&server, Strategy::FillFirst).await;
+    let mut low = subs.save_account(codex_cred("low", "low-token")).await.unwrap();
+    let mut high = subs.save_account(codex_cred("high", "high-token")).await.unwrap();
+    low.priority = i64::MIN;
+    high.priority = i64::MAX;
+    assert_eq!(subs.choose(SubProvider::Codex, None, &[(low.clone(), 0.), (high.clone(), 0.)]), 1);
+    assert_eq!(subs.choose(SubProvider::Codex, None, &[(high, 0.), (low.clone(), 0.)]), 0);
+    assert_eq!(subs.choose(SubProvider::Codex, None, &[(low, 0.)]), 0);
+}

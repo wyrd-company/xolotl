@@ -21,6 +21,7 @@ import { publicUsageWindows } from "@/lib/usage-windows";
 import { resetCreditsSummary } from "@/lib/reset-credits";
 import { dateTime, relative } from "@/lib/format";
 import { useAction } from "@/lib/hooks";
+import { priorityError, normalizePriority } from "@/lib/priority";
 
 export function AccountsPage() {
   const [search, setSearch] = useSearchParams();
@@ -154,7 +155,7 @@ function AccountRow({ account: a, open, onOpenChange }: { account: Account; open
           )}
         </div>
       </TableCell>
-      <TableCell className="font-mono">{a.priority}</TableCell>
+      <TableCell className="font-mono">{a.priority_decimal}</TableCell>
       <TableCell className="whitespace-nowrap">{relative(a.last_used_at)}</TableCell>
       <TableCell>
         <div className="flex justify-end gap-2">
@@ -182,11 +183,13 @@ function AccountDetails({
   onOpenChange: (open: boolean) => void;
 }) {
   const windows = publicUsageWindows(a.usage?.windows);
-  const [priority, setPriority] = useState(String(a.priority));
+  const [priority, setPriority] = useState(a.priority_decimal);
   const inv = {
     invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"]],
   };
-  const setPrio = useAction((p: number) => post(`/admin/accounts/${a.id}/priority`, { priority: p }), {
+  const [priorityTouched, setPriorityTouched] = useState(false);
+  const error = priorityTouched ? priorityError(priority) : null;
+  const setPrio = useAction((p: string) => post(`/admin/accounts/${a.id}/priority`, { priority: p }), {
     ...inv,
     success: "Priority saved",
   });
@@ -207,7 +210,10 @@ function AccountDetails({
       open={open}
       onOpenChange={(o) => {
         setOpen(o);
-        if (o) setPriority(String(a.priority));
+        if (o) {
+          setPriority(a.priority_decimal);
+          setPriorityTouched(false);
+        }
       }}
     >
       <DialogTrigger asChild>
@@ -282,25 +288,38 @@ function AccountDetails({
           </div>
         ) : null}
         <form
-          className="flex items-end gap-2"
+          className="flex flex-col gap-2"
           onSubmit={(e) => {
             e.preventDefault();
-            setPrio.mutate(Number(priority));
+            setPriorityTouched(true);
+            if (priorityError(priority)) {
+              e.currentTarget.querySelector("input")?.focus();
+              return;
+            }
+            setPrio.mutate(normalizePriority(priority));
           }}
         >
           <div className="flex flex-col gap-2">
             <Label htmlFor={`prio-${a.id}`}>Priority (higher is used first)</Label>
             <Input
               id={`prio-${a.id}`}
-              type="number"
-              step={1}
-              className="w-32"
+              type="text"
+              inputMode="text"
+              className="font-mono"
+              aria-invalid={!!error}
+              aria-describedby={`prio-help-${a.id}${error ? ` prio-error-${a.id}` : ""}`}
+              onBlur={() => setPriorityTouched(true)}
               value={priority}
               onChange={(e) => setPriority(e.target.value)}
             />
           </div>
-          <Button type="submit" variant="outline" disabled={setPrio.isPending || priority === "" || Number(priority) === a.priority}>
-            Save
+          <p id={`prio-help-${a.id}`} className="text-muted-foreground text-sm">
+            Whole number from −9223372036854775808 to 9223372036854775807.
+          </p>
+          {error && <p id={`prio-error-${a.id}`} role="alert" className="text-destructive text-sm">{error}</p>}
+          {setPrio.error && <p role="alert" className="text-destructive text-sm">{setPrio.error.message} Your entered priority is kept; try saving again.</p>}
+          <Button type="submit" className="self-start" variant="outline" disabled={setPrio.isPending || (!priorityError(priority) && normalizePriority(priority) === a.priority_decimal)}>
+            {setPrio.isPending ? "Saving…" : "Save priority"}
           </Button>
         </form>
         <p className="text-muted-foreground text-sm">

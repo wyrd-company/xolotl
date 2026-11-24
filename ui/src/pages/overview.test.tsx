@@ -38,6 +38,7 @@ const account = (change: Partial<Account> = {}): Account => ({
   plan: null,
   enabled: true,
   priority: 0,
+    priority_decimal: "0",
   cooldown_until: null,
   cooldown_reason: null,
   auth_failed: false,

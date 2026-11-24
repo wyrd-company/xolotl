@@ -490,6 +490,7 @@ function ProviderAccountForm({ kinds }: { kinds: AccountKindInfo[] }) {
 function ImportLogin({ kinds }: { kinds: AccountKindInfo[] }) {
   const [provider, setProvider] = useState(kinds[0].kind);
   const [file, setFile] = useState<File | null>(null);
+  const [label, setLabel] = useState("");
   const [inputKey, setInputKey] = useState(0);
   const loggedIn = useLoggedIn();
   const imp = useAction(
@@ -500,12 +501,13 @@ function ImportLogin({ kinds }: { kinds: AccountKindInfo[] }) {
       } catch {
         throw new Error("That file is not JSON.");
       }
-      return post<Account>("/admin/accounts/import", { provider, data });
+      return post<Account>("/admin/accounts/import", { provider, data, label: label.trim() || null });
     },
     {
       onSuccess: (a) => {
         loggedIn(a.email);
         setFile(null);
+        setLabel("");
         setInputKey((k) => k + 1);
       },
     },
@@ -544,6 +546,10 @@ function ImportLogin({ kinds }: { kinds: AccountKindInfo[] }) {
           </Select>
         </div>
         <div className="flex flex-col gap-2">
+          <Label htmlFor="import-label">Label (optional)</Label>
+          <Input id="import-label" placeholder="Work subscription" value={label} onChange={(e) => setLabel(e.target.value)} disabled={imp.isPending} />
+        </div>
+        <div className="flex flex-col gap-2">
           <Label htmlFor="import-file">Credential file</Label>
           <Input
             key={inputKey}
@@ -553,6 +559,7 @@ function ImportLogin({ kinds }: { kinds: AccountKindInfo[] }) {
             onChange={(e) => setFile(e.target.files?.[0] ?? null)}
           />
         </div>
+        {imp.error && <p role="alert" className="text-destructive text-sm">{imp.error.message} Choose a valid credential file and try again.</p>}
         <Button type="submit" className="self-start" disabled={!file || imp.isPending}>
           Import
         </Button>
