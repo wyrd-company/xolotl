@@ -5,11 +5,10 @@
 // ---
 use anyhow::Result;
 use serde::Serialize;
-use sqlx::{FromRow, SqliteConnection, SqliteExecutor};
+use sqlx::{FromRow, SqliteExecutor};
 
 use super::Lock;
 use crate::db::{Db, now};
-use crate::policy::Target;
 
 /// One finished request of a session.
 #[derive(Debug, Clone, Default)]
@@ -29,11 +28,6 @@ pub struct Turn {
     pub provider: String,
     pub model: String,
     pub account: Option<String>,
-    /// The digest of the request's first user turn ([`super::opening`]).
-    pub opening: Option<String>,
-    /// The session may keep the model: the policy allowed it by name, or the
-    /// session kept it already.
-    pub keep: bool,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -135,39 +129,6 @@ async fn form_lock(db: impl SqliteExecutor<'_>, client_id: &str, session_key: &s
     Ok(r.rows_affected() == 1)
 }
 
-/// Record the model that served `t`. Another model the same opening was on
-/// is dropped: that conversation has switched away from it. The session is on
-/// this model from now on, if it may keep it.
-async fn use_model(db: &mut SqliteConnection, t: &Turn) -> Result<()> {
-    sqlx::query(
-        "DELETE FROM session_models
-         WHERE client_id = ? AND session_key = ? AND opening = ? AND NOT (provider = ? AND model = ?)",
-    )
-    .bind(&t.client_id)
-    .bind(&t.session_key)
-    .bind(&t.opening)
-    .bind(&t.provider)
-    .bind(&t.model)
-    .execute(&mut *db)
-    .await?;
-    if t.keep {
-        sqlx::query(
-            "INSERT INTO session_models (client_id, session_key, provider, model, opening, last_used) VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT (client_id, session_key, provider, model) DO UPDATE SET
-               opening = COALESCE(excluded.opening, opening), last_used = excluded.last_used",
-        )
-        .bind(&t.client_id)
-        .bind(&t.session_key)
-        .bind(&t.provider)
-        .bind(&t.model)
-        .bind(&t.opening)
-        .bind(now())
-        .execute(&mut *db)
-        .await?;
-    }
-    Ok(())
-}
-
 type LockColumns = (i64, Option<String>, Option<String>, Option<String>, Option<String>);
 
 impl Db {
@@ -185,29 +146,17 @@ impl Db {
         }))
     }
 
-    /// Record a successful request and the model that served it and, at
-    /// `lock_tokens`, form `lock` on what served it, in one transaction, so
-    /// that no request sees a session past the threshold without its lock.
-    /// True when this call formed the lock. A `lock_tokens` of 0 forms none.
+    /// Record a successful request and, at `lock_tokens`, form `lock` on what
+    /// served it, in one transaction, so that no request sees a session past
+    /// the threshold without its lock. True when this call formed the lock. A
+    /// `lock_tokens` of 0 forms none.
     pub async fn finish_turn(&self, t: &Turn, lock: &Lock, lock_tokens: i64) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         let current = record_turn(&mut *tx, t).await?;
-        use_model(&mut tx, t).await?;
         let formed =
             lock_tokens > 0 && !t.side && current >= lock_tokens && form_lock(&mut *tx, &t.client_id, &t.session_key, lock).await?;
         tx.commit().await?;
         Ok(formed)
-    }
-
-    /// The models the session is on ([`use_model`]).
-    pub async fn session_models(&self, client_id: &str, session_key: &str) -> Result<Vec<Target>> {
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT provider, model FROM session_models WHERE client_id = ? AND session_key = ? ORDER BY provider, model")
-                .bind(client_id)
-                .bind(session_key)
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows.into_iter().map(|(provider, model)| Target { provider, model }).collect())
     }
 
     /// Count a failed request on `lock` and return the run of failures. A lock
@@ -292,8 +241,8 @@ impl Db {
     pub(crate) async fn prune_sessions(&self, cutoff: i64) -> Result<u64> {
         let s = sqlx::query("DELETE FROM sessions WHERE last_seen < ?").bind(cutoff).execute(&self.pool).await?;
         let t = sqlx::query("DELETE FROM tool_usage WHERE last_used < ?").bind(cutoff).execute(&self.pool).await?;
-        let m = sqlx::query("DELETE FROM session_models WHERE last_used < ?").bind(cutoff).execute(&self.pool).await?;
-        Ok(s.rows_affected() + t.rows_affected() + m.rows_affected())
+        let c = sqlx::query("DELETE FROM session_conversations WHERE last_used < ?").bind(cutoff).execute(&self.pool).await?;
+        Ok(s.rows_affected() + t.rows_affected() + c.rows_affected())
     }
 }
 
@@ -305,9 +254,5 @@ impl Db {
 
     pub async fn form_lock(&self, client_id: &str, session_key: &str, lock: &Lock) -> Result<bool> {
         form_lock(&self.pool, client_id, session_key, lock).await
-    }
-
-    pub async fn use_model(&self, t: &Turn) -> Result<()> {
-        use_model(&mut *self.pool.acquire().await?, t).await
     }
 }

@@ -5,6 +5,7 @@
 // relationships:
 //   implements: ../../docs/design/sessions.md
 // ---
+pub mod conversation;
 mod store;
 pub mod tools;
 
@@ -18,7 +19,6 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 use crate::db::Db;
-use crate::policy::Target;
 use crate::subscription::{claude, codex, grok, opencode_go};
 use crate::telemetry::metrics;
 
@@ -69,24 +69,6 @@ fn first_user(body: &Value) -> Option<&Value> {
     let turns = body.get("messages").or_else(|| body.get("input"));
     let is_user = |item: &&Value| item.get("role").and_then(Value::as_str) == Some("user");
     turns.filter(|t| t.is_string()).or_else(|| turns?.as_array()?.iter().find(is_user))
-}
-
-/// The opening of the conversation a request carries: a digest of its first
-/// user turn. A switch of the conversation to another model carries the same
-/// opening; a background request or a subagent has its own. Cache markers are
-/// left out, as a client moves them while the conversation grows. `None`
-/// without a user turn.
-pub fn opening(body: &Value) -> Option<String> {
-    fn unmarked(v: &Value) -> Value {
-        match v {
-            Value::Object(m) => {
-                Value::Object(m.iter().filter(|(k, _)| *k != "cache_control").map(|(k, v)| (k.clone(), unmarked(v))).collect())
-            }
-            Value::Array(a) => Value::Array(a.iter().map(unmarked).collect()),
-            v => v.clone(),
-        }
-    }
-    Some(digest(&[unmarked(first_user(body)?).to_string().as_bytes()]))
 }
 
 /// The identity of an LLM request: what the client says, else a digest of the
@@ -141,18 +123,6 @@ pub struct AccountPin {
     pub held: bool,
 }
 
-/// The models a request's session is on. A session keeps them after its
-/// key's policy excludes them, until it switches away from one. Empty for a
-/// request with no session, or when they can't be read: the policy then
-/// decides alone.
-pub async fn kept_models(db: &Db, client: &str, headers: &HeaderMap, body: &Value) -> Vec<Target> {
-    let Some(id) = resolve(headers, body) else { return Vec::new() };
-    db.session_models(client, &id.key).await.unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "failed to read the models of a session");
-        Vec::new()
-    })
-}
-
 /// The session state of one LLM request.
 pub struct RequestSession {
     db: Db,
@@ -160,12 +130,10 @@ pub struct RequestSession {
     id: SessionId,
     requested: String,
     estimate: i64,
-    opening: Option<String>,
     lock_tokens: u64,
     lockable: bool,
     max_failures: i64,
     lock: Mutex<Option<Lock>>,
-    keepable: Vec<Target>,
 }
 
 impl RequestSession {
@@ -197,22 +165,11 @@ impl RequestSession {
             id,
             requested: requested.to_string(),
             estimate: crate::metadata::estimate_tokens(body) as i64,
-            opening: opening(body),
             lock_tokens,
             lockable,
             max_failures: cfg.subscription.max_attempts as i64,
             lock: Mutex::new(lock),
-            keepable: Vec::new(),
         })
-    }
-
-    /// The targets the session may keep if they serve this request: those the
-    /// policy allows by name, and those the session keeps already. A target
-    /// only an alias reaches is not one, so that a session can't use it later
-    /// under a name the policy refuses. Without this, the request keeps none.
-    pub fn keeping(mut self, targets: Vec<Target>) -> Self {
-        self.keepable = targets;
-        self
     }
 
     /// The lock as the request sees it now.
@@ -284,8 +241,6 @@ impl RequestSession {
             model: model.to_string(),
             window: window.map(|w| w as i64),
             estimate: self.estimate,
-            opening: self.opening.clone(),
-            keepable: self.keepable.iter().filter(|t| t.model == model).map(|t| t.provider.clone()).collect(),
             lock_tokens: if self.lockable { self.lock_tokens as i64 } else { 0 },
             side: self.lock.lock().as_ref().is_some_and(|l| l.name != self.requested),
         }
@@ -301,9 +256,6 @@ pub struct SessionTrack {
     model: String,
     window: Option<i64>,
     estimate: i64,
-    opening: Option<String>,
-    /// The providers whose target for `model` the session may keep.
-    keepable: Vec<String>,
     lock_tokens: i64,
     side: bool,
 }
@@ -342,8 +294,6 @@ impl SessionTrack {
             provider: provider.to_string(),
             model: self.model.clone(),
             account: account.map(str::to_string),
-            opening: self.opening.clone(),
-            keep: self.keepable.iter().any(|p| p == provider),
         };
         let lock = Lock {
             generation: 0,

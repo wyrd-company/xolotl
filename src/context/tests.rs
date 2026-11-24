@@ -89,23 +89,6 @@ fn the_estimate_reads_every_wire_format() {
     }
 }
 
-#[test]
-fn the_opening_follows_a_conversation_across_models() {
-    let marked = json!([{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}]);
-    let unmarked = json!([{"type": "text", "text": "hello"}]);
-    let turn1 = json!({"model": "a", "system": "s1", "messages": [{"role": "user", "content": marked}]});
-    let turn2 = json!({"model": "b", "system": "s2", "messages": [
-        {"role": "user", "content": unmarked}, {"role": "assistant", "content": "hi"}, {"role": "user", "content": "more"}]});
-    let other = json!({"model": "a", "system": "s1", "messages": [{"role": "user", "content": "title this: hello"}]});
-    let first = opening(&turn1).unwrap();
-    assert_eq!(Some(&first), opening(&turn2).as_ref(), "the model, the system prompt and cache markers aside");
-    assert_ne!(Some(first), opening(&other), "a background request has its own");
-    assert_eq!(opening(&json!({"messages": [{"role": "assistant", "content": "x"}]})), None);
-    for body in [json!({"input": "a"}), json!({"input": [{"role": "developer", "content": "d"}, {"role": "user", "content": "a"}]})] {
-        assert!(opening(&body).is_some(), "{body}");
-    }
-}
-
 fn turn(tokens: i64, reported: bool) -> Turn {
     Turn {
         client_id: "p/k".into(),
@@ -221,50 +204,6 @@ async fn a_success_on_the_lock_ends_a_run_of_failures() {
     assert_eq!(row(&db).await.lock_failures, 0);
 }
 
-fn used(provider: &str, model: &str, opening: Option<&str>) -> Turn {
-    Turn { provider: provider.into(), model: model.into(), opening: opening.map(str::to_string), keep: true, ..turn(1, true) }
-}
-
-async fn models(db: &Db) -> Vec<String> {
-    db.session_models("p/k", "s").await.unwrap().iter().map(|t| t.qualified()).collect()
-}
-
-#[tokio::test]
-async fn a_session_is_on_each_model_until_its_conversation_switches_away() {
-    let db = Db::in_memory().await.unwrap();
-    db.use_model(&used("claude", "opus", Some("main"))).await.unwrap();
-    db.use_model(&used("claude", "haiku", Some("title"))).await.unwrap();
-    db.use_model(&used("claude", "opus", Some("main"))).await.unwrap();
-    assert_eq!(models(&db).await, ["claude/haiku", "claude/opus"], "a request with its own opening switches nothing");
-    assert!(db.session_models("q/k", "s").await.unwrap().is_empty(), "client keys don't share sessions");
-
-    db.use_model(&used("codex", "gpt", Some("main"))).await.unwrap();
-    assert_eq!(models(&db).await, ["claude/haiku", "codex/gpt"], "the conversation switched away from opus");
-
-    // A request without a user turn switches nothing, and leaves the opening where it was.
-    db.use_model(&used("llama", "qwen", None)).await.unwrap();
-    db.use_model(&used("codex", "gpt", None)).await.unwrap();
-    assert_eq!(models(&db).await, ["claude/haiku", "codex/gpt", "llama/qwen"]);
-    db.use_model(&used("claude", "opus", Some("main"))).await.unwrap();
-    assert_eq!(models(&db).await, ["claude/haiku", "claude/opus", "llama/qwen"]);
-}
-
-#[tokio::test]
-async fn a_model_the_session_may_not_keep_still_ends_the_one_it_switched_from() {
-    let db = Db::in_memory().await.unwrap();
-    db.use_model(&used("claude", "opus", Some("main"))).await.unwrap();
-    db.use_model(&Turn { keep: false, ..used("llama", "qwen", Some("main")) }).await.unwrap();
-    assert!(models(&db).await.is_empty());
-}
-
-#[tokio::test]
-async fn a_finished_turn_records_its_model() {
-    let db = Db::in_memory().await.unwrap();
-    db.finish_turn(&used("claude", "opus", Some("main")), &lock("a"), 0).await.unwrap();
-    assert_eq!(models(&db).await, ["claude/opus"]);
-    assert_eq!(row(&db).await.turns, 1);
-}
-
 #[tokio::test]
 async fn tool_usage_joins_llm_and_mcp_calls_per_key() {
     let db = Db::in_memory().await.unwrap();
@@ -290,19 +229,15 @@ async fn tool_usage_joins_llm_and_mcp_calls_per_key() {
 async fn prune_removes_old_sessions_and_tool_counts_with_the_request_log() {
     let db = Db::in_memory().await.unwrap();
     db.record_turn(&turn(1, true)).await.unwrap();
-    db.use_model(&used("claude", "opus", Some("main"))).await.unwrap();
     db.count_tools("p/k", &["read".to_string()]).await.unwrap();
     assert_eq!(db.prune(1).await.unwrap(), 0, "recent rows stay");
     assert_eq!(db.sessions(None, 10).await.unwrap().len(), 1);
     assert_eq!(db.tool_usage(None).await.unwrap().len(), 1);
-    assert_eq!(models(&db).await.len(), 1);
 
     let old = now() - 2 * 86_400;
     sqlx::query("UPDATE sessions SET last_seen = ?").bind(old).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE tool_usage SET last_used = ?").bind(old).execute(&db.pool).await.unwrap();
-    sqlx::query("UPDATE session_models SET last_used = ?").bind(old).execute(&db.pool).await.unwrap();
-    assert_eq!(db.prune(1).await.unwrap(), 3);
+    assert_eq!(db.prune(1).await.unwrap(), 2);
     assert!(db.sessions(None, 10).await.unwrap().is_empty());
     assert!(db.tool_usage(None).await.unwrap().is_empty());
-    assert!(models(&db).await.is_empty());
 }

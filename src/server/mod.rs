@@ -23,6 +23,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::catalog::{ModelCatalog, Route, Wire};
 use crate::config::Config;
+use crate::context::conversation::Conversation;
 use crate::context::{RequestSession, reason};
 use crate::db::Db;
 use crate::export::Capture;
@@ -364,7 +365,11 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
     };
     let model = if anthropic { model.strip_suffix("[1m]").unwrap_or(&model).to_string() } else { model };
     let known = state.catalog.known_providers();
-    let kept = kept_models(state, &principal, path, &headers, &json).await;
+    let conversation = conversation_for(state, &principal, path, &headers, &json);
+    let kept: Vec<Target> = match &conversation {
+        Some(c) => c.kept().await.into_iter().collect(),
+        None => Vec::new(),
+    };
     let Some(targets) = state.view_keeping(&principal, kept.clone()).lookup(&principal.policy, &known, &model) else {
         return err(StatusCode::NOT_FOUND, "not_found_error", format!("model {model:?} is not available to this key"));
     };
@@ -398,8 +403,9 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             .unwrap_or_default();
         return err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("model {model:?} is not available on {path}{hint}"));
     }
-    let keepable = usable.iter().filter(|t| principal.policy.allows_model_keeping(&t.provider, &t.model, &kept)).cloned().collect();
-    let session = session_for(state, &principal, path, &headers, &json, &model, true).await.map(|s| s.keeping(keepable));
+    // What the conversation may keep: a target the policy allows by name, or the one it keeps now.
+    let keepable = |t: &Target| principal.policy.allows_model_keeping(&t.provider, &t.model, &kept);
+    let session = session_for(state, &principal, path, &headers, &json, &model, true).await;
     let capture = capture_for(state, &principal, path, Some(&body));
     let mut usable = usable;
     if let Some(s) = session.as_ref().filter(|s| s.locks_requested_name())
@@ -501,11 +507,16 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             tracing::info!(target = %target.qualified(), status, "falling back to next alias target");
             continue;
         }
-        return match translation {
+        let resp = match translation {
             Some(t) => t.response(resp).await,
             None if anthropic && !resp.status().is_success() => normalize_messages_error(resp).await,
             None => resp,
         };
+        // Counting tokens is not a turn: it moves no conversation.
+        if let Some(c) = conversation.as_ref().filter(|_| resp.status().is_success() && path != "/v1/messages/count_tokens") {
+            c.served(Some(target).filter(|t| keepable(t))).await;
+        }
+        return resp;
     }
     unreachable!("loop returns on the last target")
 }
@@ -552,14 +563,12 @@ async fn collect_grok(resp: Response) -> Response {
     }
 }
 
-/// The models the request's session keeps past a policy that now excludes
-/// them ([`crate::context::kept_models`]). Counting tokens reads them too,
-/// though it is not a turn.
-async fn kept_models(state: &AppState, principal: &Principal, path: &str, headers: &HeaderMap, body: &Value) -> Vec<Target> {
-    match principal.client_id() {
-        Some(client) if Wire::for_path(path).is_some() => crate::context::kept_models(&state.db, client, headers, body).await,
-        _ => Vec::new(),
-    }
+/// The conversation of an LLM request, which keeps the model it is on past a
+/// policy that now excludes it ([`Conversation`]). Only a client key's
+/// requests on the wire formats have one. Counting tokens reads it too.
+fn conversation_for(state: &AppState, principal: &Principal, path: &str, headers: &HeaderMap, body: &Value) -> Option<Conversation> {
+    Wire::for_path(path)?;
+    Conversation::of(&state.db, principal.client_id()?, principal.issued_at, headers, body)
 }
 
 /// The session of an LLM request. Only a client key's requests on the wire
@@ -607,9 +616,7 @@ async fn passthrough_session(
     let raw = body?;
     let json: Value = serde_json::from_slice(raw).ok()?;
     let requested = label.unwrap_or_default();
-    // The policy or the session allowed the model before the request got here.
-    let keepable = label.and_then(Target::parse).into_iter().collect();
-    Some(session_for(state, principal, &path, headers, &json, requested, lockable && label.is_some()).await?.keeping(keepable))
+    session_for(state, principal, &path, headers, &json, requested, lockable && label.is_some()).await
 }
 
 /// Send a JSON request to one target: a subscription pool or a gateway provider.
@@ -766,10 +773,14 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     Json(json!({"object": "list", "data": data})).into_response()
 }
 
+/// A passthrough's body: buffered bytes or a stream, the `model` it names,
+/// and the conversation it belongs to.
+type PassthroughBody = (Option<Bytes>, Option<String>, Option<Body>, Option<Conversation>);
+
 /// Read a passthrough body: JSON bodies are buffered so their `model` can be
-/// checked against the policy, and the models the request's session keeps;
-/// anything else streams. With `stream_usage`, a Chat Completions stream is
-/// asked for its usage chunk (rate limits count it).
+/// checked against the policy, and against the model the request's
+/// conversation keeps; anything else streams. With `stream_usage`, a Chat
+/// Completions stream is asked for its usage chunk (rate limits count it).
 async fn passthrough_body(
     state: &AppState,
     principal: &Principal,
@@ -778,31 +789,49 @@ async fn passthrough_body(
     stream_usage: bool,
     headers: &HeaderMap,
     body: Body,
-) -> Result<(Option<Bytes>, Option<String>, Option<Body>), Response> {
+) -> Result<PassthroughBody, Response> {
     let is_json = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.starts_with("application/json"));
     if !principal.policy.allows_provider(provider) {
         return Err(json_error(StatusCode::FORBIDDEN, format!("this key may not use {provider}")));
     }
     if !is_json {
-        return Ok((None, None, Some(body)));
+        return Ok((None, None, Some(body), None));
     }
     let bytes = axum::body::to_bytes(body, state.cfg.server.max_body_bytes)
         .await
         .map_err(|_| json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?;
     let mut json = serde_json::from_slice::<Value>(&bytes).ok();
     let model = json.as_ref().and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string));
-    if let Some((m, body)) = model.as_ref().zip(json.as_ref())
+    let conversation = json.as_ref().and_then(|body| conversation_for(state, principal, &format!("/{path}"), headers, body));
+    if let Some(m) = &model
         && !principal.policy.allows_model(provider, m)
-        && !principal.policy.allows_model_keeping(provider, m, &kept_models(state, principal, &format!("/{path}"), headers, body).await)
     {
-        return Err(json_error(StatusCode::FORBIDDEN, format!("model {m} is not allowed for this key")));
+        let kept: Vec<Target> = match &conversation {
+            Some(c) => c.kept().await.into_iter().collect(),
+            None => Vec::new(),
+        };
+        if !principal.policy.allows_model_keeping(provider, m, &kept) {
+            return Err(json_error(StatusCode::FORBIDDEN, format!("model {m} is not allowed for this key")));
+        }
     }
     let rewrite = stream_usage && json.as_mut().is_some_and(|v| proxy::request_stream_usage(path, v));
     let bytes = match json {
         Some(v) if rewrite => Bytes::from(serde_json::to_vec(&v).unwrap_or_default()),
         _ => bytes,
     };
-    Ok((Some(bytes), model, None))
+    Ok((Some(bytes), model, None, conversation))
+}
+
+/// Record the model a successful passthrough used for its conversation,
+/// before its response reaches the client. The policy or the conversation
+/// allowed the model before the request got here.
+async fn passthrough_served(conversation: Option<&Conversation>, rest: &str, label: Option<&str>, success: bool) {
+    if let Some((c, target)) = conversation.zip(label.and_then(Target::parse))
+        && success
+        && rest != "v1/messages/count_tokens"
+    {
+        c.served(Some(&target)).await;
+    }
 }
 
 fn path_and_query(rest: &str, uri: &axum::http::Uri) -> String {
@@ -825,10 +854,11 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
         Err(r) => return r,
     };
     let stream_usage = state.gateway.kind(&provider) != Some(crate::config::ProviderKind::Mistral);
-    let (bytes, model, stream) = match passthrough_body(&state, &principal, &provider, &rest, stream_usage, &parts.headers, body).await {
-        Ok(x) => x,
-        Err(r) => return r,
-    };
+    let (bytes, model, stream, conversation) =
+        match passthrough_body(&state, &principal, &provider, &rest, stream_usage, &parts.headers, body).await {
+            Ok(x) => x,
+            Err(r) => return r,
+        };
     if let Err(resp) = admit(&state, &principal, &[Meter::Total, Meter::Provider(&provider)], rest.starts_with("v1/messages")) {
         return resp;
     }
@@ -843,7 +873,7 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
         (None, Some(s)) => reqwest::Body::wrap_stream(s.into_data_stream()),
         (None, None) => reqwest::Body::from(Vec::new()),
     };
-    state
+    let resp = state
         .gateway
         .passthrough(
             &provider,
@@ -856,7 +886,9 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
             session.as_ref(),
             capture.as_ref(),
         )
-        .await
+        .await;
+    passthrough_served(conversation.as_ref(), &rest, label.as_deref(), resp.status().is_success()).await;
+    resp
 }
 
 /// `/opencode-go/<rest>`: raw OpenCode Go API through the account pool
@@ -868,7 +900,8 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
         Err(r) => return r,
     };
     let provider = SubProvider::OpencodeGo.as_str();
-    let (bytes, model, stream) = match passthrough_body(&state, &principal, provider, &rest, true, &parts.headers, body).await {
+    let (bytes, model, stream, conversation) = match passthrough_body(&state, &principal, provider, &rest, true, &parts.headers, body).await
+    {
         Ok(x) => x,
         Err(r) => return r,
     };
@@ -894,7 +927,7 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
     let mut charge = Charge::new(&meters);
     let session = passthrough_session(&state, &principal, &rest, &parts.headers, Some(&bytes), label.as_deref(), true).await;
     let capture = capture_for(&state, &principal, &format!("/{rest}"), Some(&bytes));
-    state
+    let resp = state
         .subs
         .execute(
             SubProvider::OpencodeGo,
@@ -908,7 +941,9 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
             session.as_ref(),
             capture.as_ref(),
         )
-        .await
+        .await;
+    passthrough_served(conversation.as_ref(), &rest, label.as_deref(), resp.status().is_success()).await;
+    resp
 }
 
 #[cfg(test)]
