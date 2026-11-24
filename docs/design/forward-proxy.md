@@ -1,14 +1,14 @@
 # Forward proxy
 
-Xolotl runs an HTTPS forward proxy on a listener of its own, for clients that xolotl holds no account for, such as the Antigravity CLI (`agy`). A client opts in on two counts: it sets `HTTPS_PROXY` to the listener, with an egress-only client key in the URL, and it trusts the CA that issues xolotl's certificates. For each host on the capture list, xolotl terminates TLS with a certificate signed through the OpenBao PKI. It forwards each request to the real host unchanged and exports each model request as one exchange ([Exchange export](export.md)). Every other destination passes through as an encrypted tunnel that xolotl does not read. The client keeps its own sign-in, and its upstream credentials reach the upstream untouched.
+Xolotl runs an HTTPS forward proxy on a listener of its own, for clients that xolotl holds no account for, such as the Antigravity CLI (`agy`). A client opts in on two counts: it sets `HTTPS_PROXY` to the listener, with a client key whose policy lists the `egress` scope in the URL, and it trusts the CA that issues xolotl's certificates. For each host on the capture list, xolotl terminates TLS with a certificate signed through the OpenBao PKI. It forwards each request to the real host unchanged and exports each model request as one exchange ([Exchange export](export.md)). Every other destination passes through as an encrypted tunnel that xolotl does not read. The client keeps its own sign-in, and its upstream credentials reach the upstream untouched.
 
 `src/forward_proxy/` holds the listener, the tunnels, the interception, the capture and the certificates. `src/vault.rs` signs the certificates, and `src/export/` turns captured requests into rows. User documentation: [Forward proxy](../user/forward-proxy.md).
 
 ```text
-client (agy)  HTTPS_PROXY=http://agy:<egress key>@xolotl:8318
+client (agy)  HTTPS_PROXY=https://agy:<client key>@xolotl:8318   (or http:// for a dedicated key)
    │  CONNECT host:443, Proxy-Authorization
    ▼
-forward-proxy listener ── egress-only client key? ── no ──▶ 407 / 403
+forward-proxy listener ── marked egress key, scoped for this transport? ── no ──▶ 407 / 403
    │                       rechecked every 15 s while the connection is open
    │
    ├── host on capture_hosts, certificate cached ──▶ TLS with a certificate for host ──▶ HTTP requests
@@ -33,6 +33,10 @@ capture_hosts = ["daily-cloudcode-pa.googleapis.com"]   # hosts to intercept (de
 [forward_proxy.pki]             # required when capture_hosts is not empty
 mount = "pki_xolotl_proxy"      # the OpenBao PKI mount
 role = "xolotl-forward-proxy"   # the role that signs for capture_hosts
+
+[forward_proxy.tls]             # optional: TLS on the listener, for an https:// proxy URL
+cert_file = "/etc/xolotl/forward-proxy.pem"      # the listener's certificate chain, PEM
+key_file = "/etc/xolotl/forward-proxy-key.pem"   # its private key, PEM
 ```
 
 Startup validation refuses a config that breaks one of these rules:
@@ -41,6 +45,7 @@ Startup validation refuses a config that breaks one of these rules:
 - `ports` is not empty, and holds no `0`.
 - Each `capture_hosts` entry is a lowercase ASCII DNS name of at least two labels, made of letters, digits, `-` and `.`. It has no wildcard, no port, no trailing dot and no empty label, and is not an IP address. An entry appears once.
 - A non-empty `capture_hosts` needs `[forward_proxy.pki]` and at least one export destination, `[export.clickhouse]` or `[export.nats]`.
+- `[forward_proxy.tls]`, when present, names a certificate chain and a matching private key that xolotl can read and parse, with the certificate valid now.
 
 The capture list changes with the config file and a restart. Exact names keep the list, the certificates and the OpenBao role in step: each entry is one name in each.
 
@@ -50,25 +55,37 @@ Every host name is compared in one form: ASCII, lowercased, with one trailing do
 
 ## Proxy authentication
 
-Every CONNECT carries a client key in `Proxy-Authorization: Basic`, as the password. Clients take it from the proxy URL, `http://<any user>:<client key>@host:port`, and send it on each CONNECT, as `agy` does. The user name is not read. `KeyManager::authenticate` resolves the key as on the main listener ([Client keys](client-keys.md#authentication)), including expiry, rotation grace, disabling and revocation.
+Every CONNECT carries a client key in `Proxy-Authorization: Basic`, as the password. Clients take it from the proxy URL, `https://<any user>:<client key>@host:port` or `http://...`, and send it on each CONNECT, as `agy` does with either scheme. The user name is not read. `KeyManager::authenticate` resolves the key as on the main listener ([Client keys](client-keys.md#authentication)), including expiry, rotation grace, disabling and revocation.
 
-The forward proxy takes only an **egress-only client key**:
+The operator decided that a key of its own for the forward proxy is optional ([#140](https://github.com/wyrd-company/xolotl/issues/140#issuecomment-7127901981)). A client can use either kind of key:
+
+- **A dedicated key,** whose policy lists `egress` alone. It reaches the forward proxy and nothing else in xolotl.
+- **A shared key,** whose policy lists `egress` beside `proxy`, `mcp` or both. The client that already calls xolotl's LLM endpoints or `/mcp` uses the same key for the forward proxy.
+
+Both kinds hold to the same limits:
 
 - **A client key.** The principal has a client id, which names the client in the log and in every row it produces. The bootstrap admin token authenticates without a client id, so it is refused with `403`, as it is left out of the export elsewhere ([Capture](export.md#capture)).
-- **An egress-only policy.** The key's policy lists the `egress` scope, and policy validation refuses `egress` together with any other scope. `egress` is the one scope that `admin` does not imply. So a key that works on this listener can do nothing else in xolotl: no account, no MCP server, no administration. One client that also calls xolotl's LLM endpoints holds two keys.
-- **Egress-only for good.** A key resolves its policy by name at every use, so editing a policy changes what its existing keys can do. A policy's egress status is therefore fixed when the policy is first saved. Saving it again with a scope set on the other side of that line is refused with the policy's existing validation error: an egress-only policy can't gain or switch to another scope, and a policy with other scopes can't gain `egress`. A key that has crossed the cleartext listener so keeps no more than the proxy's authority, however its policy is edited. To give a client other authority, the operator issues a key under another policy and revokes the egress key. Deleting a policy while keys reference it is already refused ([Policies](client-keys.md#policies)), so a deleted egress policy's name can't be reused for keys that still exist.
+- **Client use only.** `egress` combines only with `proxy` and `mcp`, the scopes of client use. Policy validation refuses `egress` beside `admin`, `management` or `keys`. `egress` is the one scope that `admin` does not imply. So a key that works on this listener never carries administration, management of accounts or management of keys.
+- **The transport fits the key** ([Transport](#transport)). A shared key's authority reaches beyond the proxy, so it is accepted only over TLS to the listener.
 
-Egress-only keys are pending the operator's confirmation of that two-key workflow. xolotl's own description promises one client key for subscriptions, gateways and MCP servers; the forward proxy's key is a second one, for a different listener.
-
-A policy's providers, models, accounts and limits do not apply to forward-proxy traffic, because that traffic reaches no account of xolotl's. An egress-only policy needs no provider or MCP server. `egress` counts as client use for keys that manage keys ([Keys that manage keys](client-keys.md#keys-that-manage-keys)), next to `proxy` and `mcp`.
+A policy's providers, models, accounts and limits do not apply to forward-proxy traffic, because that traffic reaches no account of xolotl's. A dedicated key's policy needs no provider or MCP server. `egress` counts as client use for keys that manage keys ([Keys that manage keys](client-keys.md#keys-that-manage-keys)), next to `proxy` and `mcp`.
 
 The client id of the key is the `client_id` of the exchanges it produces, so its rows go to `xolotl.exchanges.<client_id>` on NATS.
+
+### Bound to the key
+
+A key resolves its policy by name at every use. So the limits above must hold whatever later happens to that name: an edit, or a deletion and a recreation under the same name. They must also hold when the change is made by an instance with stale or partial state, which can delete a policy while another instance's key still references it. Validation at save can't see those cases, so the limit is bound to the key itself:
+
+- **The mark.** A key record carries `egress: true` when the key is issued or rotated under a policy that lists `egress`. Once set, the mark is never cleared: rotation keeps it, and only revocation ends the key. It is stored in OpenBao with the record, so every instance that loads the key loads its mark.
+- **On every route, on every instance.** `KeyManager` refuses a marked key whose policy, as loaded now, grants anything beyond `proxy`, `mcp` and `egress`. It refuses it as it refuses an unknown key, with `401`, and logs the client and the policy at warn level. This check is in the key lookup itself, so it holds on the main listener and on the forward proxy, after an edit, after a deletion and a recreation of the name, and on an instance whose state was stale when the change was made. A marked key never gains administration, account management or key management, however its policy name comes to be defined.
+- **Only marked keys on the forward proxy.** The forward proxy takes a key only when its record is marked and its policy, as loaded now, lists `egress`. A key issued before its policy gained `egress` has no mark, and is refused with `403` until it is rotated. So the listener never accepts a key that the mark doesn't bind.
+- **Older writers.** An instance that doesn't know the mark would drop it when it rewrites a record. So every instance runs a version that knows `egress` and the mark before an egress policy is saved ([Compatibility](#compatibility)).
 
 ### Connections outlive no key
 
 A connection's authority lasts only as long as its key authenticates. Each open connection keeps the SHA-256 hash of the key it was opened with, never the key. The checks run against the keys and policies xolotl has loaded, its key state, without a reload:
 
-- **A sweep** looks up each distinct hash once. Every connection whose key no longer authenticates is closed: revoked, disabled, expired, or past its rotation grace. So is every connection whose policy no longer lists `egress` alone. A sweep runs each time `KeyManager` publishes a new key state, and every 15 s, for expiry and rotation grace, which end without a new state. `KeyManager` publishes whenever its loaded keys or policies change, whatever the cause:
+- **A sweep** looks up each distinct hash once. Every connection whose key no longer authenticates is closed: revoked, disabled, expired, or past its rotation grace. So is every connection whose policy no longer lists `egress`, or grants more than client use. On a plaintext listener, so is every connection whose policy has come to grant more than `egress`. A sweep runs each time `KeyManager` publishes a new key state, and every 15 s, for expiry and rotation grace, which end without a new state. `KeyManager` publishes whenever its loaded keys or policies change, whatever the cause:
   - after a write on this instance;
   - after a change to its cache without a write: an issue that finds the key already there and caches it, a revoke that finds a revocation marker and caches it, or a revoke that finds the key absent and forgets it;
   - after each periodic reload;
@@ -91,13 +108,21 @@ So a change reaches an instance's open connections when that instance publishes 
 
 ### Transport
 
-The CONNECT head, and with it the key, crosses the network in the clear: the listener speaks plain HTTP. Binding `listen` to a private address limits who can connect, but it does not hide the key. The path between a client and the listener is one the operator trusts with that key: the same host, a container network private to the clients, or an encrypted overlay such as WireGuard.
+The CONNECT head carries the key. How it crosses the network depends on the listener:
 
-The key's authority bounds what an observer of that path gains: tunnels to public addresses, and rows under the key's client id, until the key is revoked. It gives no account, no MCP server and no administration.
+- **With `[forward_proxy.tls]`,** the listener speaks TLS, and clients use an `https://` proxy URL. The CONNECT head, the key with it, and the tunnels inside, travel inside that TLS connection. The handshake completes within 10 s, and ALPN offers `http/1.1`, which carries CONNECT. Clients trust the listener's certificate as they trust any server's: it is issued for the name they connect to, by a CA they trust, for example the Homelab CA. Measured: `agy` 1.5.14, given `HTTPS_PROXY=https://...`, sent every CONNECT over TLS to the proxy, with `Proxy-Authorization: Basic`.
+- **Without it,** the listener speaks plain HTTP, and the key crosses the network in the clear. Binding `listen` to a private address limits who can connect, but it does not hide the key. Such a listener takes only dedicated keys, whose authority is the proxy alone. The path between a client and the listener is one the operator trusts with that key: the same host, a container network private to the clients, or an encrypted overlay such as WireGuard.
+
+A shared key that arrives on a plaintext listener is refused with `403`, before anything about the destination touches the network. That refusal can't take the key back. It has already crossed the network, so xolotl logs it at warn level with the client id, as a key to rotate, and counts it in `xolotl.forward_proxy.connections` with `reason=cleartext_shared_key`. A setup that works never sends a shared key in the clear, because the only listener that accepts one is a TLS listener.
+
+The key's authority bounds what an observer of its path gains, until the key is revoked:
+
+- **A dedicated key** gives tunnels to public addresses, and rows under its client id. It gives no account, no MCP server and no administration.
+- **A shared key** adds its `proxy` and `mcp` authority. It only ever travels inside TLS.
 
 ### Compatibility
 
-`egress` is a value that older versions of xolotl do not know. An older instance that shares the OpenBao prefix fails to load a policy that lists it. It lists that policy in `unloaded_policies`, and refuses the policy's keys with `401`, failing closed ([Policies](client-keys.md#policies)). Every instance runs a version that knows `egress` before an egress policy is saved. Rolling an instance back to such a version either deletes the egress policies first, or leaves their keys refused on that instance.
+`egress` is a value that older versions of xolotl do not know, and so is the key record's `egress` mark. An older instance that shares the OpenBao prefix fails to load a policy that lists `egress`. It lists that policy in `unloaded_policies`, and refuses the policy's keys with `401`, failing closed ([Policies](client-keys.md#policies)). It would also drop the mark from any record it rewrites, such as on a rotation. Every instance runs a version that knows `egress` and the mark before an egress policy is saved. Rolling an instance back to such a version either deletes the egress policies first, or leaves their keys refused on that instance.
 
 ## The listener
 
@@ -108,7 +133,9 @@ The listener speaks HTTP/1.1 and serves one request per connection: a CONNECT. I
 | The method is CONNECT | `405 Method Not Allowed` |
 | The authority is `host:port`, with a [host name](#host-names) or an IP literal | `400 Bad Request` |
 | `Proxy-Authorization` holds a key that authenticates | `407 Proxy Authentication Required`, with `Proxy-Authenticate: Basic realm="xolotl"` |
-| The principal is a client key, and its policy is egress-only | `403 Forbidden` |
+| The principal is a client key, and its record carries the `egress` mark | `403 Forbidden` |
+| Its policy lists `egress` and grants nothing beyond `proxy`, `mcp` and `egress` | `403 Forbidden` (a marked key under a wider policy fails earlier, at authentication) |
+| On a plaintext listener: its policy grants `egress` alone | `403 Forbidden`, logged as a shared key sent in the clear |
 | The port is in `ports` | `403 Forbidden` |
 | The host resolves | `502 Bad Gateway` |
 | Every address it resolves to passes the address check | `403 Forbidden` |
@@ -171,6 +198,7 @@ Each request on the connection is forwarded on its own:
 |---|---|---|
 | Xolotl can't reach the upstream, or the upstream's certificate fails validation | `502 Bad Gateway`, with a Google API error body, `{"error": {"code": 502, "message": "...", "status": "UNAVAILABLE"}}`. Nothing of the request is sent upstream on a connection that failed validation. | `status` 502, `error` the reason |
 | The key stops authenticating before the request is forwarded | `403`, with a Google API error body, then the connection closes | `status` 403, `error` the reason |
+| The upstream closes or resets its connection after taking the request, before any response headers | `502 Bad Gateway` at once, with a Google API error body, `{"error": {"code": 502, "message": "...", "status": "UNAVAILABLE"}}` | `status` 502, `error` `proxy_error: upstream closed before response headers`, and the request copy |
 | The upstream accepts the request but sends no response headers within `server.upstream_timeout_secs` | `504 Gateway Timeout`, with a Google API error body, `{"error": {"code": 504, "message": "...", "status": "DEADLINE_EXCEEDED"}}` | `status` 504, `error` `proxy_error: no response headers within <n> s`, and the request copy |
 | The upstream read fails, or no frame arrives for `server.upstream_timeout_secs`, after the status reached the client, with or without part of the body | A response that does not end cleanly. HTTP/2 resets the stream with `INTERNAL_ERROR`. HTTP/1.1 closes the connection before the last chunk or the declared length, so the client sees a cut body, never a complete one. | `status` the upstream's, `request` and `response` what was copied, `error` the reason and the bytes relayed |
 | The client goes away, or xolotl closes the connection for the key or for shutdown | Nothing more | `status` the upstream's when it had answered; otherwise `499`, with `error` the cause |
@@ -253,7 +281,7 @@ The capture task works on each body in three steps:
 1. **Decode.** It reads the body's `Content-Encoding` and decodes `gzip`, `x-gzip`, `deflate`, `br` and `zstd`, alone or stacked, undoing the codings in reverse of the order the header lists them. It stops after `server.max_body_bytes` of decoded output (64 MiB), which bounds what a compressed body can expand to. A body with any other coding is not decoded: nothing of it is copied or read. The client always gets the bytes the upstream sent; the capture's decoding is its own.
 2. **Copy.** When a destination takes bodies, it keeps the decoded body up to the capture's `max_body_bytes`, the largest any destination wants ([Destinations](export.md#destinations)). A body is copied when its `Content-Type` is text, JSON or XML, or absent or empty, the rule `proxy::is_text` applies to the gateway's bodies ([Capture](export.md#capture)). Otherwise the copy is empty and marked truncated, for the destinations that take bodies ([Each destination's row](#each-destinations-row)).
 3. **Read metadata.** It reads the decoded bytes into `Observed`, whatever the copy keeps and whether or not any destination takes bodies:
-   - **From the request:** a streaming JSON scanner that keeps only the key path and two values, the top-level `model` and `request.session_id`. Memory is the same whatever the size of the body. `request.session_id` becomes the session key at once: the truncated SHA-256 of source `cloud-code` and the value ([Session identity](sessions.md#session-identity)). In the metadata, and so in the `session_key` column, only the digest exists. The raw value stays inside the request body: a destination that takes bodies has it wherever it falls within its request copy, as for any body field, and a destination that doesn't take bodies has neither.
+   - **From the request:** a streaming JSON scanner that keeps only the key path and two values, the top-level `model` and `request.session_id`. Memory is the same whatever the size of the body. `request.session_id` becomes the session key at once: the truncated SHA-256 of source `cloud-code` and the value ([Session identity](sessions.md#session-identity)). In the metadata, and so in the `session_key` column, only the digest exists. The raw value stays inside the request body. A destination that takes bodies has it wherever it falls within its request copy, as for any body field. A destination that doesn't take bodies keeps the digest, in `session_key`, and has neither the raw value nor the body.
    - **From the response:** each SSE `data:` event, or the JSON body, as the gateway's tap reads them ([Request path](architecture.md#request-path)). It takes the last `usageMetadata`, and one tool call entry for each `functionCall` part, in order, repeats included, as the gateway counts calls (`context::tools::ToolCalls`). Each entry is the call's name, cut at 128 characters as there.
 
 ### Capture limits
@@ -478,10 +506,12 @@ bao write pki_xolotl_proxy/config/issuers default=<id of the new issuer, from se
 
 `intermediate/set-signed` imports the new issuer but leaves the old one as the default, so without this step the role keeps signing with the old one. Xolotl's next issuance or renewal, within 16 h, takes the new chain from the sign response's `ca_chain`.
 
-**The previous issuer** stays on the mount, with its key, after the switch. It signs nothing more, because the role signs with the default issuer. The leaves it signed before the switch still chain through it, and xolotl serves them until it renews them, at most 24 h later, the role's `max_ttl`. Once 24 h have passed since the switch, no valid leaf chains through it, and the operator deletes it:
+**The previous issuer** stays on the mount, with its key, after the switch. It signs nothing more, because the role signs with the default issuer. The leaves it signed before the switch still chain through it, and xolotl serves them until it renews them, at most 24 h later, the role's `max_ttl`. Once 24 h have passed since the switch, no valid leaf chains through it. The operator then deletes it, and its key, which OpenBao keeps as a separate object. Each intermediate made with `intermediate/generate/internal` has a key of its own, shared with no other issuer:
 
 ```text
+bao read -field=key_id pki_xolotl_proxy/issuer/<id of the previous issuer>   # note it first
 bao delete pki_xolotl_proxy/issuer/<id of the previous issuer>
+bao delete pki_xolotl_proxy/key/<that key_id>
 ```
 
 The AppRole gets one more path, in the `xolotl` policy or in a second policy on the role. It accepts the two parameters xolotl sends, and no other:
@@ -517,8 +547,9 @@ OpenBao takes the CSR's common name and SANs, because `use_csr_common_name` and 
 
 | Threat | How it is met |
 |---|---|
-| An open relay: anyone sends traffic through xolotl | Every CONNECT needs an egress-only client key. Other methods get `405`. Destination ports are limited to `ports`. |
-| A credential with more authority than the proxy, exposed in the cleartext CONNECT head | The listener takes no key whose policy lists anything beside `egress`, and no bootstrap admin token ([Proxy authentication](#proxy-authentication)). The path to the listener is one the operator trusts with the key ([Transport](#transport)). |
+| An open relay: anyone sends traffic through xolotl | Every CONNECT needs a marked client key whose policy lists `egress`. Other methods get `405`. Destination ports are limited to `ports`. |
+| A credential with more authority than the proxy, exposed in a cleartext CONNECT head | A plaintext listener takes only dedicated keys. Shared keys work only over TLS to the listener. No key usable here carries `admin`, `management` or `keys`, and the bootstrap token is refused ([Proxy authentication](#proxy-authentication), [Transport](#transport)). |
+| A key's authority widened by a later change to its policy name: an edit, a deletion and a recreation, or a change made from stale state | The `egress` mark on the key record makes every instance refuse the key on every route once its policy grants beyond client use ([Bound to the key](#bound-to-the-key)). |
 | A revoked, disabled or expired key that keeps an open connection | Open connections are rechecked on every new key state, every 15 s and on each new intercepted request, and closed when the key fails. A change takes effect on an instance when that instance publishes the first key state that contains it. On the instance that made it, that is at once. On another, it is at the end of the first successful reload that reads it after it was written, which has no fixed bound. `xolotl.forward_proxy.key_state_age` shows how old each instance's state is ([Connections outlive no key](#connections-outlive-no-key)). |
 | Reaching internal services through the proxy: OpenBao, NATS, ClickHouse, a metadata service, xolotl's own listeners | Every resolved address must pass the [address check](#the-address-check), IPv4-carrying IPv6 forms included, and xolotl connects only to an address it checked. |
 | A certificate for a name off the capture list | Xolotl requests only `capture_hosts` names, and SNI must equal the CONNECT host. The role allows exactly those names. The policy grants only `sign` on that role: not `sign-verbatim`, `issue`, the `issuer/` paths or role writes. The intermediate's constraint holds every DNS name in a certificate it signs to the capture hosts' subtrees; it does not constrain IP or URI identities, which the role refuses ([What keeps certificates to the configured names](#what-keeps-certificates-to-the-configured-names)). |
@@ -534,7 +565,7 @@ OpenBao takes the CSR's common name and SANs, because `use_csr_common_name` and 
 | Shutdown that waits on a busy connection | Tunnels close at once, and requests in flight get 5 s ([Shutdown](#shutdown)). |
 | Google refusing the account's requests for where they come from | Google refuses requests from datacenter addresses with `UNSUPPORTED_LOCATION`. Every connection through the proxy, tunneled or intercepted, leaves from xolotl's address instead of the client's. Xolotl runs where its outgoing address is one Google accepts for the account, such as the clients' own network. |
 | Google seeing a different client on capture hosts | An intercepted connection reaches Google with xolotl's TLS and HTTP/2 fingerprint, rustls and hyper, not the client's. Interception itself carries this. It is limited to capture hosts: sign-in, OAuth and every other host keep the client's own TLS, through tunnels. |
-| A leaked egress key | It relays traffic to public addresses and produces rows under its client id. It reaches no account, MCP server or administration. Rotation, disabling and revocation stop it, including on open connections. |
+| A leaked key that works on the forward proxy | A dedicated key relays traffic to public addresses and produces rows under its client id. A shared key also has its `proxy` and `mcp` authority. Neither reaches administration or management. Rotation, disabling and revocation stop it, including on open connections. |
 
 ## Telemetry
 
@@ -552,14 +583,20 @@ OpenBao takes the CSR's common name and SANs, because `use_csr_common_name` and 
 
 ### The egress scope
 
-- **The CLI:** policy files that `xolotl policies put` reads take `egress` in `scopes`, and `xolotl policies list` and `xolotl policies get` print it, as they print every scope. A file that lists `egress` beside another scope is refused, with the validation error both clients already show. No command or option is added or changed, so the command tree that `tests/cli_parity.rs` checks stays the same.
-- **The Policies editor:** it lists `egress (forward proxy)` with the other scopes. Checking it unchecks the others, and checking another unchecks it. It saves an egress-only policy with no provider or MCP server, and its key-policies hint names `proxy`, `mcp` and `egress` as the scopes a listed policy may have.
-- **Keys:** a key under an egress-only policy is issued, rotated, disabled and revoked like any key, from the CLI or the Client keys screen. Revoking or disabling it also closes its open connections ([Connections outlive no key](#connections-outlive-no-key)).
-- **The inventory:** the `policies get` and `policies put` rows of the [CLI parity](web-ui.md#cli-parity) inventory keep their assessments.
+- **The CLI:** policy files that `xolotl policies put` reads take `egress` in `scopes`, and `xolotl policies list` and `xolotl policies get` print it, as they print every scope. A file that lists `egress` beside `admin`, `management` or `keys` is refused, with the validation error both clients already show. No command or option is added or changed, so the command tree that `tests/cli_parity.rs` checks stays the same.
+- **The Policies editor:** it lists `egress (forward proxy)` with the other scopes.
+  - **Exclusive scopes:** while `egress` is checked, `admin`, `management` and `keys` are disabled, with a hint that the forward proxy's keys are for client use. While one of those is checked, `egress` is disabled with the same hint. The editor offers no combination that the server refuses, for a new policy or a saved one.
+  - **Without providers:** it saves a dedicated policy, `egress` alone, with no provider or MCP server.
+  - **The key-policies hint** names `proxy`, `mcp` and `egress` as the scopes a listed policy may have.
+- **Keys:**
+  - **Marking:** a key under an egress policy is issued, rotated, disabled and revoked like any key, from the CLI or the Client keys screen. Issuing it, or rotating it, marks it.
+  - **Showing the mark:** `xolotl keys list` and the Client keys table show the mark, as `egress`, beside the key's other states. The `keys list` row of the inventory keeps its assessment only with both.
+  - **Closing connections:** revoking or disabling a key also closes its open connections ([Connections outlive no key](#connections-outlive-no-key)).
+- **The inventory:** the `policies get`, `policies put` and `keys list` rows of the [CLI parity](web-ui.md#cli-parity) inventory keep their assessments.
 
 ### Interception readiness
 
-`GET /admin/status` has `forward_proxy`. It is `null` without the `[forward_proxy]` section. Otherwise it holds `listen` and, for each capture host, three fields:
+`GET /admin/status` has `forward_proxy`. It is `null` without the `[forward_proxy]` section. Otherwise it holds `listen`, `tls_not_after` (when the listener's certificate expires, or `null` for a plaintext listener), and, for each capture host, three fields:
 
 - `host`;
 - `not_after`: the earliest `notAfter` in its served chain, or `null`;
@@ -588,9 +625,16 @@ The tests need neither the Homelab OpenBao nor Google:
 - **The address check on its own:** a test for each registry block and each IPv4-carrying form, and integration tests through the production dialer. CONNECTs to loopback, private and link-local literals and names, and to `64:ff9b::a00:1`, are refused with `403`.
 - **A local TLS upstream:** its certificate comes from a second test CA. The interception's upstream verifier takes its roots from its constructor, so a test passes the second CA, and an upstream signed by a third CA fails validation. The config has no setting for upstream roots.
 - **A test client:** reqwest, with its proxy URL holding a test key, against the listener on an ephemeral port.
-- **Authority across edits:**
-  - Saving an egress-only policy with `proxy` added, or with `proxy` in place of `egress`, is refused. So is saving a `proxy` policy with `egress` added. The existing keys keep their authority unchanged.
-  - Issuing a key under another policy and revoking the egress key gives the client the new authority, and closes the egress key's open connections.
+- **Kinds of key and transport:**
+  - A dedicated key works on a plaintext and on a TLS listener. A shared key, `proxy` and `egress`, works on a TLS listener, and on the same key the LLM endpoints keep working.
+  - A shared key on a plaintext listener is refused with `403`, logged as a key to rotate, and counted with `reason=cleartext_shared_key`. No DNS lookup or upstream connection follows.
+  - A key whose policy gained `egress` after the key was issued is refused until it is rotated, and works after.
+  - Saving `egress` beside `admin`, `management` or `keys` is refused.
+- **Authority bound to the key:** each case uses two instances on one store, the one-instance case too, and covers a dedicated and a shared key.
+  - **A stale deletion and recreation:** instance A issues a marked key under policy `p`. Instance B, whose state lacks the key, deletes `p` and recreates it with `admin`. After both reload, the key is refused with `401` on the main listener and on the forward proxy, on both instances.
+  - **A direct store write:** a record for `p` with `admin` added, written straight to OpenBao as an operator's `bao kv put` would, refuses the key in the same way after the reload.
+  - **A skipped record:** a reload that skips the key's record leaves the key refused on that instance.
+  - **Rotation:** rotating a marked key keeps the mark.
 - **Lifecycle:**
   - A tunnel that keeps sending bytes, and an HTTP/2 intercepted connection that keeps sending requests, are closed within the sweep interval after their key is revoked, disabled, expires, or ends its rotation grace. The interval is shortened in the test.
   - **A reload outage:** while the key store fails every reload, a revocation written elsewhere leaves an open connection running, and `xolotl.forward_proxy.key_state_age` grows. The connection closes when the first successful reload publishes its state.
@@ -605,6 +649,7 @@ The tests need neither the Homelab OpenBao nor Google:
 - **One metadata-only and one body destination:** with ClickHouse at `bodies = false` and NATS at `bodies = true`, an exchange whose response was cut gives two rows with one `id`. The NATS row has the bodies, `response_truncated` true, the assembled output and any error derived from the body. The ClickHouse row has empty bodies, both truncation flags false, empty output, and the same metadata. A request that ended `incomplete` carries that error in both rows.
 - **Method:** an `OPTIONS` request to `/v1internal:streamGenerateContent` is forwarded and gives no row. A `POST` to the same path gives one.
 - **Timeouts at the upstream:** an upstream that accepts the request and sends no headers gives the client `504` and a row with `504`. One that sends headers and then no body frame gives an unclean end at the client and a row with the upstream's status and the timeout.
+- **A close before headers:** an upstream that takes a model `POST` and closes its connection, or resets it, before any headers gives the client `502` at once. One row per destination setting has `502` and the forwarding error, with and without bodies.
 - **Metadata limits:**
   - A stream whose final `usageMetadata` event exceeds 4 MiB, after an earlier usage event that fits, gives a row with empty token columns and `capture=cut`, not the earlier count.
   - A body in a coding xolotl doesn't decode gives `capture=skipped`.
@@ -637,6 +682,15 @@ The tests need neither the Homelab OpenBao nor Google:
   - A client that leaves before the upstream answers gives one row with `499`.
 - **Shutdown:** a busy tunnel and a request in flight do not hold shutdown past its deadline. The request's capture task holds the exporter until it has submitted the row, so the row reaches the destinations before they stop.
 
+The live check runs a signed-in `agy` through the proxy and sends `PING!`. That is where the assumption about the Code Assist envelope is proved or disproved. The exchange rows in ClickHouse, one or more for the turn, must show what the capture detects:
+
+- `provider` is `daily-cloudcode-pa.googleapis.com`, and `account_kind` is `forward-proxy`;
+- `model` and `upstream_model` are the model `agy` asked for, not empty;
+- `input_tokens` and `output_tokens` are filled, with `cached_tokens` when the response reports it;
+- `output_text` holds the reply, `request` holds `PING!`, and `endpoint` is `/v1internal:streamGenerateContent`.
+
+An empty model or empty token columns on a row whose response is not truncated means the envelope differs from the one assumed here.
+
 The setup commands in [OpenBao setup](#openbao-setup) run against an OpenBao dev server (`bao server -dev`). With them in place:
 
 - **Refused:** a sign request for a name off the list, a name below a capture host, a wildcard, `localhost`, an IP SAN or a URI SAN.
@@ -645,13 +699,16 @@ The setup commands in [OpenBao setup](#openbao-setup) run against an OpenBao dev
 - **Inside the subtree:** one it signs for a name below a capture host passes. This shows the bound is the subtree, not the exact name.
 - **DNS names only:** one it signs with an IP SAN passes for that address. This shows the intermediate constrains DNS names, not addresses.
 - **Adding a host without a new intermediate:** after the role alone gains a second host, the role signs for it, and a client refuses the chain with `permitted subtree violation`. That is the certificate xolotl's chain check refuses. After a replacement intermediate that names both hosts becomes the default, a leaf for the new host verifies.
-- **Retiring the previous issuer:** after the switch, the previous issuer can be deleted, and signing goes on through the new default.
+- **Retiring the previous issuer:** after the switch, the previous issuer and then its key can be deleted, and signing goes on through the new default.
 
 ## Options not chosen
 
 - **CONNECT on the main listener.** One address would serve both the admin API and an internet relay, and it could not be bound to a different network. A listener of its own is absent when the section is.
 - **Clients identified by source address.** Clients in containers share NAT addresses, and an address can't be rotated or revoked. A key names the client in every row.
-- **The `proxy` scope for the forward proxy, or `egress` beside other scopes.** The key crosses the network in the clear, so it would carry account or administrative authority with it. An egress-only key carries the proxy alone.
+- **The `proxy` scope for the forward proxy.** Every LLM key would also be a relay, without the operator choosing it per policy.
+- **`egress` beside `admin`, `management` or `keys`.** Such a key would carry administration through every client's proxy settings.
+- **Fixing a policy's egress status at save.** A save check can't see keys that another instance issued, or a policy deleted and recreated from stale state. The mark on each key holds whatever the policy name later means.
+- **Shared keys on a plaintext listener.** The key would cross the network in the clear, with LLM and MCP authority.
 - **Checking the key only at CONNECT.** A busy tunnel or an HTTP/2 connection would outlive its key's revocation without limit.
 - **`pki/issue`, which returns a key that OpenBao generated.** The private key would cross the network in OpenBao's answer. With `sign`, it never leaves xolotl.
 - **Certificates in OpenBao KV, shared by instances.** Private keys would be at rest. Issuance takes one call per host per 16 h.
@@ -670,4 +727,4 @@ The setup commands in [OpenBao setup](#openbao-setup) run against an OpenBao dev
 - **Accounting for forwarded requests like gateway requests.** The request log feeds rate limits, sessions and the Usage screen, all of which describe xolotl's own accounts.
 - **Exporting every request on a capture host.** Most of a Code Assist host's calls are onboarding, experiments and metrics, not exchanges.
 - **Transparent interception by redirecting packets.** It needs control of the client's network and takes traffic from clients that never chose it. `HTTPS_PROXY` is the client's own choice.
-- **TLS to the proxy itself, an `https://` proxy URL.** Not every client supports it. The key's authority is limited to the proxy instead, and the path to the listener is a trusted one.
+- **TLS required on every listener.** A dedicated key's authority is the proxy alone, and on a path the operator trusts, TLS adds a certificate to manage for no reach it protects. The operator chooses TLS for a listener, and it is required for shared keys.
