@@ -155,6 +155,13 @@ The **Policies** screen shows the models of a policy in two modes.
 - **Precedence:** set the order of the providers for shared names. See
 [Policies and client keys](policies-and-keys.md).
 
+The **Resolved routes** section lists every exposed model name, ordered targets,
+and native and translated endpoints. Below it, **Subscription accounts** shows
+allowed account IDs or an explicit empty pool. Failed account reads have a retry.
+Save warnings remain visible above the editor. Stored policies that did not load
+can be deleted beside their error after confirmation, once they have no keys.
+Status and key-list failures show their cause with **Retry**.
+
 ### Usage
 
 ![Apply a 36-hour window and client filter, then see validation preserve an invalid duration and the active query](assets/usage-queries.gif)

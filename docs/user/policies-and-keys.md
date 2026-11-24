@@ -141,7 +141,8 @@ claude = ["*"]                                    # every account, also new ones
   with the accounts it has now.
 - Saving a policy still succeeds in that case, but tells you. `xolotl policies put`
   prints a warning to stderr, `PUT /admin/policies/{name}` adds a `warnings` list
-  to its answer, and the web UI's policy editor shows the warning under the
+  to its answer. The web UI keeps every server warning under **Policy saved
+  with warnings**, and also shows the empty-pool warning under the
   provider. `PUT` ignores `warnings` in its input, so a saved answer can be sent
   back. Each warning names one subscription provider. `providers = ["*"]`
   allows them all, so it warns for each one with no entry. A policy whose scopes
@@ -197,7 +198,11 @@ for each refused request. The policy shows up:
 - in `unloaded_policies` of `GET /admin/status`
 - under **Needs action** on the web UI's Overview page, and on its Policies page
 
-To repair it, save a valid policy with the same name.
+To repair it, save a valid policy with the same name. To remove it instead, select
+**Delete policy…** beside its error on **Policies** and confirm. A policy with
+keys cannot be deleted; revoke those keys first. Deletion waits until the key
+list loads. If the stored-policy status or key list cannot load, its error and
+**Retry** appear above the editor.
 
 ## Model names
 
@@ -234,6 +239,17 @@ is still `opencode-go/claude-haiku-5-5`, or `haiku-go` with the rename above.
 429 or 5xx.
 
 ### See what a key sees
+
+Select a policy in **Policies** and open **Resolved routes**. Each row shows the
+model name, whether it is an alias, its targets in fallback order, and native
+and translated endpoints for the first target. **Subscription accounts** lists
+the allowed accounts of each pool, or **No accounts** for an empty pool. A failed
+account read is shown separately with **Retry accounts**; routes remain visible.
+The preview includes unsaved changes.
+
+![Resolved policy routes show an alias with ordered fallback targets, native and translated endpoints, and empty subscription pools](assets/policy-routes.png)
+
+With the CLI:
 
 ```sh
 xolotl policies view devcontainer

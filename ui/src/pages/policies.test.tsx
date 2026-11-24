@@ -15,7 +15,7 @@ const policy: Policy = {
   scopes: ["proxy"],
 };
 
-function render(path: string, withKeys = false, unloaded: UnloadedPolicy[] = [], stored: Policy = policy) {
+function render(path: string, withKeys = false, unloaded: UnloadedPolicy[] = [], stored: Policy = policy, keysFailed = false) {
   vi.stubGlobal("localStorage", { getItem: () => null });
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
@@ -23,6 +23,7 @@ function render(path: string, withKeys = false, unloaded: UnloadedPolicy[] = [],
   client.setQueryData(["policies"], [stored]);
   client.setQueryData(["status"], { unloaded_policies: unloaded });
   client.setQueryData(["keys"], withKeys ? [{ policy: "sample" }] : []);
+  if (keysFailed) client.getQueryCache().find({ queryKey: ["keys"] })!.setState({ status: "error", error: new Error("keys unavailable") });
   client.setQueryData(["providers"], []);
   client.setQueryData(["accounts"], []);
   client.setQueryData(["mcp-servers"], []);
@@ -63,6 +64,14 @@ test("unloaded policy deletion retains the key-use restriction", () => {
   const html = render("/policies/sample", true, [{ name: "sample", error: "bad policy" }]);
   expect(html).toMatch(/<button[^>]*disabled=""[^>]*aria-label="Delete unloaded policy sample"/);
   expect(html).toContain("A policy with keys can&#x27;t be deleted.");
+});
+
+test("a failed key check disables loaded and unloaded policy deletion", () => {
+  const html = render("/policies/sample", false, [{ name: "other", error: "bad policy" }], policy, true);
+  expect(html).toMatch(/<button[^>]*disabled=""[^>]*aria-label="Delete unloaded policy other"/);
+  expect(actions(html)).toMatch(/<button[^>]*disabled=""[^>]*aria-haspopup="dialog"[^>]*>Delete/);
+  expect(html).toContain("Could not check which policies have keys");
+  expect(html).toContain("keys unavailable");
 });
 
 function actions(html: string) {
