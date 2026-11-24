@@ -365,7 +365,7 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
     };
     let model = if anthropic { model.strip_suffix("[1m]").unwrap_or(&model).to_string() } else { model };
     let known = state.catalog.known_providers();
-    let conversation = conversation_for(state, &principal, path, &headers, &json);
+    let mut conversation = conversation_for(state, &principal, path, &headers, &json);
     let kept = match &conversation {
         Some(c) => c.kept().await,
         None => Vec::new(),
@@ -513,10 +513,10 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             None => resp,
         };
         // Counting tokens is not a turn: it moves no conversation.
-        if let Some(c) = conversation.as_ref().filter(|_| resp.status().is_success() && path != "/v1/messages/count_tokens") {
-            c.served(Some(target).filter(|t| keepable(t))).await;
-        }
-        return resp;
+        return match conversation.take().filter(|_| path != "/v1/messages/count_tokens") {
+            Some(c) => c.moves_with(Some(target.clone()).filter(|t| keepable(t)), resp),
+            None => resp,
+        };
     }
     unreachable!("loop returns on the last target")
 }
@@ -822,15 +822,13 @@ async fn passthrough_body(
     Ok((Some(bytes), model, None, conversation))
 }
 
-/// Record the model a successful passthrough used for its conversation,
-/// before its response reaches the client. The policy or the conversation
+/// Move a passthrough's conversation to the model it used, once its answer
+/// completes ([`Conversation::moves_with`]). The policy or the session
 /// allowed the model before the request got here.
-async fn passthrough_served(conversation: Option<&Conversation>, rest: &str, label: Option<&str>, success: bool) {
-    if let Some((c, target)) = conversation.zip(label.and_then(Target::parse))
-        && success
-        && rest != "v1/messages/count_tokens"
-    {
-        c.served(Some(&target)).await;
+fn passthrough_moves(conversation: Option<Conversation>, rest: &str, label: Option<&str>, resp: Response) -> Response {
+    match conversation.zip(label.and_then(Target::parse)).filter(|_| rest != "v1/messages/count_tokens") {
+        Some((c, target)) => c.moves_with(Some(target), resp),
+        None => resp,
     }
 }
 
@@ -887,8 +885,7 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
             capture.as_ref(),
         )
         .await;
-    passthrough_served(conversation.as_ref(), &rest, label.as_deref(), resp.status().is_success()).await;
-    resp
+    passthrough_moves(conversation, &rest, label.as_deref(), resp)
 }
 
 /// `/opencode-go/<rest>`: raw OpenCode Go API through the account pool
@@ -942,8 +939,7 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
             capture.as_ref(),
         )
         .await;
-    passthrough_served(conversation.as_ref(), &rest, label.as_deref(), resp.status().is_success()).await;
-    resp
+    passthrough_moves(conversation, &rest, label.as_deref(), resp)
 }
 
 #[cfg(test)]

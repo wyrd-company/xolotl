@@ -68,8 +68,8 @@ impl Conversation {
     /// now. `None` for a target the conversation can't keep, one only an
     /// alias reaches. A request that started before the last recorded one
     /// changes nothing, so an older request finishing late can't move the
-    /// conversation back. Called before the response reaches the client, so
-    /// that the client's next request sees it.
+    /// conversation back. [`Conversation::moves_with`] calls it once the
+    /// answer has completed, before the client sees its end.
     pub async fn served(&self, target: Option<&Target>) {
         if let Err(e) = self.db.move_conversation(self, target).await {
             tracing::warn!(error = %e, "failed to record the model of a conversation");
@@ -150,5 +150,6 @@ impl Db {
     }
 }
 
+mod completion;
 #[cfg(test)]
 mod tests;

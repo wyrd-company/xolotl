@@ -161,6 +161,82 @@ async fn an_older_request_that_finishes_after_a_switch_does_not_undo_it() {
     assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404, "the switch stands");
 }
 
+fn streamed(chunks: &[&str]) -> ResponseTemplate {
+    let body: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
+    ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+}
+
+fn streamed_answer() -> ResponseTemplate {
+    streamed(&[
+        r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"busy","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}"#,
+        r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"busy","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "[DONE]",
+    ])
+}
+
+fn streamed_failure() -> ResponseTemplate {
+    streamed(&[r#"{"error":{"message":"boom","type":"server_error"}}"#, "[DONE]"])
+}
+
+fn streaming(body: Value) -> Value {
+    let mut body = body;
+    body["stream"] = json!(true);
+    body
+}
+
+#[tokio::test]
+async fn a_switch_whose_stream_fails_leaves_the_conversation_where_it_was() {
+    let h = harness().await;
+    let key = h.key(policy("p")).await;
+    chat_mock(&h, "qwen3", chat_answer(10)).await;
+    chat_mock(&h, "busy", streamed_failure()).await;
+    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
+    let auth = format!("Bearer {key}");
+    let claude = [("authorization", auth.as_str()), ("x-claude-code-session-id", "c")];
+    let messages = |model: &str, body: Value| json!({"model": model, "stream": true, "messages": body["messages"]});
+    assert_eq!(h.call_with("POST", "/v1/messages", &claude, Some(messages("qwen3", first("qwen3", "hello")))).await.0, 200);
+    put(&h, excluding_qwen().remove(0).1).await;
+
+    let (status, body) = {
+        let auth = format!("Bearer {key}");
+        let switch = streaming(later("busy", "hello"));
+        h.call_with("POST", "/v1/chat/completions", &[("authorization", auth.as_str()), ("session_id", "s")], Some(switch)).await
+    };
+    assert_eq!(status, 200, "the provider answered 200 and then an error event");
+    assert!(body.to_string().contains("boom"), "{body}");
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200, "the conversation is still on its model");
+
+    // Translated for a Messages client, and through a passthrough.
+    let (status, body) = h.call_with("POST", "/v1/messages", &claude, Some(messages("busy", later("busy", "hello")))).await;
+    assert_eq!(status, 200);
+    assert!(body.to_string().contains("event: error"), "{body}");
+    assert_eq!(h.call_with("POST", "/v1/messages", &claude, Some(messages("qwen3", later("qwen3", "hello")))).await.0, 200);
+    let passthrough = [("authorization", auth.as_str()), ("session_id", "s")];
+    assert_eq!(h.call_with("POST", "/llama/v1/chat/completions", &passthrough, Some(streaming(later("busy", "hello")))).await.0, 200);
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200);
+}
+
+#[tokio::test]
+async fn a_streamed_switch_is_seen_by_the_next_request_and_an_older_stream_cannot_undo_it() {
+    let h = harness().await;
+    let key = h.key(policy("p")).await;
+    chat_mock(&h, "qwen3", chat_answer(10)).await;
+    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
+    put(&h, excluding_qwen().remove(0).1).await;
+
+    h.upstream.reset().await;
+    chat_mock(&h, "qwen3", streamed_answer().set_delay(Duration::from_millis(500))).await;
+    chat_mock(&h, "busy", streamed_answer()).await;
+    let (slow, switch) = tokio::join!(chat_in(&h, &key, "s", streaming(later("qwen3", "hello"))), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let switched = chat_in(&h, &key, "s", streaming(later("busy", "hello"))).await;
+        // Straight after the stream ends, with nothing waited for.
+        (switched, chat_in(&h, &key, "s", later("qwen3", "hello")).await)
+    });
+    assert_eq!((slow, switch), (200, (200, 404)), "the switch is in place as soon as its stream ends");
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404, "and the older stream, ending later, did not undo it");
+}
+
 #[tokio::test]
 async fn a_model_the_policy_never_allowed_is_refused_in_every_conversation() {
     let h = answering().await;
