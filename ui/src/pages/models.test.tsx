@@ -37,6 +37,18 @@ test("return visits show the latest background failure, underlying reason and ca
   expect(html).not.toContain("Pricing refresh succeeded");
 });
 
+test("pricing announces the result without repeating changing cache details", () => {
+  const pricing = { ...success, error: "registry returned 503" };
+  for (const age_secs of [60, 120]) {
+    const html = render(undefined, { ...pricing, age_secs }, true);
+    const region = html.match(/<section aria-label="Pricing"[\s\S]*?<\/section>/)?.[0];
+    expect(region?.match(/role="status"/g)).toHaveLength(1);
+    expect(region).toMatch(/<p role="status"[^>]*>Latest pricing refresh failed<\/p>/);
+    expect(region).toContain("registry returned 503");
+    expect(region).toContain("Cached registry prices are");
+  }
+});
+
 test("failed first fetch does not invent a last-good time or cached prices", () => {
   const html = render(undefined, { ...success, fetched_at: null, age_secs: null, error: "registry returned 503" }, true);
   expect(html).toContain("registry returned 503");

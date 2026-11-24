@@ -23,8 +23,8 @@ export function PricingFeedback({ refreshing }: { refreshing: boolean }) {
       <QueryError error={pricing.error} />
       {pricing.error && <Button variant="outline" size="sm" onClick={() => void pricing.refetch()}>Retry pricing status</Button>}
       {result ? (
-        <div role="status" className="flex flex-col gap-1 break-words">
-          <p className={refreshing ? undefined : result.error ? "text-warning" : undefined}>
+        <div className="flex flex-col gap-1 break-words">
+          <p role="status" className={refreshing ? undefined : result.error ? "text-warning" : undefined}>
             {refreshing ? "Refreshing prices…" : !result.enabled ? "Registry refresh is disabled" : result.error ? "Latest pricing refresh failed" : result.attempted_at != null ? "Pricing refresh succeeded" : result.fetched_at != null ? "Prices loaded from cache" : "Prices have not been fetched"}
           </p>
           {result.attempted_at != null && <p className="text-muted-foreground">Latest attempt: <time dateTime={new Date(result.attempted_at * 1000).toISOString()}>{dateTime(result.attempted_at)} ({relative(result.attempted_at)})</time></p>}
