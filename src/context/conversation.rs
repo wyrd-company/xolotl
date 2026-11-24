@@ -5,6 +5,7 @@
 // relationships:
 //   implements: ../../docs/design/sessions.md
 // ---
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::Result;
@@ -47,13 +48,26 @@ impl Conversation {
         })
     }
 
-    /// The models the session keeps: those its conversations are on. Every
-    /// request of a session the client names reads them, so that a new
-    /// conversation of the session, such as a subagent or what follows a
-    /// compaction, goes on with them. A session xolotl reads from the content
-    /// is only a guess at a conversation, so there only a request that carries
-    /// earlier output reads them: a repeated one-shot request keeps nothing.
-    /// When they can't be read, the policy decides alone.
+    /// The models this request's session keeps for it:
+    ///
+    /// - the model this conversation is on;
+    /// - the model another conversation of the session is on, if that one
+    ///   has used it since a conversation of the session last switched away
+    ///   from it.
+    ///
+    /// So a new conversation of the session, such as a subagent or what
+    /// follows a compaction, goes on with the session's models. Once a
+    /// conversation switches away from a model, the others that used it
+    /// before then no longer keep it, so switching back is refused, also when
+    /// the conversation left behind is the one before a compaction. A
+    /// conversation that goes on using the model, such as a subagent still at
+    /// work, keeps it for the session.
+    ///
+    /// Every request of a session the client names reads them. A session
+    /// xolotl reads from the content is only a guess at a conversation, so
+    /// there only a request that carries earlier output reads them: a repeated
+    /// one-shot request keeps nothing. When they can't be read, the policy
+    /// decides alone.
     pub async fn kept(&self) -> Vec<Target> {
         if !self.named && !self.continues {
             return Vec::new();
@@ -116,25 +130,67 @@ fn sequence() -> i64 {
 
 impl Db {
     async fn session_models(&self, c: &Conversation) -> Result<Vec<Target>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT DISTINCT provider, model FROM session_conversations
-             WHERE client_id = ? AND key_issued = ? AND session_key = ? AND provider IS NOT NULL ORDER BY provider, model",
+        type Row = (String, Option<String>, Option<String>, i64, Option<i64>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT r.opening, r.provider, r.model, r.sequence, l.sequence FROM session_conversations r
+             LEFT JOIN session_left l ON l.client_id = r.client_id AND l.key_issued = r.key_issued
+               AND l.session_key = r.session_key AND l.provider = r.provider AND l.model = r.model
+             WHERE r.client_id = ? AND r.key_issued = ? AND r.session_key = ?",
         )
         .bind(&c.client)
         .bind(&c.issued)
         .bind(&c.session)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|(provider, model)| Target { provider, model }).collect())
+        let kept: BTreeSet<Target> = rows
+            .into_iter()
+            .filter(|(opening, .., used, left)| *opening == c.opening || left.is_none_or(|left| *used > left))
+            .filter_map(|(_, provider, model, ..)| Some(Target { provider: provider?, model: model? }))
+            .collect();
+        Ok(kept.into_iter().collect())
     }
 
+    /// Move the conversation, unless a later request moved it already. A
+    /// move off a model records that the session switched away from it.
     async fn move_conversation(&self, c: &Conversation, target: Option<&Target>) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row: Option<(Option<String>, Option<String>, i64)> = sqlx::query_as(
+            "SELECT provider, model, sequence FROM session_conversations
+             WHERE client_id = ? AND key_issued = ? AND session_key = ? AND opening = ?",
+        )
+        .bind(&c.client)
+        .bind(&c.issued)
+        .bind(&c.session)
+        .bind(&c.opening)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let at = now();
+        match &row {
+            Some((.., sequence)) if *sequence >= c.sequence => return Ok(()),
+            Some((Some(provider), Some(model), _)) if target.is_none_or(|t| t.provider != *provider || t.model != *model) => {
+                sqlx::query(
+                    "INSERT INTO session_left (client_id, key_issued, session_key, provider, model, sequence, last_used)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (client_id, key_issued, session_key, provider, model) DO UPDATE SET
+                       sequence = MAX(sequence, excluded.sequence), last_used = excluded.last_used",
+                )
+                .bind(&c.client)
+                .bind(&c.issued)
+                .bind(&c.session)
+                .bind(provider)
+                .bind(model)
+                .bind(c.sequence)
+                .bind(at)
+                .execute(&mut *tx)
+                .await?;
+            }
+            _ => {}
+        }
         sqlx::query(
             "INSERT INTO session_conversations (client_id, key_issued, session_key, opening, provider, model, sequence, last_used)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (client_id, key_issued, session_key, opening) DO UPDATE SET
-               provider = excluded.provider, model = excluded.model, sequence = excluded.sequence, last_used = excluded.last_used
-             WHERE excluded.sequence > session_conversations.sequence",
+               provider = excluded.provider, model = excluded.model, sequence = excluded.sequence, last_used = excluded.last_used",
         )
         .bind(&c.client)
         .bind(&c.issued)
@@ -143,9 +199,10 @@ impl Db {
         .bind(target.map(|t| &t.provider))
         .bind(target.map(|t| &t.model))
         .bind(c.sequence)
-        .bind(now())
-        .execute(&self.pool)
+        .bind(at)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 }

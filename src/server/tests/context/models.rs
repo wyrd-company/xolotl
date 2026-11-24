@@ -81,7 +81,7 @@ async fn a_new_conversation_of_the_session_goes_on_with_its_models() {
 }
 
 #[tokio::test]
-async fn switching_back_is_refused_once_no_conversation_of_the_session_is_on_the_model() {
+async fn switching_back_is_refused_unless_another_conversation_has_used_the_model_since() {
     let h = answering().await;
     let key = h.key(policy("p")).await;
     assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
@@ -89,11 +89,34 @@ async fn switching_back_is_refused_once_no_conversation_of_the_session_is_on_the
     put(&h, excluding_qwen().remove(0).1).await;
 
     assert_eq!(chat_in(&h, &key, "s", later("busy", "hello")).await, 200);
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200, "the subagent is still on it");
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404, "the subagent hasn't used it since");
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "subagent")).await, 200, "the subagent goes on with its model");
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200, "it used it after the switch");
     assert_eq!(chat_in(&h, &key, "s", later("busy", "subagent")).await, 200);
     assert_eq!(chat_in(&h, &key, "s", later("busy", "hello")).await, 200);
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404, "now no conversation is");
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404, "now no conversation is on it");
     assert_eq!(chat_in(&h, &key, "s", first("qwen3", "another subagent")).await, 404);
+}
+
+#[tokio::test]
+async fn a_compacted_conversation_goes_on_with_its_model_and_cannot_switch_back_once_it_leaves() {
+    let h = answering().await;
+    let key = h.key(policy("p")).await;
+    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
+    put(&h, excluding_qwen().remove(0).1).await;
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200);
+    let compaction = json!({"model": "qwen3", "messages": [
+        {"role": "user", "content": "hello"}, {"role": "assistant", "content": "a"}, {"role": "user", "content": "Summarize the conversation."}]});
+    assert_eq!(chat_in(&h, &key, "s", compaction).await, 200, "the compaction");
+
+    // The client rewrites the opening: the summary is the first user turn now.
+    for _ in 0..2 {
+        assert_eq!(chat_in(&h, &key, "s", later("qwen3", "Summary: hello")).await, 200, "the conversation goes on with its model");
+    }
+    assert_eq!(chat_in(&h, &key, "s", later("busy", "Summary: hello")).await, 200, "it switches");
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "Summary: hello")).await, 404, "and can't switch back");
+    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "a subagent")).await, 404, "nor can a new conversation of the session start on it");
+    assert_eq!(chat_in(&h, &key, "s", later("busy", "Summary: hello")).await, 200);
 }
 
 #[tokio::test]

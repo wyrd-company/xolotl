@@ -242,7 +242,8 @@ impl Db {
         let s = sqlx::query("DELETE FROM sessions WHERE last_seen < ?").bind(cutoff).execute(&self.pool).await?;
         let t = sqlx::query("DELETE FROM tool_usage WHERE last_used < ?").bind(cutoff).execute(&self.pool).await?;
         let c = sqlx::query("DELETE FROM session_conversations WHERE last_used < ?").bind(cutoff).execute(&self.pool).await?;
-        Ok(s.rows_affected() + t.rows_affected() + c.rows_affected())
+        let l = sqlx::query("DELETE FROM session_left WHERE last_used < ?").bind(cutoff).execute(&self.pool).await?;
+        Ok(s.rows_affected() + t.rows_affected() + c.rows_affected() + l.rows_affected())
     }
 }
 

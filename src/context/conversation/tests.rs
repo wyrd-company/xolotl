@@ -93,17 +93,43 @@ fn pairs(targets: &[(&str, &str)]) -> Vec<(String, String)> {
     targets.iter().map(|(p, m)| (p.to_string(), m.to_string())).collect()
 }
 
+/// What the session `s` of `p/k` keeps for a request of the conversation that opened with `opening`.
+async fn kept_for(db: &Db, opening: &str) -> Vec<(String, String)> {
+    conversation(db, opening).kept().await.into_iter().map(|t| (t.provider, t.model)).collect()
+}
+
 #[tokio::test]
 async fn a_session_keeps_each_model_one_of_its_conversations_is_on() {
     let db = Db::in_memory().await.unwrap();
     conversation(&db, "a").served(Some(&target(QWEN))).await;
     conversation(&db, "b").served(Some(&target(QWEN))).await;
+    assert_eq!(kept(&db).await, pairs(&[QWEN]));
+
     conversation(&db, "a").served(Some(&target(BUSY))).await;
-    assert_eq!(kept(&db).await, pairs(&[BUSY, QWEN]), "a switched; b is still on qwen3");
+    assert_eq!(kept_for(&db, "b").await, pairs(&[BUSY, QWEN]), "b is still on qwen3");
+    assert_eq!(kept_for(&db, "a").await, pairs(&[BUSY]), "a left it, and no one has used it since");
+    assert_eq!(kept(&db).await, pairs(&[BUSY]), "nor for a new conversation");
+
+    conversation(&db, "b").served(Some(&target(QWEN))).await;
+    assert_eq!(kept_for(&db, "a").await, pairs(&[BUSY, QWEN]), "b used it after a left");
 
     // A target it can't keep ends the one it switched from.
     conversation(&db, "b").served(None).await;
     assert_eq!(kept(&db).await, pairs(&[BUSY]), "no conversation is on qwen3 now");
+}
+
+#[tokio::test]
+async fn a_compacted_conversation_goes_on_with_its_model_and_cannot_switch_back_once_it_leaves() {
+    let db = Db::in_memory().await.unwrap();
+    conversation(&db, "hello").served(Some(&target(QWEN))).await;
+    conversation(&db, "hello").served(Some(&target(QWEN))).await;
+    // After the compaction, the conversation opens with its summary.
+    assert_eq!(kept_for(&db, "summary").await, pairs(&[QWEN]), "it goes on with the model");
+    conversation(&db, "summary").served(Some(&target(QWEN))).await;
+    assert_eq!(kept_for(&db, "summary").await, pairs(&[QWEN]));
+    conversation(&db, "summary").served(Some(&target(BUSY))).await;
+    assert_eq!(kept_for(&db, "summary").await, pairs(&[BUSY]), "the conversation before the compaction doesn't keep it");
+    assert_eq!(kept_for(&db, "a subagent").await, pairs(&[BUSY]));
 }
 
 #[tokio::test]
