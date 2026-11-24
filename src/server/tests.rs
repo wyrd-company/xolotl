@@ -2730,6 +2730,57 @@ async fn opencode_sessions_reach_upstream_on_native_translated_and_passthrough_r
 }
 
 #[tokio::test]
+async fn pricing_status_survives_failed_background_refresh_without_catalog_rows() {
+    let h = harness_with(|cfg| cfg.catalog.static_models.clear()).await;
+    assert_eq!(h.call("GET", "/admin/catalog/pricing", None, None).await.0, 401);
+    let (status, initial) = h.call("GET", "/admin/catalog/pricing", Some(&h.admin), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(initial, json!({"enabled":true,"attempted_at":null,"fetched_at":null,"age_secs":null,"error":null}));
+
+    Mock::given(method("GET")).and(path("/metadata")).respond_with(ResponseTemplate::new(503)).mount(&h.upstream).await;
+    h.state.catalog.refresh_metadata(h.state.subs.http()).await;
+    let (_, cold_failure) = h.call("GET", "/admin/catalog/pricing", Some(&h.admin), None).await;
+    assert!(cold_failure["error"].as_str().unwrap().contains("503"));
+    assert!(cold_failure["fetched_at"].is_null());
+    assert!(cold_failure["age_secs"].is_null());
+    assert!(cold_failure["attempted_at"].as_i64().is_some());
+
+    h.upstream.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"sample":{"input_cost_per_token":0.000002}})))
+        .mount(&h.upstream)
+        .await;
+    assert_eq!(h.call("POST", "/admin/catalog/refresh", Some(&h.admin), None).await.0, 200);
+    let (_, success) = h.call("GET", "/admin/catalog/pricing", Some(&h.admin), None).await;
+    assert!(success["attempted_at"].as_i64().is_some());
+    assert!(success["fetched_at"].as_i64().is_some());
+    assert!(success["age_secs"].as_i64().unwrap() >= 0);
+    assert!(success["error"].is_null());
+
+    h.upstream.reset().await;
+    Mock::given(method("GET")).and(path("/metadata")).respond_with(ResponseTemplate::new(503)).mount(&h.upstream).await;
+    // Same refresh entry point used by the maintenance timer, without a browser POST.
+    h.state.catalog.refresh(&h.state.subs, &h.state.gateway).await;
+    let (_, failed) = h.call("GET", "/admin/catalog/pricing", Some(&h.admin), None).await;
+    assert_eq!(failed["fetched_at"], success["fetched_at"]);
+    assert!(failed["age_secs"].as_i64().unwrap() >= success["age_secs"].as_i64().unwrap());
+    assert!(failed["error"].as_str().unwrap().contains("503"));
+    assert_eq!(h.call("GET", "/admin/catalog/routes", Some(&h.admin), None).await.1, json!([]));
+    assert_eq!(h.call("GET", "/admin/catalog/pricing", Some(&h.admin), None).await.1["error"], failed["error"]);
+}
+
+#[tokio::test]
+async fn pricing_status_reports_disabled_registry() {
+    let h = harness_with(|cfg| cfg.catalog.metadata_url.clear()).await;
+    assert_eq!(h.call("POST", "/admin/catalog/refresh", Some(&h.admin), None).await.0, 200);
+    let (_, status) = h.call("GET", "/admin/catalog/pricing", Some(&h.admin), None).await;
+    assert_eq!(status["enabled"], false);
+    assert!(status["attempted_at"].is_null());
+    assert!(status["error"].is_null());
+}
+
+#[tokio::test]
 async fn catalog_discovery_reports_scope_errors_and_cached_models() {
     let h = harness().await;
     let (status, initial) = h.call("GET", "/admin/catalog/status", Some(&h.admin), None).await;

@@ -76,6 +76,16 @@ pub struct DiscoveryStatus {
     pub error: Option<String>,
 }
 
+/// Registry refresh feedback, even when discovery has no model rows.
+#[derive(Debug, Clone, Serialize)]
+pub struct PricingStatus {
+    pub enabled: bool,
+    pub attempted_at: Option<i64>,
+    pub fetched_at: Option<i64>,
+    pub age_secs: Option<i64>,
+    pub error: Option<String>,
+}
+
 #[derive(Default)]
 struct Snapshot {
     models: Catalog,
@@ -90,6 +100,7 @@ pub struct ModelCatalog {
     gateway_kinds: RwLock<BTreeMap<String, ProviderKind>>,
     snapshot: RwLock<Arc<Snapshot>>,
     metadata: RwLock<crate::metadata::Registry>,
+    pricing_attempted_at: RwLock<Option<i64>>,
     codex_entries: RwLock<BTreeMap<String, serde_json::Value>>,
     db: Option<crate::db::Db>,
 }
@@ -101,6 +112,7 @@ impl ModelCatalog {
             cfg,
             gateway_kinds: RwLock::new(gateway_kinds),
             metadata: Default::default(),
+            pricing_attempted_at: Default::default(),
             codex_entries: Default::default(),
             db: None,
             snapshot: RwLock::new(Arc::new(Snapshot::default())),
@@ -124,6 +136,17 @@ impl ModelCatalog {
 
     pub fn metadata(&self, provider: &str, model: &str) -> crate::metadata::Resolved {
         self.metadata.read().lookup(provider, model, self.cfg.metadata.get(&format!("{provider}/{model}")))
+    }
+
+    pub fn pricing_status(&self) -> PricingStatus {
+        let registry = self.metadata.read();
+        PricingStatus {
+            enabled: !self.cfg.metadata_url.is_empty(),
+            attempted_at: *self.pricing_attempted_at.read(),
+            fetched_at: registry.fetched_at,
+            age_secs: registry.fetched_at.map(|at| (crate::db::now() - at).max(0)),
+            error: registry.error.clone(),
+        }
     }
 
     /// The model's context window: a configured override, what Codex reports, else its metadata.
@@ -159,6 +182,7 @@ impl ModelCatalog {
             }
             Err(e) => self.metadata.write().error = Some(format!("{e:#}")),
         }
+        *self.pricing_attempted_at.write() = Some(crate::db::now());
     }
 
     /// Every provider name: subscription pools and gateway providers.
