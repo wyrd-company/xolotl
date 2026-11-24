@@ -96,7 +96,7 @@ A body is a stream when its `Content-Type` says so, or when it doesn't start as 
 - A model the catalog no longer lists loses its plain name whatever the session keeps. Xolotl can't keep a model working that its provider stops serving.
 - When the models can't be read, the policy decides alone. When a use can't be written, the session doesn't keep that model.
 
-A session's rows go together at `retention_days` after its last use of any of them, like the sessions. A session still active on one model keeps the others it used.
+A session's rows go together at `retention_days` after its last completed turn, like the sessions. A session still active on one model keeps the others it used. A turn whose target only an alias reaches counts as activity too: it refreshes the session's rows without adding its target.
 
 Upgrading to this version starts `session_models` empty. A session that was running before the upgrade keeps a model only from its first completed request on it after the upgrade. Excluding the model in between refuses the session. The `sessions` table has the session's last model but not the key issuance that used it, so prior use can't be recovered without inheriting another issuance's history.
 

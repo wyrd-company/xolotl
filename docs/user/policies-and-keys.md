@@ -256,7 +256,8 @@ request doesn't.
   the same name starts with none, which stops a model for all of that key's
   sessions at once.
 - A session keeps the models it used until it goes `database.retention_days`
-  ([configuration](configuration.md#database)) without using any of them.
+  ([configuration](configuration.md#database)) without a completed answer,
+  on any model, through any name.
 - A session that was running when you upgraded xolotl keeps a model only from
   its first completed answer from that model after the upgrade. If you
   exclude the model before then, that session is refused it.
