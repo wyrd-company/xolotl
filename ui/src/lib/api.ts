@@ -217,6 +217,11 @@ export interface PolicyView {
   account_usage?: Record<string, Consumption>;
 }
 
+export interface RevokeResult {
+  revoked: string;
+  status: "revoked" | "already_revoked" | "absent";
+}
+
 export interface KeyInfo {
   client_id: string;
   policy: string;
