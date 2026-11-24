@@ -81,7 +81,7 @@ A policy (`src/policy.rs`) is stored in OpenBao at `policies/<name>`, and every 
 - a name in the view returns its targets;
 - otherwise, `provider/model` returns that single target, if the provider exists and the policy allows the model. This form works even for a model that lost its plain name.
 
-An LLM request in a session looks its name up in `Policy::resolve_keeping`'s view instead: resolved as if the policy still allowed the models the session keeps ([Models a session keeps](sessions.md#models-a-session-keeps)).
+An LLM request that continues a conversation looks its name up in `Policy::resolve_keeping`'s view instead: resolved as if the policy still allowed the model the conversation keeps ([Models a session keeps](sessions.md#models-a-session-keeps)).
 
 The resolved view for any policy can be inspected with `xolotl policies view <name>` (`GET /admin/policies/<name>/view`). Its `accounts` maps each subscription provider the policy allows to the accounts that exist now and that the policy's `accounts` entry takes. It is `null` when the accounts can't be read, and the rest of the view still answers, because the web UI's save depends on the preview; a policy that allows no subscription provider reads nothing.
 
@@ -104,7 +104,7 @@ fast = ["codex/gpt-6-codex", "vercel/moonshotai/kimi-k3"]   # tried in order on 
 For `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`, `/v1/responses/compact`, `/v1/chat/completions` and other `POST /v1/*` (`route_json` in `src/server/mod.rs`):
 
 1. Authorize with the `proxy` scope; parse the body and read `model`.
-2. Look the name up in the view, with the models the request's session keeps. If it's not found: 404.
+2. Look the name up in the view, with the model the request's conversation keeps. If it's not found: 404.
 3. Keep the targets the endpoint reaches, natively or through translation. If none (`count_tokens`, `compact`, or a Claude subscription account off `/v1/messages`): 400 naming the endpoints the model *is* served on.
 4. Try each target in order. A 429 or 5xx moves on to the next target; the last target's response is returned. A session's [context lock](sessions.md#context-lock) puts its locked target first, and the request moves on only when the lock breaks. A translated target gets the request in its own format, and its response is translated back.
    - **Pool targets:** `model` is rewritten to the provider's name and the request goes to the pool ([Subscription accounts](subscriptions.md)).
@@ -120,7 +120,7 @@ Errors use the shape of the endpoint that was called: Anthropic-style on `/v1/me
 
 | Path | Behaviour |
 |---|---|
-| `/<provider>/<path>` | Any method, to a provider account's base URL. The client's credentials are stripped and the provider key is injected. JSON bodies are buffered so `model` can be checked against the policy and the models the request's session keeps; other bodies (multipart uploads) are streamed. |
+| `/<provider>/<path>` | Any method, to a provider account's base URL. The client's credentials are stripped and the provider key is injected. JSON bodies are buffered so `model` can be checked against the policy and the model the request's conversation keeps; other bodies (multipart uploads) are streamed. |
 | `/opencode-go/<path>` | Any method, to OpenCode Go through the account pool, so load balancing, failover and usage tracking still apply. The body is always buffered, because failover may resend it. |
 
 Both require the policy to allow the provider.

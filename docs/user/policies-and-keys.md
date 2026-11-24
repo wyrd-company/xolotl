@@ -230,27 +230,39 @@ key can call. A client gets the same names from `GET /v1/models`.
 
 ### Exclude a model
 
-The policy checks a model when a session first uses it: when the session
-starts with it or switches to it. Once a request on the model succeeds, the
-session keeps it. When you exclude the model later, with a rule, its `models`
-switch or `deny_other_models`:
+The policy checks a model when a conversation first uses it: when the
+conversation starts with it or switches to it. Once a request on the model
+succeeds, the conversation keeps it. When you exclude the model later, with a
+rule, its `models` switch or `deny_other_models`:
 
 - A conversation already on the model goes on, on the same provider and model,
   with no error. A conversation that stays on one account
   ([Context lock](accounts.md#context-lock)) stays there.
-- A new session can't use the model. It gets a 404, or a 403 through a
-  passthrough.
+- A new conversation can't use the model, in a new session or in the same one.
+  It gets a 404, or a 403 through a passthrough.
 - A conversation that switches to another model can't switch back to it.
 
-Requests that a client sends on other models under the same session, such as
-Claude Code's background requests and subagents, are not a switch: xolotl tells
-a conversation by its first user message. A session keeps a model until it
-goes `database.retention_days` ([configuration](configuration.md#database))
-without using it.
+Xolotl tells a conversation by the session the client sends, its first user
+message and the key that sent it. Requests that a client sends on other models
+under the same session, such as Claude Code's background requests, are other
+conversations, and don't switch this one. What that means in practice:
+
+- A new subagent is a new conversation: it can't start on the excluded model,
+  although the conversation that started it goes on.
+- When a client compacts a conversation by replacing its history with a
+  summary, as Claude Code does, the conversation that follows is new, and the
+  excluded model is refused there.
+- A key you rotate keeps its conversations. A key you revoke and issue again
+  under the same name starts with none.
+- A conversation keeps a model until it goes `database.retention_days`
+  ([configuration](configuration.md#database)) without a request.
 
 This covers only what xolotl decides: if the provider stops serving the model,
-the conversation fails there too. Removing a provider from `providers`, or an
-account from `accounts`, applies to every session at once.
+the conversation fails there too. Xolotl takes what the client sends as its
+conversation, so excluding a model doesn't stop a key holder who replays a
+conversation that was on it. To stop a model for every conversation of a key at
+once, revoke the key and issue it again. Removing a provider from `providers`,
+or an account from `accounts`, applies to every session at once.
 
 ## Rate limits
 
