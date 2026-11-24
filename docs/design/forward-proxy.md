@@ -262,6 +262,8 @@ OpenBao takes the CSR's common name and SANs (`use_csr_common_name` and `use_csr
 | Credentials in the export | Headers and query strings are never copied, and only model paths are, so OAuth traffic is never a row ([Redaction](#redaction)). |
 | Capture slowing or breaking a session | Copies are bounded and never wait. Rows go to queues bounded by bytes. A missing certificate makes a tunnel, not an error. |
 | Idle and slow connections | The CONNECT head is read within 10 s, handshakes and upstream connects take at most 10 s each, and tunnels and upstream reads close after `server.upstream_timeout_secs` without traffic. |
+| Google refusing the account's requests for where they come from | Google refuses requests from datacenter addresses with `UNSUPPORTED_LOCATION`. Every connection through the proxy, tunneled or intercepted, leaves from xolotl's address instead of the client's. Xolotl runs where its outgoing address is one Google accepts for the account, such as the clients' own network. |
+| Google seeing a different client on capture hosts | An intercepted connection reaches Google with xolotl's TLS and HTTP/2 fingerprint, rustls and hyper, not the client's. Interception itself carries this. It is limited to capture hosts: sign-in, OAuth and every other host keep the client's own TLS, through tunnels. |
 | A leaked `egress` key | It reaches only the proxy, not an account, and its traffic is logged under its client id. Rotation, disabling and revocation stop it as for any key. The key crosses the client's network in the clear in the CONNECT head, which is why the listener binds to the clients' network. |
 
 ## Telemetry
