@@ -96,7 +96,7 @@ export function McpPage() {
 export function RefreshResult({ servers }: { servers: McpServer[] }) {
   const failed = servers.filter((s) => s.last_error).length;
   return (
-    <div role="status" className={`rounded-md border p-3 text-sm ${failed ? "bg-warning-muted" : "bg-muted/40"}`}>
+    <div role="status" className={`rounded-md border p-3 text-sm [overflow-wrap:anywhere] ${failed ? "bg-warning-muted" : "bg-muted/40"}`}>
       <p className="font-medium">Refresh finished · {failed} {failed === 1 ? "server failed" : "servers failed"}</p>
       <ul className="mt-2 list-inside list-disc">
         {servers.map((s) => (
@@ -136,14 +136,14 @@ function ServerView({ s, onEdit }: { s: McpServer; onEdit: () => void }) {
 
   return (
     <Card className="gap-4">
-      <CardHeader>
+      <CardHeader className="flex flex-col gap-3 sm:grid sm:gap-1.5">
         <CardTitle className="flex flex-wrap items-center gap-2">
-          <span className="font-mono">{s.name}</span>
+          <h2 className="font-mono">{s.name}</h2>
           <ServerState s={s} />
           {s.source === "config" && <Badge variant="outline">config file</Badge>}
         </CardTitle>
         <CardDescription>{s.description || <Mono className="break-all">{s.url}</Mono>}</CardDescription>
-        <CardAction className="flex gap-2">
+        <CardAction className="flex flex-wrap gap-2">
           <Button variant="outline" size="sm" disabled={refresh.isPending} onClick={() => refresh.mutate(undefined)}>
             <RefreshCw className={refresh.isPending ? "animate-spin" : undefined} />
             Refresh
