@@ -1,6 +1,6 @@
-//! The conversation a request continues, and the model it is on. A
-//! conversation keeps that model after its key's policy excludes it, until it
-//! switches to another one.
+//! The conversations of a session, and the model each one is on. A session
+//! keeps every model one of its conversations is on after its key's policy
+//! excludes it. A conversation leaves a model when it switches to another one.
 // ---
 // relationships:
 //   implements: ../../docs/design/sessions.md
@@ -24,6 +24,8 @@ pub struct Conversation {
     issued: String,
     session: String,
     opening: String,
+    /// The client named the session, rather than xolotl reading it from the content.
+    named: bool,
     continues: bool,
     sequence: i64,
 }
@@ -37,6 +39,7 @@ impl Conversation {
             db: db.clone(),
             client: client.to_string(),
             issued: issued_at.map(|t| t.to_rfc3339_opts(SecondsFormat::Nanos, true)).unwrap_or_default(),
+            named: session.source != "content",
             session: session.key,
             opening: opening(body)?,
             continues: continues(body),
@@ -44,16 +47,20 @@ impl Conversation {
         })
     }
 
-    /// The model the conversation is on, when this request continues it. A
-    /// request that carries no earlier output starts a conversation, so the
-    /// policy decides it alone, as it does when the state can't be read.
-    pub async fn kept(&self) -> Option<Target> {
-        if !self.continues {
-            return None;
+    /// The models the session keeps: those its conversations are on. Every
+    /// request of a session the client names reads them, so that a new
+    /// conversation of the session, such as a subagent or what follows a
+    /// compaction, goes on with them. A session xolotl reads from the content
+    /// is only a guess at a conversation, so there only a request that carries
+    /// earlier output reads them: a repeated one-shot request keeps nothing.
+    /// When they can't be read, the policy decides alone.
+    pub async fn kept(&self) -> Vec<Target> {
+        if !self.named && !self.continues {
+            return Vec::new();
         }
-        self.db.conversation_model(self).await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "failed to read the model of a conversation");
-            None
+        self.db.session_models(self).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to read the models of a session");
+            Vec::new()
         })
     }
 
@@ -108,18 +115,17 @@ fn sequence() -> i64 {
 }
 
 impl Db {
-    async fn conversation_model(&self, c: &Conversation) -> Result<Option<Target>> {
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT provider, model FROM session_conversations
-             WHERE client_id = ? AND key_issued = ? AND session_key = ? AND opening = ? AND provider IS NOT NULL",
+    async fn session_models(&self, c: &Conversation) -> Result<Vec<Target>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT provider, model FROM session_conversations
+             WHERE client_id = ? AND key_issued = ? AND session_key = ? AND provider IS NOT NULL ORDER BY provider, model",
         )
         .bind(&c.client)
         .bind(&c.issued)
         .bind(&c.session)
-        .bind(&c.opening)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(row.map(|(provider, model)| Target { provider, model }))
+        Ok(rows.into_iter().map(|(provider, model)| Target { provider, model }).collect())
     }
 
     /// True when this call moved the conversation.

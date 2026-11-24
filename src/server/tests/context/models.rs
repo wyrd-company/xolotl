@@ -1,4 +1,5 @@
-//! A conversation keeps the model it is on past a policy that excludes it.
+//! A session keeps the models its conversations are on past a policy that
+//! excludes them.
 //! Nothing here waits for accounting: what a request records about its
 //! conversation is visible to the next request as soon as it has answered.
 // ---
@@ -66,20 +67,31 @@ async fn a_conversation_keeps_its_model_after_the_policy_excludes_it() {
 }
 
 #[tokio::test]
-async fn another_conversation_of_the_session_does_not_share_the_model() {
+async fn a_new_conversation_of_the_session_goes_on_with_its_models() {
+    let h = answering().await;
+    let key = h.key(policy("p")).await;
+    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
+    put(&h, excluding_qwen().remove(0).1).await;
+
+    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "a new subagent")).await, 200, "a subagent the session starts");
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "the summary")).await, 200, "what follows a compaction");
+    assert_eq!(chat_in(&h, &key, "new", first("qwen3", "hello")).await, 404, "another session can't start with it");
+}
+
+#[tokio::test]
+async fn switching_back_is_refused_once_no_conversation_of_the_session_is_on_the_model() {
     let h = answering().await;
     let key = h.key(policy("p")).await;
     assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
     assert_eq!(chat_in(&h, &key, "s", first("qwen3", "subagent")).await, 200);
     put(&h, excluding_qwen().remove(0).1).await;
 
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "other")).await, 404, "a conversation that never ran on it");
-    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 404, "one that starts again with the same opening");
-
-    // Two conversations on one model: one switches away, the other keeps it.
     assert_eq!(chat_in(&h, &key, "s", later("busy", "hello")).await, 200);
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404);
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "subagent")).await, 200);
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200, "the subagent is still on it");
+    assert_eq!(chat_in(&h, &key, "s", later("busy", "subagent")).await, 200);
+    assert_eq!(chat_in(&h, &key, "s", later("busy", "hello")).await, 200);
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404, "now no conversation is");
+    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "another subagent")).await, 404);
 }
 
 #[tokio::test]
@@ -228,6 +240,16 @@ async fn a_locked_conversation_stays_on_its_excluded_model_and_account() {
     let served = tokens(&h).await;
     assert!(served.iter().all(|t| *t == served[0]), "{served:?}");
     assert_eq!(claude_in(&h, &key, "other", first(OPUS, "hello")).await, 404, "a new session can't start with it");
+
+    // Counting tokens on another model moves nothing.
+    Mock::given(path("/v1/messages/count_tokens"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"input_tokens": 5})))
+        .mount(&h.upstream)
+        .await;
+    let auth = format!("Bearer {key}");
+    let headers = [("authorization", auth.as_str()), (SESSION, "s")];
+    assert_eq!(h.call_with("POST", "/v1/messages/count_tokens", &headers, Some(later(HAIKU, "hello"))).await.0, 200);
+    assert_eq!(claude_in(&h, &key, "s", later(OPUS, "hello")).await, 200);
 
     // Another name is a side request to the lock, and it can still carry the conversation away.
     assert_eq!(claude_in(&h, &key, "s", later(HAIKU, "hello")).await, 200);

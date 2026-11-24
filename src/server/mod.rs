@@ -366,8 +366,8 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
     let model = if anthropic { model.strip_suffix("[1m]").unwrap_or(&model).to_string() } else { model };
     let known = state.catalog.known_providers();
     let conversation = conversation_for(state, &principal, path, &headers, &json);
-    let kept: Vec<Target> = match &conversation {
-        Some(c) => c.kept().await.into_iter().collect(),
+    let kept = match &conversation {
+        Some(c) => c.kept().await,
         None => Vec::new(),
     };
     let Some(targets) = state.view_keeping(&principal, kept.clone()).lookup(&principal.policy, &known, &model) else {
@@ -403,7 +403,7 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             .unwrap_or_default();
         return err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("model {model:?} is not available on {path}{hint}"));
     }
-    // What the conversation may keep: a target the policy allows by name, or the one it keeps now.
+    // What the conversation may keep: a target the policy allows by name, or one the session keeps now.
     let keepable = |t: &Target| principal.policy.allows_model_keeping(&t.provider, &t.model, &kept);
     let session = session_for(state, &principal, path, &headers, &json, &model, true).await;
     let capture = capture_for(state, &principal, path, Some(&body));
@@ -563,8 +563,8 @@ async fn collect_grok(resp: Response) -> Response {
     }
 }
 
-/// The conversation of an LLM request, which keeps the model it is on past a
-/// policy that now excludes it ([`Conversation`]). Only a client key's
+/// The conversation of an LLM request. Its session keeps the models its
+/// conversations are on past a policy that now excludes them ([`Conversation`]). Only a client key's
 /// requests on the wire formats have one. Counting tokens reads it too.
 fn conversation_for(state: &AppState, principal: &Principal, path: &str, headers: &HeaderMap, body: &Value) -> Option<Conversation> {
     Wire::for_path(path)?;
@@ -778,8 +778,8 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
 type PassthroughBody = (Option<Bytes>, Option<String>, Option<Body>, Option<Conversation>);
 
 /// Read a passthrough body: JSON bodies are buffered so their `model` can be
-/// checked against the policy, and against the model the request's
-/// conversation keeps; anything else streams. With `stream_usage`, a Chat
+/// checked against the policy, and against the models the request's session
+/// keeps; anything else streams. With `stream_usage`, a Chat
 /// Completions stream is asked for its usage chunk (rate limits count it).
 async fn passthrough_body(
     state: &AppState,
@@ -806,8 +806,8 @@ async fn passthrough_body(
     if let Some(m) = &model
         && !principal.policy.allows_model(provider, m)
     {
-        let kept: Vec<Target> = match &conversation {
-            Some(c) => c.kept().await.into_iter().collect(),
+        let kept = match &conversation {
+            Some(c) => c.kept().await,
             None => Vec::new(),
         };
         if !principal.policy.allows_model_keeping(provider, m, &kept) {
