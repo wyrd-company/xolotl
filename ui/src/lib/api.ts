@@ -71,6 +71,13 @@ export interface Session {
   configured?: boolean;
 }
 
+export interface ReloadResponse {
+  policies: number;
+  keys: number;
+  accounts: number;
+  provider_accounts: number;
+}
+
 export interface Health {
   ok: boolean;
   error?: string;
@@ -215,6 +222,11 @@ export interface PolicyView {
   /** The same, per limited provider and per limited account. */
   provider_usage?: Record<string, Consumption>;
   account_usage?: Record<string, Consumption>;
+}
+
+export interface RevokeResult {
+  revoked: string;
+  status: "revoked" | "already_revoked" | "absent";
 }
 
 export interface KeyInfo {

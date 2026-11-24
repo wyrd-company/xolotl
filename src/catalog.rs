@@ -166,11 +166,21 @@ impl ModelCatalog {
         if self.cfg.metadata_url.is_empty() {
             return;
         }
-        let result: anyhow::Result<crate::metadata::Registry> = async {
+        let fetched: anyhow::Result<bytes::Bytes> = async {
             let resp = http.get(&self.cfg.metadata_url).send().await?.error_for_status()?;
-            crate::metadata::Registry::parse(resp.json().await?, crate::db::now())
+            Ok(resp.bytes().await?)
         }
         .await;
+        let (result, outcome) = match fetched {
+            Ok(body) => {
+                let registry = serde_json::from_slice(&body)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|value| crate::metadata::Registry::parse(value, crate::db::now()));
+                let outcome = if registry.is_ok() { "success" } else { "validation_error" };
+                (registry, outcome)
+            }
+            Err(e) => (Err(e), "fetch_error"),
+        };
         match result {
             Ok(registry) => {
                 if let Some(db) = &self.db
@@ -183,6 +193,7 @@ impl ModelCatalog {
             Err(e) => self.metadata.write().error = Some(format!("{e:#}")),
         }
         *self.pricing_attempted_at.write() = Some(crate::db::now());
+        crate::telemetry::metrics().pricing_refreshes.add(1, &[opentelemetry::KeyValue::new("result", outcome)]);
     }
 
     /// Every provider name: subscription pools and gateway providers.

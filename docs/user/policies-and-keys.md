@@ -18,7 +18,8 @@ belongs to a policy. The policy decides what the key can do.
 4. Set the models, the MCP servers and the rate limits. Each section folds
    away.
 5. Select **Create policy**. Later changes take effect when you select
-   **Save policy**.
+   **Save policy**. A model you exclude keeps serving the sessions already
+   on it; see [Exclude a model](#exclude-a-model).
 
 The editor warns when a subscription provider has no accounts: the provider
 looks allowed, but its requests get a 403.
@@ -227,6 +228,45 @@ keys can use for each subscription provider the policy allows, and says
 `no accounts` where there are none. With MCP servers, it also lists the tools a
 key can call. A client gets the same names from `GET /v1/models`.
 
+### Exclude a model
+
+Excluding a model is for maintenance: it stops new use of the model without
+breaking sessions that already use it. The policy checks a model when a session
+first uses it. Once an answer from the model completes, the session keeps it.
+When you exclude the model later, with a rule, its `models` switch or
+`deny_other_models`:
+
+- A session that has used the model can go on using it in any way, with no
+  error. That covers switching to another model and back, subagents, background
+  requests, and the conversation after any number of compactions. A session
+  that stays on one account ([Context lock](accounts.md#context-lock)) stays
+  there.
+- A session that never used the model can't use it. It gets a 404, or a 403
+  through a passthrough.
+
+Xolotl tells sessions apart by the session ID each client sends: Claude Code,
+Codex, Grok and OpenCode all send one. A client that sends no session ID gets a
+session from its system prompt and first message. There, only a request that
+continues the conversation keeps the model, so a script that repeats one
+request doesn't.
+
+- Only a completed answer counts: if the provider answers with an error, the
+  session hasn't used the model. Counting tokens doesn't count.
+- A key you rotate keeps its sessions. A key you revoke and issue again under
+  the same name starts with none, which stops a model for all of that key's
+  sessions at once.
+- A session keeps the models it used until it goes `database.retention_days`
+  ([configuration](configuration.md#database)) without a completed answer,
+  on any model, through any name.
+- A session that was running when you upgraded xolotl keeps a model only from
+  its first completed answer from that model after the upgrade. If you
+  exclude the model before then, that session is refused it.
+- Removing a provider from `providers`, or an account from `accounts`, applies
+  to every session at once.
+
+This covers only what xolotl decides: if the provider stops serving the model,
+the session fails there too.
+
 ## Rate limits
 
 A policy can limit how much its keys use the LLM endpoints, in total and per
@@ -297,11 +337,16 @@ screen also shows the consumption of each provider and account limit. The metric
 
 1. Open **Client keys** in the web UI.
 2. Under **Issue a key**, choose the **Policy**, enter a **Client name** (for
-   example `laptop`) and a **Description**, and pick when it **Expires**.
+   example `laptop`) and an optional **Description**, and pick when it **Expires**.
+   The default is **Never**. Choose **Custom** for a positive duration such as
+   `36h`; units are `s`, `m`, `h`, `d` or `w`, or seconds without a unit.
 3. Select **Issue key**.
 
 The screen then shows the `bao` command the client reads the key with, and the
-OpenBao policy to grant the client. It never shows the key.
+OpenBao policy to grant the client. It never shows the key. If deployment
+status cannot load, retrieval instructions stay unavailable; use **Retry**
+to load the correct vault mount and prefix. If policies cannot load, retry
+the policy list before issuing a key.
 
 With the CLI:
 
@@ -329,14 +374,26 @@ xolotl reload keys from OpenBao, at most every 10 seconds.
 
 ## Manage keys
 
-The **Client keys** screen lists each key with its state, OpenBao path, last
-rotation, expiry, requests in the last 7 days and consumption against the
-policy's rate limits. On a row:
+The **Client keys** screen lists each key with its description, state, OpenBao
+path, creation time, last rotation, expiry and any rotation grace end. A key
+that has never rotated uses its creation time as the rotation reference.
+Current requests and tokens per minute and per day are shown even without
+limits. Limited windows show consumption against the policy limit, labelled
+when shared by the policy. Requests in the last 7 days appear separately;
+a failed query says **Unavailable** and offers **Retry**. On a row:
 
 - **Rotate…** writes a new key to the same path. Pick a **Grace period**, during
   which the old key keeps working, so the client can pick up the new one.
+  The default is zero: the old key stops immediately. Choose **Custom** for
+  a nonnegative duration such as `45m` or `0s`, using the same units as expiry.
 - **Disable** and **Enable** stop and restart the key.
 - **Revoke** stops the key at once and destroys every stored version of it.
+
+To repeat a revocation, or revoke a key whose row is absent, enter
+`policy/name` under **Revoke by client ID**, select **Revoke…** and confirm.
+The result distinguishes **Revoked**, **Already revoked** and **No key found**.
+If revocation fails, its error is shown; retry to ensure every stored version
+is destroyed.
 
 With the CLI:
 

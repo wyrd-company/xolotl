@@ -912,8 +912,7 @@ impl Subscriptions {
             SubProvider::OpencodeGo => Some(opencode_go::session_key(&headers, client_id)),
             SubProvider::Grok => grok::session_key(&headers, body_json.as_ref().unwrap_or(&Value::Null)),
         };
-        let prices =
-            self.catalog.as_ref().and_then(|c| Some(c.metadata(provider.as_str(), body_json.as_ref()?.get("model")?.as_str()?).values));
+        let prices = self.catalog.as_ref().and_then(|c| Some(c.metadata(provider.as_str(), body_json.as_ref()?.get("model")?.as_str()?)));
         let upstream_model = body_json.as_ref().and_then(|b| b.get("model")?.as_str()).unwrap_or_default().to_string();
         let window = self.catalog.as_ref().and_then(|c| c.context_window(provider.as_str(), &upstream_model));
         let mut accounting = Accounting::new(self.db.clone(), provider.as_str(), path, client_id, model)

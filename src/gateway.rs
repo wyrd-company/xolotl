@@ -508,7 +508,7 @@ impl Gateway {
             }
         }
         let mut accounting = Accounting::new(self.db.clone(), &target.provider, path, client_id, Some(requested_model))
-            .with_prices(self.catalog.as_ref().map(|c| c.metadata(&target.provider, &target.model).values))
+            .with_prices(self.catalog.as_ref().map(|c| c.metadata(&target.provider, &target.model)))
             .with_limiter(&self.limiter)
             .with_session(session.map(|s| s.track(&target.model, self.window(&target.provider, &target.model))))
             .with_capture(capture.cloned())
@@ -544,7 +544,7 @@ impl Gateway {
         let endpoint = path_and_query.split('?').next().unwrap_or(path_and_query);
         let prices = self.catalog.as_ref().and_then(|c| {
             let model = model?.strip_prefix(&format!("{provider}/")).unwrap_or(model?);
-            Some(c.metadata(provider, model).values)
+            Some(c.metadata(provider, model))
         });
         let upstream_model = model.map(|m| m.strip_prefix(&format!("{provider}/")).unwrap_or(m)).unwrap_or_default();
         let mut accounting = Accounting::new(self.db.clone(), provider, endpoint, client_id, model)

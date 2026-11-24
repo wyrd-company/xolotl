@@ -206,17 +206,15 @@ impl Server {
 
 #[tokio::test]
 #[ignore = "needs a NATS server"]
-async fn nats_startup_checks_the_stream() {
+async fn nats_checks_the_stream_after_connecting() {
     let _turn = SERVER.lock().await;
     let Some(s) = Server::new(&["xolotl.exchanges.team.>"], -1).await else { return };
-    let err = start(s.cfg(), None).await.err().expect("a stream that misses rows is refused");
+    let client = async_nats::connect(&s.url).await.unwrap();
+    let err = check_stream(&s.cfg(), client.clone()).await.err().expect("a stream that misses rows is refused");
     assert!(format!("{err:#}").contains("don't cover 'xolotl.exchanges.>'"), "{err:#}");
     let missing = NatsConfig { stream: "XOLOTL_TEST_MISSING".into(), ..s.cfg() };
-    let err = start(missing, None).await.err().expect("a missing stream is refused");
+    let err = check_stream(&missing, client).await.err().expect("a missing stream is refused");
     assert!(format!("{err:#}").contains("NATS stream \"XOLOTL_TEST_MISSING\" not found"), "{err:#}");
-    let nowhere = NatsConfig { url: "nats://127.0.0.1:9".into(), ..s.cfg() };
-    let err = start(nowhere, None).await.err().expect("an unreachable server is refused");
-    assert!(format!("{err:#}").contains("connecting to NATS"), "{err:#}");
     s.delete().await;
 }
 
@@ -225,7 +223,7 @@ async fn nats_startup_checks_the_stream() {
 async fn nats_publishes_each_row_once() {
     let _turn = SERVER.lock().await;
     let Some(s) = Server::new(&[SUBJECTS], -1).await else { return };
-    let publisher = connect(&s.cfg(), None).await.unwrap();
+    let publisher = check_stream(&s.cfg(), async_nats::connect(&s.url).await.unwrap()).await.unwrap();
     let r = row(&uuid::Uuid::now_v7().to_string());
     publisher.send(&r).await;
     // A retry after a lost ack: the stream's duplicate window drops it.
@@ -245,7 +243,7 @@ async fn nats_cuts_or_refuses_rows_too_large_for_the_stream() {
     let _turn = SERVER.lock().await;
     // The stream's own limit is lower than the server's `max_payload`.
     let Some(s) = Server::new(&[SUBJECTS], 64 * 1024).await else { return };
-    let publisher = connect(&s.cfg(), None).await.unwrap();
+    let publisher = check_stream(&s.cfg(), async_nats::connect(&s.url).await.unwrap()).await.unwrap();
     let mut big = row(&uuid::Uuid::now_v7().to_string());
     big.request = "é".repeat(100 * 1024);
     big.response = "r".repeat(100 * 1024);
@@ -434,4 +432,88 @@ async fn nats_rows_reach_clickhouse_after_its_outage() {
     let errors = select("SELECT count() FROM xolotl.exchanges_errors FORMAT TSV".into()).await.unwrap();
     assert_eq!(errors.trim(), "0");
     exporter.shutdown().await;
+}
+
+/// Repair either a missing stream or its subject coverage without restarting
+/// the gateway. No row may be consumed before the stream passes validation.
+#[tokio::test]
+#[ignore = "needs a NATS server"]
+async fn nats_rows_wait_for_stream_repair() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let _turn = SERVER.lock().await;
+    for missing in [true, false] {
+        let Some(s) = Server::new(&[&subject("team/laptop")], -1).await else { panic!("set XOLOTL_TEST_NATS") };
+        if missing {
+            s.js.delete_stream(&s.stream).await.unwrap();
+        }
+        let exporter = Exporter::new(vec![start(s.cfg(), None).await.unwrap()]);
+        let r = row(&uuid::Uuid::now_v7().to_string());
+        exporter.enqueue_row(r.clone());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(exporter.sinks()[0].queued() > 0, "invalid stream must keep rows queued");
+        let config = stream::Config {
+            name: s.stream.clone(),
+            subjects: vec![SUBJECTS.into()],
+            duplicate_window: Duration::from_secs(120),
+            ..Default::default()
+        };
+        if missing {
+            s.js.create_stream(config).await.unwrap();
+        } else {
+            s.js.update_stream(config).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while exporter.sinks()[0].queued() > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("repair must resume publishing without restarting xolotl");
+        let messages = s.messages().await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].1, r.id);
+        exporter.shutdown().await;
+        s.delete().await;
+    }
+}
+
+/// Stop the server before sink initialization, then prove initial retry, first
+/// connection stream validation, queue delivery, and a later reconnect.
+#[tokio::test]
+#[ignore = "needs a NATS server in docker"]
+async fn nats_initial_outage_preserves_rows_and_later_reconnects() {
+    let _turn = SERVER.lock().await;
+    let container = std::env::var("XOLOTL_TEST_NATS_CONTAINER").expect("set XOLOTL_TEST_NATS_CONTAINER");
+    let Some(s) = Server::new(&[SUBJECTS], -1).await else { panic!("set XOLOTL_TEST_NATS") };
+    let docker = |verb: &str| {
+        assert!(std::process::Command::new("docker").args([verb, &container]).status().unwrap().success());
+    };
+    docker("stop");
+    let sink =
+        tokio::time::timeout(Duration::from_secs(1), start(s.cfg(), None)).await.expect("offline startup must return promptly").unwrap();
+    let exporter = Exporter::new(vec![sink]);
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let id = uuid::Uuid::now_v7().to_string();
+        exporter.enqueue_row(row(&id));
+        ids.push(id);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(exporter.sinks()[0].queued() > 0, "rows wait through each outage");
+        docker("start");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while exporter.sinks()[0].queued() > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("queue drains after NATS comes back");
+        if ids.len() < 2 {
+            docker("stop");
+        }
+    }
+    let s = Server { js: jetstream::new(async_nats::connect(&s.url).await.unwrap()), ..s };
+    let stored: Vec<String> = s.messages().await.into_iter().map(|(_, id, _)| id).collect();
+    assert_eq!(stored, ids);
+    exporter.shutdown().await;
+    s.delete().await;
 }
