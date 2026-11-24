@@ -6,14 +6,18 @@ mkdir -p "$MODELS_EVIDENCE_DIR"
 printf '{"status":"failed","reason":"capture did not finish"}\n' > "$MODELS_EVIDENCE_DIR/result.json"
 ab() { agent-browser --session models-pricing-evidence "$@"; }
 control() { curl -fsS "http://127.0.0.1:18888/control?$1"; }
-ab --cdp "${MODELS_BROWSER_CDP:-http://127.0.0.1:19222}" open http://127.0.0.1:18317
+ab --cdp "${MODELS_BROWSER_CDP:-http://127.0.0.1:19222}" open http://127.0.0.1:28317
 ab set viewport 1200 1000
-ab find role button click --name 'Sign in'
-ab wait --text 'Continue as demo operator'
-ab find role link click --name 'Continue as demo operator'
-ab wait --text 'Overview'
+ab wait h1
+if [[ "$(ab get text body)" == *'Sign in with your identity provider'* ]]; then
+  ab find role link click --name 'Sign in' --exact
+  ab wait --text 'Continue as demo operator'
+  ab find role link click --name 'Continue as demo operator'
+  ab wait --text 'Overview'
+fi
 ab find role link click --name Models --exact
-ab wait --text 'Last good registry fetch'
+ab wait --text 'Provider discovery'
+ab find role button click --name 'Light theme' --exact
 control 'status=200&delay=5000' > /dev/null
 ab record start "$MODELS_EVIDENCE_DIR/models-pricing.webm"
 ab find role button click --name 'Refresh models' --exact
@@ -50,7 +54,7 @@ ab wait --text 'Cached registry prices are'
 ab screenshot "$MODELS_EVIDENCE_DIR/scheduled-failure.png"
 ab get text body > "$MODELS_EVIDENCE_DIR/scheduled-failure.txt"
 ab set viewport 390 844
-ab screenshot "$MODELS_EVIDENCE_DIR/phone-failure.png"
+ab screenshot --full "$MODELS_EVIDENCE_DIR/phone-failure.png"
 ab eval --stdin <<'JS'
 if (document.documentElement.scrollWidth > innerWidth) throw new Error('page overflows phone viewport');
 JS

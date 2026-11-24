@@ -8,6 +8,8 @@ assets:
   - assets/social.png
   - assets/usage-sessions.png
   - assets/policy-no-accounts.png
+  - assets/models-pricing.png
+  - assets/models-pricing.gif
 products:
   xolotl:
     name: xolotl

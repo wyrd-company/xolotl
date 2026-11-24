@@ -1,5 +1,5 @@
 [server]
-listen = "0.0.0.0:18317"
+listen = "0.0.0.0:28317"
 [vault]
 address = "http://127.0.0.1:18200"
 [vault.approle]
@@ -8,7 +8,7 @@ secret_id = "models-test-secret"
 [ui.oidc]
 issuer = "http://127.0.0.1:18888"
 client_id = "models-test"
-redirect_url = "http://127.0.0.1:18317/admin/session/callback"
+redirect_url = "http://127.0.0.1:28317/admin/session/callback"
 admin_group = "xolotl-admins"
 [catalog]
 metadata_url = "http://127.0.0.1:18888/registry"

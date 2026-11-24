@@ -183,4 +183,11 @@ On **Models**, choose **Refresh models** to refresh provider discovery and regis
 
 When pricing fails, the summary shows the underlying reason and retains any cached prices. Correct the registry or connection problem, then choose **Refresh models** again. The same summary appears when you return after a scheduled refresh; it also works when the catalog is empty. If prices have never been fetched, the page says no cached registry prices are available. Configuration overrides still apply. The latest attempt and error are kept until the server restarts; the last good registry cache survives restarts.
 
+![Models shows a pricing refresh failure, its underlying registry error and the age of retained cached prices.](assets/models-pricing.png)
+
+![Refresh models shows progress, succeeds, then reports a registry outage while keeping cached prices.](assets/models-pricing.gif)
+
+The recording shows **Refresh models**, its progress state, successful pricing,
+and a second refresh failing with cached prices retained.
+
 Usage and Traffic show API-equivalent USD with priced-request coverage; subscription value is not billed spend.

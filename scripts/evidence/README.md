@@ -42,7 +42,7 @@ docker run -d --name models-task7-app --network host \
   xolotl-models-pricing:task7
 ```
 
-Wait for the page on `http://127.0.0.1:18317`, then capture:
+Wait for the page on `http://127.0.0.1:28317`, then capture:
 
 ```bash
 scripts/evidence/models-pricing-capture.sh
