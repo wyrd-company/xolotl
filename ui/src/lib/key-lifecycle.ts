@@ -1,5 +1,10 @@
 import type { RevokeResult } from "./api";
 
+/** Each vault-path segment follows the server's valid_name contract. */
+export function validClientId(value: string): boolean {
+  return /^[a-z0-9][a-z0-9_-]{0,62}\/[a-z0-9][a-z0-9_-]{0,62}$/.test(value);
+}
+
 /** Durations sent to the API must remain exact JSON integers. */
 export function keyDuration(value: string, allowZero = false): number {
   const match = /^(\d+)([smhdw]?)$/.exec(value.trim());

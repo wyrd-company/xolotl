@@ -14,7 +14,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { del, get, post, type KeyInfo, type Policy, type RevokeResult, type Status, type UsageRow } from "@/lib/api";
 import { dateTime, num } from "@/lib/format";
 import { useAction } from "@/lib/hooks";
-import { keyDuration, revokeMessage } from "@/lib/key-lifecycle";
+import { keyDuration, revokeMessage, validClientId } from "@/lib/key-lifecycle";
 
 const WEEK = 7 * 86_400;
 const TTLS: [string, number | null][] = [
@@ -298,7 +298,10 @@ function LimitUsage({ k }: { k: KeyInfo }) {
         const limit = k.limits?.[w];
         const used = limit == null ? k.usage?.[w] : k.limit_usage?.[w];
         return (
-          <span key={w} className={limit != null && used != null && used >= limit ? "whitespace-nowrap text-destructive" : "whitespace-nowrap"}>
+          <span
+            key={w}
+            className={limit != null && used != null && used >= limit ? "whitespace-nowrap text-destructive" : "whitespace-nowrap"}
+          >
             {used == null ? "unavailable" : num(used)}
             {limit != null && `/${num(limit)}`} {label}
           </span>
@@ -463,7 +466,7 @@ function RotateKey({ k }: { k: KeyInfo }) {
 function RevokeById({ result, onRevoked }: { result: RevokeResult | null; onRevoked: (r: RevokeResult) => void }) {
   const [id, setId] = useState("");
   const trimmed = id.trim();
-  const valid = /^[a-z0-9_-]{1,63}\/[a-z0-9_-]{1,63}$/.test(trimmed);
+  const valid = validClientId(trimmed);
   const revoke = useAction(() => del<RevokeResult>(`/admin/keys/${trimmed}`), {
     invalidate: [["keys"]],
     success: revokeMessage,
@@ -499,7 +502,7 @@ function RevokeById({ result, onRevoked }: { result: RevokeResult | null; onRevo
           </Confirm>
         </div>
         <p id="revoke-help" className="text-muted-foreground text-sm">
-          Use policy/name. Each part is 1–63 lowercase letters, digits, hyphens or underscores.
+          Use policy/name. Each part is 1–63 lowercase letters, digits, hyphens or underscores, starting with a letter or digit.
         </p>
         {result && <p role="status">{revokeMessage(result)}</p>}
       </CardContent>

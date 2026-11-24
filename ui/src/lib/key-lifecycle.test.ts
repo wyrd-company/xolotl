@@ -3,7 +3,29 @@
 //   tests: key-lifecycle
 // ---
 import { expect, test } from "vitest";
-import { keyDuration, revokeMessage } from "./key-lifecycle";
+import { keyDuration, revokeMessage, validClientId } from "./key-lifecycle";
+
+test("client IDs require two valid vault names, each starting with a lowercase letter or digit", () => {
+  for (const id of ["team/editor", "0/1", "team-a/editor_2", `${"a".repeat(63)}/${"b".repeat(63)}`]) {
+    expect(validClientId(id), id).toBe(true);
+  }
+  for (const id of [
+    "-a/b",
+    "_a/b",
+    "a/-b",
+    "a/_b",
+    "A/b",
+    "a/B",
+    "a/",
+    "/b",
+    "a/b/c",
+    "a b/c",
+    `${"a".repeat(64)}/b`,
+    `a/${"b".repeat(64)}`,
+  ]) {
+    expect(validClientId(id), id).toBe(false);
+  }
+});
 
 test("custom key durations support CLI units and exact seconds", () => {
   for (const [value, seconds] of [
