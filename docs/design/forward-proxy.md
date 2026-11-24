@@ -75,10 +75,13 @@ A tunnel is closed by shutting both of its sockets. On an intercepted connection
 So a change reaches an instance's open connections when that instance publishes the first key state that contains it:
 
 - **On the instance that made the change,** that is the write itself.
-- **On another instance,** it is the end of the first reload that reads the change. At the latest, that is the first reload to start after the change. Reloads start every 60 s, or, when one runs longer than that, as soon as it ends. Each reads every policy and key from OpenBao in turn and publishes the new state only when it has read them all. So its duration grows with the number of keys and with OpenBao's latency, and no fixed number of seconds bounds it.
-- **A reload that fails** leaves the state an instance loaded last in place, for every route of xolotl ([Client keys](client-keys.md#authentication)). While its reloads fail, a change made elsewhere does not reach that instance at all; it arrives with the first reload that succeeds after the change. Each failed reload is logged at warn level.
+- **On another instance,** it is the end of the first successful reload that reads the changed key or policy after the change was written. A reload already running when the change is written may have read that entry before it, so it can be the reload after that one.
+  - **When reloads run:** key reloads run in xolotl's maintenance loop ([Background tasks](architecture.md#background-tasks)). On each 60 s tick, the loop reloads keys and policies, then syncs accounts, then reloads provider accounts and MCP servers, waiting for each before the next. A round that overruns the tick starts the next round as soon as it ends. So the next key reload starts 60 s after the last tick, or later, by however long the rest of the round takes.
+  - **How long one takes:** each key reload reads every policy and key from OpenBao in turn, and publishes the new state only when it has read them all. Its duration grows with the number of keys and with OpenBao's latency.
+  - **No fixed bound:** no fixed number of seconds bounds either the start or the duration.
+- **A reload that fails** leaves the state an instance loaded last in place, for every route of xolotl ([Client keys](client-keys.md#authentication)). While its reloads fail, a change made elsewhere does not reach that instance at all. It arrives with the first successful reload that reads it after it was written. Each failed reload is logged at warn level.
 
-`xolotl.forward_proxy.key_state_age` reports, in seconds, how old the key state in use is, counted from the start of the reload that read it ([Telemetry](#telemetry)). Every change made elsewhere before that start is in the state.
+`xolotl.forward_proxy.key_state_age` reports, in seconds, the age of the reload that produced the key state in use, counted from that reload's start ([Telemetry](#telemetry)). A successful reload can still leave out an entry: it skips a policy or a key record it can't read or parse, logs it at warn level and publishes the rest. A key whose record or policy was skipped then authenticates nowhere, so the gap fails closed and keeps no stale grant ([Policies](client-keys.md#policies)).
 
 ### Transport
 
@@ -146,9 +149,14 @@ Each request on the connection is forwarded on its own:
   - **Always removed:** `connection`, `keep-alive`, `proxy-authorization`, `proxy-authenticate`, `proxy-connection`, `te` other than `te: trailers`, `trailer`, `transfer-encoding` and `upgrade`.
   - **Named by the sender:** every field that the message's own `connection` header names, in its headers and its trailers.
   - **Kept:** `authorization`, cookies and every `x-goog-*` header pass unchanged, so the upstream sees the client's own credentials.
-  - **On responses:** the status returns unchanged. Response headers drop the same fields, and `alt-svc`, which would point the client at the host directly.
+  - **On responses:** the status returns unchanged. Response headers drop the same fields, and `alt-svc`, which would point the client at the host directly. The one exception is the `101 Switching Protocols` that answers a forwarded upgrade ([Upgrades](#interception)).
 - **Bodies:** sent frame by frame, data and trailers, in both directions, as the sender encoded them. Each frame is written to the other side as it arrives, with no buffer in between, so a streamed reply reaches the client chunk by chunk. Xolotl imposes no body size limit here.
-- **Upgrades:** an HTTP/1.1 request with `Upgrade` is forwarded on an HTTP/1.1 upstream connection of its own. It keeps `upgrade` and a `connection: upgrade` naming only that field, and drops every other connection-specific field. HTTP/2 carries no upgrade. After a `101 Switching Protocols`, the two upgraded connections are joined and copied as bytes, like a tunnel, until the key stops authenticating. They are not captured.
+- **Upgrades:** an HTTP/1.1 request with `Upgrade` is forwarded on an HTTP/1.1 upstream connection of its own. Both halves of the handshake keep what it needs:
+  - **The request** keeps `upgrade` and a `connection: upgrade` naming only that field, and drops every other connection-specific field.
+  - **The upstream's `101 Switching Protocols`** reaches the client with the `upgrade` it selected and a `connection: upgrade` naming only that field. Its other headers pass unchanged, as on every response, `sec-websocket-accept` included. Every other connection-specific field is dropped. A client checks both fields before it accepts the switch (RFC 6455, section 4.1).
+  - **After the switch,** the two upgraded connections are joined and copied as bytes, like a tunnel, until the key stops authenticating. They are not captured.
+
+  HTTP/2 carries no upgrade.
 
 ### Failures
 
@@ -195,20 +203,29 @@ The capture runs beside forwarding and never holds it up. The export is held ope
 2. **The capture task.** The forwarding task then spawns the request's capture task and moves the hold into it. The hold is a value that has one owner at a time; it is released only when it is dropped.
 3. **Submission.** The capture task submits the row through the hold. `CaptureHold::submit` builds the row and queues it on every destination, on the capture task, before it releases the hold, as `Pending::submit` does for gateway rows.
 
-The forwarding task and the capture task talk through one queue, which carries these messages in order:
+The forwarding task and the capture task talk through one queue of events. Each event belongs to one direction, the request or the response, except the end marker:
 
-- **The request head:** its `Content-Type` and `Content-Encoding`.
-- **Request frames.**
-- **The response head:** the upstream's status, `Content-Type` and `Content-Encoding`, sent when the upstream's headers arrive.
-- **Response frames.**
-- **The end marker:** the outcome from [Failures](#failures). That is the status xolotl gave the client when xolotl answered itself, the latency, and xolotl's own error.
+| Event | Direction | Sent |
+|---|---|---|
+| Head | Request: its `Content-Type` and `Content-Encoding`. Response: the upstream's status, `Content-Type` and `Content-Encoding`. | The request head at admission; the response head when the upstream's headers arrive |
+| Frame | Either | As each data frame is forwarded |
+| Body end | Either: the body ended, or it was cancelled | When that direction's body ends, or is reset or abandoned |
+| End marker | None: the outcome from [Failures](#failures), meaning the status xolotl gave the client when xolotl answered itself, and xolotl's own error | Once both directions have ended or been cancelled |
 
-How the messages flow:
+How the events flow:
 
-- **Frames by reference.** The forwarding task writes each frame onward first, and then hands the same frame to the queue, by reference, without copying it. The queue holds at most 8 MiB of frames. When a frame doesn't fit, the capture of that request stops reading frames, and forwarding goes on.
-- **Heads and the marker are always taken.** They sit outside the 8 MiB bound and are never refused.
-- **A dropped forwarding task** closes the queue without an end marker. The capture task then takes the status from the last head it read: the upstream's status when a response head arrived, and `499` otherwise. So a task dropped after a `200` head and one dropped before any answer give `200` and `499`, even with no frame between.
-- **One submission.** The capture task reads every message queued before the marker or the closed queue, finishes decoding and reading metadata, and then submits the row once, through its hold. The last frame the client received is in the row whenever it fitted in the queue: no scheduling between the two tasks can drop it.
+- **Two directions, independent.** Each direction's events keep their order, but the two directions interleave freely, as HTTP/2 allows: the upstream can send its response head and data before the client has finished its upload (RFC 9113, section 8.1). The capture task keeps a decoder, a copy and a metadata reader for each direction, and routes each event by its direction tag, never by what came before. A request frame that arrives after response data is still request data. Neither direction waits for the other: the forwarding task never holds a frame back to keep an order.
+- **Frames by reference.** The forwarding task writes each frame onward first, and then hands the same frame to the queue, by reference, without copying it. The queue holds at most 8 MiB of frames, from both directions together. When a frame doesn't fit, the capture of that request stops reading frames in both directions, and forwarding goes on.
+- **Heads, body ends and the marker are always taken.** They sit outside the 8 MiB bound and are never refused.
+- **The latency** is measured by the capture task, from the request's start, which the forwarding task hands it at admission, to the end marker or the queue's closing.
+- **A dropped forwarding task** closes the queue without an end marker. The capture task then:
+  - takes the status from the last response head it read: the upstream's status when one arrived, and `499` otherwise;
+  - ends each direction that has no body end as cancelled;
+  - sets `error` to `incomplete: the request ended without an outcome`, with the bytes relayed in each direction;
+  - keeps what `Observed` read, as for any cut response.
+
+  So a task dropped after a `200` head and one dropped before any answer give `200` and `499`. Neither reads as a completed exchange.
+- **One submission.** The capture task reads every event queued before the marker or the closed queue. It finishes both directions' decoding and metadata, and then submits the row once, through its hold. The last frame the client received, in either direction, is in the row whenever it fitted in the queue: no scheduling between the two tasks can drop it.
 
 The capture task works on each body in three steps:
 
@@ -256,7 +273,8 @@ pub struct Forwarded {
     pub response: Captured,
     /// Read from the decoded bodies, whatever the copies keep.
     pub observed: Observed,
-    /// Xolotl's own failure, or why the request ended early.
+    /// Xolotl's own failure, why the request ended early, or `incomplete: ...`
+    /// when the forwarding task ended without an end marker.
     pub error: Option<String>,
 }
 
@@ -431,7 +449,7 @@ OpenBao takes the CSR's common name and SANs, because `use_csr_common_name` and 
 |---|---|
 | An open relay: anyone sends traffic through xolotl | Every CONNECT needs an egress-only client key. Other methods get `405`. Destination ports are limited to `ports`. |
 | A credential with more authority than the proxy, exposed in the cleartext CONNECT head | The listener takes no key whose policy lists anything beside `egress`, and no bootstrap admin token ([Proxy authentication](#proxy-authentication)). The path to the listener is one the operator trusts with the key ([Transport](#transport)). |
-| A revoked, disabled or expired key that keeps an open connection | Open connections are rechecked on every new key state, every 15 s and on each new intercepted request, and closed when the key fails. A change takes effect on an instance when that instance publishes a key state that contains it: at once on the instance that made it, and at the end of another instance's next successful reload, which has no fixed bound. `xolotl.forward_proxy.key_state_age` shows how old each instance's state is ([Connections outlive no key](#connections-outlive-no-key)). |
+| A revoked, disabled or expired key that keeps an open connection | Open connections are rechecked on every new key state, every 15 s and on each new intercepted request, and closed when the key fails. A change takes effect on an instance when that instance publishes the first key state that contains it. On the instance that made it, that is at once. On another, it is at the end of the first successful reload that reads it after it was written, which has no fixed bound. `xolotl.forward_proxy.key_state_age` shows how old each instance's state is ([Connections outlive no key](#connections-outlive-no-key)). |
 | Reaching internal services through the proxy: OpenBao, NATS, ClickHouse, a metadata service, xolotl's own listeners | Every resolved address must pass the [address check](#the-address-check), IPv4-carrying IPv6 forms included, and xolotl connects only to an address it checked. |
 | A certificate for a name off the capture list | Xolotl requests only `capture_hosts` names, and SNI must equal the CONNECT host. The role allows exactly those names. The policy grants only `sign` on that role: not `sign-verbatim`, `issue`, the `issuer/` paths or role writes. The intermediate's constraint holds every DNS name in a certificate it signs to the capture hosts' subtrees; it does not constrain IP or URI identities, which the role refuses ([What keeps certificates to the configured names](#what-keeps-certificates-to-the-configured-names)). |
 | A leaked certificate key | The key exists only in memory. Its certificate is valid for the role's `ttl`, 24 h, which the token can't extend: the policy refuses `not_after` and `ttl`. |
@@ -456,7 +474,7 @@ OpenBao takes the CSR's common name and SANs, because `use_csr_common_name` and 
 | `xolotl.forward_proxy.closed` | `reason`: `key` (no longer authenticates) or `shutdown` | Connections xolotl closed |
 | `xolotl.forward_proxy.requests` | `host`, `status`, `capture`: `none` (not a model path), `full`, `skipped` (a body's coding xolotl doesn't decode; it takes precedence over `cut`) or `cut` (a copy was cut, or `Observed.complete` is false) | Requests on intercepted connections |
 | `xolotl.forward_proxy.certificates` | `host`, `outcome`: `issued` or `failed` | Issuances and renewals |
-| `xolotl.forward_proxy.key_state_age` | none | A gauge: the age of the key state in use, in seconds since the start of the reload that read it |
+| `xolotl.forward_proxy.key_state_age` | none | A gauge: the age of the reload that produced the key state in use, in seconds since that reload started |
 
 `host` is an attribute only where it is a capture host, so its cardinality is the capture list's. Exported rows count in `xolotl.export.rows`, as for every row.
 
@@ -504,6 +522,8 @@ The tests need neither the Homelab OpenBao nor Google:
   - A tunnel that keeps sending bytes, and an HTTP/2 intercepted connection that keeps sending requests, are closed within the sweep interval after their key is revoked, disabled, expires, or ends its rotation grace. The interval is shortened in the test.
   - **A reload outage:** while the key store fails every reload, a revocation written elsewhere leaves an open connection running, and `xolotl.forward_proxy.key_state_age` grows. The connection closes when the first successful reload publishes its state.
   - **A slow reload:** a key store that answers each read slowly makes a successful reload last longer than the 15 s sweep interval. A revocation it reads leaves the connection open until the reload publishes its state, and closes it then, through the sweep that the publication triggers.
+  - **A reload already running:** a revocation written after a running reload has read that key is not in its state. The connection closes when the next reload publishes.
+  - **A skipped record:** a reload that can't read one key record publishes without it. That key then authenticates nowhere, and its open connections close.
   - The bootstrap admin token, and a key whose policy lists `egress` beside another scope, are refused.
 - **Encodings:** a gzip, a Brotli and a zstd SSE response reach the client byte for byte. Their decoded copies and `Observed` match the identity response's. A body in an unknown coding is forwarded and not copied, and a body that decodes past the limit stops there.
 - **Metadata without bodies:** with `bodies = false` on every destination, a row still has `model`, the session, the token counts and the tool calls. Two responses with the same prefix and different final `usageMetadata` give different token counts.
@@ -513,7 +533,12 @@ The tests need neither the Homelab OpenBao nor Google:
   - A response with two calls to the same tool keeps both entries.
   - A response with more calls than the entry limit keeps the first 256 and marks the metadata incomplete.
 - **Capture completion:** the capture task is held back until the forwarding task has sent the last frame and the end marker. The row still has the last frame's output and its `usageMetadata`, and it is submitted once.
-- **Status without an end marker:** a forwarding task dropped after a `200` response head and before any frame gives a row with `200`. One dropped before any response head gives `499`.
+- **Early response:** an HTTP/2 client sends its first request frame, and the upstream answers with a `200` head and data before the client sends its last request frame. The client waits for that data before it ends its upload. The exchange completes, so nothing stalls on an order. The row's request copy holds both request frames, and its response copy holds the response data, each in its own order.
+- **No end marker:**
+  - A forwarding task dropped after a `200` response head gives a row with `200` and an `incomplete` error. That holds with no frame, and with one SSE event carrying `usageMetadata`, whose tokens the row keeps.
+  - One dropped before any response head gives `499` and the same error.
+  - Both rows have the elapsed time from the request's start as their latency.
+- **Upgrade:** a WebSocket handshake through an intercepted connection opens. The client receives the upstream's `101` with `upgrade: websocket`, `connection: upgrade` and `sec-websocket-accept`.
 - **Hold ownership:**
   - Shutdown begins while a capture task has been spawned but not yet run. The admission hold keeps the export open, and the row arrives.
   - The capture task is paused inside `submit`, after the row is built and before it is queued. The hold keeps the export open, and the row arrives.
