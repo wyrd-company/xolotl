@@ -13,6 +13,7 @@ These pages describe how xolotl is built and why. For installing, configuring an
 | [Web UI](web-ui.md) | OpenID Connect sign-in, sessions and CSRF, how the UI is built and served |
 | [Client keys](client-keys.md) | Key records in OpenBao, authentication, rotation and revocation |
 | [Exchange export](export.md) | Copying requests to accounts and their responses to ClickHouse, directly or through NATS JetStream: capture points, assembly, destinations, queues and their bounds |
+| [Forward proxy](forward-proxy.md) | The opt-in HTTPS forward-proxy listener: proxy authentication, tunnels, interception of capture hosts, certificates from the OpenBao PKI, capture of model requests into the exchange export, the OpenBao setup, threats |
 | [Rate limits](limits.md) | Request and token limits on policies: windows, per-key or per-policy counting, 429 responses, consumption |
 | [Releases](releases.md) | Intentional, CI, and the release workflow's tag guard |
 | [Known limitations](../user/limitations.md) | What isn't done yet, with the issues that track it |
