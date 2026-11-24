@@ -14,7 +14,7 @@ forward-proxy listener ── egress-only client key? ── no ──▶ 407 / 
    ├── host on capture_hosts, certificate cached ──▶ TLS with a certificate for host ──▶ HTTP requests
    │                                                    │ each forwarded unchanged over TLS to host,
    │                                                    │ verified against the system roots
-   │                                                    └ model paths: frames shared with a capture task
+   │                                                    └ model paths: frames, then an end marker, to a capture task
    │                                                        ──▶ decoded copy + metadata ──▶ Exporter ──▶ ClickHouse, NATS
    │
    └── any other host ──▶ encrypted tunnel to host:port, bytes copied both ways, not read
@@ -57,6 +57,8 @@ The forward proxy takes only an **egress-only client key**:
 - **A client key.** The principal has a client id, which names the client in the log and in every row it produces. The bootstrap admin token authenticates without a client id, so it is refused with `403`, as it is left out of the export elsewhere ([Capture](export.md#capture)).
 - **An egress-only policy.** The key's policy lists the `egress` scope, and policy validation refuses `egress` together with any other scope. `egress` is the one scope that `admin` does not imply. So a key that works on this listener can do nothing else in xolotl: no account, no MCP server, no administration. One client that also calls xolotl's LLM endpoints holds two keys.
 
+Egress-only keys are pending the operator's confirmation of that two-key workflow. xolotl's own description promises one client key for subscriptions, gateways and MCP servers; the forward proxy's key is a second one, for a different listener.
+
 A policy's providers, models, accounts and limits do not apply to forward-proxy traffic, because that traffic reaches no account of xolotl's. An egress-only policy needs no provider or MCP server. `egress` counts as client use for keys that manage keys ([Keys that manage keys](client-keys.md#keys-that-manage-keys)), next to `proxy` and `mcp`.
 
 The client id of the key is the `client_id` of the exchanges it produces, so its rows go to `xolotl.exchanges.<client_id>` on NATS.
@@ -70,7 +72,9 @@ A connection's authority lasts only as long as its key authenticates. Each open 
 
 A tunnel is closed by shutting both of its sockets. On an intercepted connection, xolotl sends HTTP/2 `GOAWAY` or closes the HTTP/1.1 connection. Requests in flight end as in [Failures](#failures), and their rows say why.
 
-A change made on this instance takes effect within 15 s. Another instance learns of it at its next reload of keys and policies, every 60 s, so it takes effect there within 75 s.
+A change made on this instance takes effect within 15 s. Another instance learns of it at its next successful reload of keys and policies, which runs every 60 s, so while its reloads succeed the change takes effect there within 75 s.
+
+A reload that fails leaves the keys and policies an instance loaded last in place, for every route of xolotl ([Client keys](client-keys.md#authentication)). While an instance's reloads fail, its sweeps check open connections against that state, so a change made elsewhere reaches its connections within 15 s of its next successful reload, not before. Each failed reload is logged at warn level, and `xolotl.forward_proxy.key_state_age` reports the seconds since the last successful one ([Telemetry](#telemetry)).
 
 ### Transport
 
@@ -129,7 +133,7 @@ Xolotl answers `200 Connection Established`, then accepts TLS from the client wi
 Each request on the connection is forwarded on its own:
 
 - **Its host:** `Host`, or `:authority` in HTTP/2, names the CONNECT host, with port 443 or none. Any other answers `421 Misdirected Request`, so a client that reuses a connection for another name opens a new one.
-- **Its upstream:** connections to the CONNECT host that belong to this client connection alone. The first request opens one. Later requests reuse it, or open another when HTTP/1.1 is busy, and all of them close when the client connection closes. No upstream connection carries two client connections' requests, so requests of different keys, and of different Google sign-ins behind one key, never share a connection.
+- **Its upstream:** connections to the CONNECT host that belong to this client connection alone. The first request opens one. Later requests reuse it, or open another when HTTP/1.1 is busy, and all of them close when the client connection closes. No upstream connection carries the requests of two client connections, so requests of different client connections, and so of different keys, never share one. Requests that one client multiplexes on its own connection share its upstream connections, as they shared the client's connection; xolotl does not read their credentials to separate them.
   - **Each new upstream connection** resolves the host and passes the [address check](#the-address-check), and connects within 10 s.
   - **Validation:** it validates the host's certificate with `rustls-platform-verifier` against the container's system roots, as every other upstream call of xolotl does. It sends the host as SNI.
   - **Protocols:** ALPN offers `h2` and `http/1.1`. HTTP/2 and HTTP/1.1 meet in either direction, because forwarding works on requests, not bytes.
@@ -151,7 +155,7 @@ Each request on the connection is forwarded on its own:
 | The upstream read fails, or no frame arrives for `server.upstream_timeout_secs`, after the status and part of the body reached the client | A response that does not end cleanly. HTTP/2 resets the stream with `INTERNAL_ERROR`. HTTP/1.1 closes the connection before the last chunk or the declared length, so the client sees a cut body, never a complete one. | `status` the upstream's, `request` and `response` what was copied, `error` the reason and the bytes relayed |
 | The client goes away, or xolotl closes the connection for the key or for shutdown | Nothing more | `status` the upstream's when it had answered; otherwise `499`, with `error` the cause |
 
-Each model request has one capture guard, owned by the task that forwards it. The guard submits the request's `Forwarded` once: when the response ends, on a failure, or when the task is dropped.
+The forwarding task decides the outcome in the table and hands it to the request's capture task as its end marker. The capture task submits the row ([Capture](#capture)).
 
 ## Certificates
 
@@ -176,33 +180,42 @@ Exact names are enforced by xolotl, by the client's handshake and by the role. T
 
 1. **Xolotl's request:** `certs::Store` holds only the `capture_hosts` names, compared exactly, so no client input reaches the CSR.
 2. **SNI:** a client's SNI that differs from the CONNECT host fails the handshake, so no client can be served a certificate for another name.
-3. **The role:** `allowed_domains` holds exactly the capture hosts. Its other settings refuse subdomains, globs, wildcards, IP SANs, URI SANs, `localhost` and client authentication ([OpenBao setup](#openbao-setup)). The AppRole's policy grants `update` on `<mount>/sign/<role>`, and no other path of the mount. The mount holds this one role, and only the operator's own tokens can write roles on it.
-4. **The intermediate:** the issuing CA carries the name constraint `permitted_dns_domains` of the capture hosts. Under RFC 5280, a DNS constraint permits a name and every name below it. So every certificate the intermediate signs is valid at a client only for a capture host or a name under one, such as `x.daily-cloudcode-pa.googleapis.com`, and never for another Google name or another domain. A certificate for a name below a capture host passes this check, and only the role keeps it from being signed. OpenBao 2.7.3 sets `permitted_dns_domains` and ignores `excluded_dns_domains`, so the intermediate can't carry the excluded subtree that would make it exact.
+3. **The role and its policy:** `allowed_domains` holds exactly the capture hosts. The role's other settings refuse subdomains, globs, wildcards, IP SANs, URI SANs, `localhost` and client authentication ([OpenBao setup](#openbao-setup)). The AppRole's policy grants `update` on `<mount>/sign/<role>` and no other path of the mount. On that path it accepts only the parameters `csr` and `common_name`, so the token can't set `not_after`, which OpenBao honors past the role's `max_ttl`, or `ttl`, `alt_names` or any other override. The mount holds this one role, and only the operator's own tokens can write roles on it.
+4. **The intermediate:** the issuing CA carries the name constraint `permitted_dns_domains` of the capture hosts. It constrains DNS names, and only DNS names. Under RFC 5280, a DNS constraint permits a name and every name below it. So every DNS name in a certificate the intermediate signs is valid at a client only if it is a capture host or a name under one, such as `x.daily-cloudcode-pa.googleapis.com`, and never another Google name or another domain. A DNS name below a capture host passes this check, and only the role keeps it from being signed. The intermediate carries no constraint for IP addresses or URIs; the role's refusal of IP and URI SANs is what keeps them out. OpenBao 2.7.3 sets `permitted_dns_domains` and ignores `excluded_dns_domains`, so the intermediate can't carry the excluded subtree that would make it exact.
 
 ## Capture
 
-The capture runs beside forwarding and never holds it up. For each request on a [model path](#model-requests), the forwarding task writes each frame onward first, and then hands the same frame to the request's capture task, by reference, without copying it. The queue between them holds at most 8 MiB of frames. When a frame doesn't fit, the capture of that request stops, and forwarding goes on. The capture task works on each body in three steps:
+The capture runs beside forwarding and never holds it up. Each request on a [model path](#model-requests) gets its own capture task when the request starts. Before it reads anything, the task takes a hold on the export, so that shutdown waits for it ([Shutdown](#shutdown)). The forwarding task and the capture task talk through one queue:
+
+- **Frames.** The forwarding task writes each frame onward first, and then hands the same frame to the queue, by reference, without copying it. The queue holds at most 8 MiB of frames. When a frame doesn't fit, the capture of that request stops reading frames, and forwarding goes on.
+- **The end marker.** When the request ends, however it ends, the forwarding task puts one end marker on the queue, outside the 8 MiB bound. It carries the outcome from [Failures](#failures): the status, the latency and xolotl's own error. A forwarding task that is dropped closes the queue, which the capture task reads as a marker for a request that ended without an answer: `499`, or the upstream's status when it had answered.
+- **One submission.** The capture task reads every frame queued before the marker, finishes decoding and reading metadata, and then submits the row once, through its hold. The last frame the client received is in the row whenever it fitted in the queue: no scheduling between the two tasks can drop it.
+
+The capture task works on each body in three steps:
 
 1. **Decode.** It reads the body's `Content-Encoding` and decodes `gzip`, `x-gzip`, `deflate`, `br` and `zstd`, alone or stacked, undoing the codings in reverse of the order the header lists them. It stops after `server.max_body_bytes` of decoded output (64 MiB), which bounds what a compressed body can expand to. A body with any other coding is not decoded: nothing of it is copied or read. The client always gets the bytes the upstream sent; the capture's decoding is its own.
 2. **Copy.** When a destination takes bodies, it keeps the decoded body up to the capture's `max_body_bytes`, the largest any destination wants ([Destinations](export.md#destinations)). A body is copied when its `Content-Type` is text, JSON or XML, or absent or empty, the rule `proxy::is_text` applies to the gateway's bodies ([Capture](export.md#capture)). Otherwise its column is empty and marked `*_truncated`.
 3. **Read metadata.** It reads the decoded bytes into `Observed`, whatever the copy keeps and whether or not any destination takes bodies:
    - **From the request:** a streaming JSON scanner that keeps only the key path and two values, the top-level `model` and `request.session_id`. Memory is the same whatever the size of the body. `request.session_id` becomes the session key at once: the truncated SHA-256 of source `cloud-code` and the value ([Session identity](sessions.md#session-identity)). The raw value goes no further.
-   - **From the response:** each SSE `data:` event, or the JSON body, as the gateway's tap reads them ([Request path](architecture.md#request-path)). It takes the last `usageMetadata` and the names of the `functionCall` parts.
+   - **From the response:** each SSE `data:` event, or the JSON body, as the gateway's tap reads them ([Request path](architecture.md#request-path)). It takes the last `usageMetadata`, and one tool call entry for each `functionCall` part, in order, repeats included, as the gateway counts calls (`context::tools::ToolCalls`). Each entry is the call's name, cut at 128 characters as there.
 
 ### Capture limits
 
+Every limit below that skips something `Observed` would have read sets `Observed.complete` to false. The row then leaves its token columns empty rather than hold a count that may not be the last one ([The row](#the-row)), and `xolotl.forward_proxy.requests` counts the request with `capture=cut`.
+
 | Limit | Value | When it is reached |
 |---|---|---|
-| Frames waiting for the capture task | 8 MiB per request | The capture stops for that request. The copies end there, marked `*_truncated`, and `Observed` is marked incomplete. |
-| Decoded bytes per body | `server.max_body_bytes` (64 MiB) | Decoding stops. The copy ends there, marked `*_truncated`, and `Observed` is marked incomplete. |
-| The body copy | The capture's `max_body_bytes` of decoded bytes | The copy is cut, as on the gateway, and marked `*_truncated`. Metadata reading goes on. |
-| One SSE event, or a JSON response, for metadata | 4 MiB, the gateway's `MAX_JSON_SCAN` | That event or body is not read for metadata. |
-| `model` and `request.session_id` | 256 bytes each | The value is not kept. |
-| Tool call names | 64 distinct names | Later names are not kept. |
+| Frames waiting for the capture task | 8 MiB per request | The capture stops reading frames for that request. The copies end there, marked `*_truncated`, and `complete` is false. The end marker still arrives. |
+| Decoded bytes per body | `server.max_body_bytes` (64 MiB) | Decoding stops. The copy ends there, marked `*_truncated`, and `complete` is false. |
+| A coding xolotl doesn't decode | Any coding but the five above | Nothing of that body is copied or read, and `complete` is false. |
+| The body copy | The capture's `max_body_bytes` of decoded bytes | The copy is cut, as on the gateway, and marked `*_truncated`. Metadata reading goes on, and `complete` is unaffected. |
+| One SSE event, or a JSON response, for metadata | 4 MiB, the gateway's `MAX_JSON_SCAN` | That event or body is not read, and `complete` is false. |
+| `model` and `request.session_id` | 256 bytes each | The value is not kept, and `complete` is false. |
+| Tool call entries | 256 per response | Later calls are not kept, and `complete` is false. |
 
 ### The interface to the export
 
-When the guard submits, the forward proxy hands one `Forwarded` to its `CaptureSink` and moves on:
+The capture task starts with a hold from its `CaptureSink`, and submits one `Forwarded` through it:
 
 ```rust
 /// One request on a model path of an intercepted host.
@@ -212,8 +225,8 @@ pub struct Forwarded {
     pub host: String,
     /// The path without its query string.
     pub path: String,
-    /// The upstream's status; xolotl's own answer when it answered instead;
-    /// 499 when neither answered ([Failures](#failures)).
+    /// From the end marker: the upstream's status; xolotl's own answer when it
+    /// answered instead; 499 when neither answered ([Failures](#failures)).
     pub status: u16,
     pub started_at: DateTime<Utc>,
     pub latency_ms: u64,
@@ -233,20 +246,31 @@ pub struct Observed {
     /// The session digest of `request.session_id`, never the raw value.
     pub session_key: Option<String>,
     pub usage: TokenUsage,
+    /// One entry per call, repeats included.
     pub tool_calls: Vec<String>,
-    /// False when a limit stopped the reading before the bodies ended.
+    /// False when a limit skipped anything this would have read ([Capture limits](#capture-limits)).
     pub complete: bool,
 }
 
 pub trait CaptureSink: Send + Sync {
     /// The most body bytes to copy, or `None` when no destination takes bodies.
     fn body_limit(&self) -> Option<usize>;
-    /// Take a finished request. Returns at once, and can't fail the request.
-    fn submit(&self, forwarded: Forwarded);
+    /// Hold the sink open for one request's capture: shutdown waits for every hold.
+    fn hold(&self) -> CaptureHold;
+}
+
+/// Keeps the export open for one request's capture.
+pub struct CaptureHold { /* private */ }
+
+impl CaptureHold {
+    /// Take the finished request and release the hold. Returns at once, and
+    /// can't fail the request. A hold dropped without a submission releases
+    /// itself and submits nothing.
+    pub fn submit(self, forwarded: Forwarded);
 }
 ```
 
-`Exporter` is the sink. `submit` holds the exporter open, as a `Pending` does, and spawns the task that builds the row and queues it on each destination ([Queue and delivery](export.md#queue-and-delivery-to-clickhouse)). From there the row takes the path every exported row takes: one row per distinct destination setting, the destinations' queues bounded by bytes, and drops counted in `xolotl.export.rows`. An export failure, a full queue or an unreachable NATS loses rows and never touches the live request.
+`Exporter` is the sink. `hold` counts the request among the exporter's rows in progress, as `Capture::pending` does for gateway requests. `submit` spawns the task that builds the row and queues it on each destination ([Queue and delivery](export.md#queue-and-delivery-to-clickhouse)). From there the row takes the path every exported row takes: one row per distinct destination setting, the destinations' queues bounded by bytes, and drops counted in `xolotl.export.rows`. An export failure, a full queue or an unreachable NATS loses rows and never touches the live request.
 
 ### Not an account
 
@@ -279,7 +303,7 @@ A forwarded request fills the existing columns of the exchange row ([NATS export
 | `client_endpoint`, `endpoint` | The path, without the query string |
 | `session_key`, `session_source` | `Observed.session_key` and `cloud-code` when the request has a `request.session_id`; otherwise both are empty |
 | `streamed` | The response is `text/event-stream` |
-| `input_tokens`, `cached_tokens`, `output_tokens` | From `Observed.usage`, the last `usageMetadata`: `promptTokenCount`, `cachedContentTokenCount`, and `candidatesTokenCount` plus `thoughtsTokenCount` |
+| `input_tokens`, `cached_tokens`, `output_tokens` | From `Observed.usage`, the last `usageMetadata`: `promptTokenCount`, `cachedContentTokenCount`, and `candidatesTokenCount` plus `thoughtsTokenCount`. Empty when `Observed.complete` is false ([Capture limits](#capture-limits)). |
 | `cache_write_tokens`, `context_tokens`, `context_window`, `cost` | Empty |
 | `tool_calls` | `Observed.tool_calls` |
 | `output`, `output_text`, `stop_reason` | Assembled from the response copy, as for every row; empty when no destination takes bodies |
@@ -315,9 +339,9 @@ On the shutdown signal, before the exporter drains:
 
 1. Both listeners stop accepting. The certificate tasks stop.
 2. Every tunnel is closed. Tunnels carry nothing to capture.
-3. Intercepted connections take no new request: HTTP/2 sends `GOAWAY`, and HTTP/1.1 answers with `connection: close`. Requests in flight get up to 5 s to finish.
-4. Requests still open after 5 s are closed as in [Failures](#failures). Their guards submit their rows.
-5. `Exporter::shutdown` drains, with its own ten-second deadline ([Queue and delivery](export.md#queue-and-delivery-to-clickhouse)). A row submitted after it begins is dropped and counted in `xolotl.export.rows`.
+3. Intercepted connections take no new request: HTTP/2 sends `GOAWAY`, and HTTP/1.1 answers with `connection: close`. No new capture task starts, so no new hold is taken. Requests in flight get up to 5 s to finish.
+4. Requests still open after 5 s are closed as in [Failures](#failures). Each forwarding task puts its end marker on its capture task's queue.
+5. `Exporter::shutdown` waits for every hold, as it waits for gateway rows in progress, and then has each destination send what is queued. Both waits share its ten-second deadline ([Queue and delivery](export.md#queue-and-delivery-to-clickhouse)). Each capture task drains the frames queued before its marker, submits its row and releases its hold. A capture task still running at the deadline is abandoned, and its row is lost and counted in `xolotl.export.rows`.
 
 The forward proxy's part takes at most 5 s, so shutdown ends within 15 s of the signal plus the main listener's own drain.
 
@@ -350,11 +374,19 @@ bao write pki_xolotl_proxy/roles/xolotl-forward-proxy \
 
 Several capture hosts are comma-separated in `permitted_dns_domains` and `allowed_domains`. A host added to `capture_hosts` is added to both, and the intermediate is signed again with the new constraint.
 
-The AppRole gets one more path, in the `xolotl` policy or in a second policy on the role:
+The AppRole gets one more path, in the `xolotl` policy or in a second policy on the role. It accepts the two parameters xolotl sends, and no other:
 
 ```hcl
-path "pki_xolotl_proxy/sign/xolotl-forward-proxy" { capabilities = ["update"] }
+path "pki_xolotl_proxy/sign/xolotl-forward-proxy" {
+  capabilities = ["update"]
+  allowed_parameters = {
+    "csr"         = []
+    "common_name" = []
+  }
+}
 ```
+
+Without `allowed_parameters`, a token on this path can send `not_after`, which OpenBao 2.7.3 honors past the role's `max_ttl`, giving a certificate that is valid for months. With it, every other parameter is refused with `403`.
 
 The role's settings that matter, with OpenBao's default where it differs:
 
@@ -366,7 +398,7 @@ The role's settings that matter, with OpenBao's default where it differs:
 | `allow_ip_sans`, `allow_localhost` | `false` (defaults `true`) | No address or `localhost` |
 | `client_flag` | `false` (default `true`) | A server certificate only |
 | `key_type`, `key_bits` | `ec`, `256` (default `rsa`) | The key xolotl generates |
-| `ttl`, `max_ttl` | `24h` | Renewed every 16 h; a leaked key is valid for at most a day |
+| `ttl`, `max_ttl` | `24h` | Renewed every 16 h; with the policy's `allowed_parameters`, a leaked key is valid for at most a day |
 | `no_store` | `true` | Certificates are short-lived and many; OpenBao keeps no copy |
 
 OpenBao takes the CSR's common name and SANs, because `use_csr_common_name` and `use_csr_sans` default to `true`. It refuses a name outside the role with `400` and `common name ... not allowed by this role`.
@@ -377,12 +409,12 @@ OpenBao takes the CSR's common name and SANs, because `use_csr_common_name` and 
 |---|---|
 | An open relay: anyone sends traffic through xolotl | Every CONNECT needs an egress-only client key. Other methods get `405`. Destination ports are limited to `ports`. |
 | A credential with more authority than the proxy, exposed in the cleartext CONNECT head | The listener takes no key whose policy lists anything beside `egress`, and no bootstrap admin token ([Proxy authentication](#proxy-authentication)). The path to the listener is one the operator trusts with the key ([Transport](#transport)). |
-| A revoked, disabled or expired key that keeps an open connection | Open connections are rechecked every 15 s and on each new intercepted request, and closed when the key fails: within 15 s on this instance, 75 s on another ([Connections outlive no key](#connections-outlive-no-key)). |
+| A revoked, disabled or expired key that keeps an open connection | Open connections are rechecked every 15 s and on each new intercepted request, and closed when the key fails. That is within 15 s on this instance, and within 75 s on another while its reloads succeed. While its reloads fail, an instance applies a remote change within 15 s of its next successful reload, and reports the age of its key state ([Connections outlive no key](#connections-outlive-no-key)). |
 | Reaching internal services through the proxy: OpenBao, NATS, ClickHouse, a metadata service, xolotl's own listeners | Every resolved address must pass the [address check](#the-address-check), IPv4-carrying IPv6 forms included, and xolotl connects only to an address it checked. |
 | A certificate for a name off the capture list | Xolotl requests only `capture_hosts` names, and SNI must equal the CONNECT host. The role allows exactly those names. The policy grants only `sign` on that role: not `sign-verbatim`, `issue`, the `issuer/` paths or role writes. The intermediate's constraint holds every certificate it signs to the capture hosts' subtrees ([What keeps certificates to the configured names](#what-keeps-certificates-to-the-configured-names)). |
-| A leaked certificate key | The key exists only in memory and is valid for the role's `ttl`, 24 h. |
+| A leaked certificate key | The key exists only in memory. Its certificate is valid for the role's `ttl`, 24 h, which the token can't extend: the policy refuses `not_after` and `ttl`. |
 | A request for another host on an intercepted connection | `Host` or `:authority`, in the [compared form](#host-names), must name the CONNECT host, else `421`. |
-| Requests of different keys or Google sign-ins linked on one upstream connection | Upstream connections belong to one client connection ([Interception](#interception)). |
+| Requests of different client connections or keys linked on one upstream connection | Upstream connections belong to one client connection ([Interception](#interception)). Requests a client multiplexes on its own connection share its upstream connections, as they shared its connection. |
 | A forged upstream | The upstream certificate is validated for the CONNECT host against the system roots, with no setting that turns validation off. A failure answers `502` and sends nothing upstream. |
 | A proxy loop | Upstream connections ignore proxy environment variables, so xolotl's own upstream traffic never re-enters its listener. |
 | Credentials in the export | Headers and query strings are never copied, and only model paths are captured, so OAuth traffic is never a row ([Redaction](#redaction)). |
@@ -400,8 +432,9 @@ OpenBao takes the CSR's common name and SANs, because `use_csr_common_name` and 
 |---|---|---|
 | `xolotl.forward_proxy.connections` | `outcome`: `tunnel`, `intercept`, `fallback` (a capture host tunneled without a certificate) or `refused`; `reason` for `refused`; `client` | CONNECTs |
 | `xolotl.forward_proxy.closed` | `reason`: `key` (no longer authenticates) or `shutdown` | Connections xolotl closed |
-| `xolotl.forward_proxy.requests` | `host`, `status`, `capture`: `none` (not a model path), `full`, `cut` (a copy or `Observed` stopped at a limit) or `skipped` (an encoding xolotl doesn't decode) | Requests on intercepted connections |
+| `xolotl.forward_proxy.requests` | `host`, `status`, `capture`: `none` (not a model path), `full`, `cut` (a copy was cut, or `Observed.complete` is false) or `skipped` (an encoding xolotl doesn't decode) | Requests on intercepted connections |
 | `xolotl.forward_proxy.certificates` | `host`, `outcome`: `issued` or `failed` | Issuances and renewals |
+| `xolotl.forward_proxy.key_state_age` | none | A gauge: seconds since the keys and policies were last loaded successfully |
 
 `host` is an attribute only where it is a capture host, so its cardinality is the capture list's. Exported rows count in `xolotl.export.rows`, as for every row.
 
@@ -422,15 +455,15 @@ OpenBao takes the CSR's common name and SANs, because `use_csr_common_name` and 
 - `not_after`: when its certificate expires, or `null`;
 - `error`: the last issuance or renewal error, or `null`.
 
-Overview shows each capture host in one of three states:
+Together they put each capture host in one of three states:
 
-| State | `not_after` | `error` | Overview shows |
+| State | `not_after` | `error` | Meaning |
 |---|---|---|---|
-| Ready | set | `null` | Ready to intercept until `not_after` |
-| Ready, renewal failing | set | set | Ready to intercept until `not_after`, with the error, so the PKI is repaired before the certificate expires |
-| Not ready | `null` | set, or `null` while the first issuance runs | Tunneled without capture, with the error |
+| Ready | set | `null` | Xolotl intercepts the host until `not_after` |
+| Ready, renewal failing | set | set | Xolotl intercepts the host until `not_after`, unless a renewal succeeds first |
+| Not ready | `null` | set, or `null` while the first issuance runs | The host's CONNECTs are tunneled without capture |
 
-The status shows whether xolotl can intercept a host. It does not show whether a request was captured or a row delivered: rows are counted in `xolotl.export.rows`. The CLI has no status command, so this state has no CLI counterpart in the inventory.
+The status shows whether xolotl can intercept a host. It does not show whether a request was captured or a row delivered: rows are counted in `xolotl.export.rows`. The web UI does not show the status, and the CLI has no status command, so it has no counterpart in the [CLI parity](web-ui.md#cli-parity) inventory.
 
 ### Configuration
 
@@ -447,20 +480,27 @@ The tests need neither the Homelab OpenBao nor Google:
 - **A test client:** reqwest, with its proxy URL holding a test key, against the listener on an ephemeral port.
 - **Lifecycle:**
   - A tunnel that keeps sending bytes, and an HTTP/2 intercepted connection that keeps sending requests, are closed within the sweep interval after their key is revoked, disabled, expires, or ends its rotation grace. The interval is shortened in the test.
+  - **A reload outage:** while the key store fails every reload, a revocation written elsewhere leaves an open connection running, and `xolotl.forward_proxy.key_state_age` grows. After the first successful reload, the connection closes within the sweep interval.
   - The bootstrap admin token, and a key whose policy lists `egress` beside another scope, are refused.
 - **Encodings:** a gzip, a Brotli and a zstd SSE response reach the client byte for byte. Their decoded copies and `Observed` match the identity response's. A body in an unknown coding is forwarded and not copied, and a body that decodes past the limit stops there.
 - **Metadata without bodies:** with `bodies = false` on every destination, a row still has `model`, the session, the token counts and the tool calls. Two responses with the same prefix and different final `usageMetadata` give different token counts.
+- **Metadata limits:**
+  - A stream whose final `usageMetadata` event exceeds 4 MiB, after an earlier usage event that fits, gives a row with empty token columns and `capture=cut`, not the earlier count.
+  - A response with two calls to the same tool keeps both entries.
+  - A response with more calls than the entry limit keeps the first 256 and marks the metadata incomplete.
+- **Capture completion:** the capture task is held back until the forwarding task has sent the last frame and the end marker. The row still has the last frame's output and its `usageMetadata`, and it is submitted once.
 - **Failures:**
   - A response cut after its headers ends uncleanly at the client, and gives one row with the upstream's status and an `error`.
   - A client that leaves before the upstream answers gives one row with `499`.
-- **Shutdown:** a busy tunnel and a request in flight do not hold shutdown past its deadline, and the request's row is submitted before the exporter drains.
+- **Shutdown:** a busy tunnel and a request in flight do not hold shutdown past its deadline. The request's capture task holds the exporter until it has submitted the row, so the row reaches the destinations before they stop.
 
 The setup commands in [OpenBao setup](#openbao-setup) run against an OpenBao dev server (`bao server -dev`). With them in place:
 
-- **Refused:** a sign request for a name off the list, a name below a capture host, a wildcard, `localhost` or an IP SAN.
-- **Denied:** the AppRole's policy reaches no other path of the mount.
+- **Refused:** a sign request for a name off the list, a name below a capture host, a wildcard, `localhost`, an IP SAN or a URI SAN.
+- **Denied:** the AppRole's policy reaches no other path of the mount. On the signing path, it refuses `not_after` and `ttl` with `403`, while a request with `csr` and `common_name` alone gets a 24 h certificate.
 - **Outside the subtree:** a certificate that a wider role on the same mount signs for another domain fails validation at a client.
 - **Inside the subtree:** one it signs for a name below a capture host passes. This shows the bound is the subtree, not the exact name.
+- **DNS names only:** one it signs with an IP SAN passes for that address. This shows the intermediate constrains DNS names, not addresses.
 
 ## Options not chosen
 
@@ -473,10 +513,13 @@ The setup commands in [OpenBao setup](#openbao-setup) run against an OpenBao dev
 - **A wildcard certificate, such as `*.googleapis.com`.** It would cover every name under it, not the capture list.
 - **A role on the trusted CA's own mount.** It works with the same configuration, but that CA can sign any name, so a wider role or a token with more rights on the mount mints certificates for any host. The intermediate's constraint limits every certificate it signs to the capture hosts' subtrees.
 - **An intermediate whose constraint is exact, with the names below each capture host excluded.** OpenBao 2.7.3 ignores `excluded_dns_domains`, so the intermediate would have to be signed outside OpenBao.
-- **Failing a capture host's CONNECT when there is no certificate.** The live session would stop whenever OpenBao is unreachable. The export is for analysis, and the fallback is counted and shown on Overview.
+- **Failing a capture host's CONNECT when there is no certificate.** The live session would stop whenever OpenBao is unreachable. The export is for analysis, and the fallback is logged, counted and in the status.
 - **Removing `accept-encoding` to get identity bodies.** It changes a header the client sent. Without it, the upstream may answer in any coding, which the client never asked for.
 - **Copying from the frames on the forwarding task.** Decoding there would put the capture's work between frames of the live response.
-- **Upstream connections pooled per host.** Requests of different keys and different Google sign-ins would share connections, which links them for the upstream.
+- **Upstream connections pooled per host.** Requests of different client connections and keys would share connections, which links them for the upstream.
+- **Refusing forward-proxy traffic while an instance's key state is stale.** An OpenBao outage would then cut every opted-in client off from the network, sign-in included. Every other route of xolotl keeps serving from its last loaded keys too.
+- **Submitting the row from the forwarding task.** The capture task may not have read the last frames yet, so the row could lose the final usage and output.
+- **Denying `not_after` alone on the signing path.** An allowlist of the two parameters xolotl sends also covers any parameter a later OpenBao adds.
 - **Accounting for forwarded requests like gateway requests.** The request log feeds rate limits, sessions and the Usage screen, all of which describe xolotl's own accounts.
 - **Exporting every request on a capture host.** Most of a Code Assist host's calls are onboarding, experiments and metrics, not exchanges.
 - **Transparent interception by redirecting packets.** It needs control of the client's network and takes traffic from clients that never chose it. `HTTPS_PROXY` is the client's own choice.
