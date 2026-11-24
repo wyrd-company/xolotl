@@ -261,8 +261,14 @@ mod tests {
         let long = "x".repeat(2 * 1024 * 1024);
         let line = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{long}\"}},\"finish_reason\":\"stop\"}}]}}\n\n");
         let mut o = Outcome::new(true);
-        o.feed(line.as_bytes());
-        assert!(o.succeeded(), "a 2 MB final event");
+        for piece in line.as_bytes().chunks(64 * 1024) {
+            o.feed(piece);
+        }
+        assert!(o.succeeded(), "a 2 MB final event, in pieces");
+
+        let mut o = Outcome::new(false);
+        o.feed(format!("{{\"error\":{{\"message\":\"{long}\"}}}}").as_bytes());
+        assert!(!o.succeeded(), "a 2 MB error body");
 
         let mut o = Outcome::new(false);
         o.feed(format!("{{\"text\":\"{}\"}}", "x".repeat(MAX_LINE)).as_bytes());
