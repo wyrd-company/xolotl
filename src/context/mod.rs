@@ -5,7 +5,7 @@
 // relationships:
 //   implements: ../../docs/design/sessions.md
 // ---
-pub mod conversation;
+pub mod models;
 mod store;
 pub mod tools;
 
@@ -50,25 +50,13 @@ pub struct SessionId {
 
 impl SessionId {
     fn new(source: &'static str, parts: &[&[u8]]) -> Self {
-        Self { key: digest(parts), source }
+        let mut hash = Sha256::new();
+        for part in parts {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part);
+        }
+        Self { key: hex::encode(&hash.finalize()[..16]), source }
     }
-}
-
-/// A truncated SHA-256 of `parts`, each prefixed by its length.
-fn digest(parts: &[&[u8]]) -> String {
-    let mut hash = Sha256::new();
-    for part in parts {
-        hash.update((part.len() as u64).to_be_bytes());
-        hash.update(part);
-    }
-    hex::encode(&hash.finalize()[..16])
-}
-
-/// The first user turn of a body on any of the wire formats.
-fn first_user(body: &Value) -> Option<&Value> {
-    let turns = body.get("messages").or_else(|| body.get("input"));
-    let is_user = |item: &&Value| item.get("role").and_then(Value::as_str) == Some("user");
-    turns.filter(|t| t.is_string()).or_else(|| turns?.as_array()?.iter().find(is_user))
 }
 
 /// What the OpenCode client sends its session in, to a provider configured
@@ -101,7 +89,7 @@ pub fn resolve(headers: &HeaderMap, body: &Value) -> Option<SessionId> {
     let items = || turns.and_then(Value::as_array).into_iter().flatten();
     let role_is = |item: &&Value, roles: &[&str]| item.get("role").and_then(Value::as_str).is_some_and(|r| roles.contains(&r));
     let system = body.get("system").or_else(|| body.get("instructions")).or_else(|| items().find(|i| role_is(i, &["system", "developer"])));
-    let first_user = first_user(body);
+    let first_user = turns.filter(|t| t.is_string()).or_else(|| items().find(|i| role_is(i, &["user"])));
     if system.is_none() && first_user.is_none() {
         return None;
     }

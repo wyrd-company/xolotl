@@ -1,8 +1,8 @@
-//! A response body that moves its conversation only once the answer is
-//! complete: a stream must end with the format's final event and no error
-//! event. The end of the answer is held back until the move is written, so
-//! the client can't see the answer complete before its next request would
-//! see the move.
+//! A response body that records the model its session used only once the
+//! answer is complete: a stream must end with the format's final event and no
+//! error event. The end of the answer is held back until the use is written,
+//! so the client can't see the answer complete before its next request would
+//! see it.
 // ---
 // relationships:
 //   implements: ../../../docs/design/sessions.md
@@ -15,7 +15,7 @@ use axum::response::Response;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
 
-use super::Conversation;
+use super::SessionModels;
 use crate::policy::Target;
 
 /// The longest line kept while looking for the end of a stream.
@@ -134,15 +134,13 @@ impl Outcome {
     }
 }
 
-impl Conversation {
-    /// Move the conversation to `target` once `resp` has answered: a 2xx
-    /// response whose body completes ([`Outcome`]). A failed stream, or a
-    /// client that leaves before the end, moves nothing. `None` for a target
-    /// the conversation can't keep ([`Conversation::served`]).
-    pub fn moves_with(self, target: Option<Target>, resp: Response) -> Response {
-        if !resp.status().is_success() {
-            return resp;
-        }
+impl SessionModels {
+    /// Record that the session used `target` once `resp` has answered: a
+    /// 2xx response whose body completes ([`Outcome`]). A failed stream, or
+    /// a client that leaves before the end, records nothing. `None` for a
+    /// target the session can't keep, one only an alias reaches.
+    pub fn uses(self, target: Option<Target>, resp: Response) -> Response {
+        let Some(target) = target.filter(|_| resp.status().is_success()) else { return resp };
         let sse =
             resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.starts_with("text/event-stream"));
         let (parts, body) = resp.into_parts();
@@ -155,23 +153,18 @@ struct Relay<S> {
     inner: S,
     outcome: Outcome,
     /// The end of the answer, from its final event (or, for a body that is
-    /// not a stream, its last chunk), held until the move is written.
+    /// not a stream, its last chunk), held until the use is written.
     held: Vec<Bytes>,
     ready: VecDeque<Result<Bytes, axum::Error>>,
-    moves: Option<(Conversation, Option<Target>)>,
+    uses: Option<(SessionModels, Target)>,
     done: bool,
 }
 
-fn completion<S>(
-    inner: S,
-    outcome: Outcome,
-    conversation: Conversation,
-    target: Option<Target>,
-) -> impl Stream<Item = Result<Bytes, axum::Error>>
+fn completion<S>(inner: S, outcome: Outcome, session: SessionModels, target: Target) -> impl Stream<Item = Result<Bytes, axum::Error>>
 where
     S: Stream<Item = Result<Bytes, axum::Error>> + Unpin + Send + 'static,
 {
-    let relay = Relay { inner, outcome, held: Vec::new(), ready: VecDeque::new(), moves: Some((conversation, target)), done: false };
+    let relay = Relay { inner, outcome, held: Vec::new(), ready: VecDeque::new(), uses: Some((session, target)), done: false };
     futures::stream::unfold(relay, |mut r| async move {
         loop {
             if let Some(item) = r.ready.pop_front() {
@@ -200,9 +193,9 @@ where
                 None => {
                     r.done = true;
                     if r.outcome.succeeded()
-                        && let Some((conversation, target)) = r.moves.take()
+                        && let Some((session, target)) = r.uses.take()
                     {
-                        conversation.served(target.as_ref()).await;
+                        session.record(&target).await;
                     }
                     r.ready.extend(r.held.drain(..).map(Ok));
                 }
@@ -284,7 +277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_client_gets_the_last_chunk_of_a_json_body_only_once_the_move_is_written() {
+    async fn the_client_gets_the_last_chunk_of_a_json_body_only_once_the_use_is_written() {
         use axum::http::HeaderMap;
         use serde_json::json;
 
@@ -292,20 +285,20 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("session_id", "s".parse().unwrap());
         let body = json!({"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "a"}]});
-        let conversation = || Conversation::of(&db, "p/k", None, &headers, &body).unwrap();
+        let session = || SessionModels::of(&db, "p/k", None, &headers, &body).unwrap();
         let target = Target { provider: "llama".into(), model: "busy".into() };
         let chunks = ["{\"choices\":[{\"message\":", "{\"content\":\"hi\"}}]}"];
         let upstream = futures::stream::iter(chunks.map(|c| Ok(Bytes::from(c))));
-        let mut relayed = Box::pin(completion(upstream, Outcome::new(false), conversation(), Some(target.clone())));
+        let mut relayed = Box::pin(completion(upstream, Outcome::new(false), session(), target.clone()));
         assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[0]);
-        assert!(conversation().kept().await.is_empty());
+        assert!(session().kept().await.is_empty());
         assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[1], "the last chunk");
-        assert_eq!(conversation().kept().await, vec![target], "is released after the move");
+        assert_eq!(session().kept().await, vec![target], "is released after the use is written");
         assert!(relayed.next().await.is_none());
     }
 
     #[tokio::test]
-    async fn the_client_gets_the_final_event_only_once_the_move_is_written() {
+    async fn the_client_gets_the_final_event_only_once_the_use_is_written() {
         use axum::http::HeaderMap;
         use serde_json::json;
 
@@ -313,7 +306,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("session_id", "s".parse().unwrap());
         let body = json!({"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "a"}]});
-        let conversation = || Conversation::of(&db, "p/k", None, &headers, &body).unwrap();
+        let session = || SessionModels::of(&db, "p/k", None, &headers, &body).unwrap();
         let target = Target { provider: "llama".into(), model: "busy".into() };
         let chunks = [
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
@@ -321,11 +314,11 @@ mod tests {
             "data: [DONE]\n\n",
         ];
         let upstream = futures::stream::iter(chunks.map(|c| Ok(Bytes::from(c))));
-        let mut relayed = Box::pin(completion(upstream, Outcome::new(true), conversation(), Some(target.clone())));
+        let mut relayed = Box::pin(completion(upstream, Outcome::new(true), session(), target.clone()));
         assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[0]);
-        assert!(conversation().kept().await.is_empty());
+        assert!(session().kept().await.is_empty());
         assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[1], "the final event");
-        assert_eq!(conversation().kept().await, vec![target], "is released after the move");
+        assert_eq!(session().kept().await, vec![target], "is released after the use is written");
         assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[2]);
         assert!(relayed.next().await.is_none());
     }

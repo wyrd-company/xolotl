@@ -1,5 +1,4 @@
-//! A session keeps the models its conversations are on past a policy that
-//! excludes them.
+//! A session keeps the models it has used past a policy that excludes them.
 //! Nothing here waits for accounting: what a request records about its
 //! conversation is visible to the next request as soon as it has answered.
 // ---
@@ -49,7 +48,7 @@ async fn chat_in(h: &Harness, key: &str, session: &str, body: Value) -> u16 {
 }
 
 #[tokio::test]
-async fn a_conversation_keeps_its_model_after_the_policy_excludes_it() {
+async fn a_session_keeps_its_model_after_the_policy_excludes_it() {
     for (how, excluding) in excluding_qwen() {
         let h = answering().await;
         let key = h.key(policy("p")).await;
@@ -58,86 +57,46 @@ async fn a_conversation_keeps_its_model_after_the_policy_excludes_it() {
 
         assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200, "{how}: the conversation goes on");
         assert_eq!(chat_in(&h, &key, "new", first("qwen3", "hello")).await, 404, "{how}: a new session can't start with it");
-        assert_eq!(chat_in(&h, &key, "s", first("busy", "title this")).await, 200, "{how}");
-        assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200, "{how}: a background request switches nothing");
-        assert_eq!(chat_models(&h).await, ["qwen3", "qwen3", "busy", "qwen3"], "{how}");
-
-        assert_eq!(chat_in(&h, &key, "s", later("busy", "hello")).await, 200, "{how}: the conversation switches");
-        assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404, "{how}: and can't switch back");
-        assert_eq!(chat_in(&h, &key, "s", later("llama/qwen3", "hello")).await, 404, "{how}: under any name");
+        assert_eq!(chat_in(&h, &key, "s", later("busy", "hello")).await, 200, "{how}: the session switches");
+        assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200, "{how}: and goes back");
+        assert_eq!(chat_in(&h, &key, "s", later("llama/qwen3", "hello")).await, 200, "{how}: under any name");
+        assert_eq!(chat_models(&h).await, ["qwen3", "qwen3", "busy", "qwen3", "qwen3"], "{how}");
     }
 }
 
 #[tokio::test]
-async fn a_new_conversation_of_the_session_goes_on_with_its_models() {
+async fn compactions_and_background_requests_go_on_with_the_models_of_the_session() {
     let h = answering().await;
     let key = h.key(policy("p")).await;
     assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
     put(&h, excluding_qwen().remove(0).1).await;
 
-    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "a new subagent")).await, 200, "a subagent the session starts");
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "the summary")).await, 200, "what follows a compaction");
+    let summarize = |model: &str, opening: &str| {
+        json!({"model": model, "messages": [
+            {"role": "user", "content": opening}, {"role": "assistant", "content": "a"}, {"role": "user", "content": "Summarize the conversation."}]})
+    };
+    assert_eq!(chat_in(&h, &key, "s", summarize("qwen3", "hello")).await, 200, "a compaction");
+    assert_eq!(chat_in(&h, &key, "s", later("busy", "Summary: hello")).await, 200, "its first request already on another model");
+    assert_eq!(chat_in(&h, &key, "s", summarize("busy", "Summary: hello")).await, 200, "a second compaction");
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "Summary: summary")).await, 200, "back on the excluded model after it");
+    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "title this")).await, 200, "a background request");
+    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "a new subagent")).await, 200, "a subagent");
     assert_eq!(chat_in(&h, &key, "new", first("qwen3", "hello")).await, 404, "another session can't start with it");
 }
 
 #[tokio::test]
-async fn switching_back_is_refused_unless_another_conversation_has_used_the_model_since() {
+async fn a_model_the_session_never_used_stays_refused() {
     let h = answering().await;
     let key = h.key(policy("p")).await;
     assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
-    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "subagent")).await, 200);
-    put(&h, excluding_qwen().remove(0).1).await;
+    put(&h, Policy { rules: vec![Rule::Deny("llama/*".into())], ..policy("p") }).await;
 
-    assert_eq!(chat_in(&h, &key, "s", later("busy", "hello")).await, 200);
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404, "the subagent hasn't used it since");
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "subagent")).await, 200, "the subagent goes on with its model");
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200, "it used it after the switch");
-    assert_eq!(chat_in(&h, &key, "s", later("busy", "subagent")).await, 200);
-    assert_eq!(chat_in(&h, &key, "s", later("busy", "hello")).await, 200);
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404, "now no conversation is on it");
-    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "another subagent")).await, 404);
-}
-
-#[tokio::test]
-async fn a_compacted_conversation_goes_on_with_its_model_and_cannot_switch_back_once_it_leaves() {
-    let h = answering().await;
-    let key = h.key(policy("p")).await;
-    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
-    put(&h, excluding_qwen().remove(0).1).await;
     assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200);
-    let compaction = json!({"model": "qwen3", "messages": [
-        {"role": "user", "content": "hello"}, {"role": "assistant", "content": "a"}, {"role": "user", "content": "Summarize the conversation."}]});
-    assert_eq!(chat_in(&h, &key, "s", compaction).await, 200, "the compaction");
-
-    // The client rewrites the opening: the summary is the first user turn now.
-    for _ in 0..2 {
-        assert_eq!(chat_in(&h, &key, "s", later("qwen3", "Summary: hello")).await, 200, "the conversation goes on with its model");
-    }
-    assert_eq!(chat_in(&h, &key, "s", later("busy", "Summary: hello")).await, 200, "it switches");
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "Summary: hello")).await, 404, "and can't switch back");
-    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "a subagent")).await, 404, "nor can a new conversation of the session start on it");
-    assert_eq!(chat_in(&h, &key, "s", later("busy", "Summary: hello")).await, 200);
+    assert_eq!(chat_in(&h, &key, "s", later("busy", "hello")).await, 404, "the session never used it");
 }
 
 #[tokio::test]
-async fn a_compacted_conversation_that_switches_on_its_first_request_cannot_switch_back() {
-    let h = answering().await;
-    let key = h.key(policy("p")).await;
-    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
-    put(&h, excluding_qwen().remove(0).1).await;
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200);
-    let compaction = json!({"model": "qwen3", "messages": [
-        {"role": "user", "content": "hello"}, {"role": "assistant", "content": "a"}, {"role": "user", "content": "Summarize the conversation."}]});
-    assert_eq!(chat_in(&h, &key, "s", compaction).await, 200, "the compaction");
-
-    // The first request with the rewritten opening is already on another model.
-    assert_eq!(chat_in(&h, &key, "s", later("busy", "Summary: hello")).await, 200, "it switches");
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "Summary: hello")).await, 404, "and can't switch back");
-    assert_eq!(chat_in(&h, &key, "s", later("busy", "Summary: hello")).await, 200);
-}
-
-#[tokio::test]
-async fn a_conversation_without_a_session_header_is_told_from_a_new_one_with_the_same_opening() {
+async fn a_session_without_a_session_header_keeps_its_model_only_for_requests_that_go_on() {
     let h = answering().await;
     let key = h.key(policy("p")).await;
     let auth = format!("Bearer {key}");
@@ -165,7 +124,7 @@ async fn current_key(h: &Harness) -> String {
 }
 
 #[tokio::test]
-async fn a_rotated_key_keeps_its_conversations_and_a_key_issued_again_does_not() {
+async fn a_rotated_key_keeps_its_sessions_and_a_key_issued_again_does_not() {
     let h = answering().await;
     let key = h.key(policy("p")).await;
     assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
@@ -180,25 +139,6 @@ async fn a_rotated_key_keeps_its_conversations_and_a_key_issued_again_does_not()
     h.state.keys.issue(IssueRequest { policy: "p".into(), name: "client".into(), ..Default::default() }).await.unwrap();
     let again = current_key(&h).await;
     assert_eq!(chat_in(&h, &again, "s", later("qwen3", "hello")).await, 404, "a key issued again under the name starts over");
-}
-
-#[tokio::test]
-async fn an_older_request_that_finishes_after_a_switch_does_not_undo_it() {
-    let h = harness().await;
-    let key = h.key(policy("p")).await;
-    chat_mock(&h, "qwen3", chat_answer(10)).await;
-    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
-    put(&h, excluding_qwen().remove(0).1).await;
-
-    h.upstream.reset().await;
-    chat_mock(&h, "qwen3", chat_answer(10).set_delay(Duration::from_millis(500))).await;
-    chat_mock(&h, "busy", chat_answer(10)).await;
-    let (slow, switch) = tokio::join!(chat_in(&h, &key, "s", later("qwen3", "hello")), async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        chat_in(&h, &key, "s", later("busy", "hello")).await
-    });
-    assert_eq!((slow, switch), (200, 200));
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404, "the switch stands");
 }
 
 fn streamed(chunks: &[&str]) -> ResponseTemplate {
@@ -225,60 +165,46 @@ fn streaming(body: Value) -> Value {
 }
 
 #[tokio::test]
-async fn a_switch_whose_stream_fails_leaves_the_conversation_where_it_was() {
+async fn a_model_whose_answer_fails_is_not_used() {
     let h = harness().await;
     let key = h.key(policy("p")).await;
     chat_mock(&h, "qwen3", chat_answer(10)).await;
     chat_mock(&h, "busy", streamed_failure()).await;
     assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
     let auth = format!("Bearer {key}");
-    let claude = [("authorization", auth.as_str()), ("x-claude-code-session-id", "c")];
-    let messages = |model: &str, body: Value| json!({"model": model, "stream": true, "messages": body["messages"]});
-    assert_eq!(h.call_with("POST", "/v1/messages", &claude, Some(messages("qwen3", first("qwen3", "hello")))).await.0, 200);
-    put(&h, excluding_qwen().remove(0).1).await;
-
     let (status, body) = {
-        let auth = format!("Bearer {key}");
-        let switch = streaming(later("busy", "hello"));
-        h.call_with("POST", "/v1/chat/completions", &[("authorization", auth.as_str()), ("session_id", "s")], Some(switch)).await
+        let headers = [("authorization", auth.as_str()), ("session_id", "s")];
+        h.call_with("POST", "/v1/chat/completions", &headers, Some(streaming(later("busy", "hello")))).await
     };
     assert_eq!(status, 200, "the provider answered 200 and then an error event");
     assert!(body.to_string().contains("boom"), "{body}");
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200, "the conversation is still on its model");
-
     // Translated for a Messages client, and through a passthrough.
-    let (status, body) = h.call_with("POST", "/v1/messages", &claude, Some(messages("busy", later("busy", "hello")))).await;
+    let claude = [("authorization", auth.as_str()), ("x-claude-code-session-id", "s")];
+    let messages = json!({"model": "busy", "stream": true, "messages": later("busy", "hello")["messages"]});
+    let (status, body) = h.call_with("POST", "/v1/messages", &claude, Some(messages)).await;
     assert_eq!(status, 200);
     assert!(body.to_string().contains("event: error"), "{body}");
-    assert_eq!(h.call_with("POST", "/v1/messages", &claude, Some(messages("qwen3", later("qwen3", "hello")))).await.0, 200);
     let passthrough = [("authorization", auth.as_str()), ("session_id", "s")];
     assert_eq!(h.call_with("POST", "/llama/v1/chat/completions", &passthrough, Some(streaming(later("busy", "hello")))).await.0, 200);
+
+    put(&h, Policy { rules: vec![Rule::Deny("llama/*".into())], ..policy("p") }).await;
     assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200);
+    assert_eq!(chat_in(&h, &key, "s", later("busy", "hello")).await, 404, "no answer from it completed");
 }
 
 #[tokio::test]
-async fn a_streamed_switch_is_seen_by_the_next_request_and_an_older_stream_cannot_undo_it() {
+async fn a_streamed_answer_counts_as_used_before_its_end_reaches_the_client() {
     let h = harness().await;
     let key = h.key(policy("p")).await;
-    chat_mock(&h, "qwen3", chat_answer(10)).await;
-    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
-    put(&h, excluding_qwen().remove(0).1).await;
-
-    h.upstream.reset().await;
-    chat_mock(&h, "qwen3", streamed_answer().set_delay(Duration::from_millis(500))).await;
     chat_mock(&h, "busy", streamed_answer()).await;
-    let (slow, switch) = tokio::join!(chat_in(&h, &key, "s", streaming(later("qwen3", "hello"))), async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let switched = chat_in(&h, &key, "s", streaming(later("busy", "hello"))).await;
-        // Straight after the stream ends, with nothing waited for.
-        (switched, chat_in(&h, &key, "s", later("qwen3", "hello")).await)
-    });
-    assert_eq!((slow, switch), (200, (200, 404)), "the switch is in place as soon as its stream ends");
-    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404, "and the older stream, ending later, did not undo it");
+    assert_eq!(chat_in(&h, &key, "s", streaming(first("busy", "hello"))).await, 200);
+    // Straight after the stream ends, with nothing waited for.
+    put(&h, Policy { rules: vec![Rule::Deny("llama/busy".into())], ..policy("p") }).await;
+    assert_eq!(chat_in(&h, &key, "s", streaming(later("busy", "hello"))).await, 200);
 }
 
 #[tokio::test]
-async fn a_model_the_policy_never_allowed_is_refused_in_every_conversation() {
+async fn a_model_the_policy_never_allowed_is_refused_in_every_session() {
     let h = answering().await;
     let mut p = Policy { rules: vec![Rule::Deny("llama/qwen3".into())], ..policy("p") };
     p.aliases.insert("fast".into(), AliasTargets::One("llama/qwen3".into()));
@@ -287,7 +213,7 @@ async fn a_model_the_policy_never_allowed_is_refused_in_every_conversation() {
     assert_eq!(chat_in(&h, &key, "s", first("busy", "hello")).await, 200);
     assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404);
 
-    // An alias reaches it, which doesn't make it the conversation's to keep.
+    // An alias reaches it, which doesn't make it the session's to keep.
     assert_eq!(chat_in(&h, &key, "s", later("fast", "hello")).await, 200);
     assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 404);
     assert_eq!(chat_in(&h, &key, "s", later("llama/qwen3", "hello")).await, 404);
@@ -295,7 +221,7 @@ async fn a_model_the_policy_never_allowed_is_refused_in_every_conversation() {
 }
 
 #[tokio::test]
-async fn a_conversation_does_not_keep_a_provider_the_policy_drops() {
+async fn a_session_does_not_keep_a_provider_the_policy_drops() {
     let h = answering().await;
     let key = h.key(policy("p")).await;
     assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
@@ -321,11 +247,7 @@ async fn counting_tokens_and_passthroughs_keep_the_model_too() {
     assert_eq!(call("/llama/v1/chat/completions", "s").await, 200);
     assert_eq!(call("/llama/v1/chat/completions", "new").await, 403);
 
-    // A passthrough switch is the conversation's switch too.
-    let body = json!({"model": "busy", "messages": later("busy", "hello")["messages"]});
     let headers = [("authorization", auth.as_str()), ("session_id", "s")];
-    assert_eq!(h.call_with("POST", "/llama/v1/chat/completions", &headers, Some(body)).await.0, 200);
-    assert_eq!(call("/llama/v1/chat/completions", "s").await, 403);
 
     // Another endpoint has no conversation, so it has nothing to keep.
     Mock::given(path("/llama/v1/embeddings")).respond_with(chat_answer(5)).mount(&h.upstream).await;
@@ -340,7 +262,7 @@ async fn claude_in(h: &Harness, key: &str, session: &str, body: Value) -> u16 {
 }
 
 #[tokio::test]
-async fn a_locked_conversation_stays_on_its_excluded_model_and_account() {
+async fn a_locked_session_stays_on_its_excluded_model_and_account() {
     let (h, _, _) = pool(|_| {}).await;
     let key = h.key(policy("p")).await;
     reset_to(&h, answer(5000), answer(5000)).await;
@@ -359,7 +281,7 @@ async fn a_locked_conversation_stays_on_its_excluded_model_and_account() {
     assert!(served.iter().all(|t| *t == served[0]), "{served:?}");
     assert_eq!(claude_in(&h, &key, "other", first(OPUS, "hello")).await, 404, "a new session can't start with it");
 
-    // Counting tokens on another model moves nothing.
+    // Counting tokens on another model breaks nothing.
     Mock::given(path("/v1/messages/count_tokens"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"input_tokens": 5})))
         .mount(&h.upstream)
@@ -369,9 +291,29 @@ async fn a_locked_conversation_stays_on_its_excluded_model_and_account() {
     assert_eq!(h.call_with("POST", "/v1/messages/count_tokens", &headers, Some(later(HAIKU, "hello"))).await.0, 200);
     assert_eq!(claude_in(&h, &key, "s", later(OPUS, "hello")).await, 200);
 
-    // Another name is a side request to the lock, and it can still carry the conversation away.
+    // Another name is a side request to the lock; the session can switch to it and back.
     assert_eq!(claude_in(&h, &key, "s", later(HAIKU, "hello")).await, 200);
-    assert_eq!(claude_in(&h, &key, "s", later(OPUS, "hello")).await, 404, "so it can't switch back");
+    assert_eq!(claude_in(&h, &key, "s", later(OPUS, "hello")).await, 200);
+}
+
+#[tokio::test]
+async fn counting_tokens_on_a_model_is_not_using_it() {
+    let (h, _, _) = pool(|_| {}).await;
+    let key = h.key(policy("p")).await;
+    reset_to(&h, answer(5), answer(5)).await;
+    Mock::given(path("/v1/messages/count_tokens"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"input_tokens": 5})))
+        .mount(&h.upstream)
+        .await;
+    assert_eq!(claude_in(&h, &key, "s", first(OPUS, "hello")).await, 200);
+    let auth = format!("Bearer {key}");
+    let headers = [("authorization", auth.as_str()), (SESSION, "s")];
+    assert_eq!(h.call_with("POST", "/v1/messages/count_tokens", &headers, Some(later(HAIKU, "hello"))).await.0, 200);
+    let mut p = policy("p");
+    p.models.insert(HAIKU.into(), false);
+    put(&h, p).await;
+    assert_eq!(claude_in(&h, &key, "s", later(HAIKU, "hello")).await, 404, "the session only counted tokens on it");
+    assert_eq!(claude_in(&h, &key, "s", later(OPUS, "hello")).await, 200);
 }
 
 #[tokio::test]

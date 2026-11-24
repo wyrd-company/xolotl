@@ -4,9 +4,9 @@
 //! put across turns and model switches, earlier output on later requests,
 //! background requests and subagents with their own first turn, and what a
 //! compaction does. The bodies keep only the parts xolotl reads. In each
-//! test, the session goes on with an excluded model through all of it.
-//! Another session of the same client can't start with it, and once the
-//! conversation, compacted, switches away, it can't switch back.
+//! test, the session goes on with an excluded model through all of it,
+//! including a switch away and back after the compaction. Another session of
+//! the same client can't start with it.
 // ---
 // relationships:
 //   tests: context
@@ -55,7 +55,7 @@ async fn claude_code() {
     assert_eq!(post(&h, &key, "/v1/messages", &agent, turn("qwen3", vec![asked("Say hi from the subagent.")])).await, 200, "a subagent");
     let switched = vec![compacted[0].clone(), said("ok"), asked("after compaction"), said("ok"), asked("switching model")];
     assert_eq!(post(&h, &key, "/v1/messages", &session, turn("busy", switched.clone())).await, 200, "a switch");
-    assert_eq!(post(&h, &key, "/v1/messages", &session, turn("qwen3", switched)).await, 404, "and back");
+    assert_eq!(post(&h, &key, "/v1/messages", &session, turn("qwen3", switched)).await, 200, "and back");
     let other = [("x-claude-code-session-id", "another-session")];
     assert_eq!(post(&h, &key, "/v1/messages", &other, turn("qwen3", vec![reminder()])).await, 404);
 }
@@ -94,7 +94,7 @@ async fn codex() {
     assert_eq!(post(&h, &key, "/v1/responses", &session, turn("qwen3", compacted.clone())).await, 200, "the turn after it");
     let switched = [compacted, vec![msg("assistant", "ok"), msg("developer", "<model_switch>"), msg("user", "switching model")]].concat();
     assert_eq!(post(&h, &key, "/v1/responses", &session, turn("busy", switched.clone())).await, 200, "a switch");
-    assert_eq!(post(&h, &key, "/v1/responses", &session, turn("qwen3", switched)).await, 404, "and back");
+    assert_eq!(post(&h, &key, "/v1/responses", &session, turn("qwen3", switched)).await, 200, "and back");
     let other = [("session-id", "another-thread"), ("thread-id", "another-thread")];
     let start = [opening(), vec![msg("user", "hello there")]].concat();
     assert_eq!(post(&h, &key, "/v1/responses", &other, turn("qwen3", start)).await, 404);
@@ -146,11 +146,7 @@ async fn grok() {
     assert_eq!(post(&h, &key, "/v1/responses", &summary, turn("qwen3", "turn-summary-89267f56", summary_after)).await, 200);
     let switched = [compacted, vec![msg("assistant", "ok"), msg("user", "<user_query> switching model </user_query>")]].concat();
     assert_eq!(post(&h, &key, "/v1/responses", &session, turn("busy", id, switched.clone())).await, 200, "a switch");
-    assert_eq!(
-        post(&h, &key, "/v1/responses", &session, turn("qwen3", id, switched)).await,
-        404,
-        "and back: the turn summaries came before it"
-    );
+    assert_eq!(post(&h, &key, "/v1/responses", &session, turn("qwen3", id, switched)).await, 200, "and back");
     let other = [("x-grok-session-id", "another-session"), ("x-grok-conv-id", "another-session")];
     let start = [opening(), vec![msg("user", "<user_query> hello there </user_query>")]].concat();
     assert_eq!(post(&h, &key, "/v1/responses", &other, turn("qwen3", "another-session", start)).await, 404);
@@ -189,7 +185,7 @@ async fn opencode() {
     assert_eq!(post(&h, &key, "/v1/chat/completions", &session, turn("qwen3", compacted.clone())).await, 200, "the turn after it");
     let switched = [compacted, vec![msg("assistant", "ok"), msg("user", "switching model")]].concat();
     assert_eq!(post(&h, &key, "/v1/chat/completions", &session, turn("busy", switched.clone())).await, 200, "a switch");
-    assert_eq!(post(&h, &key, "/v1/chat/completions", &session, turn("qwen3", switched)).await, 404, "and back");
+    assert_eq!(post(&h, &key, "/v1/chat/completions", &session, turn("qwen3", switched)).await, 200, "and back");
     let other = [("x-opencode-session-id", "ses_another")];
     let start = vec![msg("system", "You are opencode, an interactive CLI tool."), msg("user", "\"hello there\"")];
     assert_eq!(post(&h, &key, "/v1/chat/completions", &other, turn("qwen3", start)).await, 404);

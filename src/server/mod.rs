@@ -23,7 +23,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::catalog::{ModelCatalog, Route, Wire};
 use crate::config::Config;
-use crate::context::conversation::Conversation;
+use crate::context::models::SessionModels;
 use crate::context::{RequestSession, reason};
 use crate::db::Db;
 use crate::export::Capture;
@@ -365,8 +365,8 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
     };
     let model = if anthropic { model.strip_suffix("[1m]").unwrap_or(&model).to_string() } else { model };
     let known = state.catalog.known_providers();
-    let mut conversation = conversation_for(state, &principal, path, &headers, &json);
-    let kept = match &conversation {
+    let mut session_models = session_models_for(state, &principal, path, &headers, &json);
+    let kept = match &session_models {
         Some(c) => c.kept().await,
         None => Vec::new(),
     };
@@ -403,7 +403,7 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             .unwrap_or_default();
         return err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("model {model:?} is not available on {path}{hint}"));
     }
-    // What the conversation may keep: a target the policy allows by name, or one the session keeps now.
+    // What the session may keep: a target the policy allows by name, or one it keeps now.
     let keepable = |t: &Target| principal.policy.allows_model_keeping(&t.provider, &t.model, &kept);
     let session = session_for(state, &principal, path, &headers, &json, &model, true).await;
     let capture = capture_for(state, &principal, path, Some(&body));
@@ -512,9 +512,9 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             None if anthropic && !resp.status().is_success() => normalize_messages_error(resp).await,
             None => resp,
         };
-        // Counting tokens is not a turn: it moves no conversation.
-        return match conversation.take().filter(|_| path != "/v1/messages/count_tokens") {
-            Some(c) => c.moves_with(Some(target.clone()).filter(|t| keepable(t)), resp),
+        // Counting tokens is not a turn: it uses no model.
+        return match session_models.take().filter(|_| path != "/v1/messages/count_tokens") {
+            Some(s) => s.uses(Some(target.clone()).filter(|t| keepable(t)), resp),
             None => resp,
         };
     }
@@ -563,12 +563,12 @@ async fn collect_grok(resp: Response) -> Response {
     }
 }
 
-/// The conversation of an LLM request. Its session keeps the models its
-/// conversations are on past a policy that now excludes them ([`Conversation`]). Only a client key's
-/// requests on the wire formats have one. Counting tokens reads it too.
-fn conversation_for(state: &AppState, principal: &Principal, path: &str, headers: &HeaderMap, body: &Value) -> Option<Conversation> {
+/// The models an LLM request's session has used, which it keeps past a
+/// policy that now excludes them ([`SessionModels`]). Only a client key's
+/// requests on the wire formats have a session. Counting tokens reads them too.
+fn session_models_for(state: &AppState, principal: &Principal, path: &str, headers: &HeaderMap, body: &Value) -> Option<SessionModels> {
     Wire::for_path(path)?;
-    Conversation::of(&state.db, principal.client_id()?, principal.issued_at, headers, body)
+    SessionModels::of(&state.db, principal.client_id()?, principal.issued_at, headers, body)
 }
 
 /// The session of an LLM request. Only a client key's requests on the wire
@@ -774,8 +774,8 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
 }
 
 /// A passthrough's body: buffered bytes or a stream, the `model` it names,
-/// and the conversation it belongs to.
-type PassthroughBody = (Option<Bytes>, Option<String>, Option<Body>, Option<Conversation>);
+/// and the models its session has used.
+type PassthroughBody = (Option<Bytes>, Option<String>, Option<Body>, Option<SessionModels>);
 
 /// Read a passthrough body: JSON bodies are buffered so their `model` can be
 /// checked against the policy, and against the models the request's session
@@ -802,11 +802,11 @@ async fn passthrough_body(
         .map_err(|_| json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?;
     let mut json = serde_json::from_slice::<Value>(&bytes).ok();
     let model = json.as_ref().and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string));
-    let conversation = json.as_ref().and_then(|body| conversation_for(state, principal, &format!("/{path}"), headers, body));
+    let session_models = json.as_ref().and_then(|body| session_models_for(state, principal, &format!("/{path}"), headers, body));
     if let Some(m) = &model
         && !principal.policy.allows_model(provider, m)
     {
-        let kept = match &conversation {
+        let kept = match &session_models {
             Some(c) => c.kept().await,
             None => Vec::new(),
         };
@@ -819,15 +819,15 @@ async fn passthrough_body(
         Some(v) if rewrite => Bytes::from(serde_json::to_vec(&v).unwrap_or_default()),
         _ => bytes,
     };
-    Ok((Some(bytes), model, None, conversation))
+    Ok((Some(bytes), model, None, session_models))
 }
 
-/// Move a passthrough's conversation to the model it used, once its answer
-/// completes ([`Conversation::moves_with`]). The policy or the session
-/// allowed the model before the request got here.
-fn passthrough_moves(conversation: Option<Conversation>, rest: &str, label: Option<&str>, resp: Response) -> Response {
-    match conversation.zip(label.and_then(Target::parse)).filter(|_| rest != "v1/messages/count_tokens") {
-        Some((c, target)) => c.moves_with(Some(target), resp),
+/// Record the model a passthrough used for its session, once its answer
+/// completes ([`SessionModels::uses`]). The policy or the session allowed the
+/// model before the request got here.
+fn passthrough_uses(session_models: Option<SessionModels>, rest: &str, label: Option<&str>, resp: Response) -> Response {
+    match session_models.zip(label.and_then(Target::parse)).filter(|_| rest != "v1/messages/count_tokens") {
+        Some((s, target)) => s.uses(Some(target), resp),
         None => resp,
     }
 }
@@ -852,7 +852,7 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
         Err(r) => return r,
     };
     let stream_usage = state.gateway.kind(&provider) != Some(crate::config::ProviderKind::Mistral);
-    let (bytes, model, stream, conversation) =
+    let (bytes, model, stream, session_models) =
         match passthrough_body(&state, &principal, &provider, &rest, stream_usage, &parts.headers, body).await {
             Ok(x) => x,
             Err(r) => return r,
@@ -885,7 +885,7 @@ async fn passthrough(State(state): State<AppState>, Path((provider, rest)): Path
             capture.as_ref(),
         )
         .await;
-    passthrough_moves(conversation, &rest, label.as_deref(), resp)
+    passthrough_uses(session_models, &rest, label.as_deref(), resp)
 }
 
 /// `/opencode-go/<rest>`: raw OpenCode Go API through the account pool
@@ -897,11 +897,11 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
         Err(r) => return r,
     };
     let provider = SubProvider::OpencodeGo.as_str();
-    let (bytes, model, stream, conversation) = match passthrough_body(&state, &principal, provider, &rest, true, &parts.headers, body).await
-    {
-        Ok(x) => x,
-        Err(r) => return r,
-    };
+    let (bytes, model, stream, session_models) =
+        match passthrough_body(&state, &principal, provider, &rest, true, &parts.headers, body).await {
+            Ok(x) => x,
+            Err(r) => return r,
+        };
     // Failover may resend the body, so it is always buffered here.
     let bytes = match (bytes, stream) {
         (Some(b), _) => b,
@@ -939,7 +939,7 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
             capture.as_ref(),
         )
         .await;
-    passthrough_moves(conversation, &rest, label.as_deref(), resp)
+    passthrough_uses(session_models, &rest, label.as_deref(), resp)
 }
 
 #[cfg(test)]
