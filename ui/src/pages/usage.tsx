@@ -141,7 +141,7 @@ function NarrowLink({ to, group, children }: { to: string | null; group: GroupBy
 
 function UsageFilters({ params, apply }: { params: URLSearchParams; apply: (change: Record<string, string | null>) => void }) {
   const view = readView(params);
-  const [duration, setDuration] = useState(params.get("since") ?? formatDuration(view.period ?? 86_400));
+  const [duration, setDuration] = useState(view.period === null ? params.get("since") ?? "" : formatDuration(view.period));
   const [error, setError] = useState<string>();
   const [draft, setDraft] = useState(() => Object.fromEntries(GROUPS.map(([g]) => [g, {
     enabled: params.has(g), value: params.get(g) ?? "",

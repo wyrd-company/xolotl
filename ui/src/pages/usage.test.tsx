@@ -14,7 +14,7 @@ function render(search: string, period: number | null, filters: [string, string]
 
 test("URL filters populate direct entry even with no matching rows", () => {
   const html = render("?since=129600&client=&model=missing-model", 129600, [["client", ""], ["model", "missing-model"]]);
-  expect(html).toContain('value="129600"');
+  expect(html).toContain('value="36h"');
   expect(html).toContain('value="missing-model"');
   expect(html).toContain("admin token");
   expect(html).toContain("No matching requests in this period");
