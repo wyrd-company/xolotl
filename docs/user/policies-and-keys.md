@@ -297,11 +297,16 @@ screen also shows the consumption of each provider and account limit. The metric
 
 1. Open **Client keys** in the web UI.
 2. Under **Issue a key**, choose the **Policy**, enter a **Client name** (for
-   example `laptop`) and a **Description**, and pick when it **Expires**.
+   example `laptop`) and an optional **Description**, and pick when it **Expires**.
+   The default is **Never**. Choose **Custom** for a positive duration such as
+   `36h`; units are `s`, `m`, `h`, `d` or `w`, or seconds without a unit.
 3. Select **Issue key**.
 
 The screen then shows the `bao` command the client reads the key with, and the
-OpenBao policy to grant the client. It never shows the key.
+OpenBao policy to grant the client. It never shows the key. If deployment
+status cannot load, retrieval instructions stay unavailable; use **Retry**
+to load the correct vault mount and prefix. If policies cannot load, retry
+the policy list before issuing a key.
 
 With the CLI:
 
@@ -329,14 +334,26 @@ xolotl reload keys from OpenBao, at most every 10 seconds.
 
 ## Manage keys
 
-The **Client keys** screen lists each key with its state, OpenBao path, last
-rotation, expiry, requests in the last 7 days and consumption against the
-policy's rate limits. On a row:
+The **Client keys** screen lists each key with its description, state, OpenBao
+path, creation time, last rotation, expiry and any rotation grace end. A key
+that has never rotated uses its creation time as the rotation reference.
+Current requests and tokens per minute and per day are shown even without
+limits. Limited windows show consumption against the policy limit, labelled
+when shared by the policy. Requests in the last 7 days appear separately;
+a failed query says **Unavailable** and offers **Retry**. On a row:
 
 - **Rotate…** writes a new key to the same path. Pick a **Grace period**, during
   which the old key keeps working, so the client can pick up the new one.
+  The default is zero: the old key stops immediately. Choose **Custom** for
+  a nonnegative duration such as `45m` or `0s`, using the same units as expiry.
 - **Disable** and **Enable** stop and restart the key.
 - **Revoke** stops the key at once and destroys every stored version of it.
+
+To repeat a revocation, or revoke a key whose row is absent, enter
+`policy/name` under **Revoke by client ID**, select **Revoke…** and confirm.
+The result distinguishes **Revoked**, **Already revoked** and **No key found**.
+If revocation fails, its error is shown; retry to ensure every stored version
+is destroyed.
 
 With the CLI:
 
