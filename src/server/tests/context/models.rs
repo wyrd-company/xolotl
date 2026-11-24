@@ -249,6 +249,12 @@ async fn counting_tokens_and_passthroughs_keep_the_model_too() {
 
     let headers = [("authorization", auth.as_str()), ("session_id", "s")];
 
+    // A model first used through a passthrough is the session's too.
+    let busy = json!({"model": "busy", "messages": later("busy", "hello")["messages"]});
+    assert_eq!(h.call_with("POST", "/llama/v1/chat/completions", &headers, Some(busy)).await.0, 200);
+    put(&h, Policy { rules: vec![Rule::Deny("llama/*".into())], ..policy("p") }).await;
+    assert_eq!(chat_in(&h, &key, "s", later("busy", "hello")).await, 200);
+
     // Another endpoint has no conversation, so it has nothing to keep.
     Mock::given(path("/llama/v1/embeddings")).respond_with(chat_answer(5)).mount(&h.upstream).await;
     let embed = json!({"model": "llama/qwen3", "input": "hello"});
