@@ -288,7 +288,11 @@ override `claude`. See [Clients](clients.md#wire-formats-and-translation).
 `catalog.metadata_url` defaults to LiteLLM's public model registry. Set it to an
 empty string to disable network refresh. Refresh uses `catalog.refresh_secs`
 and `xolotl models --refresh`. The last validated snapshot is cached in SQLite;
-failed fetches keep its values and age. Models need no metadata to route.
+failed downloads and registries with no usable limits or prices keep its values
+and age and expose a refresh error. Missing provider information does not prevent
+prices from loading. Invalid limits or rates become unknown while valid fields
+and other models still load. A successful refresh clears the error. Models need
+no metadata to route.
 
 Map or override an individual model with its full `provider/model` key:
 

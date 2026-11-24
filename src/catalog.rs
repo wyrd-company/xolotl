@@ -428,6 +428,88 @@ impl ModelCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    async fn pricing_catalog(server: &MockServer) -> ModelCatalog {
+        let mut cfg = CatalogConfig { metadata_url: server.uri(), ..Default::default() };
+        cfg.static_models.insert("codex".into(), vec!["configured".into()]);
+        ModelCatalog::new(cfg, BTreeMap::new()).with_db(crate::db::Db::in_memory().await.unwrap()).await
+    }
+
+    #[tokio::test]
+    async fn mixed_registry_refresh_prices_configured_models() {
+        let server = MockServer::start().await;
+        let catalog = pricing_catalog(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "openai/configured": {"input_cost_per_token":0.000002,"output_cost_per_token":0.000008},
+                "valid": {"litellm_provider":"sample","input_cost_per_token":0.0},
+                "invalid-rates": {"litellm_provider":"sample","input_cost_per_token":-1,"output_cost_per_token":"free",
+                                  "cache_read_input_token_cost":-1,"cache_creation_input_token_cost":"bad","max_input_tokens":128000},
+                "not-an-entry": []
+            })))
+            .mount(&server)
+            .await;
+        catalog.refresh_metadata(&reqwest::Client::new()).await;
+        assert!(catalog.models()["codex"].contains("configured"));
+        let resolved = catalog.metadata("codex", "configured");
+        assert_eq!(resolved.values.input_cost_per_token, Some(0.000002));
+        assert_eq!(resolved.values.output_cost_per_token, Some(0.000008));
+        assert_eq!(resolved.source.as_deref(), Some("LiteLLM:openai/configured"));
+        assert!(resolved.fetched_at.is_some());
+        assert!(resolved.error.is_none());
+        let invalid = catalog.metadata("sample", "invalid-rates");
+        assert_eq!(invalid.values.max_input_tokens, Some(128000));
+        assert_eq!(invalid.values.input_cost_per_token, None);
+        assert_eq!(invalid.values.output_cost_per_token, None);
+        assert_eq!(invalid.values.cache_read_input_token_cost, None);
+        assert_eq!(invalid.values.cache_creation_input_token_cost, None);
+        let restored = ModelCatalog::new(catalog.cfg.clone(), BTreeMap::new()).with_db(catalog.db.clone().unwrap()).await;
+        assert_eq!(restored.metadata("codex", "configured").values.input_cost_per_token, Some(0.000002));
+    }
+
+    async fn assert_failed_pricing_refresh_retains_snapshot(failure: ResponseTemplate, expected_error: &str) {
+        let server = MockServer::start().await;
+        let catalog = pricing_catalog(&server).await;
+        let http = reqwest::Client::new();
+        let good = ResponseTemplate::new(200).set_body_json(json!({
+            "openai/configured":{"litellm_provider":"openai","input_cost_per_token":0.000002,"output_cost_per_token":0.000008}
+        }));
+        Mock::given(method("GET")).respond_with(good.clone()).mount(&server).await;
+        catalog.refresh_metadata(&http).await;
+        let before = catalog.metadata("codex", "configured");
+        let cached_before = catalog.db.as_ref().unwrap().metadata_cache().await.unwrap();
+        assert!(before.fetched_at.is_some());
+        assert_eq!(before.values.input_cost_per_token, Some(0.000002));
+        server.reset().await;
+        Mock::given(method("GET")).respond_with(failure).mount(&server).await;
+        catalog.refresh_metadata(&http).await;
+        let after = catalog.metadata("codex", "configured");
+        assert_eq!(after.values.input_cost_per_token, before.values.input_cost_per_token);
+        assert_eq!(after.values.output_cost_per_token, before.values.output_cost_per_token);
+        assert_eq!(after.source, before.source);
+        assert_eq!(after.fetched_at, before.fetched_at);
+        assert!(after.error.as_deref().unwrap().contains(expected_error));
+        assert_eq!(catalog.db.as_ref().unwrap().metadata_cache().await.unwrap(), cached_before);
+        server.reset().await;
+        Mock::given(method("GET")).respond_with(good).mount(&server).await;
+        catalog.refresh_metadata(&http).await;
+        assert!(catalog.metadata("codex", "configured").error.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_pricing_download_retains_last_good_snapshot() {
+        assert_failed_pricing_refresh_retains_snapshot(ResponseTemplate::new(503), "503").await;
+    }
+
+    #[tokio::test]
+    async fn wholly_unusable_pricing_registry_retains_last_good_snapshot() {
+        let unusable = json!({"m":{"litellm_provider":"openai","input_cost_per_token":-1,"output_cost_per_token":"free"},
+                              "empty":{},"not-an-entry":[],"sample_spec":{"max_input_tokens":100}});
+        assert_failed_pricing_refresh_retains_snapshot(ResponseTemplate::new(200).set_body_json(unusable), "no usable model metadata")
+            .await;
+    }
 
     #[test]
     fn wire_rules_and_overrides() {
