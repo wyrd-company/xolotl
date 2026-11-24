@@ -231,36 +231,32 @@ key can call. A client gets the same names from `GET /v1/models`.
 ### Exclude a model
 
 Excluding a model is for maintenance: it stops new use of the model without
-breaking sessions that run on it. The policy checks a model when a session
-first uses it: when a conversation of the session starts with it or switches
-to it. Once a request on the model succeeds, the session keeps it. When you
-exclude the model later, with a rule, its `models` switch or
+breaking sessions that already use it. The policy checks a model when a session
+first uses it. Once an answer from the model completes, the session keeps it.
+When you exclude the model later, with a rule, its `models` switch or
 `deny_other_models`:
 
-- A session already on the model goes on, on the same provider and model, with
-  no error. That includes its subagents and the conversation that follows a
-  compaction. A session that stays on one account
-  ([Context lock](accounts.md#context-lock)) stays there.
-- A new session can't use the model. It gets a 404, or a 403 through a
-  passthrough.
-- A conversation that switches to another model can't switch back to it, also
-  after a compaction. Another conversation of the session that still uses the
-  model, such as a subagent at work, keeps it while it does. A switch counts
-  once the other model's answer completes: if that answer fails, the
-  conversation stays on the excluded model.
+- A session that has used the model can go on using it in any way, with no
+  error. That covers switching to another model and back, subagents, background
+  requests, and the conversation after any number of compactions. A session
+  that stays on one account ([Context lock](accounts.md#context-lock)) stays
+  there.
+- A session that never used the model can't use it. It gets a 404, or a 403
+  through a passthrough.
 
 Xolotl tells sessions apart by the session ID each client sends: Claude Code,
-Codex, Grok and OpenCode all send one. Requests that a client sends on other
-models in the same session, such as Grok's turn summaries or OpenCode's titles,
-don't switch the conversation. A client that sends no session ID gets a session
-from its system prompt and first message. There, only a request that continues
-the conversation keeps the model, so a script that repeats one request doesn't.
+Codex, Grok and OpenCode all send one. A client that sends no session ID gets a
+session from its system prompt and first message. There, only a request that
+continues the conversation keeps the model, so a script that repeats one
+request doesn't.
 
+- Only a completed answer counts: if the provider answers with an error, the
+  session hasn't used the model. Counting tokens doesn't count.
 - A key you rotate keeps its sessions. A key you revoke and issue again under
   the same name starts with none, which stops a model for all of that key's
   sessions at once.
 - A session keeps a model until it goes `database.retention_days`
-  ([configuration](configuration.md#database)) without a request on it.
+  ([configuration](configuration.md#database)) without using it.
 - Removing a provider from `providers`, or an account from `accounts`, applies
   to every session at once.
 

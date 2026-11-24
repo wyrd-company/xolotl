@@ -1,6 +1,6 @@
 # Sessions and context
 
-Every LLM request of a client key belongs to a **session**: one conversation. Xolotl records how full each session is, and once a session's prompt cache is worth keeping, it **locks** the session to the account and model that hold that cache. A session also **keeps** the models its conversations are on after the key's policy excludes them. `src/context/` holds the identity, the accounting, the lock and the conversations; the pool (`src/subscription/mod.rs`) and `route_json` (`src/server/mod.rs`) apply the lock, and `route_json` and the passthroughs apply the kept models.
+Every LLM request of a client key belongs to a **session**: one conversation. Xolotl records how full each session is, and once a session's prompt cache is worth keeping, it **locks** the session to the account and model that hold that cache. A session also **keeps** the models it has used after the key's policy excludes them. `src/context/` holds the identity, the accounting, the lock and the models a session keeps; the pool (`src/subscription/mod.rs`) and `route_json` (`src/server/mod.rs`) apply the lock, and `route_json` and the passthroughs apply the kept models.
 
 ## Session identity
 
@@ -44,7 +44,7 @@ While the lock holds, a request for the locked name goes to the locked target an
 | `policy` | The key's policy no longer allows the account |
 | `limit` | The account is at a limit of the key's policy, or the provider is and the alias has another target |
 | `upstream_errors` | `subscription.max_attempts` consecutive failed requests on the lock |
-| `target_unavailable` | The requested name no longer offers the locked target. A policy that excludes the locked model doesn't break the lock while the session keeps the model ([Models a session keeps](#models-a-session-keeps)) |
+| `target_unavailable` | The requested name no longer offers the locked target. A policy that excludes the locked model doesn't break the lock, as the session keeps the model ([Models a session keeps](#models-a-session-keeps)) |
 
 After a break the request routes normally, and a later success past the threshold locks the session where it landed. A lock's generation changes each time one forms. Releasing a lock or counting a failure names the generation it read, so a stale request can't touch a newer lock, even on the same target. A policy that can use no account of the locked pool breaks the lock before routing, as that pool's 403 would stop an alias from moving on. Idle time and compaction release nothing: the lock goes with its session row at `retention_days`, and holding it costs only the account choice.
 
@@ -68,69 +68,60 @@ These client behaviors shaped the rules above and have not been measured:
 |---|---|
 | A client retries a 5xx, so a short failure on a lock costs a retry and not a failed turn | `request_log`: a row with `status` 5xx and a `session_key` with no later row for that `session_key` |
 | Claude Code sends background requests on a cheaper model under its session id, in an interactive session (none came in the measured print mode) | `request_log`: no `session_key` from a `claude-code` session with more than one `model` |
-| A background request on another model never opens with its conversation's first user turn ([Clients](#clients): none did) | The exported exchanges of one `session_key`: a request on another model with the conversation's first user turn, followed by the conversation on its own model again |
 
 ## Models a session keeps
 
-A model exclusion is a maintenance control, not a security boundary: it stops new uptake of a model, and a running session never breaks because of it (decided by the operator on 2026-11-24). So a model is checked against the key's policy when a session first uses it: when a conversation of the session starts with it, or switches to it. Once a request on it succeeds, the session keeps it while one of its conversations is on it. A later exclusion by a rule, its `models` switch or `deny_other_models` doesn't stop the session's requests to it, from that conversation or from a new one, such as a subagent or what follows a compaction. Another session can't start with it. Once a conversation of the session switches away from it, the session can't switch back, also after a compaction rewrote the conversation's opening, unless another conversation has used the model since (decided by the operator on 2026-11-24).
+A model exclusion is a maintenance control, not a security boundary. It stops new uptake of a model, and a running session never breaks because of it. The operator's ruling (2026-11-24): "Once a session has used a model, it can use that model in any capacity. Even go back."
 
-### Conversations
+So a model is checked against the key's policy when a session first uses it. Once an answer from it completes, the session keeps it. A later exclusion by a rule, its `models` switch or `deny_other_models` doesn't stop the session's requests to it. That holds from any of its conversations, after switching away and back, across compactions, and for background requests and subagents. A session that never used the model can't start with it.
 
-A session carries more than one conversation: the main one, subagents, and background requests on other models ([Clients](#clients)). By model name alone, a background request between two turns on a model looks like a switch away and back. So each conversation (`context::conversation`) records the target it is on, told apart within its session by its **opening**: a digest of the first user turn, without the cache markers that clients move as a conversation grows. Neither the model nor the system prompt is part of it: Claude Code names its model in the system prompt. The state also carries the key's **issuance**, its id and the time it was issued, so a key issued again under a revoked key's name starts with nothing, while a rotation keeps it. Revoking a key and issuing it again therefore cuts what its sessions keep.
+`session_models` holds the models each session has used, per client key issuance: the key's id and the time it was issued. A key issued again under a revoked key's name starts with nothing. A rotation keeps the issuance and its sessions. Revoking a key and issuing it again therefore cuts what its sessions keep.
 
-`session_conversations` holds one row per conversation. Every request of a session the client names reads the targets of all its conversations. A `content` session is xolotl's guess from the system prompt and first user turn, so there only a request that **continues** a conversation reads them: one that carries an earlier assistant message or a Responses output item. A script that repeats a one-shot request doesn't keep an excluded model.
+### Lookup and use
 
-### Lookup and moves
+`route_json`, counting tokens and the passthroughs read the session's models before the policy (`context::models`), and look the name up in a view resolved as if the policy still allowed them (`Policy::resolve_keeping`). A kept model gets back the plain name or rename the exclusion took from it, ahead of another provider that serves the same name, and its `provider/model` form works again. Its lock, if it has one, holds.
 
-`route_json`, counting tokens and the passthroughs read the session's targets before the policy, and look the name up in a view resolved as if the policy still allowed them (`Policy::resolve_keeping`). A kept model gets back the plain name or rename the exclusion took from it, ahead of another provider that serves the same name, and its `provider/model` form works again. Its lock, if it has one, holds.
+Every request of a session the client names reads them. A `content` session is xolotl's guess from the system prompt and first user turn. There, only a request that carries an earlier assistant message or a Responses output item reads them, so a script that repeats a one-shot request keeps nothing.
 
-A request whose answer completes moves its conversation to the target that served it (`Conversation::moves_with`). The answer completes when it is a 2xx response and either:
+A request records its model once its answer completes (`SessionModels::uses`). The answer completes when it is a 2xx response and either:
 
 - a stream reaches its final event with no error event. The final event is `message_stop`, `response.completed` or `response.incomplete`, a Chat `finish_reason`, or `[DONE]`. An error event is Messages or Responses `error`, or a Chat chunk with an `error`.
 - a JSON body is not an error.
 
-A body is a stream when its `Content-Type` says so, or when it doesn't start as JSON. A provider can answer 200 and then send only an error: that moves nothing, and the session goes on with the model it was on. The end of the answer is held until the move is written: a stream from its final event on, or a JSON body's last chunk. The client can't see the answer complete before its next request would see the move. A client that leaves before the end moves nothing.
+A body is a stream when its `Content-Type` says so, or when it doesn't start as JSON. A provider can answer 200 and then send only an error: that records nothing. The end of the answer is held until the use is written: a stream from its final event on, or a JSON body's last chunk. So the client can't see the answer complete before its next request would see it. A client that leaves before the end records nothing. Counting tokens records nothing.
 
-Every request takes a sequence number when it arrives: microseconds since the epoch, raised past the last one. A move applies only over an older one, so a request that started before a switch and finishes after it doesn't move the conversation back. Counting tokens moves nothing.
-
-- A request keeps its target only if the policy allows the model by name, or the session keeps it already. A target only an alias reaches still moves the conversation, which then keeps nothing, so that the session can't reach that target later under a name the policy refuses. Aliases ignore model rules, so an exclusion never stops them anyway.
-- A model the policy never allowed never gets into `session_conversations`, so it stays refused in every session.
-- A provider that `providers` no longer allows is not kept, and neither is an account: those apply to every session at once, and an account's lock breaks with `policy`.
+- A request records its target only if the policy allows the model by name, or the session keeps it already. A target only an alias reaches is never recorded, so the session can't reach it later under a name the policy refuses. Aliases ignore model rules, so an exclusion never stops them anyway.
+- A model the policy never allowed never gets into `session_models`, so it stays refused in every session.
+- A provider that `providers` no longer allows is not kept, and neither is an account. Those apply to every session at once, and an account's lock breaks with `policy`.
 - A model the catalog no longer lists loses its plain name whatever the session keeps. Xolotl can't keep a model working that its provider stops serving.
-- When the state can't be read, the policy decides alone. When a move can't be written, the conversation stays where it was.
-- In a locked session, a switch to another name is a request for another name: it leaves the lock alone, and still moves the conversation. The lock then stays on a model no request reaches, and goes with the session.
-- A switch records that the session left the model it moved off (`session_left`). From then on, another conversation's row keeps that model only if the conversation has used it since. For a conversation that has already started, the other conversation must also have used the model since that start. So when the first request after a compaction is already on another model, the conversation before it, quiet since before it started, doesn't bring the model back either. The one before a compaction, a finished subagent, and turn summaries all went quiet before the switch, so they don't bring the model back. A subagent still at work on it keeps it for the session, and while it does, switching back works. **Pending a product ruling:** a sibling's request that completes on the model after the switch is enough to let the conversation that left it come back, even once that request has finished. The rule tracks the last completed use and has no signal that the sibling is still running. Claude Code's `x-claude-code-agent-id` and Grok's auxiliary `x-grok-conv-id` values are client-specific signals that could tell such siblings apart, but none covers a new or rewritten opening with no known lineage. A conversation's own model always counts, so that it is never refused because another one left the model.
+- When the models can't be read, the policy decides alone. When a use can't be written, the session doesn't keep that model.
 
-Rows go at `retention_days` after their last move, like the sessions.
+Rows go at `retention_days` after their last use, like the sessions.
 
 ### Clients
 
 Measured on 2026-11-24 with each client in a clean container against a mock provider, over several turns, a model switch and a compaction. `src/server/tests/context/models/clients.rs` replays what xolotl reads from each.
 
-| Client | Session | First user turn | Later requests | Other conversations | After a compaction |
-|---|---|---|---|---|---|
-| Claude Code 2.1.330 | `x-claude-code-session-id` | Holds across turns and a switch | Carry earlier output | A subagent: same session id, `x-claude-code-agent-id`, its own first turn, no earlier output | A new first turn, earlier output |
-| Codex 0.171.0 | `session-id`, `thread-id`; `prompt_cache_key` is the thread | Holds | Carry earlier output | None seen | The history is rebuilt: a new first turn, no earlier output |
-| Grok 1.0.92 | `x-grok-session-id`, `x-grok-conv-id` | Holds | Carry earlier output | Turn summaries (`x-grok-conv-id: turn-summary-…`, their own first turn, on the conversation's model), title refreshes (the conversation on its model) | The same first turn, no earlier output |
-| OpenCode 1.19.6 | `x-opencode-session-id`, `x-session-id` | Holds | Carry earlier output | Title generation on the small model, its own first turn | A new first turn |
+| Client | Session | Other requests in the session | After a compaction |
+|---|---|---|---|
+| Claude Code 2.1.330 | `x-claude-code-session-id` | A subagent: same session id, `x-claude-code-agent-id` | A new first user turn |
+| Codex 0.171.0 | `session-id`, `thread-id`; `prompt_cache_key` is the thread | None seen | A new first user turn, no earlier output |
+| Grok 1.0.92 | `x-grok-session-id`, `x-grok-conv-id` | Turn summaries and title refreshes, on the conversation's model | The same first user turn, no earlier output |
+| OpenCode 1.19.6 | `x-opencode-session-id`, `x-session-id` | Title generation on the small model | A new first user turn |
 
-So a rule that kept a model only for the conversation that used it, or only for requests that carry earlier output, would refuse every client after a compaction, and Claude Code's subagents. And a rule that kept the session on every model its conversations are on would let every client switch back after a compaction, and Grok after any turn, as its turn summaries run on the conversation's model.
+Every client keeps its session id across turns, model switches and compactions, so the session is what keeps a model. A rule tied to one conversation, or to requests that carry earlier output, would refuse each of them after a compaction, and Claude Code's subagents.
 
-Grok also sends one request at startup with empty session headers, on its default model rather than the selected one. It is a `content` one-shot, so it never keeps a model: excluding Grok's default model refuses it, before and after this feature.
+Grok also sends one request at startup with empty session headers, on its default model rather than the selected one. It is a `content` one-shot, so it never keeps a model, and excluding Grok's default model refuses it.
 
-The measurements ran without a real model, so no client called tools on its own, and Claude Code's subagent was started by a scripted tool call. They don't show how often background requests come in a long interactive session.
+The measurements ran without a real model, so no client called tools on its own, and Claude Code's subagent was started by a scripted tool call.
 
 Options not chosen:
 
 | Option | Why not |
 |---|---|
-| The model of the session's last request | A background request on another model would end the conversation's model, and an excluded model would fail at the conversation's next turn |
-| Every model the session ever used | A conversation could switch back to an excluded model |
-| A request on another model whose prompt is as large as the conversation is a switch | A subagent on another model can grow as large as its parent |
+| Keep only the model the session's conversation is on, so that switching back is refused | Superseded by the operator's ruling. It also needed client-specific guesses: which requests are background ones, and which conversation a compaction continues |
 | Keep a model only for the conversation that used it, or only for requests that carry earlier output | Every measured client starts a new conversation, or leaves no earlier output, at a compaction, and Claude Code subagents start new ones: the running session would break |
-| Link a compacted conversation to the one it summarizes | Only text the client writes links them, so the link would be a guess at each client's format. Recording when the session left a model needs no link: the conversation before a compaction is quiet by the time its successor switches |
-| Keep every model a conversation of the session is on | A compacted conversation could switch back through the row of the one before it, and a Grok session through its turn summaries |
-| Retire a quiet conversation's row when another switches away | A subagent that is between requests is quiet too; counting its own model whatever the session left keeps it at work |
+| Record a model on its 2xx headers | A provider that answers 200 and then only an error event would make a model the session never got an answer from its own |
 
 ## Tool usage
 
