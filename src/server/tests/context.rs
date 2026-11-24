@@ -9,6 +9,8 @@ use super::*;
 use crate::context::{Lock, SessionRow, Turn};
 use crate::db::UsageWindow;
 
+mod models;
+
 const SESSION: &str = "x-claude-code-session-id";
 const OPUS: &str = "claude/claude-opus-5";
 const HAIKU: &str = "claude/claude-haiku-5-5";

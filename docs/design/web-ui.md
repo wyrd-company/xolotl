@@ -63,7 +63,7 @@ success toast does not account for those fields.
 | `xolotl auth` | — | Add account / account details | Excluded: command-group navigation; child action below. |
 | `xolotl providers` | — | Accounts, Providers tab | Excluded: command-group navigation; child action below. |
 | `xolotl mcp` | — | MCP servers | Excluded: command-group navigation; child actions below. |
-| `xolotl reload` | — | Gap | Gap: no control calls `/admin/reload`. CLI returns loaded policy, key, pool account and provider-account counts, or the underlying failure. A page refresh is not a vault reload. Group: deployment reload. |
+| `xolotl reload` | — | Overview: Deployment → Reload from OpenBao | Equal: explicit vault reload shows loaded policy, client key, pool account and provider-account counts, including zero, or the underlying failure with retry guidance. Pending reload disables resubmission. Model discovery has its own status and refresh control; reload completion does not claim discovery completion. |
 | `xolotl help` | `<command>` | Documentation and control labels | Excluded: clap-generated command help; a command path can be supplied recursively, including `help help`. |
 
 ### Client keys
@@ -158,7 +158,7 @@ They describe missing behavior and feedback, without deciding a screen layout.
 
 | Group | Capabilities and feedback to account for together |
 |---|---|
-| Deployment reload | Explicit vault reload; loaded policy/key/account/provider counts and failure detail, with catalog discovery distinguished from reload completion. |
+| Deployment reload | Implemented on Overview: explicit vault reload, loaded policy/key/account/provider counts and underlying failure detail, with catalog discovery shown separately. |
 | Account form inputs | Import label and exact signed 64-bit priority entry, with input validation. |
 | Account recovery and usage | Retry availability for any existing account; polling disabled accounts; complete provider usage diagnostics in account details; unsaved-token state on account rows. |
 | Account login feedback | HTTP polling errors for subscription login flows and immediate catalog discovery outcome after credential-file import, in Add account. |
@@ -197,7 +197,7 @@ work; the check's passing result proves coverage, not closure of those gaps.
 
 | Screen | Covers | API |
 |---|---|---|
-| Overview | OpenBao and SQLite health, stored policies that did not load, pool availability and usage windows, 24 h totals, provider accounts, recent failed requests | `GET /admin/status`, `/admin/accounts`, `/admin/providers`, `/admin/usage` |
+| Overview | Vault reload with counts and errors, separate model discovery, OpenBao and SQLite health, stored policies that did not load, pool availability and usage windows, 24 h totals, provider accounts, recent failed requests | `GET /admin/status`, `/admin/accounts`, `/admin/providers`, `/admin/usage`, `/admin/catalog/status`; `POST /admin/reload`, `/admin/catalog/refresh` |
 | Accounts | Pool accounts by provider; refresh usage, enable/disable, priority, Retry, replace API key, refresh models, remove; details. Provider accounts: kind, key state, base URL, source; set or replace the key; remove the ones in OpenBao. A **Providers** tab (`?kind=providers`) | `/admin/accounts/...`, `GET /admin/providers`, `POST /admin/providers/<name>/key`, `DELETE /admin/providers/<name>`, `GET /admin/account-kinds` |
 | Add account | Built from the account kinds: a login component per OAuth kind, a key form per API-key pool kind, import of a CLI credential file, and one provider account form with a kind selector | `GET /admin/account-kinds`, `/admin/auth/...`, `POST /admin/accounts/import`, `POST /admin/accounts` |
 | Policies | A warning listing stored policies that did not load (`unloaded_policies` of `GET /admin/status`). Collapsible sections: scopes, with `key_policies` under the `keys` scope; providers with the accounts of each pool (`accounts`), and a warning under an allowed pool with no accounts checked, when the policy's keys can call providers; MCP access; rate limits in total, per provider and per account, with the policy's consumption. The model list has two modes. Rules: the ordered `rules` (a switch for allow/deny, move up/down, matched and decided counts), a summary of the model switches, the `deny_other_models` row, and aliases (name, a searchable target, fallbacks). Effective models: aliases read-only, and every model of the allowed providers (a switch written to `models`; greyed with the deciding rule when a rule masks it; an override, a rule for the exact `provider/model` at the top, switched in place in the warning colour; inline rename; the winner of a shared name; the state of the accounts the policy uses), with turn on/off all shown models, filter by provider, sort, show/hide denied. Precedence above both | `/admin/policies/...`, `POST /admin/policy-preview`, `GET /admin/status`, `GET /admin/accounts`, `GET /admin/providers` |

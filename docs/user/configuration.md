@@ -60,11 +60,11 @@ come back to xolotl and finish without a pasted URL.
 ```toml
 [database]
 path = "xolotl.db"      # the container image uses /data/xolotl.db
-retention_days = 90     # request log, MCP call log, sessions and tool counts
+retention_days = 90     # request log, MCP call log, sessions and their models, tool counts
 ```
 
 The database holds cooldowns, usage snapshots, the account index, the request
-log, the MCP call log, sessions and tool counts. It holds no secrets. If you lose it, xolotl rebuilds
+log, the MCP call log, sessions and the models they keep, and tool counts. It holds no secrets. If you lose it, xolotl rebuilds
 the account index from OpenBao.
 
 ## `[vault]`

@@ -44,7 +44,7 @@ pub struct NatsConfig {
     /// Several servers of one cluster are separated by commas.
     pub url: String,
     /// The stream that stores the rows. It must exist, and its subjects must
-    /// cover `xolotl.exchanges.>`; xolotl checks both at startup.
+    /// cover `xolotl.exchanges.>`; xolotl checks both after connecting.
     pub stream: String,
     /// PEM CA bundle for a privately signed NATS certificate.
     pub ca_cert: Option<PathBuf>,

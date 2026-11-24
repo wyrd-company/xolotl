@@ -100,13 +100,16 @@ pub struct KeyInfo {
 pub struct Principal {
     /// `None` for the bootstrap admin token.
     pub client_id: Option<String>,
+    /// When the key was issued. A key issued again under a revoked key's name
+    /// is another issuance; rotating a key keeps its issuance.
+    pub issued_at: Option<DateTime<Utc>>,
     pub policy: Arc<Policy>,
 }
 
 impl Principal {
     /// The bootstrap admin token or a web UI session.
     pub fn operator() -> Self {
-        Principal { client_id: None, policy: Arc::new(Policy::unrestricted()) }
+        Principal { client_id: None, issued_at: None, policy: Arc::new(Policy::unrestricted()) }
     }
     pub fn has_scope(&self, scope: Scope) -> bool {
         self.policy.has_scope(scope)
@@ -345,7 +348,7 @@ impl KeyManager {
             tracing::warn!(client = %id, policy = %e.info.policy, "refusing a valid key: its policy is not loaded");
             return None;
         };
-        Some(Principal { client_id: Some(id.clone()), policy })
+        Some(Principal { client_id: Some(id.clone()), issued_at: e.info.created_at, policy })
     }
 
     // ---- policies

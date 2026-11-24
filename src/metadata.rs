@@ -49,19 +49,35 @@ impl Metadata {
         );
     }
 
+    /// Token categories and their rates. Missing usage stays unknown, while
+    /// observed cache tokens still establish a required rate without a total.
+    fn priced_tokens(&self, usage: crate::proxy::TokenUsage) -> [(Option<i64>, Option<f64>); 4] {
+        let input = usage.input.map(|n| n.max(0));
+        let output = usage.output.map(|n| n.max(0));
+        let read = usage.cached.unwrap_or(0).max(0);
+        let read = input.map_or(read, |n| read.min(n));
+        let write = usage.cache_write.unwrap_or(0).max(0);
+        let write = input.map_or(write, |n| write.min(n - read));
+        [
+            (input.map(|n| n - read - write), self.input_cost_per_token),
+            (output, self.output_cost_per_token),
+            (Some(read), self.cache_read_input_token_cost),
+            (Some(write), self.cache_creation_input_token_cost),
+        ]
+    }
+
     /// Input includes cache reads/writes. Missing required prices yield unknown, not zero.
     pub fn cost(&self, usage: crate::proxy::TokenUsage) -> Option<f64> {
-        let input = usage.input?.max(0);
-        let output = usage.output?.max(0);
-        let read = usage.cached.unwrap_or(0).clamp(0, input);
-        let write = usage.cache_write.unwrap_or(0).clamp(0, input - read);
-        let rate = |tokens: i64, price: Option<f64>| if tokens == 0 { Some(0.0) } else { price.map(|p| p * tokens as f64) };
-        Some(
-            rate(input - read - write, self.input_cost_per_token)?
-                + rate(output, self.output_cost_per_token)?
-                + rate(read, self.cache_read_input_token_cost)?
-                + rate(write, self.cache_creation_input_token_cost)?,
-        )
+        self.priced_tokens(usage).into_iter().try_fold(0.0, |total, (tokens, price)| {
+            let tokens = tokens?;
+            Some(total + if tokens == 0 { 0.0 } else { price? * tokens as f64 })
+        })
+    }
+
+    /// A known positive token count proves a rate is required. Unknown usage
+    /// alone cannot establish a pricing miss, even when a rate is absent.
+    pub fn has_missing_rate(&self, usage: crate::proxy::TokenUsage) -> bool {
+        self.priced_tokens(usage).into_iter().any(|(tokens, price)| tokens.is_some_and(|n| n > 0) && price.is_none())
     }
 }
 

@@ -5,6 +5,7 @@
 // relationships:
 //   implements: ../../docs/design/sessions.md
 // ---
+pub mod models;
 mod store;
 pub mod tools;
 
@@ -58,6 +59,11 @@ impl SessionId {
     }
 }
 
+/// What the OpenCode client sends its session in, to a provider configured
+/// in it (OpenCode 1.19.6, measured). `x-opencode-session` is what OpenCode Go
+/// reads.
+const OPENCODE_CLIENT_HEADER: &str = "x-opencode-session-id";
+
 /// The identity of an LLM request: what the client says, else a digest of the
 /// system prompt and first user turn. `None` for a body with neither.
 pub fn resolve(headers: &HeaderMap, body: &Value) -> Option<SessionId> {
@@ -67,9 +73,11 @@ pub fn resolve(headers: &HeaderMap, body: &Value) -> Option<SessionId> {
     }
     let header =
         |names: &[&str]| names.iter().find_map(|h| headers.get(*h)?.to_str().ok().filter(|v| !v.trim().is_empty()).map(str::to_string));
-    for (source, names) in
-        [("codex", codex::SESSION_HEADERS), ("grok", grok::SESSION_HEADERS), ("opencode", &[opencode_go::SESSION_HEADER])]
-    {
+    for (source, names) in [
+        ("codex", codex::SESSION_HEADERS),
+        ("grok", grok::SESSION_HEADERS),
+        ("opencode", &[opencode_go::SESSION_HEADER, OPENCODE_CLIENT_HEADER]),
+    ] {
         if let Some(value) = header(names) {
             return sent(source, value);
         }

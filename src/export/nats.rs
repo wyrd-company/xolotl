@@ -15,10 +15,12 @@ use anyhow::{Context, Result};
 use async_nats::jetstream::{self, ErrorCode, context::PublishErrorKind, message::PublishMessage};
 use async_nats::{ConnectOptions, Event, ServerAddr};
 use bytes::Bytes;
+use opentelemetry::KeyValue;
 use serde_json::{Map, Value};
 
 use super::{Exchange, Queue, Sink, count};
 use crate::config::NatsConfig;
+use crate::telemetry::metrics;
 
 const SINK: &str = "nats";
 /// Rows are published to `<SUBJECT_PREFIX>.<client_id>`.
@@ -31,16 +33,36 @@ const HEADER_ROOM: usize = 128;
 const RETRY_MIN: Duration = Duration::from_millis(500);
 const RETRY_MAX: Duration = Duration::from_secs(10);
 
-/// Connect to NATS, check the stream, and start publishing. `secret` is the
-/// vault secret `nats`: `user` and `password`, or `creds`. Fails when NATS
-/// can't be reached, or the stream is missing or doesn't take
-/// `xolotl.exchanges.>`.
+/// Validate local configuration and start the destination. Network connection
+/// and stream validation happen in the worker, while rows wait in its queue.
+/// `secret` is the vault secret `nats`: `user` and `password`, or `creds`.
 pub async fn start(cfg: NatsConfig, secret: Option<Map<String, Value>>) -> Result<Sink> {
-    let publisher = connect(&cfg, secret).await?;
-    Ok(Sink::spawn(SINK, cfg.bodies, cfg.max_body_bytes, cfg.queue_mb, |q| publisher.run(q)))
+    let (opts, servers) = options(&cfg, secret)?;
+    connected(false);
+    Ok(Sink::spawn(SINK, cfg.bodies, cfg.max_body_bytes, cfg.queue_mb, |mut q| async move {
+        let connection = connect(&cfg, opts, servers);
+        tokio::pin!(connection);
+        let (publisher, stopping) = tokio::select! {
+            publisher = &mut connection => (publisher, false),
+            _ = &mut q.stop => {
+                q.rx.close();
+                if q.rx.is_empty() {
+                    return;
+                }
+                // Give queued rows the same bounded shutdown grace as a publish.
+                (connection.await, true)
+            }
+        };
+        publisher.run(q, stopping).await;
+    }))
 }
 
-async fn connect(cfg: &NatsConfig, secret: Option<Map<String, Value>>) -> Result<Publisher> {
+fn connected(value: bool) {
+    metrics().export_connected.record(u64::from(value), &[KeyValue::new("sink", SINK)]);
+}
+
+/// Parse and read local inputs before handing any network work to the worker.
+fn options(cfg: &NatsConfig, secret: Option<Map<String, Value>>) -> Result<(ConnectOptions, Vec<ServerAddr>)> {
     let servers: Vec<ServerAddr> = cfg
         .url
         .split(',')
@@ -52,8 +74,14 @@ async fn connect(cfg: &NatsConfig, secret: Option<Map<String, Value>>) -> Result
         .max_reconnects(None)
         .event_callback(|event| async move {
             match event {
-                Event::Connected => tracing::info!("NATS export connected"),
-                Event::Disconnected => tracing::warn!("NATS export disconnected; rows wait in the queue"),
+                Event::Connected => {
+                    connected(true);
+                    tracing::info!("NATS export connected");
+                }
+                Event::Disconnected | Event::Closed => {
+                    connected(false);
+                    tracing::warn!("NATS export disconnected; rows wait in the queue");
+                }
                 Event::SlowConsumer(_) => {}
                 other => tracing::warn!(event = %other, "NATS export"),
             }
@@ -72,7 +100,39 @@ async fn connect(cfg: &NatsConfig, secret: Option<Map<String, Value>>) -> Result
     if cfg.url.split(',').any(|s| s.trim().starts_with("tls://")) {
         opts = opts.require_tls(true);
     }
-    let client = opts.connect(servers).await.with_context(|| format!("connecting to NATS at {}", cfg.url))?;
+    Ok((opts, servers))
+}
+
+/// Retry the initial connection as part of the sink, never gateway startup.
+/// Once connected, async-nats owns reconnection with no attempt limit.
+async fn connect(cfg: &NatsConfig, opts: ConnectOptions, servers: Vec<ServerAddr>) -> Publisher {
+    let mut delay = RETRY_MIN;
+    let client = loop {
+        match opts.clone().connect(servers.clone()).await {
+            Ok(client) => break client,
+            Err(error) => {
+                tracing::warn!(error = %error, "NATS export unreachable; rows wait in the queue; retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RETRY_MAX);
+            }
+        }
+    };
+    delay = RETRY_MIN;
+    loop {
+        match check_stream(cfg, client.clone()).await {
+            Ok(publisher) => return publisher,
+            Err(error) => {
+                tracing::error!(error = %format!("{error:#}"), "NATS export stream check failed; rows wait in the queue; retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RETRY_MAX);
+            }
+        }
+    }
+}
+
+/// Check before consuming any rows, including when the queue is empty. A
+/// repaired stream can then resume this sink without restarting the gateway.
+async fn check_stream(cfg: &NatsConfig, client: async_nats::Client) -> Result<Publisher> {
     let js = jetstream::new(client.clone());
     let stream = js.get_stream(&cfg.stream).await.with_context(|| {
         format!("NATS stream {:?} not found: create it with subjects '{SUBJECTS}' (see the NATS export docs)", cfg.stream)
@@ -204,8 +264,7 @@ struct Publisher {
 }
 
 impl Publisher {
-    async fn run(self, mut q: Queue) {
-        let mut stopping = false;
+    async fn run(self, mut q: Queue, mut stopping: bool) {
         loop {
             let row = if stopping {
                 match q.rx.try_recv() {

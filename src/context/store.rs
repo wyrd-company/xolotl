@@ -241,7 +241,16 @@ impl Db {
     pub(crate) async fn prune_sessions(&self, cutoff: i64) -> Result<u64> {
         let s = sqlx::query("DELETE FROM sessions WHERE last_seen < ?").bind(cutoff).execute(&self.pool).await?;
         let t = sqlx::query("DELETE FROM tool_usage WHERE last_used < ?").bind(cutoff).execute(&self.pool).await?;
-        Ok(s.rows_affected() + t.rows_affected())
+        // A session keeps every model it used while it is active, on any of them.
+        let m = sqlx::query(
+            "DELETE FROM session_models WHERE (client_id, key_issued, session_key) IN (
+               SELECT client_id, key_issued, session_key FROM session_models
+               GROUP BY client_id, key_issued, session_key HAVING MAX(last_used) < ?)",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(s.rows_affected() + t.rows_affected() + m.rows_affected())
     }
 }
 
