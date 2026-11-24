@@ -53,6 +53,18 @@ test("shows no warning when every stored policy loaded", () => {
   expect(html).not.toContain("Stored policies did not load");
 });
 
+test("unloaded policy offers confirmed deletion when no keys use it", () => {
+  const html = render("/policies/other", false, [{ name: "other", error: "bad policy" }]);
+  expect(html).toMatch(/<button[^>]*aria-label="Delete unloaded policy other"[^>]*aria-haspopup="dialog"/);
+  expect(html).toContain("Delete policy…");
+});
+
+test("unloaded policy deletion retains the key-use restriction", () => {
+  const html = render("/policies/sample", true, [{ name: "sample", error: "bad policy" }]);
+  expect(html).toMatch(/<button[^>]*disabled=""[^>]*aria-label="Delete unloaded policy sample"/);
+  expect(html).toContain("A policy with keys can&#x27;t be deleted.");
+});
+
 function actions(html: string) {
   const form = html.slice(html.indexOf("<form"), html.indexOf("</form>"));
   const start = form.indexOf('aria-label="Policy actions"');
