@@ -203,10 +203,15 @@ max_body_bytes = 4194304         # longer bodies are cut, and the row says so
 queue_mb = 32                    # rows waiting while NATS is unreachable; rows past this are dropped
 ```
 
-At startup xolotl connects to NATS and checks that the stream exists and that
-its subjects cover `xolotl.exchanges.>`. If not, it stops with an error that
-says which. Start NATS before xolotl, or let your service manager restart
-xolotl until NATS is up.
+At startup xolotl validates the server URL, the CA file's presence and the
+vault credentials' format. An error in these local inputs stops startup.
+If NATS is unreachable, xolotl serves proxy and admin requests, logs a warning,
+and retries the connection while rows wait in its memory queue.
+
+After connecting, xolotl checks that the stream exists and that its subjects
+cover `xolotl.exchanges.>`, even when there are no queued rows. A missing stream
+or wrong subjects produces an error log. Rows stay queued while xolotl retries
+the check; fix the stream to resume publishing without restarting xolotl.
 
 You can keep `[export.clickhouse]` too. Each destination then has its own
 queue, and gets the bodies its own `bodies` and `max_body_bytes` allow.
@@ -233,6 +238,11 @@ queue, and gets the bodies its own `bodies` and `max_body_bytes` allow.
 | `published` | The stream stored the row |
 | `dropped` | The queue was full |
 | `refused` | The row is too large for the stream, even without its bodies |
+
+`xolotl.export.connected` with `sink = nats` is 0 before a connection and while
+disconnected, and 1 while connected to NATS. It reports connectivity; the stream
+check can still be failing while it is 1. Check the error logs for stream
+configuration problems.
 
 See [Telemetry](telemetry.md).
 

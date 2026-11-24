@@ -3525,3 +3525,46 @@ async fn every_account_kind_is_exported_with_or_without_a_session() {
     assert_eq!((transcription["request"].as_str(), transcription["request_truncated"].as_bool()), (Some(""), Some(true)));
     assert_eq!(transcription["response"], r#"{"text":"hello"}"#);
 }
+
+/// The gateway initializes its optional sink before serving either router.
+#[tokio::test]
+async fn unreachable_nats_does_not_block_proxy_or_admin() {
+    use crate::config::NatsConfig;
+    use crate::export::{Exporter, nats};
+    use std::time::Duration;
+
+    // A bound TCP socket without listen refuses connections and reserves the
+    // port, so another test cannot accidentally start a service on it.
+    let refused = tokio::net::TcpSocket::new_v4().unwrap();
+    refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    for url in ["nats://xolotl-nats.invalid:4222".to_string(), format!("nats://{}", refused.local_addr().unwrap())] {
+        let mut h = harness_with(|cfg| cfg.export.nats = Some(NatsConfig { url, ..Default::default() })).await;
+        let cfg = h.state.cfg.export.nats.clone().unwrap();
+        let sink = tokio::time::timeout(Duration::from_secs(1), nats::start(cfg, None))
+            .await
+            .expect("unreachable export must not delay gateway startup")
+            .unwrap();
+        let export = Exporter::new(vec![sink]);
+        h.state.export = Some(export.clone());
+        Mock::given(method("POST"))
+            .and(path("/llama/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"choices": [], "usage": {"prompt_tokens": 3}})))
+            .expect(1)
+            .mount(&h.upstream)
+            .await;
+        let key = h.key(Policy { name: "local".into(), providers: vec!["llama".into()], ..Default::default() }).await;
+        let requests = async {
+            assert_eq!(h.call("GET", "/admin/keys", Some(&h.admin), None).await.0, 200);
+            assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(json!({"model": "qwen3", "messages": []}))).await.0, 200);
+        };
+        tokio::time::timeout(Duration::from_secs(2), requests).await.expect("requests remain available");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while export.sinks()[0].queued() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the proxy exchange waits in the export queue");
+        export.shutdown().await;
+    }
+}

@@ -131,6 +131,7 @@ pub struct Metrics {
     pub session_locks: Counter<u64>,
     pub tool_calls: Counter<u64>,
     pub export_rows: Counter<u64>,
+    pub export_connected: Gauge<u64>,
 }
 
 pub fn metrics() -> &'static Metrics {
@@ -186,6 +187,10 @@ pub fn metrics() -> &'static Metrics {
                 .build(),
             session_locks: meter.u64_counter("xolotl.session.locks").with_description("Context locks formed and broken").build(),
             tool_calls: meter.u64_counter("xolotl.tool_calls").with_description("Tool calls in LLM responses, by client and tool").build(),
+            export_connected: meter
+                .u64_gauge("xolotl.export.connected")
+                .with_description("1 when the export is connected to NATS, 0 while unreachable")
+                .build(),
             export_rows: meter
                 .u64_counter("xolotl.export.rows")
                 .with_description("Exported exchanges by sink and outcome: inserted or published, dropped (queue full), failed or refused")
