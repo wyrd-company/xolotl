@@ -154,7 +154,7 @@ pub struct Accounting {
     pub started: Instant,
     started_at: chrono::DateTime<chrono::Utc>,
     limiter: Option<Arc<Limiter>>,
-    prices: Option<crate::metadata::Metadata>,
+    prices: Option<crate::metadata::Resolved>,
     session: Option<SessionTrack>,
     /// The request's export, when exporting is on and the request has a client key.
     capture: Option<Arc<Capture>>,
@@ -194,7 +194,7 @@ impl Accounting {
         }
     }
 
-    pub fn with_prices(mut self, prices: Option<crate::metadata::Metadata>) -> Self {
+    pub fn with_prices(mut self, prices: Option<crate::metadata::Resolved>) -> Self {
         self.prices = prices;
         self
     }
@@ -235,7 +235,7 @@ impl Accounting {
     }
 
     pub fn finish(mut self, status: u16, usage: TokenUsage) {
-        self.record.api_equivalent_cost = self.prices.and_then(|p| p.cost(usage));
+        self.record.api_equivalent_cost = self.prices.as_ref().and_then(|p| p.values.cost(usage));
         self.record.status = status;
         self.record.input_tokens = usage.input;
         self.record.output_tokens = usage.output;
@@ -260,6 +260,14 @@ impl Accounting {
         ];
         let m = metrics();
         m.requests.add(1, &attrs);
+        let complete_usage = usage.input.is_some() && usage.output.is_some();
+        if complete_usage
+            && self.record.api_equivalent_cost.is_none()
+            && let Some(prices) = &self.prices
+        {
+            let reason = if prices.source.is_some() { "missing_rate" } else { "model_not_found" };
+            m.pricing_misses.add(1, &[attrs[0].clone(), attrs[1].clone(), KeyValue::new("reason", reason)]);
+        }
         m.duration.record(self.started.elapsed().as_secs_f64(), &attrs[..3]);
         for (dir, n) in [("input", usage.input), ("output", usage.output), ("cached", usage.cached)] {
             if let Some(n) = n.filter(|n| *n > 0) {

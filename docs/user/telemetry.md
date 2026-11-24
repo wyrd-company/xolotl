@@ -43,6 +43,8 @@ The OpenBao values win over `[telemetry.otlp_headers]`.
 | `xolotl.account.usage_percent` | account, provider, window | Usage of each account window |
 | `xolotl.account.available` | account, provider | 1 when the account can take requests |
 | `xolotl.upstream.errors` | provider, status or kind | Upstream errors of subscription accounts |
+| `xolotl.pricing.refreshes` | result | Model pricing refresh attempts: `success`, `fetch_error` or `validation_error` (see below) |
+| `xolotl.pricing.misses` | provider, model, reason | Requests whose cost is unknown because pricing is missing: `model_not_found` or `missing_rate` (see below) |
 | `xolotl.oauth.refreshes` | provider, result | OAuth token refreshes. `result=uncertain`: the provider may have used the refresh token, but no usable answer came back |
 | `xolotl.vault.unsaved_credentials` | | Refreshed tokens not yet written to OpenBao. Alert when this stays above 0 |
 | `xolotl.mcp.tool_calls` | server, tool, status | MCP tool calls |
@@ -55,6 +57,31 @@ The OpenBao values win over `[telemetry.otlp_headers]`.
 | `xolotl.session.locks` | event (`formed`, `broken`), provider, and reason when broken | Context locks. See [Context lock](accounts.md#context-lock) |
 | `xolotl.tool_calls` | client, tool | Tool calls named in LLM responses |
 | `xolotl.export.rows` | sink (`clickhouse`, `nats`), outcome | Exchanges exported. ClickHouse: `inserted`, `dropped` (queue full) or `failed` (ClickHouse refused the batch). NATS: `published`, `dropped` (queue full) or `refused` (too large for the stream). See [ClickHouse export](clickhouse-export.md) and [NATS export](nats-export.md) |
+
+Pricing refresh results describe each attempted download of the model pricing
+registry. An empty `catalog.metadata_url` disables downloads and records no attempt.
+
+- `success`: the registry contained usable metadata and replaced the in-memory
+  prices. Malformed fields or entries that can be ignored do not make a usable
+  registry fail. A failure to save the local cache does not change this result.
+- `fetch_error`: the download failed, including connection, HTTP status or response
+  body transfer errors. The last usable prices remain available.
+- `validation_error`: the downloaded body was invalid JSON, was not a registry
+  object, or contained no usable model metadata. The last usable prices remain
+  available.
+
+Pricing misses count once per completed request with both input and output token
+usage available and an unknown cost:
+
+- `model_not_found`: no registry entry or configured metadata override matched
+  the served model.
+- `missing_rate`: metadata matched, but a rate needed for the request's nonzero
+  input, output, cache-read or cache-write tokens was missing.
+
+A zero-token category needs no rate, and a zero price is valid. Missing input or
+output token usage does not count as a pricing miss. The `provider` and `model`
+attributes use the same request identity as `xolotl.requests`, including a requested
+alias where applicable. Registry keys, URLs and error messages are not attributes.
 
 ## Request log
 

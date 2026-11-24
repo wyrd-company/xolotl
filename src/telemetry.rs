@@ -119,6 +119,8 @@ pub struct Metrics {
     pub account_usage: Gauge<f64>,
     pub account_available: Gauge<u64>,
     pub token_refreshes: Counter<u64>,
+    pub pricing_refreshes: Counter<u64>,
+    pub pricing_misses: Counter<u64>,
     pub unsaved_credentials: Gauge<u64>,
     pub mcp_tool_calls: Counter<u64>,
     pub mcp_tool_call_duration: Histogram<f64>,
@@ -151,6 +153,14 @@ pub fn metrics() -> &'static Metrics {
                 .build(),
             account_available: meter.u64_gauge("xolotl.account.available").with_description("1 when the account can take requests").build(),
             token_refreshes: meter.u64_counter("xolotl.oauth.refreshes").build(),
+            pricing_refreshes: meter
+                .u64_counter("xolotl.pricing.refreshes")
+                .with_description("Model pricing refresh attempts by result")
+                .build(),
+            pricing_misses: meter
+                .u64_counter("xolotl.pricing.misses")
+                .with_description("Requests with complete token usage but missing model pricing, by reason")
+                .build(),
             unsaved_credentials: meter
                 .u64_gauge("xolotl.vault.unsaved_credentials")
                 .with_description("Refreshed OAuth credentials not yet written to the vault")
