@@ -108,6 +108,23 @@ A model's switch in the editor writes `models`.
 
 A policy that allows MCP servers or lists `key_policies` needs no `providers`.
 
+For a T3 Code hub credential, use only the `management` scope. This minimal
+policy needs no providers, MCP servers or delegated key policies:
+
+```toml
+name = "hub"
+scopes = ["management"]
+```
+
+Save it as `hub.toml` and run `xolotl policies put hub.toml`. Check the saved
+policy with `xolotl policies get hub`. In the existing policy editor, select
+only **management (T3Code hubs)** under **Scopes**, leave providers and MCP
+servers unchecked, and select **Create policy**.
+
+Issue its client key as described below. The key can call the management API;
+it cannot call inference, MCP, key administration or other admin endpoints.
+Adding other scopes still requires the corresponding access entries.
+
 ### Accounts
 
 A subscription provider serves a policy's keys from the accounts listed under
