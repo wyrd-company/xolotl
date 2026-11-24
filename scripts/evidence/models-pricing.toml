@@ -1,0 +1,24 @@
+[server]
+listen = "0.0.0.0:18317"
+[vault]
+address = "http://127.0.0.1:18200"
+[vault.approle]
+role_id = "models-test-role"
+secret_id = "models-test-secret"
+[ui.oidc]
+issuer = "http://127.0.0.1:18888"
+client_id = "models-test"
+redirect_url = "http://127.0.0.1:18317/admin/session/callback"
+admin_group = "xolotl-admins"
+[catalog]
+metadata_url = "http://127.0.0.1:18888/registry"
+refresh_secs = 60
+[catalog.static_models]
+demo = ["priced-model", "local-model"]
+[catalog.metadata."demo/local-model"]
+input_cost_per_token = 0.0000001
+output_cost_per_token = 0.0000002
+[gateway.providers.demo]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:18888/v1"
+no_auth = true
