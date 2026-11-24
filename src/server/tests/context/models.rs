@@ -113,6 +113,13 @@ async fn counting_tokens_and_passthroughs_keep_the_model_too() {
     assert_eq!(call("/v1/messages/count_tokens", "new").await, 404);
     assert_eq!(call("/llama/v1/chat/completions", "s").await, 200);
     assert_eq!(call("/llama/v1/chat/completions", "new").await, 403);
+
+    // Another endpoint has no conversation, so it has nothing to keep.
+    Mock::given(path("/llama/v1/embeddings")).respond_with(chat_answer(5)).mount(&h.upstream).await;
+    let embed = json!({"model": "llama/qwen3", "input": "hello"});
+    let headers = [("authorization", auth.as_str()), ("session_id", "s")];
+    assert_eq!(h.call_with("POST", "/v1/embeddings", &headers, Some(embed.clone())).await.0, 404);
+    assert_eq!(h.call_with("POST", "/llama/v1/embeddings", &headers, Some(embed)).await.0, 403);
 }
 
 #[tokio::test]
