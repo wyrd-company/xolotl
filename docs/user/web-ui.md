@@ -177,4 +177,10 @@ The UI has a light and a dark theme. By default it follows the browser's color
 scheme. The three buttons above **Sign out** in the sidebar pick the system, light or
 dark theme. The browser keeps the choice.
 
-Model catalog rows show context, maximum output, input/output and cache prices per million tokens, with the LiteLLM key or override and last successful fetch age. Failed refreshes retain cached data. Usage and Traffic show API-equivalent USD with priced-request coverage; subscription value is not billed spend.
+Model catalog rows show context, maximum output, input/output and cache prices per million tokens, with the LiteLLM key or override and last successful fetch age. Small rates retain their precision, including cache prices such as $0.005 per million tokens.
+
+On **Models**, choose **Refresh models** to refresh provider discovery and registry prices. **Provider discovery** reports each provider's model count and discovery errors. **Pricing** reports its own result: the latest completed attempt, the last good registry fetch and the age of cached prices. A successful discovery does not mean pricing succeeded. While the refresh runs, the button is disabled and the pricing summary says **Refreshing prices…**.
+
+When pricing fails, the summary shows the underlying reason and retains any cached prices. Correct the registry or connection problem, then choose **Refresh models** again. The same summary appears when you return after a scheduled refresh; it also works when the catalog is empty. If prices have never been fetched, the page says no cached registry prices are available. Configuration overrides still apply. The latest attempt and error are kept until the server restarts; the last good registry cache survives restarts.
+
+Usage and Traffic show API-equivalent USD with priced-request coverage; subscription value is not billed spend.

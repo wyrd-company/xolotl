@@ -14,7 +14,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { get, type CatalogRoute } from "@/lib/api";
-import { compact, relative } from "@/lib/format";
+import { compact, price, relative } from "@/lib/format";
 
 export function ModelsPage() {
   const routes = useQuery({ queryKey: ["catalog-routes"], queryFn: () => get<CatalogRoute[]>("/admin/catalog/routes") });
@@ -60,7 +60,7 @@ function Catalog({ routes }: { routes: CatalogRoute[] }) {
         </CardAction>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
-        <CatalogRefresh />
+        <CatalogRefresh pricing />
         <EndpointsLegend />
       </CardContent>
       <Table className="min-w-[1100px]">
@@ -88,12 +88,12 @@ function Catalog({ routes }: { routes: CatalogRoute[] }) {
               </TableCell>
               <TableCell className="font-mono text-xs">
                 {price(r.metadata?.input_cost_per_token)} / {price(r.metadata?.output_cost_per_token)}
-                <div className="text-muted-foreground">Cache read {price(r.metadata?.cache_read_input_token_cost)} / write {price(r.metadata?.cache_creation_input_token_cost)}</div>
+                <div className="text-muted-foreground">Cache read {price(r.metadata?.cache_read_input_token_cost, 2)} / write {price(r.metadata?.cache_creation_input_token_cost, 2)}</div>
               </TableCell>
               <TableCell className="max-w-72 break-all text-xs">
                 {r.metadata?.source ?? "Unknown"}
                 <div className="text-muted-foreground">{r.metadata?.fetched_at ? relative(r.metadata.fetched_at) : r.metadata?.source ? "Config override" : "No data"}</div>
-                {r.metadata?.error && <div className="text-warning break-normal">Refresh failed; cached data retained</div>}
+                {r.metadata?.error && <div className="text-warning break-normal">Pricing refresh failed; see reason above</div>}
               </TableCell>
               <TableCell className="font-mono text-xs">
                 {(servedBy.get(r.model) ?? []).filter((p) => p !== r.provider).join(", ") || "-"}
@@ -106,5 +106,3 @@ function Catalog({ routes }: { routes: CatalogRoute[] }) {
     </Card>
   );
 }
-
-function price(rate: number | null | undefined) { return rate == null ? "Unknown" : `$${(rate * 1e6).toFixed(2)}`; }

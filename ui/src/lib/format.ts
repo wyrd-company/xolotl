@@ -37,6 +37,17 @@ const compactNf = new Intl.NumberFormat(undefined, { notation: "compact", maximu
 /** 1234 -> "1.2K". */
 export const compact = (n: number) => compactNf.format(n);
 
+/** USD per million tokens. Keep small nonzero rates visible instead of rounding to zero. */
+export function price(rate: number | null | undefined, minimumFractionDigits = 4): string {
+  if (rate == null) return "Unknown";
+  const perMillion = rate * 1e6;
+  if (perMillion > 0 && perMillion < 1e-100) return `$${perMillion.toPrecision(12)}`;
+  return `$${new Intl.NumberFormat(undefined, {
+    minimumFractionDigits,
+    maximumFractionDigits: Math.min(100, Math.max(4, 11 - Math.floor(Math.log10(perMillion || 1)))),
+  }).format(perMillion)}`;
+}
+
 /** Endpoint paths shortened for tables: /v1/chat/completions -> chat. */
 export function endpointName(path: string): string {
   return path.replace(/^\/v1\//, "").replace("chat/completions", "chat");

@@ -462,6 +462,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pricing_status_uses_last_good_cache_time_without_an_attempt() {
+        let db = crate::db::Db::in_memory().await.unwrap();
+        let fetched_at = crate::db::now() - 7200;
+        let registry = crate::metadata::Registry::parse(json!({"sample":{"input_cost_per_token":0.000002}}), fetched_at).unwrap();
+        db.save_metadata_cache(&serde_json::to_string(&registry).unwrap()).await.unwrap();
+        let catalog = ModelCatalog::new(CatalogConfig::default(), BTreeMap::new()).with_db(db).await;
+        let status = catalog.pricing_status();
+        assert!(status.enabled);
+        assert!(status.attempted_at.is_none());
+        assert_eq!(status.fetched_at, Some(fetched_at));
+        assert!((7200..=7201).contains(&status.age_secs.unwrap()));
+        assert!(status.error.is_none());
+    }
+
+    #[tokio::test]
     async fn mixed_registry_refresh_prices_configured_models() {
         let server = MockServer::start().await;
         let catalog = pricing_catalog(&server).await;

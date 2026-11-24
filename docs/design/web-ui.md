@@ -123,7 +123,7 @@ Sources: [models](../../ui/src/pages/models.tsx), [catalog refresh](../../ui/src
 
 | Command | Local options / arguments | UI equivalent | Status, results and error detail |
 |---|---|---|---|
-| `xolotl models` | `--metadata --refresh` | Models catalog and Refresh models | Partial: discovery refresh, provider/model lists, endpoint support, context/max output, input/output/cache prices, source and fetch age are visible. `--metadata` affects `--json` only; its meaningful fields require the same display. Provider discovery errors/counts are shown. Pricing metadata errors become generic "Refresh failed; cached data retained"; underlying `metadata.error` is hidden. No separate pricing attempt/result display exists when the catalog has no rows. Returning after a scheduled pricing refresh shows only the same generic failure warning and per-row last-good fetch age, with no summary of the latest pricing attempt/result. UI rounds every price to two decimal places per Mtok; CLI formats input/output to four decimals and cache prices without that rounding. A $0.005/Mtok cache price appears as $0.01 in the UI. Group: pricing refresh feedback. |
+| `xolotl models` | `--metadata --refresh` | Models catalog and Refresh models | Equal: provider/model lists, endpoint support, limits, input/output/cache prices, source and fetch age are visible. `--metadata` affects `--json` only; its meaningful fields have the same display. Discovery counts/errors and pricing results are separate. Pricing shows the latest completed attempt, underlying error, last good registry fetch and cache age independently of catalog rows, including return visits after scheduled failures. No prior fetch, disabled registry and loading states are explicit. Input/output prices show at least four decimal places per Mtok; small cache rates such as $0.005 remain distinct from zero. CLI output and refresh response are unchanged. |
 | `xolotl usage` | `--account --client --group-by --model --provider --since` | Usage group tabs, period selector, row drilldown and removable filter chips | Partial: all four groupings and filters, including empty values, reach the same API; response requests/errors/input/output/cached counts and query errors are visible. CLI accepts arbitrary duration (default 24h); UI allows only 24h/7d/30d/90d, even in its URL parser. Filter values can be set in the browser URL, but there are no direct entry controls for values absent from displayed rows. Group: request usage queries. |
 
 Catalog refresh calls the same endpoint in both clients; the server refreshes
@@ -204,7 +204,7 @@ work; the check's passing result proves coverage, not closure of those gaps.
 | Policies | A warning listing stored policies that did not load (`unloaded_policies` of `GET /admin/status`). Collapsible sections: scopes, with `key_policies` under the `keys` scope; providers with the accounts of each pool (`accounts`), and a warning under an allowed pool with no accounts checked, when the policy's keys can call providers; MCP access; rate limits in total, per provider and per account, with the policy's consumption. The model list has two modes. Rules: the ordered `rules` (a switch for allow/deny, move up/down, matched and decided counts), a summary of the model switches, the `deny_other_models` row, and aliases (name, a searchable target, fallbacks). Effective models: aliases read-only, and every model of the allowed providers (a switch written to `models`; greyed with the deciding rule when a rule masks it; an override, a rule for the exact `provider/model` at the top, switched in place in the warning colour; inline rename; the winner of a shared name; the state of the accounts the policy uses), with turn on/off all shown models, filter by provider, sort, show/hide denied. Precedence above both | `/admin/policies/...`, `POST /admin/policy-preview`, `GET /admin/status`, `GET /admin/accounts`, `GET /admin/providers` |
 | Client keys | Issue, rotate with grace, enable/disable, revoke. Consumption against the policy's rate limits. Shows the vault path and the `bao` command and Vault policy the client needs, never the key | `/admin/keys/...` |
 | MCP servers | Upstream MCP servers from the config file and OpenBao: add, edit and remove the latter; header secrets; OAuth sign-in; tools; recent tool calls | `/admin/mcp/...` |
-| Models | The catalog with each model's endpoints. `#/providers` redirects here | `GET /admin/catalog/routes`, `POST /admin/catalog/refresh` |
+| Models | The catalog with each model's endpoints and separate discovery/pricing results. `#/providers` redirects here | `GET /admin/catalog/routes`, `GET /admin/catalog/status`, `GET /admin/catalog/pricing`, `POST /admin/catalog/refresh` |
 | Usage | Request log grouped by client, account, provider or model. Selecting a row narrows the view to it and groups by the first of model, account, client and provider that is neither shown nor narrowed yet; filters show as removable chips and live in the hash route (`/#/usage?group=model&client=…`). Sessions and tools called, narrowed by the client filter. Link to `telemetry.dashboard_url` | `GET /admin/usage?group_by=…&since_secs=…&client=…&account=…&provider=…&model=…` (an empty filter value matches rows without that key, such as the admin token), `GET /admin/sessions?client=…`, `GET /admin/tools?client=…` |
 
 ## Editing
@@ -231,6 +231,14 @@ of the last attempt, or null), `models` (including cached and static entries), a
 `error` (or null). `POST /admin/catalog/refresh?providers=provider-a,provider-b`
 refreshes those providers; omit the query to refresh all providers. Its response
 remains the provider-to-model-list map used by the CLI.
+
+`GET /admin/catalog/pricing` returns aggregate registry status: `enabled`,
+`attempted_at` (latest completed attempt in this process, Unix seconds or null),
+`fetched_at` (last good fetch, including a restored cache), `age_secs` and `error`.
+It uses the same admin authorization as discovery and works with zero catalog
+rows. Both manual and scheduled refreshes update it; failed attempts preserve
+the last good registry. Attempt/error state is process-local. Models polls it
+every 30 seconds and invalidates it when a manual refresh finishes.
 
 Account imports, completed logins, reset, enable/disable, removal, and provider key
 changes trigger discovery, as does admin reload. The UI checks discovery status
