@@ -11,6 +11,9 @@ assets:
   - assets/policy-no-accounts.png
   - assets/models-pricing.png
   - assets/models-pricing.gif
+  - assets/account-import.png
+  - assets/account-priority.png
+  - assets/account-forms.gif
 products:
   xolotl:
     name: xolotl
