@@ -298,13 +298,15 @@ function LimitUsage({ k }: { k: KeyInfo }) {
         const limit = k.limits?.[w];
         const used = limit == null ? k.usage?.[w] : k.limit_usage?.[w];
         return (
-          <span key={w} className={limit != null && used != null && used >= limit ? "text-destructive" : undefined}>
+          <span key={w} className={limit != null && used != null && used >= limit ? "whitespace-nowrap text-destructive" : "whitespace-nowrap"}>
             {used == null ? "unavailable" : num(used)}
             {limit != null && `/${num(limit)}`} {label}
           </span>
         );
       })}
-      {k.limits?.per === "policy" && <span className="text-muted-foreground font-sans">limited windows shared by the policy</span>}
+      {k.limits?.per === "policy" && (
+        <span className="text-muted-foreground max-w-32 whitespace-normal font-sans">limited windows shared by the policy</span>
+      )}
     </div>
   );
 }
@@ -338,7 +340,7 @@ function KeyRow({ k, requests, onRevoked }: { k: KeyInfo; requests: number | nul
         <div>Expires: {k.expires_at ? timestamp(k.expires_at) : "never"}</div>
       </TableCell>
       <TableCell className="font-mono text-xs whitespace-nowrap">{k.vault_path}</TableCell>
-      <TableCell className="text-sm whitespace-nowrap">
+      <TableCell className="text-sm">
         <LimitUsage k={k} />
       </TableCell>
       <TableCell className="text-right font-mono">{requests == null ? "Unavailable" : num(requests)}</TableCell>
