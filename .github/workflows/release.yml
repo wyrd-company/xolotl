@@ -234,8 +234,14 @@ jobs:
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
+          expected_digest=
           while IFS= read -r tag; do
-            docker buildx imagetools inspect "$tag"
+            docker buildx imagetools inspect "$tag" --raw > "${RUNNER_TEMP}/manifest.json"
+            jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]' "${RUNNER_TEMP}/manifest.json"
+            digest=$(sha256sum "${RUNNER_TEMP}/manifest.json" | cut -d ' ' -f1)
+            expected_digest=${expected_digest:-$digest}
+            [[ "$digest" == "$expected_digest" ]]
+            echo "${tag}@sha256:${digest} contains linux/amd64 and linux/arm64"
           done <<< "$TAGS"
 
   # A release made with GITHUB_TOKEN starts no other workflows, and wyrd.foo
