@@ -59,6 +59,12 @@ impl AppState {
     pub fn view(&self, p: &Principal) -> View {
         p.policy.resolve(&self.catalog.models())
     }
+
+    /// The model names a principal's policy exposes to a session that keeps
+    /// the models in `kept` ([`crate::policy::Policy::resolve_keeping`]).
+    pub fn view_keeping(&self, p: &Principal, kept: Vec<Target>) -> View {
+        p.policy.resolve_keeping(&self.catalog.models(), kept)
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -358,7 +364,8 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
     };
     let model = if anthropic { model.strip_suffix("[1m]").unwrap_or(&model).to_string() } else { model };
     let known = state.catalog.known_providers();
-    let Some(targets) = state.view(&principal).lookup(&principal.policy, &known, &model) else {
+    let kept = kept_models(state, &principal, path, &headers, &json).await;
+    let Some(targets) = state.view_keeping(&principal, kept.clone()).lookup(&principal.policy, &known, &model) else {
         return err(StatusCode::NOT_FOUND, "not_found_error", format!("model {model:?} is not available to this key"));
     };
 
@@ -391,7 +398,8 @@ async fn route_json(state: &AppState, principal: Principal, path: &str, headers:
             .unwrap_or_default();
         return err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("model {model:?} is not available on {path}{hint}"));
     }
-    let session = session_for(state, &principal, path, &headers, &json, &model, true).await;
+    let keepable = usable.iter().filter(|t| principal.policy.allows_model_keeping(&t.provider, &t.model, &kept)).cloned().collect();
+    let session = session_for(state, &principal, path, &headers, &json, &model, true).await.map(|s| s.keeping(keepable));
     let capture = capture_for(state, &principal, path, Some(&body));
     let mut usable = usable;
     if let Some(s) = session.as_ref().filter(|s| s.locks_requested_name())
@@ -544,6 +552,16 @@ async fn collect_grok(resp: Response) -> Response {
     }
 }
 
+/// The models the request's session keeps past a policy that now excludes
+/// them ([`crate::context::kept_models`]). Counting tokens reads them too,
+/// though it is not a turn.
+async fn kept_models(state: &AppState, principal: &Principal, path: &str, headers: &HeaderMap, body: &Value) -> Vec<Target> {
+    match principal.client_id() {
+        Some(client) if Wire::for_path(path).is_some() => crate::context::kept_models(&state.db, client, headers, body).await,
+        _ => Vec::new(),
+    }
+}
+
 /// The session of an LLM request. Only a client key's requests on the wire
 /// formats have one, and counting tokens is not a turn of the conversation.
 #[allow(clippy::too_many_arguments)]
@@ -589,7 +607,9 @@ async fn passthrough_session(
     let raw = body?;
     let json: Value = serde_json::from_slice(raw).ok()?;
     let requested = label.unwrap_or_default();
-    session_for(state, principal, &path, headers, &json, requested, lockable && label.is_some()).await
+    // The policy or the session allowed the model before the request got here.
+    let keepable = label.and_then(Target::parse).into_iter().collect();
+    Some(session_for(state, principal, &path, headers, &json, requested, lockable && label.is_some()).await?.keeping(keepable))
 }
 
 /// Send a JSON request to one target: a subscription pool or a gateway provider.
@@ -747,8 +767,9 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
 }
 
 /// Read a passthrough body: JSON bodies are buffered so their `model` can be
-/// checked against the policy; anything else streams. With `stream_usage`, a
-/// Chat Completions stream is asked for its usage chunk (rate limits count it).
+/// checked against the policy, and the models the request's session keeps;
+/// anything else streams. With `stream_usage`, a Chat Completions stream is
+/// asked for its usage chunk (rate limits count it).
 async fn passthrough_body(
     state: &AppState,
     principal: &Principal,
@@ -770,8 +791,9 @@ async fn passthrough_body(
         .map_err(|_| json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?;
     let mut json = serde_json::from_slice::<Value>(&bytes).ok();
     let model = json.as_ref().and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string));
-    if let Some(m) = &model
+    if let Some((m, body)) = model.as_ref().zip(json.as_ref())
         && !principal.policy.allows_model(provider, m)
+        && !principal.policy.allows_model_keeping(provider, m, &kept_models(state, principal, &format!("/{path}"), headers, body).await)
     {
         return Err(json_error(StatusCode::FORBIDDEN, format!("model {m} is not allowed for this key")));
     }
