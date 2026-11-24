@@ -1,2 +1,16 @@
-const {chromium}=require('/runner/node_modules/playwright');
-(async()=>{const browser=await chromium.launch({headless:true});const page=await browser.newPage();await page.goto('http://localhost:35317');console.log(await page.locator('body').innerText());await page.getByRole('link',{name:/sign in/i}).click();await page.waitForURL('http://localhost:35317/');await page.getByRole('heading',{name:'Overview',exact:true}).waitFor();await page.context().storageState({path:'/evidence/session.json'});console.log('Signed in via browser OIDC');await browser.close();})().catch(e=>{console.error(e);process.exit(1)});
+const { chromium } = require("/runner/node_modules/playwright");
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+  await page.goto("http://localhost:35317");
+  console.log(await page.locator("body").innerText());
+  await page.getByRole("link", { name: /sign in/i }).click();
+  await page.waitForURL("http://localhost:35317/");
+  await page.getByRole("heading", { name: "Overview", exact: true }).waitFor();
+  await page.context().storageState({ path: "/evidence/session.json" });
+  console.log("Signed in via browser OIDC");
+  await browser.close();
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
