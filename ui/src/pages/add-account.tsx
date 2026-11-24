@@ -559,7 +559,7 @@ function ImportLogin({ kinds }: { kinds: AccountKindInfo[] }) {
             onChange={(e) => setFile(e.target.files?.[0] ?? null)}
           />
         </div>
-        {imp.error && <p role="alert" className="text-destructive text-sm">{imp.error.message} Choose a valid credential file and try again.</p>}
+        {imp.error && <p role="alert" className="text-destructive text-sm">{imp.error.message} Your label and selected file are kept. Correct the input or retry.</p>}
         <Button type="submit" className="self-start" disabled={!file || imp.isPending}>
           Import
         </Button>
