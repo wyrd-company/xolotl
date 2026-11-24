@@ -72,7 +72,7 @@ These client behaviors shaped the rules above and have not been measured:
 
 ## Models a session keeps
 
-A model exclusion is a maintenance control, not a security boundary: it stops new uptake of a model, and a running session never breaks because of it (decided by the operator on 2026-11-24). So a model is checked against the key's policy when a session first uses it: when a conversation of the session starts with it, or switches to it. Once a request on it succeeds, the session keeps it while one of its conversations is on it. A later exclusion by a rule, its `models` switch or `deny_other_models` doesn't stop the session's requests to it, from that conversation or from a new one, such as a subagent or what follows a compaction. Another session can't start with it, and once no conversation of the session is on it, switching back is refused.
+A model exclusion is a maintenance control, not a security boundary: it stops new uptake of a model, and a running session never breaks because of it (decided by the operator on 2026-11-24). So a model is checked against the key's policy when a session first uses it: when a conversation of the session starts with it, or switches to it. Once a request on it succeeds, the session keeps it while one of its conversations is on it. A later exclusion by a rule, its `models` switch or `deny_other_models` doesn't stop the session's requests to it, from that conversation or from a new one, such as a subagent or what follows a compaction. Another session can't start with it. Once a conversation of the session switches away from it, the session can't switch back, also after a compaction rewrote the conversation's opening, unless another conversation has used the model since (decided by the operator on 2026-11-24).
 
 ### Conversations
 
@@ -99,7 +99,7 @@ Every request takes a sequence number when it arrives: microseconds since the ep
 - A model the catalog no longer lists loses its plain name whatever the session keeps. Xolotl can't keep a model working that its provider stops serving.
 - When the state can't be read, the policy decides alone. When a move can't be written, the conversation stays where it was.
 - In a locked session, a switch to another name is a request for another name: it leaves the lock alone, and still moves the conversation. The lock then stays on a model no request reaches, and goes with the session.
-- A switch leaves the model kept while another conversation of the session is still on it: a subagent on the main model, or the conversation before a compaction, which keeps its row. Switching back then works. This fails open: a running session is never refused because of it.
+- A switch records that the session left the model it moved off (`session_left`). From then on, another conversation's row keeps that model only if the conversation has used it since. The one before a compaction, a finished subagent, and turn summaries all went quiet before the switch, so they don't bring the model back. A subagent still at work on it keeps it for the session, and while it does, switching back works. A conversation's own model always counts, so that it is never refused because another one left the model.
 
 Rows go at `retention_days` after their last move, like the sessions.
 
@@ -111,10 +111,10 @@ Measured on 2026-11-24 with each client in a clean container against a mock prov
 |---|---|---|---|---|---|
 | Claude Code 2.1.330 | `x-claude-code-session-id` | Holds across turns and a switch | Carry earlier output | A subagent: same session id, `x-claude-code-agent-id`, its own first turn, no earlier output | A new first turn, earlier output |
 | Codex 0.171.0 | `session-id`, `thread-id`; `prompt_cache_key` is the thread | Holds | Carry earlier output | None seen | The history is rebuilt: a new first turn, no earlier output |
-| Grok 1.0.92 | `x-grok-session-id`, `x-grok-conv-id` | Holds | Carry earlier output | Turn summaries (`x-grok-conv-id: turn-summary-…`, their own first turn), title refreshes (the conversation on its model) | The same first turn, no earlier output |
+| Grok 1.0.92 | `x-grok-session-id`, `x-grok-conv-id` | Holds | Carry earlier output | Turn summaries (`x-grok-conv-id: turn-summary-…`, their own first turn, on the conversation's model), title refreshes (the conversation on its model) | The same first turn, no earlier output |
 | OpenCode 1.19.6 | `x-opencode-session-id`, `x-session-id` | Holds | Carry earlier output | Title generation on the small model, its own first turn | A new first turn |
 
-So a rule that kept a model only for the conversation that used it, or only for requests that carry earlier output, would refuse every client after a compaction, and Claude Code's subagents.
+So a rule that kept a model only for the conversation that used it, or only for requests that carry earlier output, would refuse every client after a compaction, and Claude Code's subagents. And a rule that kept the session on every model its conversations are on would let every client switch back after a compaction, and Grok after any turn, as its turn summaries run on the conversation's model.
 
 Grok also sends one request at startup with empty session headers, on its default model rather than the selected one. It is a `content` one-shot, so it never keeps a model: excluding Grok's default model refuses it, before and after this feature.
 
@@ -128,7 +128,9 @@ Options not chosen:
 | Every model the session ever used | A conversation could switch back to an excluded model |
 | A request on another model whose prompt is as large as the conversation is a switch | A subagent on another model can grow as large as its parent |
 | Keep a model only for the conversation that used it, or only for requests that carry earlier output | Every measured client starts a new conversation, or leaves no earlier output, at a compaction, and Claude Code subagents start new ones: the running session would break |
-| Link a compacted conversation to the one it summarizes | Only text the client writes links them, so the link would be a guess at each client's format, and keeping the session's models makes it unnecessary |
+| Link a compacted conversation to the one it summarizes | Only text the client writes links them, so the link would be a guess at each client's format. Recording when the session left a model needs no link: the conversation before a compaction is quiet by the time its successor switches |
+| Keep every model a conversation of the session is on | A compacted conversation could switch back through the row of the one before it, and a Grok session through its turn summaries |
+| Retire a quiet conversation's row when another switches away | A subagent that is between requests is quiet too; counting its own model whatever the session left keeps it at work |
 
 ## Tool usage
 
