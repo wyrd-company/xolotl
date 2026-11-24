@@ -1,0 +1,21 @@
+const {chromium}=require('/runner/node_modules/playwright');
+const fs=require('fs');
+(async()=>{
+ const browser=await chromium.launch();
+ const context=await browser.newContext({storageState:'/evidence/session.json',viewport:{width:1100,height:850},recordVideo:{dir:'/evidence',size:{width:1100,height:850}}});
+ const page=await context.newPage();
+ await page.goto('http://localhost:34317/#/usage');
+ await page.getByRole('heading',{name:'Usage',exact:true}).waitFor();
+ await page.getByLabel('Look back',{exact:true}).fill('36h');
+ await page.getByLabel('Filter by client',{exact:true}).check();
+ await page.getByLabel('Client',{exact:true}).fill('team/editor');
+ await page.getByRole('button',{name:'Apply filters',exact:true}).click();
+ await page.getByRole('link',{name:'Remove client filter',exact:true}).waitFor();
+ await page.waitForTimeout(1000);
+ await page.getByLabel('Look back',{exact:true}).fill('36hours');
+ await page.getByRole('button',{name:'Apply filters',exact:true}).click();
+ await page.getByRole('alert').waitFor();
+ await page.waitForTimeout(1200);
+ const video=page.video();await context.close();
+ await video.saveAs('/evidence/usage-queries.webm');await browser.close();
+})().catch(e=>{console.error(e);process.exit(1)});

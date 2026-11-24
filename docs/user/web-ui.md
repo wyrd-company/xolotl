@@ -142,6 +142,8 @@ The **Policies** screen shows the models of a policy in two modes.
 
 ### Usage
 
+![Apply a 36-hour window and client filter, then see validation preserve an invalid duration and the active query](assets/usage-queries.gif)
+
 Use **Look back** to enter a positive whole-number duration, such as `36h`,
 `15m`, `2w`, or `90` seconds. The default is 24 hours. Supported units are
 `s`, `m`, `h`, `d` and `w`.
