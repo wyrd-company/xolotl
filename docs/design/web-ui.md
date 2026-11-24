@@ -159,6 +159,7 @@ They describe missing behavior and feedback, without deciding a screen layout.
 | Group | Capabilities and feedback to account for together |
 |---|---|
 | Deployment reload | Implemented on Overview: explicit vault reload, loaded policy/key/account/provider counts and underlying failure detail, with catalog discovery shown separately. |
+| Key lifecycle | Implemented on Client keys: custom expiry/grace with Never/zero defaults, creation/rotation timestamps and current counters, repeated revocation by ID with distinct outcomes, descriptions during grace, and query errors with retry. |
 | Account form inputs | Import label and exact signed 64-bit priority entry, with input validation. |
 | Account recovery and usage | Retry availability for any existing account; polling disabled accounts; complete provider usage diagnostics in account details; unsaved-token state on account rows. |
 | Account login feedback | HTTP polling errors for subscription login flows and immediate catalog discovery outcome after credential-file import, in Add account. |
