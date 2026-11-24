@@ -16,7 +16,6 @@ import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { get, type GroupBy, type Status, type UsageRow } from "@/lib/api";
 import { DURATION_ERROR, durationSeconds, formatDuration } from "@/lib/duration";
 import { num } from "@/lib/format";
@@ -162,11 +161,14 @@ function UsageFilters({ params, apply }: { params: URLSearchParams; apply: (chan
       <div className="flex flex-wrap items-start gap-6">
         <div className="flex flex-col gap-2">
           <span id="group-by" className="text-sm font-medium">Group by</span>
-          <Tabs value={view.group} onValueChange={(group) => apply({ group })}>
-            <TabsList aria-labelledby="group-by">
-              {GROUPS.map(([g, label]) => <TabsTrigger key={g} value={g}>{label}</TabsTrigger>)}
-            </TabsList>
-          </Tabs>
+          <div role="group" aria-labelledby="group-by" className="flex flex-wrap gap-2">
+            {GROUPS.map(([g, label]) => (
+              <Button key={g} type="button" variant={view.group === g ? "secondary" : "outline"}
+                aria-pressed={view.group === g} className="rounded-full" onClick={() => apply({ group: g })}>
+                {label}
+              </Button>
+            ))}
+          </div>
         </div>
         <LookBackInput value={duration} onChange={setDuration} error={error} />
       </div>
