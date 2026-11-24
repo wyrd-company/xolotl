@@ -106,11 +106,16 @@ async fn a_key_issued_again_does_not_inherit_and_other_sessions_and_keys_share_n
 }
 
 #[tokio::test]
-async fn the_models_of_a_session_are_pruned_with_it() {
+async fn the_models_of_a_session_are_pruned_with_it_and_not_before() {
     let db = Db::in_memory().await.unwrap();
     in_session(&db, &later("a")).record(&target(QWEN)).await;
-    assert_eq!(db.prune(1).await.unwrap(), 0);
-    sqlx::query("UPDATE session_models SET last_used = ?").bind(now() - 2 * 86_400).execute(&db.pool).await.unwrap();
-    assert_eq!(db.prune(1).await.unwrap(), 1);
+    in_session(&db, &later("a")).record(&target(BUSY)).await;
+    let old = now() - 2 * 86_400;
+    sqlx::query("UPDATE session_models SET last_used = ? WHERE model = 'qwen3'").bind(old).execute(&db.pool).await.unwrap();
+    assert_eq!(db.prune(1).await.unwrap(), 0, "the session is still active, on busy");
+    assert_eq!(kept(&db).await, pairs(&[BUSY, QWEN]), "so it keeps qwen3 too");
+
+    sqlx::query("UPDATE session_models SET last_used = ?").bind(old).execute(&db.pool).await.unwrap();
+    assert_eq!(db.prune(1).await.unwrap(), 2, "the session went quiet");
     assert_eq!(kept(&db).await, vec![]);
 }

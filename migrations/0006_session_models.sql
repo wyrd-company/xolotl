@@ -1,7 +1,8 @@
 -- relationships:
 --   implements: ../docs/design/sessions.md
 -- The models each session has used, for the key issuance that used them. The
--- session keeps them after its key's policy excludes them.
+-- session keeps them after its key's policy excludes them. They go together,
+-- once the session has used none of them for the retention period.
 CREATE TABLE session_models (
     client_id   TEXT NOT NULL,
     key_issued  TEXT NOT NULL,

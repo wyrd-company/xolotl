@@ -85,6 +85,20 @@ async fn compactions_and_background_requests_go_on_with_the_models_of_the_sessio
 }
 
 #[tokio::test]
+async fn a_session_active_on_another_model_keeps_the_one_it_used_before_through_retention() {
+    let h = answering().await;
+    let key = h.key(policy("p")).await;
+    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
+    assert_eq!(chat_in(&h, &key, "s", later("busy", "hello")).await, 200);
+    // qwen3's last use is past the retention period; busy's isn't.
+    let old = crate::db::now() - 2 * 86_400;
+    sqlx::query("UPDATE session_models SET last_used = ? WHERE model = 'qwen3'").bind(old).execute(&h.state.db.pool).await.unwrap();
+    h.state.db.prune(1).await.unwrap();
+    put(&h, excluding_qwen().remove(0).1).await;
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200, "the session returns to it");
+}
+
+#[tokio::test]
 async fn a_model_the_session_never_used_stays_refused() {
     let h = answering().await;
     let key = h.key(policy("p")).await;
