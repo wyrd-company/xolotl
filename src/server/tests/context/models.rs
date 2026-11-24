@@ -10,6 +10,8 @@ use super::*;
 use crate::keys::IssueRequest;
 use crate::policy::Rule;
 
+mod clients;
+
 async fn put(h: &Harness, p: Policy) {
     h.state.keys.put_policy(p, &h.state.catalog.known_providers(), &h.state.mcp.server_names()).await.unwrap();
 }
