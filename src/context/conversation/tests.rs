@@ -133,6 +133,16 @@ async fn a_compacted_conversation_goes_on_with_its_model_and_cannot_switch_back_
 }
 
 #[tokio::test]
+async fn a_compacted_conversation_that_switches_at_once_cannot_switch_back() {
+    let db = Db::in_memory().await.unwrap();
+    conversation(&db, "hello").served(Some(&target(QWEN))).await;
+    conversation(&db, "hello").served(Some(&target(QWEN))).await;
+    assert_eq!(kept_for(&db, "summary").await, pairs(&[QWEN]), "its first request could still use the model");
+    conversation(&db, "summary").served(Some(&target(BUSY))).await;
+    assert_eq!(kept_for(&db, "summary").await, pairs(&[BUSY]), "the conversation before it went quiet before it began");
+}
+
+#[tokio::test]
 async fn every_request_of_a_named_session_reads_it_and_a_guessed_one_needs_earlier_output() {
     let db = Db::in_memory().await.unwrap();
     conversation(&db, "a").served(Some(&target(QWEN))).await;

@@ -53,15 +53,17 @@ impl Conversation {
     /// - the model this conversation is on;
     /// - the model another conversation of the session is on, if that one
     ///   has used it since a conversation of the session last switched away
-    ///   from it.
+    ///   from it, and since this conversation started.
     ///
     /// So a new conversation of the session, such as a subagent or what
     /// follows a compaction, goes on with the session's models. Once a
     /// conversation switches away from a model, the others that used it
     /// before then no longer keep it, so switching back is refused, also when
-    /// the conversation left behind is the one before a compaction. A
-    /// conversation that goes on using the model, such as a subagent still at
-    /// work, keeps it for the session.
+    /// the conversation left behind is the one before a compaction. One that
+    /// went quiet before this conversation started is behind it too: the one
+    /// before a compaction whose first request was already on another model.
+    /// A conversation that goes on using the model, such as a subagent still
+    /// at work, keeps it for the session.
     ///
     /// Every request of a session the client names reads them. A session
     /// xolotl reads from the content is only a guess at a conversation, so
@@ -130,9 +132,9 @@ fn sequence() -> i64 {
 
 impl Db {
     async fn session_models(&self, c: &Conversation) -> Result<Vec<Target>> {
-        type Row = (String, Option<String>, Option<String>, i64, Option<i64>);
+        type Row = (String, Option<String>, Option<String>, i64, i64, Option<i64>);
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT r.opening, r.provider, r.model, r.sequence, l.sequence FROM session_conversations r
+            "SELECT r.opening, r.provider, r.model, r.started, r.sequence, l.sequence FROM session_conversations r
              LEFT JOIN session_left l ON l.client_id = r.client_id AND l.key_issued = r.key_issued
                AND l.session_key = r.session_key AND l.provider = r.provider AND l.model = r.model
              WHERE r.client_id = ? AND r.key_issued = ? AND r.session_key = ?",
@@ -142,9 +144,11 @@ impl Db {
         .bind(&c.session)
         .fetch_all(&self.pool)
         .await?;
+        // A new conversation has started nowhere yet, so only departures count.
+        let started = rows.iter().find(|r| r.0 == c.opening).map_or(i64::MIN, |r| r.3);
         let kept: BTreeSet<Target> = rows
             .into_iter()
-            .filter(|(opening, .., used, left)| *opening == c.opening || left.is_none_or(|left| *used > left))
+            .filter(|(opening, .., used, left)| *opening == c.opening || *used > started.max(left.unwrap_or(i64::MIN)))
             .filter_map(|(_, provider, model, ..)| Some(Target { provider: provider?, model: model? }))
             .collect();
         Ok(kept.into_iter().collect())
@@ -187,8 +191,8 @@ impl Db {
             _ => {}
         }
         sqlx::query(
-            "INSERT INTO session_conversations (client_id, key_issued, session_key, opening, provider, model, sequence, last_used)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO session_conversations (client_id, key_issued, session_key, opening, provider, model, started, sequence, last_used)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (client_id, key_issued, session_key, opening) DO UPDATE SET
                provider = excluded.provider, model = excluded.model, sequence = excluded.sequence, last_used = excluded.last_used",
         )
@@ -198,6 +202,7 @@ impl Db {
         .bind(&c.opening)
         .bind(target.map(|t| &t.provider))
         .bind(target.map(|t| &t.model))
+        .bind(c.sequence)
         .bind(c.sequence)
         .bind(at)
         .execute(&mut *tx)

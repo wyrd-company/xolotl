@@ -4,8 +4,9 @@
 -- had it. The session keeps those models after its key's policy excludes
 -- them. `opening` is a digest of the conversation's first user turn.
 -- `provider` and `model` are NULL while it is on a target it can't keep, one
--- only an alias reaches. `sequence` is its latest request, so that an older
--- request finishing late can't move it back.
+-- only an alias reaches. `started` is its first recorded request, and
+-- `sequence` its latest, so that an older request finishing late can't move it
+-- back.
 CREATE TABLE session_conversations (
     client_id   TEXT NOT NULL,
     key_issued  TEXT NOT NULL,
@@ -13,6 +14,7 @@ CREATE TABLE session_conversations (
     opening     TEXT NOT NULL,
     provider    TEXT,
     model       TEXT,
+    started     INTEGER NOT NULL,
     sequence    INTEGER NOT NULL,
     last_used   INTEGER NOT NULL,
     PRIMARY KEY (client_id, key_issued, session_key, opening)

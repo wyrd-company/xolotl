@@ -120,6 +120,23 @@ async fn a_compacted_conversation_goes_on_with_its_model_and_cannot_switch_back_
 }
 
 #[tokio::test]
+async fn a_compacted_conversation_that_switches_on_its_first_request_cannot_switch_back() {
+    let h = answering().await;
+    let key = h.key(policy("p")).await;
+    assert_eq!(chat_in(&h, &key, "s", first("qwen3", "hello")).await, 200);
+    put(&h, excluding_qwen().remove(0).1).await;
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "hello")).await, 200);
+    let compaction = json!({"model": "qwen3", "messages": [
+        {"role": "user", "content": "hello"}, {"role": "assistant", "content": "a"}, {"role": "user", "content": "Summarize the conversation."}]});
+    assert_eq!(chat_in(&h, &key, "s", compaction).await, 200, "the compaction");
+
+    // The first request with the rewritten opening is already on another model.
+    assert_eq!(chat_in(&h, &key, "s", later("busy", "Summary: hello")).await, 200, "it switches");
+    assert_eq!(chat_in(&h, &key, "s", later("qwen3", "Summary: hello")).await, 404, "and can't switch back");
+    assert_eq!(chat_in(&h, &key, "s", later("busy", "Summary: hello")).await, 200);
+}
+
+#[tokio::test]
 async fn a_conversation_without_a_session_header_is_told_from_a_new_one_with_the_same_opening() {
     let h = answering().await;
     let key = h.key(policy("p")).await;
