@@ -49,3 +49,21 @@ describe("narrowTo", () => {
 it("retains the errors-only filter when narrowing to a provider", () => {
   expect(narrowTo(params("group=provider&errors=true"), "gateway-a")).toBe("?group=model&errors=true&provider=gateway-a");
 });
+
+describe("readView", () => {
+  it("keeps arbitrary look-back periods through row navigation", () => {
+    const view = params("since=129600&group=client&provider=a%2Fb&model=");
+    expect(readView(view).period).toBe(129600);
+    const next = readView(params(narrowTo(view, "team/editor")!));
+    expect(next.period).toBe(129600);
+    expect(next.filters).toEqual([["client", "team/editor"], ["provider", "a/b"], ["model", ""]]);
+  });
+
+  it("accepts CLI-style durations and defaults only an absent period", () => {
+    expect(readView(params("")).period).toBe(86400);
+    expect(readView(params("since=36h")).period).toBe(129600);
+    for (const value of ["", "nope", "0", "-1", "9007199254740992"]) {
+      expect(readView(params(`since=${value}`)).period).toBeNull();
+    }
+  });
+});

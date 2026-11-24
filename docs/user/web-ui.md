@@ -142,10 +142,22 @@ The **Policies** screen shows the models of a policy in two modes.
 
 ### Usage
 
+Use **Look back** to enter a positive whole-number duration, such as `36h`,
+`15m`, `2w`, or `90` seconds. The default is 24 hours. Supported units are
+`s`, `m`, `h`, `d` and `w`.
+
+Check **Filter by client**, **account**, **provider** or **model** and enter
+an exact value, even one that does not appear in the table. An unchecked filter
+matches any value. A checked filter with an empty entry matches requests without
+that value, such as the admin token's requests without a client key. Select
+**Apply filters** to apply the look-back period and filters together. Invalid
+durations keep your entries and show how to correct them. Query failures show
+the underlying error with **Retry query**.
+
 Select a row to narrow the view to it. The view then groups by the first of
 model, account, client and provider that is not shown or narrowed yet. Each
 filter shows as a chip; remove a chip to widen the view again. The URL keeps
-the filters (`/#/usage?group=model&client=...`), so you can bookmark a view.
+the filters and period (`/#/usage?group=model&since=129600&client=...`), so you can bookmark a view.
 
 ![The Usage screen: requests per client, then sessions with their size, cache hits and lock, then the tools each key called](assets/usage-sessions.png)
 

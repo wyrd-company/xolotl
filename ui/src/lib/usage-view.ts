@@ -1,16 +1,11 @@
 import type { GroupBy } from "@/lib/api";
+import { durationSeconds } from "@/lib/duration";
 
 export const GROUPS: [GroupBy, string][] = [
   ["client", "Client"],
   ["account", "Account"],
   ["provider", "Provider"],
   ["model", "Model"],
-];
-export const PERIODS: [string, number][] = [
-  ["Last 24 hours", 86_400],
-  ["Last 7 days", 7 * 86_400],
-  ["Last 30 days", 30 * 86_400],
-  ["Last 90 days", 90 * 86_400],
 ];
 // After narrowing to a row, show the first of these that is not already narrowed.
 const NEXT_GROUP: GroupBy[] = ["model", "account", "client", "provider"];
@@ -21,7 +16,7 @@ export function readView(params: URLSearchParams) {
   const groupParam = params.get("group");
   const group = GROUPS.find(([g]) => g === groupParam)?.[0] ?? "client";
   const sinceParam = params.get("since");
-  const period = PERIODS.find(([, secs]) => String(secs) === sinceParam)?.[1] ?? PERIODS[0][1];
+  const period = sinceParam === null ? 86_400 : durationSeconds(sinceParam);
   const filters = GROUPS.flatMap(([g]) => {
     const value = params.get(g);
     return value === null ? [] : [[g, value] as const];
