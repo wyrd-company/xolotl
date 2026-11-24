@@ -276,6 +276,13 @@ OpenBao takes the CSR's common name and SANs (`use_csr_common_name` and `use_csr
 
 `host` is an attribute only where it is a capture host, so its cardinality is the capture list's. Exported rows count in `xolotl.export.rows`, as for every row.
 
+## CLI and web UI
+
+- **The `egress` scope:** policy files that `xolotl policies put` reads take `egress` in `scopes`, and `xolotl policies list` and `xolotl policies get` print it, as they print every scope. No command or option is added or changed, so the command tree that `tests/cli_parity.rs` checks stays the same. The Policies editor lists `egress (forward proxy)` with the other scopes. It saves a policy whose only scope is `egress` with no provider or MCP server, and its key-policies hint names `proxy`, `mcp` and `egress` as the scopes a listed policy may have. The `policies get` and `policies put` rows of the [CLI parity](web-ui.md#cli-parity) inventory keep their assessments.
+- **Keys:** a key under an `egress` policy is issued, rotated, disabled and revoked like any key, from the CLI or the Client keys screen.
+- **Forward-proxy state:** `GET /admin/status` has `forward_proxy`. It is `null` without the `[forward_proxy]` section; otherwise it holds `listen` and, for each capture host, `host`, `not_after` (when its certificate expires, or `null`) and `error` (the last issuance error, or `null`). Overview lists each capture host as captured until `not_after`, or as tunneled without capture, with the error. The CLI has no status command, so this state has no CLI counterpart in the inventory.
+- **Configuration:** `xolotl check-config` prints the `[forward_proxy]` section with the rest of the config, and refuses it on the rules in [Configuration](#configuration).
+
 ## Tests
 
 The tests need neither the Homelab OpenBao nor Google:
