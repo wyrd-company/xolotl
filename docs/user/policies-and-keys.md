@@ -18,7 +18,8 @@ belongs to a policy. The policy decides what the key can do.
 4. Set the models, the MCP servers and the rate limits. Each section folds
    away.
 5. Select **Create policy**. Later changes take effect when you select
-   **Save policy**.
+   **Save policy**. A model you exclude keeps serving the conversations
+   already on it; see [Exclude a model](#exclude-a-model).
 
 The editor warns when a subscription provider has no accounts: the provider
 looks allowed, but its requests get a 403.
@@ -226,6 +227,30 @@ natively and through translation. It lists the accounts that exist now and that
 keys can use for each subscription provider the policy allows, and says
 `no accounts` where there are none. With MCP servers, it also lists the tools a
 key can call. A client gets the same names from `GET /v1/models`.
+
+### Exclude a model
+
+The policy checks a model when a session first uses it: when the session
+starts with it or switches to it. Once a request on the model succeeds, the
+session keeps it. When you exclude the model later, with a rule, its `models`
+switch or `deny_other_models`:
+
+- A conversation already on the model goes on, on the same provider and model,
+  with no error. A conversation that stays on one account
+  ([Context lock](accounts.md#context-lock)) stays there.
+- A new session can't use the model. It gets a 404, or a 403 through a
+  passthrough.
+- A conversation that switches to another model can't switch back to it.
+
+Requests that a client sends on other models under the same session, such as
+Claude Code's background requests and subagents, are not a switch: xolotl tells
+a conversation by its first user message. A session keeps a model until it
+goes `database.retention_days` ([configuration](configuration.md#database))
+without using it.
+
+This covers only what xolotl decides: if the provider stops serving the model,
+the conversation fails there too. Removing a provider from `providers`, or an
+account from `accounts`, applies to every session at once.
 
 ## Rate limits
 
