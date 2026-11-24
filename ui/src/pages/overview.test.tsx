@@ -302,7 +302,7 @@ test("reload completion shows each returned count, including zero, separately fr
 test("pending reload disables another submission and hides previous counts", () => {
   reloadMock.state = { isPending: true, data: { policies: 99 } };
   const html = render([]);
-  expect(html).toMatch(/<button[^>]*disabled[^>]*>.*?Reloading from OpenBao…/);
+  expect(html).toMatch(/<button[^>]* disabled=""[^>]*>(?:(?!<\/button>).)*Reloading from OpenBao…/);
   expect(html).toContain("Waiting for the server result");
   expect(html).not.toContain("Reload completed");
   expect(html).not.toContain("99 policies");
