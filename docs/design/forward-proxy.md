@@ -56,6 +56,7 @@ The forward proxy takes only an **egress-only client key**:
 
 - **A client key.** The principal has a client id, which names the client in the log and in every row it produces. The bootstrap admin token authenticates without a client id, so it is refused with `403`, as it is left out of the export elsewhere ([Capture](export.md#capture)).
 - **An egress-only policy.** The key's policy lists the `egress` scope, and policy validation refuses `egress` together with any other scope. `egress` is the one scope that `admin` does not imply. So a key that works on this listener can do nothing else in xolotl: no account, no MCP server, no administration. One client that also calls xolotl's LLM endpoints holds two keys.
+- **Egress-only for good.** A key resolves its policy by name at every use, so editing a policy changes what its existing keys can do. A policy's egress status is therefore fixed when the policy is first saved. Saving it again with a scope set on the other side of that line is refused with the policy's existing validation error: an egress-only policy can't gain or switch to another scope, and a policy with other scopes can't gain `egress`. A key that has crossed the cleartext listener so keeps no more than the proxy's authority, however its policy is edited. To give a client other authority, the operator issues a key under another policy and revokes the egress key. Deleting a policy while keys reference it is already refused ([Policies](client-keys.md#policies)), so a deleted egress policy's name can't be reused for keys that still exist.
 
 Egress-only keys are pending the operator's confirmation of that two-key workflow. xolotl's own description promises one client key for subscriptions, gateways and MCP servers; the forward proxy's key is a second one, for a different listener.
 
@@ -67,8 +68,9 @@ The client id of the key is the `client_id` of the exchanges it produces, so its
 
 A connection's authority lasts only as long as its key authenticates. Each open connection keeps the SHA-256 hash of the key it was opened with, never the key. The checks run against the keys and policies xolotl has loaded, its key state, without a reload:
 
-- **A sweep** looks up each distinct hash once. Every connection whose key no longer authenticates is closed: revoked, disabled, expired, or past its rotation grace. So is every connection whose policy no longer lists `egress` alone. A sweep runs each time `KeyManager` publishes a new key state, and every 15 s, for expiry and rotation grace, which end without a new state. `KeyManager` publishes a new state on four occasions:
+- **A sweep** looks up each distinct hash once. Every connection whose key no longer authenticates is closed: revoked, disabled, expired, or past its rotation grace. So is every connection whose policy no longer lists `egress` alone. A sweep runs each time `KeyManager` publishes a new key state, and every 15 s, for expiry and rotation grace, which end without a new state. `KeyManager` publishes whenever its loaded keys or policies change, whatever the cause:
   - after a write on this instance;
+  - after a change to its cache without a write: an issue that finds the key already there and caches it, a revoke that finds a revocation marker and caches it, or a revoke that finds the key absent and forgets it;
   - after each periodic reload;
   - after a reload on demand when a client presents an unknown `xol_` key, on either listener, at most once per 10 s ([Authentication](client-keys.md#authentication));
   - after a reload on demand through `POST /admin/reload`.
@@ -169,7 +171,8 @@ Each request on the connection is forwarded on its own:
 |---|---|---|
 | Xolotl can't reach the upstream, or the upstream's certificate fails validation | `502 Bad Gateway`, with a Google API error body, `{"error": {"code": 502, "message": "...", "status": "UNAVAILABLE"}}`. Nothing of the request is sent upstream on a connection that failed validation. | `status` 502, `error` the reason |
 | The key stops authenticating before the request is forwarded | `403`, with a Google API error body, then the connection closes | `status` 403, `error` the reason |
-| The upstream read fails, or no frame arrives for `server.upstream_timeout_secs`, after the status and part of the body reached the client | A response that does not end cleanly. HTTP/2 resets the stream with `INTERNAL_ERROR`. HTTP/1.1 closes the connection before the last chunk or the declared length, so the client sees a cut body, never a complete one. | `status` the upstream's, `request` and `response` what was copied, `error` the reason and the bytes relayed |
+| The upstream accepts the request but sends no response headers within `server.upstream_timeout_secs` | `504 Gateway Timeout`, with a Google API error body, `{"error": {"code": 504, "message": "...", "status": "DEADLINE_EXCEEDED"}}` | `status` 504, `error` `proxy_error: no response headers within <n> s`, and the request copy |
+| The upstream read fails, or no frame arrives for `server.upstream_timeout_secs`, after the status reached the client, with or without part of the body | A response that does not end cleanly. HTTP/2 resets the stream with `INTERNAL_ERROR`. HTTP/1.1 closes the connection before the last chunk or the declared length, so the client sees a cut body, never a complete one. | `status` the upstream's, `request` and `response` what was copied, `error` the reason and the bytes relayed |
 | The client goes away, or xolotl closes the connection for the key or for shutdown | Nothing more | `status` the upstream's when it had answered; otherwise `499`, with `error` the cause |
 
 The forwarding task decides the outcome in the table, and its guard hands it to the request's capture task in the terminal event. The capture task submits the row ([Capture](#capture)).
@@ -183,6 +186,7 @@ To issue for a host:
 1. Generate an ECDSA P-256 key pair in memory, and a CSR whose common name and only DNS SAN are the host.
 2. `VaultClient::pki_sign` posts the CSR to `<mount>/sign/<role>` with `common_name` set to the host, as the AppRole xolotl already logs in with.
 3. Check the answer: the leaf's only DNS SAN is the host, it has no IP or URI SAN, it is valid now, and its public key is the one generated. Then build the chain from `certificate` and `ca_chain`, leaving out a self-signed root.
+4. Check that the chain covers the host. Each CA certificate in the chain that carries a DNS name constraint must permit the host. A chain whose constraint leaves the host out would fail at every client, so the certificate is refused rather than cached. It is logged at warn level, counted as `failed`, and leaves the host not ready, so its CONNECTs are tunneled. This is the case when a capture host is added without replacing the intermediate ([Adding a capture host](#adding-a-capture-host)).
 
 The role's `ttl` sets the lifetime: xolotl does not ask for one. The private key exists only in xolotl's memory. It is not written to OpenBao, to SQLite, to disk or to a log. Each instance of xolotl issues its own certificates.
 
@@ -215,7 +219,7 @@ The forwarding task and the capture task talk through one queue of events. Each 
 | Head | Request: its `Content-Type` and `Content-Encoding`. Response: the upstream's status, `Content-Type` and `Content-Encoding`. | The request head at admission; the response head when the upstream's headers arrive |
 | Frame | Either | As each data frame is forwarded |
 | Body end | Either: the body ended, or it was cancelled | When that direction's body ends, or is reset or abandoned |
-| Terminal event | None. It carries how forwarding ended: the outcome from [Failures](#failures) (the status xolotl gave the client when xolotl answered itself, and xolotl's own error), or `dropped`. It also carries the bytes relayed in each direction, whether the queue refused any frame, and the instant forwarding ended. | Exactly once, by the request's guard: when both directions have ended or been cancelled, or when the forwarding task is dropped |
+| Terminal event | None. It carries how forwarding ended: the outcome from [Failures](#failures) (the status xolotl gave the client when xolotl answered itself, and xolotl's own error), or `dropped`. It also carries the request's UTC start time, the bytes relayed and the bytes queued in each direction, and the instant forwarding ended. | Exactly once, by the request's guard: when both directions have ended or been cancelled, or when the forwarding task is dropped |
 
 How the events flow:
 
@@ -223,18 +227,23 @@ How the events flow:
 - **Frames by reference.** The forwarding task writes each frame onward first, and then hands the same frame to the queue, by reference, without copying it. The queue holds at most 8 MiB of frames, from both directions together. When a frame doesn't fit, it is not queued, the capture of that request stops reading frames in both directions, and forwarding goes on.
 - **Heads, body ends and the terminal event are always taken.** They sit outside the 8 MiB bound and are never refused.
 - **The guard.** At admission, the forwarding task creates a guard, which it owns. The guard holds the facts the capture task can't see for itself, because they are not in the queued frames:
-  - **The clock:** the request's start, as an instant.
+  - **The clock:** the request's start, as a UTC time for `started_at` and as a monotonic instant for the latency.
   - **Bytes relayed:** a running count per direction, of every frame forwarded, queued or not.
-  - **Refusals:** whether the queue refused any frame.
+  - **Bytes queued:** a running count per direction, of the frames the queue took.
 
-  The guard sends the terminal event exactly once: at the normal end, with the outcome and the instant forwarding ended, or from its `Drop`. `Drop` runs when the forwarding task is cancelled or panics, and then sends the outcome `dropped`, with the instant of the drop. So every request's capture ends with a terminal event that carries these facts, however forwarding ended.
-- **Exact fit and overflow differ.** When the terminal event says the queue refused a frame, the copies of the refused direction end at their last queued frame and are marked `*_truncated`, and `Observed.complete` is false. That holds however many frames were queued before it. A response whose frames all fitted, even with exactly 8 MiB queued, is complete. The capture can only see the difference through the refusal flag, because the queued frames are the same in both cases.
-- **Time comes from the forwarding side.** `latency_ms` runs from the guard's start instant to the instant in the terminal event, and `finished_at`, which the export derives from `started_at` and `latency_ms`, follows from it. How long the capture task takes to drain its queue changes neither.
+  The guard sends the terminal event exactly once, carrying the start time, both counts for each direction, the outcome and the instant forwarding ended. It sends it at the normal end, or from its `Drop`. `Drop` runs when the forwarding task is cancelled or panics, and then sends the outcome `dropped`, with the instant of the drop. So every request's capture ends with a terminal event that carries these facts, however forwarding ended.
+- **Omissions are counted per direction.** Once the queue refuses a frame, the capture stops in both directions, so every later frame of either direction is left out too. A direction lost bytes exactly when its bytes relayed exceed its bytes queued. The capture task compares the two counts for each direction from the terminal event:
+  - **A direction that lost bytes** has its copy end at its last queued frame, marked `*_truncated`, whichever direction's frame the queue refused first.
+  - **`Observed.complete`** is false when either direction lost bytes.
+  - **A direction whose counts are equal** is whole.
+
+  So a 23-byte request frame refused behind 8 MiB of queued response data, followed by a 7-byte response frame, marks both the request and the response truncated. A response whose frames all fitted, even with exactly 8 MiB queued, is complete. The queued frames alone can't show the difference; the counts can.
+- **Time comes from the forwarding side.** `started_at` is the guard's UTC start time, taken at admission. `latency_ms` runs from the guard's start instant to the instant in the terminal event. `finished_at`, which the export derives from `started_at` and `latency_ms`, follows from both. How long the capture task takes to start or to drain its queue changes none of the three.
 - **A dropped forwarding task** sends the outcome `dropped`. The capture task then:
   - takes the status from the last response head it read: the upstream's status when one arrived, and `499` otherwise;
   - ends each direction that has no body end as cancelled;
   - sets `error` to `incomplete: the request ended without an outcome`, with the bytes relayed in each direction from the terminal event;
-  - keeps what `Observed` read, unless the queue refused a frame, as for any cut response.
+  - keeps what `Observed` read, unless a direction lost bytes, as for any cut response.
 
   So a task dropped after a `200` head and one dropped before any answer give `200` and `499`. Neither reads as a completed exchange.
 - **One submission.** The capture task reads every event queued before the terminal event. It finishes both directions' decoding and metadata, and then submits the row once, through its hold. The last frame the client received, in either direction, is in the row whenever it fitted in the queue: no scheduling between the two tasks can drop it.
@@ -242,9 +251,9 @@ How the events flow:
 The capture task works on each body in three steps:
 
 1. **Decode.** It reads the body's `Content-Encoding` and decodes `gzip`, `x-gzip`, `deflate`, `br` and `zstd`, alone or stacked, undoing the codings in reverse of the order the header lists them. It stops after `server.max_body_bytes` of decoded output (64 MiB), which bounds what a compressed body can expand to. A body with any other coding is not decoded: nothing of it is copied or read. The client always gets the bytes the upstream sent; the capture's decoding is its own.
-2. **Copy.** When a destination takes bodies, it keeps the decoded body up to the capture's `max_body_bytes`, the largest any destination wants ([Destinations](export.md#destinations)). A body is copied when its `Content-Type` is text, JSON or XML, or absent or empty, the rule `proxy::is_text` applies to the gateway's bodies ([Capture](export.md#capture)). Otherwise its column is empty and marked `*_truncated`.
+2. **Copy.** When a destination takes bodies, it keeps the decoded body up to the capture's `max_body_bytes`, the largest any destination wants ([Destinations](export.md#destinations)). A body is copied when its `Content-Type` is text, JSON or XML, or absent or empty, the rule `proxy::is_text` applies to the gateway's bodies ([Capture](export.md#capture)). Otherwise the copy is empty and marked truncated, for the destinations that take bodies ([Each destination's row](#each-destinations-row)).
 3. **Read metadata.** It reads the decoded bytes into `Observed`, whatever the copy keeps and whether or not any destination takes bodies:
-   - **From the request:** a streaming JSON scanner that keeps only the key path and two values, the top-level `model` and `request.session_id`. Memory is the same whatever the size of the body. `request.session_id` becomes the session key at once: the truncated SHA-256 of source `cloud-code` and the value ([Session identity](sessions.md#session-identity)). The raw value goes no further.
+   - **From the request:** a streaming JSON scanner that keeps only the key path and two values, the top-level `model` and `request.session_id`. Memory is the same whatever the size of the body. `request.session_id` becomes the session key at once: the truncated SHA-256 of source `cloud-code` and the value ([Session identity](sessions.md#session-identity)). In the metadata, and so in the `session_key` column, only the digest exists. The raw value stays inside the request body: a destination that takes bodies has it wherever it falls within its request copy, as for any body field, and a destination that doesn't take bodies has neither.
    - **From the response:** each SSE `data:` event, or the JSON body, as the gateway's tap reads them ([Request path](architecture.md#request-path)). It takes the last `usageMetadata`, and one tool call entry for each `functionCall` part, in order, repeats included, as the gateway counts calls (`context::tools::ToolCalls`). Each entry is the call's name, cut at 128 characters as there.
 
 ### Capture limits
@@ -253,7 +262,7 @@ Every limit below that skips something `Observed` would have read sets `Observed
 
 | Limit | Value | When it is reached |
 |---|---|---|
-| Frames waiting for the capture task | 8 MiB per request | The refused frame is not queued, and the capture stops reading frames for that request. The terminal event reports the refusal, so the copies end at their last queued frame, marked `*_truncated`, and `complete` is false. |
+| Frames waiting for the capture task | 8 MiB per request, both directions together | The refused frame is not queued, and the capture stops taking frames in both directions. Each direction whose bytes relayed exceed its bytes queued has its copy end at its last queued frame, marked `*_truncated`, and `complete` is false. |
 | Decoded bytes per body | `server.max_body_bytes` (64 MiB) | Decoding stops. The copy ends there, marked `*_truncated`, and `complete` is false. |
 | A coding xolotl doesn't decode | Any coding but the five above | Nothing of that body is copied or read, and `complete` is false. |
 | The body copy | The capture's `max_body_bytes` of decoded bytes | The copy is cut, as on the gateway, and marked `*_truncated`. Metadata reading goes on, and `complete` is unaffected. |
@@ -325,7 +334,20 @@ impl CaptureHold {
 }
 ```
 
-`Exporter` is the sink. `hold` counts the request among the exporter's rows in progress, as `Capture::pending` does for gateway requests. `submit` builds the row and queues it on each destination before the count goes down ([Queue and delivery](export.md#queue-and-delivery-to-clickhouse)). From there the row takes the path every exported row takes: one row per distinct destination setting, the destinations' queues bounded by bytes, and drops counted in `xolotl.export.rows`. An export failure, a full queue or an unreachable NATS loses rows and never touches the live request.
+`Exporter` is the sink. `hold` counts the request among the exporter's rows in progress, as `Capture::pending` does for gateway requests. `submit` builds the rows and queues them on each destination before the count goes down ([Queue and delivery](export.md#queue-and-delivery-to-clickhouse)). From there the rows take the path every exported row takes: the destinations' queues bounded by bytes, their own retries, and their outcomes counted in `xolotl.export.rows`. An export failure, a full queue or an unreachable NATS loses or delays rows and never touches the live request.
+
+### Each destination's row
+
+`submit` builds one row for each distinct `(bodies, max_body_bytes)` among the destinations, all with one `id`, as `Capture::submit` does for gateway rows ([Destinations](export.md#destinations)). Every row has the same metadata columns: `status`, the times, the model, the session, the token counts and `tool_calls`. The body columns follow each destination's own setting:
+
+| Columns | A destination with `bodies = true` | A destination with `bodies = false` |
+|---|---|---|
+| `request`, `response` | The decoded copies, cut to its own `max_body_bytes` | Empty |
+| `request_truncated`, `response_truncated` | True when its copy was cut to its limit, when the capture left bytes out, or when the body was not copyable | False: it keeps no body to call incomplete |
+| `output`, `output_text`, `stop_reason` | Assembled from its own response copy | Empty |
+| `error` | The forwarding error, else one derived from the body | The forwarding error only |
+
+The **forwarding error** is `Forwarded.error`: xolotl's own answer, a request that ended early, or `incomplete`. It doesn't depend on any body, so every row carries it. An error **derived from the body** is `translate::upstream_error` on a response that isn't 2xx, or the error the assembled body reports. Only a row that has the body can carry it.
 
 ### Not an account
 
@@ -333,12 +355,14 @@ impl CaptureHold {
 
 ### Model requests
 
-A request becomes an exchange when its path, without the query string, is a model path of the Code Assist API, the API that `daily-cloudcode-pa.googleapis.com` serves:
+A request becomes an exchange when its method is `POST` and its path, without the query string, is a model path of the Code Assist API, the API that `daily-cloudcode-pa.googleapis.com` serves. Both model calls use `POST`:
 
-| Path | Body |
+| Method and path | Body |
 |---|---|
-| `/v1internal:streamGenerateContent` | Request JSON; response SSE (`?alt=sse`) |
-| `/v1internal:generateContent` | Request JSON; response JSON |
+| `POST /v1internal:streamGenerateContent` | Request JSON; response SSE (`?alt=sse`) |
+| `POST /v1internal:generateContent` | Request JSON; response JSON |
+
+A request with another method on one of these paths, such as an `OPTIONS` preflight, invokes no model. It is forwarded and not captured.
 
 Every other request on an intercepted host is forwarded and not handed to a capture task. That includes `loadCodeAssist`, `onboardUser`, `countTokens`, `listExperiments`, `recordCodeAssistMetrics`, user settings and quota, and operation polls. One CLI turn makes several model requests, and each is its own row.
 
@@ -361,8 +385,8 @@ A forwarded request fills the existing columns of the exchange row ([NATS export
 | `input_tokens`, `cached_tokens`, `output_tokens` | From `Observed.usage`, the last `usageMetadata`: `promptTokenCount`, `cachedContentTokenCount`, and `candidatesTokenCount` plus `thoughtsTokenCount`. Empty when `Observed.complete` is false ([Capture limits](#capture-limits)). |
 | `cache_write_tokens`, `context_tokens`, `context_window`, `cost` | Empty |
 | `tool_calls` | `Observed.tool_calls` |
-| `output`, `output_text`, `stop_reason` | Assembled from the response copy, as for every row; empty when no destination takes bodies |
-| `error` | `Forwarded.error`, else `translate::upstream_error` on a response that isn't 2xx, else the error the assembled body reports |
+| `output`, `output_text`, `stop_reason` | Assembled from the destination's own response copy; empty for a destination with `bodies = false` ([Each destination's row](#each-destinations-row)) |
+| `error` | `Forwarded.error` in every row, else, in a row that has the body, `translate::upstream_error` on a response that isn't 2xx or the error the assembled body reports |
 | `request`, `response` | The decoded copies |
 
 `translate::cloudcode` decodes a Code Assist body into an `ir::Response`, as the wire decoders do, and `translate::assemble` runs it for these rows. The body is either the SSE stream or one JSON object. The export is the decoder's only user: no route translates to or from Code Assist.
@@ -427,7 +451,17 @@ bao write pki_xolotl_proxy/roles/xolotl-forward-proxy \
   ttl=24h max_ttl=24h no_store=true require_cn=true
 ```
 
-Several capture hosts are comma-separated in `permitted_dns_domains` and `allowed_domains`. A host added to `capture_hosts` is added to both, and the intermediate is signed again with the new constraint.
+Several capture hosts are comma-separated in `permitted_dns_domains` and `allowed_domains`.
+
+### Adding a capture host
+
+The intermediate's name constraint names every capture host, so a new host needs a new intermediate as well as a wider role:
+
+1. Write the role again with the new host added to `allowed_domains`, keeping every other setting.
+2. Replace the intermediate as in [The intermediate's lifetime](#the-intermediates-lifetime), with the new host added to `permitted_dns_domains`, and switch the mount's default issuer to it.
+3. Add the host to `capture_hosts` and restart xolotl.
+
+Without step 2, the role signs for the new host from the old intermediate, whose constraint leaves the host out, and every client would refuse the chain. Xolotl's chain check refuses such a certificate instead of caching it ([Certificates](#certificates)). The host is not ready and its CONNECTs are tunneled, and the status shows the error.
 
 ### The intermediate's lifetime
 
@@ -442,7 +476,13 @@ To replace the intermediate, before its last 24 h, the operator repeats the setu
 bao write pki_xolotl_proxy/config/issuers default=<id of the new issuer, from set-signed's imported_issuers>
 ```
 
-`intermediate/set-signed` imports the new issuer but leaves the old one as the default, so without this step the role keeps signing with the old one. Xolotl's next issuance or renewal, within 16 h, takes the new chain from the sign response's `ca_chain`. Certificates already issued stay valid until their own `notAfter`.
+`intermediate/set-signed` imports the new issuer but leaves the old one as the default, so without this step the role keeps signing with the old one. Xolotl's next issuance or renewal, within 16 h, takes the new chain from the sign response's `ca_chain`.
+
+**The previous issuer** stays on the mount, with its key, after the switch. It signs nothing more, because the role signs with the default issuer. The leaves it signed before the switch still chain through it, and xolotl serves them until it renews them, at most 24 h later, the role's `max_ttl`. Once 24 h have passed since the switch, no valid leaf chains through it, and the operator deletes it:
+
+```text
+bao delete pki_xolotl_proxy/issuer/<id of the previous issuer>
+```
 
 The AppRole gets one more path, in the `xolotl` policy or in a second policy on the role. It accepts the two parameters xolotl sends, and no other:
 
@@ -548,16 +588,23 @@ The tests need neither the Homelab OpenBao nor Google:
 - **The address check on its own:** a test for each registry block and each IPv4-carrying form, and integration tests through the production dialer. CONNECTs to loopback, private and link-local literals and names, and to `64:ff9b::a00:1`, are refused with `403`.
 - **A local TLS upstream:** its certificate comes from a second test CA. The interception's upstream verifier takes its roots from its constructor, so a test passes the second CA, and an upstream signed by a third CA fails validation. The config has no setting for upstream roots.
 - **A test client:** reqwest, with its proxy URL holding a test key, against the listener on an ephemeral port.
+- **Authority across edits:**
+  - Saving an egress-only policy with `proxy` added, or with `proxy` in place of `egress`, is refused. So is saving a `proxy` policy with `egress` added. The existing keys keep their authority unchanged.
+  - Issuing a key under another policy and revoking the egress key gives the client the new authority, and closes the egress key's open connections.
 - **Lifecycle:**
   - A tunnel that keeps sending bytes, and an HTTP/2 intercepted connection that keeps sending requests, are closed within the sweep interval after their key is revoked, disabled, expires, or ends its rotation grace. The interval is shortened in the test.
   - **A reload outage:** while the key store fails every reload, a revocation written elsewhere leaves an open connection running, and `xolotl.forward_proxy.key_state_age` grows. The connection closes when the first successful reload publishes its state.
   - **A slow reload:** a key store that answers each read slowly makes a successful reload last longer than the 15 s sweep interval. A revocation it reads leaves the connection open until the reload publishes its state, and closes it then, through the sweep that the publication triggers.
   - **A reload already running:** a revocation written after a running reload has read that key is not in its state. The connection closes when the next reload publishes.
   - **A skipped record:** a reload that can't read one key record publishes without it. That key then authenticates nowhere, and its open connections close.
+  - **A cache change without a write:** an idempotent revoke that finds a revocation marker written elsewhere caches it, publishes, and closes the key's open connections at once, without waiting for the periodic sweep.
   - **A reload on demand:** a revocation written elsewhere, followed by an unknown `xol_` key presented to this instance, publishes the change through the on-demand reload, and the revoked key's connections close then, before the next periodic reload.
   - The bootstrap admin token, and a key whose policy lists `egress` beside another scope, are refused.
 - **Encodings:** a gzip, a Brotli and a zstd SSE response reach the client byte for byte. Their decoded copies and `Observed` match the identity response's. A body in an unknown coding is forwarded and not copied, and a body that decodes past the limit stops there.
 - **Metadata without bodies:** with `bodies = false` on every destination, a row still has `model`, the session, the token counts and the tool calls. Two responses with the same prefix and different final `usageMetadata` give different token counts.
+- **One metadata-only and one body destination:** with ClickHouse at `bodies = false` and NATS at `bodies = true`, an exchange whose response was cut gives two rows with one `id`. The NATS row has the bodies, `response_truncated` true, the assembled output and any error derived from the body. The ClickHouse row has empty bodies, both truncation flags false, empty output, and the same metadata. A request that ended `incomplete` carries that error in both rows.
+- **Method:** an `OPTIONS` request to `/v1internal:streamGenerateContent` is forwarded and gives no row. A `POST` to the same path gives one.
+- **Timeouts at the upstream:** an upstream that accepts the request and sends no headers gives the client `504` and a row with `504`. One that sends headers and then no body frame gives an unclean end at the client and a row with the upstream's status and the timeout.
 - **Metadata limits:**
   - A stream whose final `usageMetadata` event exceeds 4 MiB, after an earlier usage event that fits, gives a row with empty token columns and `capture=cut`, not the earlier count.
   - A body in a coding xolotl doesn't decode gives `capture=skipped`.
@@ -565,11 +612,16 @@ The tests need neither the Homelab OpenBao nor Google:
   - A response with more calls than the entry limit keeps the first 256 and marks the metadata incomplete.
 - **Capture completion:** the capture task is held back until the forwarding task has sent the last frame and the terminal event. The row still has the last frame's output and its `usageMetadata`, and it is submitted once.
 - **Queue pressure, with the capture task paused:**
-  - **Exact fit:** a response of 512 frames of 16 KiB fills the queue exactly and ends normally. The row is complete, with its tokens.
+  - **Exact fit:** the request body is sent and the capture task drains it, so no request frame is waiting. It is then paused. A response of 512 frames of 16 KiB fills the queue exactly and ends normally. Both directions' counts are equal, and the row is complete, with its tokens.
+  - **Mixed directions:** with 8 MiB of response data queued and the capture task paused, a 23-byte request frame is refused, and a later 7-byte response frame is left out. Both `request_truncated` and `response_truncated` are true, with a copy limit above 8 MiB, and the token columns are empty.
   - **Overflow:** the same 512 frames, followed by a final SSE event carrying `usageMetadata` that the queue refuses. The client still receives every byte. The row's response is marked `*_truncated` (with a copy limit above 8 MiB), its token columns are empty and `capture=cut`.
   - **A drop under pressure:** the same overflow, ended by a dropped forwarding task, gives the same truncation, and the `incomplete` error carries the bytes relayed, including the refused frame.
-- **Forwarding time:** forwarding ends at 20 ms and the capture task is held until 100 ms. The row's `latency_ms` is 20, and its `finished_at` is 20 ms after `started_at`. The same holds for a dropped forwarding task.
-- **A failing destination while the response streams:** with the fixture upstream streaming an SSE response, a ClickHouse destination answers every insert with `500`, and a NATS destination is unreachable. The client receives every frame, byte for byte, at the pace the upstream sends them. The rows are dropped and counted in `xolotl.export.rows`, and the next request is forwarded the same way.
+- **Forwarding time:** the test records the wall-clock time at admission and when forwarding ends, at 20 ms, on the forwarding side. The capture task starts only at 100 ms. The row's `started_at` equals the recorded admission time, its `latency_ms` is 20, and its `finished_at` equals the recorded end time. The same holds for a dropped forwarding task.
+- **A failing destination while a response streams:** the test follows the destinations' delivery contract. A request's row is queued only when the request ends, so the failure has to be in progress while a later response streams.
+  1. ClickHouse and NATS start working. Exchange 1 completes, and its row is `inserted` and `published`.
+  2. NATS is disconnected, and ClickHouse answers every insert with `500`. Exchange 2 completes. Its row waits in the NATS publisher's retry, and ClickHouse starts its bounded tries.
+  3. Exchange 3 streams an SSE response while the test holds the NATS publisher inside a retry and ClickHouse inside a try. The client receives every frame of exchange 3, byte for byte, at the pace the upstream sends them.
+  4. After its bounded tries, ClickHouse counts the batch as `failed`. NATS is reconnected, and the rows of exchanges 2 and 3, which stayed queued within `queue_mb`, are `published`. No row is counted as `dropped`, which is for a full queue.
 - **Early response:** an HTTP/2 client sends its first request frame, and the upstream answers with a `200` head and data before the client sends its last request frame. The client waits for that data before it ends its upload. The exchange completes, so nothing stalls on an order. The row's request copy holds both request frames, and its response copy holds the response data, each in its own order.
 - **A dropped forwarding task:**
   - A task dropped after a `200` response head gives a row with `200` and an `incomplete` error. That holds with no frame, and with one SSE event carrying `usageMetadata`, whose tokens the row keeps.
@@ -592,6 +644,8 @@ The setup commands in [OpenBao setup](#openbao-setup) run against an OpenBao dev
 - **Outside the subtree:** a certificate that a wider role on the same mount signs for another domain fails validation at a client.
 - **Inside the subtree:** one it signs for a name below a capture host passes. This shows the bound is the subtree, not the exact name.
 - **DNS names only:** one it signs with an IP SAN passes for that address. This shows the intermediate constrains DNS names, not addresses.
+- **Adding a host without a new intermediate:** after the role alone gains a second host, the role signs for it, and a client refuses the chain with `permitted subtree violation`. That is the certificate xolotl's chain check refuses. After a replacement intermediate that names both hosts becomes the default, a leaf for the new host verifies.
+- **Retiring the previous issuer:** after the switch, the previous issuer can be deleted, and signing goes on through the new default.
 
 ## Options not chosen
 
