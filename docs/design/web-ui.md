@@ -12,6 +12,180 @@ noreferrer`, names that behavior for screen readers, and has a visible keyboard
 focus outline. The link remains available on narrow screens and every signed-in
 route.
 
+## CLI parity
+
+This inventory compares the command declarations and handlers in
+[the CLI](../../src/cli.rs), the [admin API](../../src/server/admin.rs), and all
+[UI pages](../../ui/src/pages). It describes the implementation at the 0.7.0 epic
+base, rather than asserting browser acceptance. The standard container uses a
+distroless runtime with no shell; routine management requires a browser workflow.
+The [parity issue](https://github.com/wyrd-company/xolotl/issues/138) defines that
+workflow's acceptance requirement.
+
+Each row lists its local options and positional arguments. Angle brackets name
+arguments; optionality, defaults and accepted values are explained below. Every
+remote command also accepts the shared connection/output options. **Equal** means
+the source exposes the same meaningful status, results and error details in a
+browser form; it does not promise identical JSON or formatting. **Partial** names
+the missing capability or feedback. **Gap** means there is no UI equivalent.
+**Excluded** gives the reason a command has no browser workflow. A group row is a
+navigation entry, with its actions assessed in the child rows.
+
+### Shared options and feedback
+
+| CLI option | Browser equivalent and assessment |
+|---|---|
+| `--url` / `XOLOTL_URL` (default `http://127.0.0.1:8317`) | Excluded as a form control: open the deployment's URL; UI requests use the same origin. |
+| `--token` / `XOLOTL_ADMIN_TOKEN` | OIDC sign-in creates an admin session with CSRF protection. Excluded as a token-entry control: bootstrap recovery and keys-scoped CLI principals are separate access methods; the UI grants full administration to its configured OIDC group. |
+| `--json` | Excluded as a literal output format: the browser presents data as controls and tables. Meaningful fields in JSON still require a visible equivalent; the rows below include gaps discovered by reading the response bodies. |
+| `-h`, `--help` | Excluded as parser controls: the UI labels its controls and links to documentation; help subcommands dispatch to the same command help, recursively. |
+| `-V`, `--version` | Excluded as a local binary inspection: the running deployment's version is shown in the sidebar from `/admin/status`. |
+
+The CLI reports non-success HTTP status and the API's `error.message`. The shared
+UI [API client](../../ui/src/lib/api.ts) preserves that message; mutation actions
+toast it through [useAction](../../ui/src/lib/hooks.ts), and queries display it
+only where a `QueryError` is rendered. Numeric HTTP status remains in `ApiError`
+rather than its rendered message. Treat absence of a visible query error as a
+feedback gap, even when the API request fails correctly. A successful HTTP result
+can contain an embedded warning, discovery failure or per-server error; a generic
+success toast does not account for those fields.
+
+### Server and command navigation
+
+| Command | Local options / arguments | UI equivalent | Status, results and error detail |
+|---|---|---|---|
+| `xolotl` | — | Sidebar navigation | Excluded: local parser entry; the command groups below map its navigation. |
+| `xolotl serve` | `--config` | Deployment configuration | Excluded: launches the process hosting the UI. `-c` / `--config` and `XOLOTL_CONFIG` select the local config file; starting or changing that process is a deployment operation. |
+| `xolotl check-config` | `--config` | Deployment config validation | Excluded: validates a local file and prints redacted config without a running server. `-c` / `--config` and `XOLOTL_CONFIG` select that file. |
+| `xolotl keys` | — | Client keys | Navigation; child actions below. |
+| `xolotl policies` | — | Policies | Navigation; child actions below. |
+| `xolotl accounts` | — | Accounts / Add account | Navigation; child actions below. |
+| `xolotl auth` | — | Add account / account details | Navigation; child action below. |
+| `xolotl providers` | — | Accounts, Providers tab | Navigation; child action below. |
+| `xolotl mcp` | — | MCP servers | Navigation; child actions below. |
+| `xolotl reload` | — | Gap | No control calls `/admin/reload`. CLI returns loaded policy, key, pool account and provider-account counts, or the underlying failure. A page refresh is not a vault reload. Group: deployment reload. |
+| `xolotl help` | `<command>` | Documentation and control labels | Excluded: clap-generated command help; a command path can be supplied recursively, including `help help`. |
+
+### Client keys
+
+Source: [keys page](../../ui/src/pages/keys.tsx). Key IDs select policy/name rows;
+neither interface prints the secret. CLI duration arguments accept numbers with
+`s`, `m`, `h`, `d` or `w` suffixes.
+
+| Command | Local options / arguments | UI equivalent | Status, results and error detail |
+|---|---|---|---|
+| `xolotl keys issue` | `--description --name --policy --ttl` | Issue a key: policy, client name, description, expiry | Partial: required policy/name and optional description match; absent TTL means never. UI TTLs are only never, 30d, 90d, 365d; CLI accepts custom durations. Issued/exists and vault retrieval instructions are visible, with underlying API errors. Group: key lifecycle. |
+| `xolotl keys list` | — | Client keys table | Partial: identity, description, active/disabled/expired/grace state, vault path, rotation/expiry and limited consumption are visible. CLI also prints current request/token minute/day usage when a policy has no corresponding limit; UI hides those unbounded counters and substitutes a 7d request count. CLI falls back to creation time when never rotated; UI renders only `rotated_at`. Query errors are visible. Group: key lifecycle. |
+| `xolotl keys rotate` | `--grace <id>` | Rotate dialog on the selected key | Partial: optional grace defaults to zero in CLI, one hour in UI; UI offers only zero, 15m, 1h, 1d. Result refreshes the row with grace end and expiry; errors are surfaced. Group: key lifecycle. |
+| `xolotl keys revoke` | `<id>` | Revoke confirmation | Partial: removes the row and reports success or API error. CLI distinguishes revoked, already revoked and absent; UI always toasts "Revoked" and has no selectable absent/revoked row for a repeat request. Group: key lifecycle. |
+| `xolotl keys enable` | `<id>` | Enable on a disabled key | Equal: success toast, refreshed key state, underlying API error. |
+| `xolotl keys disable` | `<id>` | Disable on an enabled key | Equal: success toast, refreshed key state, underlying API error. |
+
+### Policies
+
+Sources: [editor](../../ui/src/pages/policies.tsx), [model list](../../ui/src/pages/policy-model-list.tsx)
+and [provider/account selection](../../ui/src/pages/policy-providers.tsx).
+
+| Command | Local options / arguments | UI equivalent | Status, results and error detail |
+|---|---|---|---|
+| `xolotl policies list` | — | Policy navigation and selected editor; unloaded-policy warning | Partial: providers, scopes and description can be inspected in the editor; unloaded policies show their name, underlying error and effect on keys. The status query has no visible error if the unloaded-policy check itself fails; CLI explicitly warns about that failure. Group: policy inspection. |
+| `xolotl policies get` | `<name>` | Select policy in editor | Equal for the current policy fields: identity, description, providers/accounts, ordered rules, model switches/default, precedence, winners, aliases/fallbacks, renames, scopes, MCP access, key-policy restrictions and limits. List query failure is displayed. JSON file export is a formatting exclusion. |
+| `xolotl policies put` | `<file>` | New policy / Save policy | Partial: structured editor represents policy fields; local TOML/JSON file parsing is replaced by browser controls. Preview validation and mutation errors are visible, and empty allowed pools have an inline warning. The save response's `warnings` array is discarded, so server warning text is not assured to reach the operator. Group: policy inspection. |
+| `xolotl policies delete` | `<name>` | Delete policy confirmation | Equal: key-use restriction is visible, deletion removes the editor, mutation errors are surfaced. |
+| `xolotl policies view` | `<name>` | Effective models, aliases, provider accounts and MCP tools in policy preview | Partial: shows decisions, names, provider winner/health, alias targets/fallbacks and allowed tool names. Does not render the resolved `models` routing rows with native and translated endpoint lists that CLI prints, or the explicit accounts-read failure when `accounts` is null. Preview errors are visible. Group: policy inspection. |
+
+### Accounts, authentication and provider credentials
+
+Sources: [accounts](../../ui/src/pages/accounts.tsx), [add account/login/import](../../ui/src/pages/add-account.tsx)
+and [provider accounts](../../ui/src/pages/provider-accounts.tsx). Selected rows
+provide the account ID or provider name rather than requiring it to be typed.
+
+| Command | Local options / arguments | UI equivalent | Status, results and error detail |
+|---|---|---|---|
+| `xolotl accounts list` | `--provider` | All, subscription-provider and Providers tabs | Equal for the CLI's formatted list: pool ID, label/email, state, plan, priority, usage windows; provider kind/source/key state. Optional provider filter accepts the subscription provider enum. Account/provider query errors are shown. |
+| `xolotl accounts enable` | `<id>` | Enable on account row | Equal: state refresh, success and underlying API errors; discovery feedback is visible in shared Refresh models status. |
+| `xolotl accounts disable` | `<id>` | Disable on account row | Equal: state refresh, success and underlying API errors; discovery feedback is visible in shared Refresh models status. |
+| `xolotl accounts reset` | `<id>` | Retry in details | Equal: clears cooldown/auth failure, reports discovery outcome separately, preserves enabled state; errors and refreshed state are visible. |
+| `xolotl accounts remove` | `<id>` | Remove in details | Equal: confirmation, removed row, underlying API error. |
+| `xolotl accounts priority` | `<id> <priority>` | Priority in details | Partial: numeric control and success/error feedback exist. CLI accepts signed 64-bit priority; JavaScript Number cannot preserve every integer in that range. Group: account input and diagnostics. |
+| `xolotl accounts usage` | `<id>` | Refresh usage | Partial: public windows, age and Claude/Codex reset credits are visible, with success and upstream errors. CLI prints the returned usage JSON including provider-specific `raw` fields; details have no way to inspect other raw diagnostics. The internal `iguana_necktie` bucket is deliberately filtered by both interfaces' API source; that exclusion does not require a new window control. Group: account input and diagnostics. |
+| `xolotl accounts import` | `--label <provider> <file>` | Import a login: provider and local JSON file | Partial: file upload, JSON error and API errors are visible, imported identity appears in Accounts. Optional `--label` has no UI field. CLI enum includes providers whose import support the server rejects; the UI offers account kinds marked importable. Group: account input and diagnostics. |
+| `xolotl accounts add-key` | `--label --provider` | Add account, API-key pool form | Equal: provider (CLI defaults to opencode-go), optional label and password input replace stdin; result, identity and discovery status are visible with underlying errors. Unsupported enum/provider combinations are rejected by the API in CLI; UI shows supported kinds. |
+| `xolotl accounts add-provider` | `--base-url --header --kind --no-auth <name>` | Add account, provider form | Equal: name, required kind, optional base URL, no-auth and repeatable Name=value headers; kind choices are anthropic/openai/vercel/mistral/openai-compatible. Password input replaces stdin unless no-auth. Validation, creation and discovery errors/counts are visible. |
+| `xolotl accounts remove-provider` | `<name>` | Remove on a runtime provider row | Equal: config-owned rows cannot be removed; confirmation, policy-use error or successful removal is visible. |
+| `xolotl auth login` | `--browser <provider>` | Add account and Log in again in details | Partial: Codex device/default and browser/paste flows, Claude paste and Grok device flows map; pending/completed/failed status from successful poll responses is visible. HTTP polling errors are not rendered in DeviceCode; CLI stops with the error. Group: account input and diagnostics. |
+| `xolotl providers set-key` | `<name>` | Set key / Replace key on provider row | Partial: password input replaces stdin, saved key state and API errors appear. Response includes `catalog_refresh`; this page discards the immediate discovery result, relying on later shared discovery polling. UI hides this action for disabled/no-auth/workload-identity providers, while CLI can submit any name and receive the API's result/rejection. Group: account input and diagnostics. |
+
+### Models and request usage
+
+Sources: [models](../../ui/src/pages/models.tsx), [catalog refresh](../../ui/src/components/catalog-refresh.tsx),
+[usage](../../ui/src/pages/usage.tsx) and [usage URL state](../../ui/src/lib/usage-view.ts).
+
+| Command | Local options / arguments | UI equivalent | Status, results and error detail |
+|---|---|---|---|
+| `xolotl models` | `--metadata --refresh` | Models catalog and Refresh models | Partial: discovery refresh, provider/model lists, endpoint support, context/max output, input/output/cache prices, source and fetch age are visible. `--metadata` affects `--json` only; its meaningful fields require the same display. Provider discovery errors/counts are shown. Pricing metadata errors become generic "Refresh failed; cached data retained"; underlying `metadata.error` is hidden. No separate pricing attempt/result display exists when the catalog has no rows. Group: pricing refresh feedback. |
+| `xolotl usage` | `--account --client --group-by --model --provider --since` | Usage group tabs, period selector, row drilldown and removable filter chips | Partial: all four groupings and filters, including empty values, reach the same API; response requests/errors/input/output/cached counts and query errors are visible. CLI accepts arbitrary duration (default 24h); UI allows only 24h/7d/30d/90d, even in its URL parser. Filter values can be set in the browser URL, but there are no direct entry controls for values absent from displayed rows. Group: usage queries. |
+
+Catalog refresh calls the same endpoint in both clients; the server refreshes
+metadata with discovery. The CLI prints the underlying pricing error from route
+metadata. Browser discovery status is a different result from pricing status;
+its "refreshed" time cannot prove a pricing fetch succeeded. Pricing feedback
+belongs with the epic's Models pricing refresh task.
+
+### MCP gateway
+
+Source: [MCP page](../../ui/src/pages/mcp.tsx). Selecting a server provides the
+`server` argument. File-based definition input maps to form fields for URL,
+description, headers, authentication, OAuth client/scopes and call timeout.
+
+| Command | Local options / arguments | UI equivalent | Status, results and error detail |
+|---|---|---|---|
+| `xolotl mcp servers` | — | MCP server cards | Equal: name, namespace, source, URL, state, tool count, required secret fields/set state, OAuth sign-in reason and last error; query errors are shown. |
+| `xolotl mcp put` | `<file>` | Add server / Edit runtime server | Equal: form maps the server definition, local TOML/JSON parsing is replaced by controls. Config-owned definitions remain read-only. Saved status and mutation errors appear; background tool discovery errors appear on the card. |
+| `xolotl mcp remove` | `<server>` | Remove runtime server confirmation | Equal: removal, policy-use/config ownership restriction and underlying API error. |
+| `xolotl mcp tools` | `<server>` | Show tools | Partial: names, first description line and query errors match normal CLI output; CLI JSON also exposes input schema and full tool definition. UI has no schema/detail inspector. Group: MCP administration. |
+| `xolotl mcp refresh` | `<server>` | Refresh tools globally; Refresh on each card | Partial: optional server maps to both controls. Single-server count/error is shown. Global response contains per-server states/errors; UI discards it and toasts "Tool lists refreshed" even if individual refreshes failed. Cards refetch last errors, but do not provide an aggregate mixed outcome. Group: MCP administration. |
+| `xolotl mcp set-secret` | `<server> <field>` | Password field and Save for each required header placeholder | Partial: set/unset badges and underlying mutation errors are visible. CLI can name any field; UI exposes only the fields listed in `secret_fields` and trims input. Group: MCP administration. |
+| `xolotl mcp unset-secret` | `<server> <field>` | Gap | No remove-value control sends a null secret field. Removing a header placeholder is not deleting the stored secret. Group: MCP administration. |
+| `xolotl mcp login` | `<server>` | Sign in / Sign in again | Partial: authorization URL, callback polling or pasted redirect, completion and OAuth failure reason appear. Callback polling HTTP errors have no visible QueryError; CLI exits with the underlying failure. Group: MCP administration. |
+| `xolotl mcp logout` | `<server>` | Sign out confirmation | Partial: deletes OAuth tokens and shows the new sign-in requirement and mutation errors. Sign out is hidden whenever `needs_login` is set, though CLI can still forget existing rejected/expired tokens. Group: MCP administration. |
+| `xolotl mcp usage` | `--group-by --since` | Tool calls, last 24 hours | Partial: server/tool/client grouping, calls/errors/average latency match. Optional CLI window defaults to 24h and accepts custom durations; UI fixes 24h. The aggregate query error is not rendered, so a failure can leave an empty table. Group: usage queries. |
+
+### Gap groups
+
+These groups provide boundaries for implementation tasks and the UI mockup.
+They describe missing behavior and feedback, without deciding a screen layout.
+
+| Group | Capabilities and feedback to account for together |
+|---|---|
+| Deployment reload | Explicit vault reload; loaded policy/key/account/provider counts and failure detail, with catalog discovery distinguished from reload completion. |
+| Key lifecycle | Custom TTL/grace with explicit defaults; creation/rotation timestamps and all current usage counters; accurate repeated revoke outcomes. |
+| Account input and diagnostics | Import label; priority integer precision; complete usage diagnostics; visible login polling failures; provider key action availability and immediate discovery outcome. |
+| Policy inspection | Complete resolved routes with endpoint types and accounts-read failures; unloaded-policy status fetch errors; saved warning text. |
+| MCP administration | Secret field set/removal and value handling; full tool definitions; global refresh mixed outcomes; callback polling errors; forgetting tokens that already need sign-in. |
+| Usage queries | Arbitrary look-back durations for requests and MCP calls; direct filter entry; visible MCP aggregate errors. |
+| Pricing refresh feedback | Underlying pricing errors, retained-price age, explicit refresh outcome including empty catalogs, and scheduled-refresh state when returning to Models. |
+
+### Maintaining parity
+
+[The coverage check](../../tests/cli_parity.rs) walks clap's built command tree and
+compares every declared command and local option/argument with the first two
+columns above. Shared flags and generated help are assessed separately. It runs
+under the existing CI cargo test job. The check prints the recursive long help
+with this command, which is also the inventory's command-listing evidence:
+
+```sh
+cargo test --locked --test cli_parity print_recursive_help_listing -- --nocapture
+```
+
+The [repository instruction](../../AGENTS.md) applies the parity requirement to
+new and changed capabilities, including defaults, accepted values, response
+fields and error feedback. A structural check cannot decide whether a browser
+workflow conveys the same meaning. That assessment uses the CLI handlers and API
+responses, and affected workflows are verified through the standard container
+using the browser alone. Existing partial/gap rows are the inventory for that
+work; the check's passing result proves coverage, not closure of those gaps.
+
 ## Screens
 
 | Screen | Covers | API |
