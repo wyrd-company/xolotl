@@ -11,7 +11,7 @@ Every LLM request of a client key belongs to a **session**: one conversation. Xo
 | `claude-code` | `x-claude-code-session-id`, or `session_id` in the JSON of `metadata.user_id` |
 | `codex` | `session_id`, `session-id` or `thread-id` |
 | `grok` | `x-grok-session-id` or `x-grok-conv-id` |
-| `opencode` | `x-opencode-session` |
+| `opencode` | `x-opencode-session`, or `x-opencode-session-id`, which the OpenCode client sends to a provider configured in it |
 | `prompt-cache-key` | `prompt_cache_key` in the body |
 | `content` | A digest of the system prompt and the first user turn |
 
