@@ -106,12 +106,12 @@ pub fn continues(body: &Value) -> bool {
 }
 
 /// Orders the requests of a conversation: microseconds since the epoch, and
-/// never less than one more than the last value, so that two requests never
-/// share one. A restart starts from the clock again.
+/// past the last value, so that two requests never share one. A restart
+/// starts from the clock again.
 fn sequence() -> i64 {
-    static LAST: AtomicI64 = AtomicI64::new(0);
-    LAST.fetch_max(Utc::now().timestamp_micros() - 1, Ordering::SeqCst);
-    LAST.fetch_add(1, Ordering::SeqCst) + 1
+    static NEXT: AtomicI64 = AtomicI64::new(0);
+    NEXT.fetch_max(Utc::now().timestamp_micros(), Ordering::SeqCst);
+    NEXT.fetch_add(1, Ordering::SeqCst)
 }
 
 impl Db {
@@ -128,9 +128,8 @@ impl Db {
         Ok(rows.into_iter().map(|(provider, model)| Target { provider, model }).collect())
     }
 
-    /// True when this call moved the conversation.
-    async fn move_conversation(&self, c: &Conversation, target: Option<&Target>) -> Result<bool> {
-        let r = sqlx::query(
+    async fn move_conversation(&self, c: &Conversation, target: Option<&Target>) -> Result<()> {
+        sqlx::query(
             "INSERT INTO session_conversations (client_id, key_issued, session_key, opening, provider, model, sequence, last_used)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (client_id, key_issued, session_key, opening) DO UPDATE SET
@@ -147,7 +146,7 @@ impl Db {
         .bind(now())
         .execute(&self.pool)
         .await?;
-        Ok(r.rows_affected() == 1)
+        Ok(())
     }
 }
 
