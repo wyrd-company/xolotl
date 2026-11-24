@@ -297,13 +297,22 @@ function LimitUsage({ k }: { k: KeyInfo }) {
       {WINDOWS.map(([w, label]) => {
         const limit = k.limits?.[w];
         const used = limit == null ? k.usage?.[w] : k.limit_usage?.[w];
+        const usedText = used == null ? "unavailable" : num(used);
+        const limitText = limit == null ? "" : `/${num(limit)}`;
         return (
           <span
             key={w}
-            className={limit != null && used != null && used >= limit ? "whitespace-nowrap text-destructive" : "whitespace-nowrap"}
+            title={`${usedText}${limitText} ${label}`}
+            className={`max-w-32 whitespace-normal${limit != null && used != null && used >= limit ? " text-destructive" : ""}`}
           >
-            {used == null ? "unavailable" : num(used)}
-            {limit != null && `/${num(limit)}`} {label}
+            <span className="inline-block max-w-full align-bottom [overflow-wrap:anywhere]">{usedText}</span>
+            {limitText && (
+              <>
+                <wbr />
+                <span className="inline-block max-w-full align-bottom [overflow-wrap:anywhere]">{limitText}</span>
+              </>
+            )}{" "}
+            <span className="whitespace-nowrap">{label}</span>
           </span>
         );
       })}

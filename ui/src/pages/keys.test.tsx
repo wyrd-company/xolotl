@@ -97,6 +97,21 @@ test("limited windows use policy totals while unbounded windows retain key count
   expect(html).toContain("limited windows shared by the policy");
 });
 
+test("four realistic shared windows keep exact used and limit values in the row", () => {
+  const html = render([
+    {
+      ...key,
+      limits: { requests_per_minute: 600, requests_per_day: 10000, tokens_per_minute: 200000, tokens_per_day: 10000000, per: "policy" },
+      limit_usage: { requests_per_minute: 42, requests_per_day: 3456, tokens_per_minute: 123456, tokens_per_day: 2345678 },
+    },
+  ]);
+  const text = html.replace(/<[^>]*>/g, "");
+  for (const value of ["42/600 req/min", "3,456/10,000 req/day", "123,456/200,000 tok/min", "2,345,678/10,000,000 tok/day"]) {
+    expect(text).toContain(value);
+    expect(html).toContain(`title="${value}"`);
+  }
+});
+
 test("failed queries show causes and retry controls and do not turn usage into zero", () => {
   const html = render([key], ["status", "usage", "policies"]);
   for (const value of [
