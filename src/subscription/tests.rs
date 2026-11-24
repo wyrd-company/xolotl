@@ -54,7 +54,7 @@ fn responses_body() -> Bytes {
 }
 
 fn principal(policy: crate::policy::Policy) -> Principal {
-    Principal { client_id: Some(format!("{}/client", policy.name)), policy: Arc::new(policy) }
+    Principal { client_id: Some(format!("{}/client", policy.name)), issued_at: None, policy: Arc::new(policy) }
 }
 
 fn any_policy() -> crate::policy::Policy {

@@ -2137,7 +2137,7 @@ mod mcp_gateway {
         // The database is busy: the row write waits after the upstream answered.
         let held = h.state.db.hold().await;
         let hub = h.state.mcp.clone();
-        let p = crate::keys::Principal { client_id: None, policy: Arc::new(mcp_policy(&["calc"], &[])) };
+        let p = crate::keys::Principal { client_id: None, issued_at: None, policy: Arc::new(mcp_policy(&["calc"], &[])) };
         let call = tokio::spawn(async move { hub.call(&p, "calc", "whoami", Default::default()).await });
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         call.abort();
@@ -2418,7 +2418,7 @@ mod mcp_gateway {
         }
 
         fn principal() -> Principal {
-            Principal { client_id: Some("agents/client".into()), policy: Arc::new(mcp_policy(&["cloud"], &[])) }
+            Principal { client_id: Some("agents/client".into()), issued_at: None, policy: Arc::new(mcp_policy(&["cloud"], &[])) }
         }
 
         async fn whoami(hub: &McpHub) -> Result<String, String> {
@@ -2553,7 +2553,7 @@ mod mcp_gateway {
             let mut renamed = def();
             renamed.description = "new".into();
             hub.put_server("live", renamed, false).await.unwrap();
-            let p = Principal { client_id: None, policy: Arc::new(mcp_policy(&["live"], &[])) };
+            let p = Principal { client_id: None, issued_at: None, policy: Arc::new(mcp_policy(&["live"], &[])) };
             assert!(hub.call(&p, "live", "whoami", Default::default()).await.is_ok());
         }
 
@@ -2562,7 +2562,7 @@ mod mcp_gateway {
             let a = auth_server().await;
             let h = oauth_harness(&a, |_| {}).await;
             let hub = &h.state.mcp;
-            let p = Principal { client_id: None, policy: Arc::new(mcp_policy(&["live", "cloud"], &[])) };
+            let p = Principal { client_id: None, issued_at: None, policy: Arc::new(mcp_policy(&["live", "cloud"], &[])) };
             let call = |server: &'static str| hub.call(&p, server, "whoami", Default::default());
             let def = |extra: Value| {
                 let mut v = json!({"url": format!("{}/mcp", a.base), "auth": "oauth"});
@@ -2681,7 +2681,7 @@ mod mcp_gateway {
         }
 
         fn principal_for(server: &str) -> Principal {
-            Principal { client_id: None, policy: Arc::new(mcp_policy(&[server], &[])) }
+            Principal { client_id: None, issued_at: None, policy: Arc::new(mcp_policy(&[server], &[])) }
         }
     }
 }
