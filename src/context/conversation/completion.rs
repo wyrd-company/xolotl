@@ -44,9 +44,9 @@ pub(super) struct Outcome {
     /// The final event has started: `message_stop`, `response.completed` or
     /// `response.incomplete`, a choice's `finish_reason`, or `[DONE]`.
     ended: bool,
-    /// An error event: Messages and Responses `error`, a Chat `error`. A
-    /// failed Responses stream ends with `response.failed` and no
-    /// `response.completed`, so it never ends well.
+    /// An event with an `error`: a Messages error event, a Chat error chunk,
+    /// a JSON error body. A Responses `error` or `response.failed` event
+    /// ends the stream with no `response.completed`, so it never ends well.
     failed: bool,
 }
 
@@ -90,15 +90,8 @@ impl Outcome {
         self.ended
     }
 
+    /// Each event's `data` says what it is; its `event` line repeats it.
     fn observe(&mut self, line: &[u8]) {
-        if let Some(event) = line.strip_prefix(b"event:") {
-            match event.trim_ascii() {
-                b"error" => self.failed = true,
-                b"message_stop" => self.ended = true,
-                _ => {}
-            }
-            return;
-        }
         let Some(data) = line.strip_prefix(b"data:").map(<[u8]>::trim_ascii) else { return };
         if data == b"[DONE]" {
             self.ended = true;
@@ -109,10 +102,8 @@ impl Outcome {
     }
 
     fn observe_json(&mut self, v: &Value) {
-        match v.get("type").and_then(Value::as_str) {
-            Some("message_stop" | "response.completed" | "response.incomplete") => self.ended = true,
-            Some("error") => self.failed = true,
-            _ => {}
+        if let Some("message_stop" | "response.completed" | "response.incomplete") = v.get("type").and_then(Value::as_str) {
+            self.ended = true;
         }
         if v.get("error").is_some_and(|e| !e.is_null()) {
             self.failed = true;
@@ -263,6 +254,48 @@ mod tests {
         assert!(!outcome(false, ""), "no body");
         assert!(!outcome(false, "data: {\"error\":{\"message\":\"boom\"}}\n\n"), "a stream that doesn't say so");
         assert!(outcome(false, "\n data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn a_long_final_line_and_a_long_json_body_are_still_read() {
+        let long = "x".repeat(2 * 1024 * 1024);
+        let line = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{long}\"}},\"finish_reason\":\"stop\"}}]}}\n\n");
+        let mut o = Outcome::new(true);
+        o.feed(line.as_bytes());
+        assert!(o.succeeded(), "a 2 MB final event");
+
+        let mut o = Outcome::new(false);
+        o.feed(format!("{{\"text\":\"{}\"}}", "x".repeat(MAX_LINE)).as_bytes());
+        assert!(o.succeeded(), "a JSON body too long to read is taken as an answer");
+
+        // An error body in two chunks of 3 kB: their sum, not their product, is what is kept.
+        let error = format!("{{\"error\":{{\"message\":\"{}\"}}}}", "x".repeat(6000));
+        let mut o = Outcome::new(false);
+        let (a, b) = error.as_bytes().split_at(3000);
+        o.feed(a);
+        o.feed(b);
+        assert!(!o.succeeded());
+    }
+
+    #[tokio::test]
+    async fn the_client_gets_the_last_chunk_of_a_json_body_only_once_the_move_is_written() {
+        use axum::http::HeaderMap;
+        use serde_json::json;
+
+        let db = crate::db::Db::in_memory().await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", "s".parse().unwrap());
+        let body = json!({"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "a"}]});
+        let conversation = || Conversation::of(&db, "p/k", None, &headers, &body).unwrap();
+        let target = Target { provider: "llama".into(), model: "busy".into() };
+        let chunks = ["{\"choices\":[{\"message\":", "{\"content\":\"hi\"}}]}"];
+        let upstream = futures::stream::iter(chunks.map(|c| Ok(Bytes::from(c))));
+        let mut relayed = Box::pin(completion(upstream, Outcome::new(false), conversation(), Some(target.clone())));
+        assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[0]);
+        assert!(conversation().kept().await.is_empty());
+        assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[1], "the last chunk");
+        assert_eq!(conversation().kept().await, vec![target], "is released after the move");
+        assert!(relayed.next().await.is_none());
     }
 
     #[tokio::test]
