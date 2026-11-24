@@ -76,6 +76,16 @@ pub struct DiscoveryStatus {
     pub error: Option<String>,
 }
 
+/// Registry refresh feedback, even when discovery has no model rows.
+#[derive(Debug, Clone, Serialize)]
+pub struct PricingStatus {
+    pub enabled: bool,
+    pub attempted_at: Option<i64>,
+    pub fetched_at: Option<i64>,
+    pub age_secs: Option<i64>,
+    pub error: Option<String>,
+}
+
 #[derive(Default)]
 struct Snapshot {
     models: Catalog,
@@ -90,6 +100,7 @@ pub struct ModelCatalog {
     gateway_kinds: RwLock<BTreeMap<String, ProviderKind>>,
     snapshot: RwLock<Arc<Snapshot>>,
     metadata: RwLock<crate::metadata::Registry>,
+    pricing_attempted_at: RwLock<Option<i64>>,
     codex_entries: RwLock<BTreeMap<String, serde_json::Value>>,
     db: Option<crate::db::Db>,
 }
@@ -101,6 +112,7 @@ impl ModelCatalog {
             cfg,
             gateway_kinds: RwLock::new(gateway_kinds),
             metadata: Default::default(),
+            pricing_attempted_at: Default::default(),
             codex_entries: Default::default(),
             db: None,
             snapshot: RwLock::new(Arc::new(Snapshot::default())),
@@ -126,6 +138,17 @@ impl ModelCatalog {
         self.metadata.read().lookup(provider, model, self.cfg.metadata.get(&format!("{provider}/{model}")))
     }
 
+    pub fn pricing_status(&self) -> PricingStatus {
+        let registry = self.metadata.read();
+        PricingStatus {
+            enabled: !self.cfg.metadata_url.is_empty(),
+            attempted_at: *self.pricing_attempted_at.read(),
+            fetched_at: registry.fetched_at,
+            age_secs: registry.fetched_at.map(|at| (crate::db::now() - at).max(0)),
+            error: registry.error.clone(),
+        }
+    }
+
     /// The model's context window: a configured override, what Codex reports, else its metadata.
     pub fn context_window(&self, provider: &str, model: &str) -> Option<u64> {
         let configured = self.cfg.metadata.get(&format!("{provider}/{model}")).and_then(|o| o.values.max_input_tokens);
@@ -143,11 +166,21 @@ impl ModelCatalog {
         if self.cfg.metadata_url.is_empty() {
             return;
         }
-        let result: anyhow::Result<crate::metadata::Registry> = async {
+        let fetched: anyhow::Result<bytes::Bytes> = async {
             let resp = http.get(&self.cfg.metadata_url).send().await?.error_for_status()?;
-            crate::metadata::Registry::parse(resp.json().await?, crate::db::now())
+            Ok(resp.bytes().await?)
         }
         .await;
+        let (result, outcome) = match fetched {
+            Ok(body) => {
+                let registry = serde_json::from_slice(&body)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|value| crate::metadata::Registry::parse(value, crate::db::now()));
+                let outcome = if registry.is_ok() { "success" } else { "validation_error" };
+                (registry, outcome)
+            }
+            Err(e) => (Err(e), "fetch_error"),
+        };
         match result {
             Ok(registry) => {
                 if let Some(db) = &self.db
@@ -159,6 +192,8 @@ impl ModelCatalog {
             }
             Err(e) => self.metadata.write().error = Some(format!("{e:#}")),
         }
+        *self.pricing_attempted_at.write() = Some(crate::db::now());
+        crate::telemetry::metrics().pricing_refreshes.add(1, &[opentelemetry::KeyValue::new("result", outcome)]);
     }
 
     /// Every provider name: subscription pools and gateway providers.
@@ -435,6 +470,21 @@ mod tests {
         let mut cfg = CatalogConfig { metadata_url: server.uri(), ..Default::default() };
         cfg.static_models.insert("codex".into(), vec!["configured".into()]);
         ModelCatalog::new(cfg, BTreeMap::new()).with_db(crate::db::Db::in_memory().await.unwrap()).await
+    }
+
+    #[tokio::test]
+    async fn pricing_status_uses_last_good_cache_time_without_an_attempt() {
+        let db = crate::db::Db::in_memory().await.unwrap();
+        let fetched_at = crate::db::now() - 7200;
+        let registry = crate::metadata::Registry::parse(json!({"sample":{"input_cost_per_token":0.000002}}), fetched_at).unwrap();
+        db.save_metadata_cache(&serde_json::to_string(&registry).unwrap()).await.unwrap();
+        let catalog = ModelCatalog::new(CatalogConfig::default(), BTreeMap::new()).with_db(db).await;
+        let status = catalog.pricing_status();
+        assert!(status.enabled);
+        assert!(status.attempted_at.is_none());
+        assert_eq!(status.fetched_at, Some(fetched_at));
+        assert!((7200..=7201).contains(&status.age_secs.unwrap()));
+        assert!(status.error.is_none());
     }
 
     #[tokio::test]

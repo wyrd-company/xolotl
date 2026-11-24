@@ -71,6 +71,13 @@ export interface Session {
   configured?: boolean;
 }
 
+export interface ReloadResponse {
+  policies: number;
+  keys: number;
+  accounts: number;
+  provider_accounts: number;
+}
+
 export interface Health {
   ok: boolean;
   error?: string;
@@ -215,6 +222,11 @@ export interface PolicyView {
   /** The same, per limited provider and per limited account. */
   provider_usage?: Record<string, Consumption>;
   account_usage?: Record<string, Consumption>;
+}
+
+export interface RevokeResult {
+  revoked: string;
+  status: "revoked" | "already_revoked" | "absent";
 }
 
 export interface KeyInfo {
@@ -433,3 +445,12 @@ export interface McpCall {
 
 /** Per-provider discovery attempt; failures retain the catalog's cached/static models. */
 export type CatalogDiscovery = Record<string, { refreshed_at: number | null; models: number; error: string | null }>;
+
+/** Latest registry result, independent of model discovery or catalog rows. */
+export interface CatalogPricing {
+  enabled: boolean;
+  attempted_at: number | null;
+  fetched_at: number | null;
+  age_secs: number | null;
+  error: string | null;
+}

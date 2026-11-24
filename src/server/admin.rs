@@ -36,6 +36,7 @@ pub fn router() -> Router<AppState> {
         .route("/catalog", get(catalog))
         .route("/catalog/routes", get(catalog_routes))
         .route("/catalog/status", get(catalog_status))
+        .route("/catalog/pricing", get(catalog_pricing))
         .route("/catalog/refresh", post(refresh_catalog))
         .route("/keys", get(list_keys).post(issue_key))
         .route("/keys/{policy}/{name}", delete(revoke_key))
@@ -271,6 +272,11 @@ async fn catalog_routes(State(s): State<AppState>, h: HeaderMap) -> Res {
 async fn catalog_status(State(s): State<AppState>, h: HeaderMap) -> Res {
     admin(&s, &h).await?;
     ok(s.catalog.discovery_status())
+}
+
+async fn catalog_pricing(State(s): State<AppState>, h: HeaderMap) -> Res {
+    admin(&s, &h).await?;
+    ok(s.catalog.pricing_status())
 }
 
 #[derive(Deserialize)]

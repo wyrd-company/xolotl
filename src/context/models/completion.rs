@@ -1,0 +1,342 @@
+//! A response body that records the model its session used only once the
+//! answer is complete: a stream must end with the format's final event and no
+//! error event. The end of the answer is held back until the use is written,
+//! so the client can't see the answer complete before its next request would
+//! see it.
+// ---
+// relationships:
+//   implements: ../../../docs/design/sessions.md
+// ---
+use std::collections::VecDeque;
+
+use axum::body::{Body, Bytes};
+use axum::http::header;
+use axum::response::Response;
+use futures::{Stream, StreamExt};
+use serde_json::Value;
+
+use super::SessionModels;
+use crate::policy::Target;
+
+/// The longest line kept while looking for the end of a stream.
+const MAX_LINE: usize = 4 * 1024 * 1024;
+
+/// How a response body carries its answer.
+#[derive(Debug, Default, PartialEq)]
+enum Shape {
+    /// Not known until the first byte that isn't whitespace.
+    #[default]
+    Unknown,
+    /// Server-sent events.
+    Sse,
+    /// One JSON document.
+    Json,
+}
+
+/// What a response body says about its answer.
+#[derive(Debug, Default)]
+pub(super) struct Outcome {
+    shape: Shape,
+    /// The SSE line being read, or the JSON body so far (up to `MAX_LINE`).
+    line: Vec<u8>,
+    /// The JSON body outgrew `MAX_LINE`, so it is taken as an answer.
+    overflowed: bool,
+    /// The final event has started: `message_stop`, `response.completed` or
+    /// `response.incomplete`, a choice's `finish_reason`, or `[DONE]`.
+    ended: bool,
+    /// An event with an `error`: a Messages error event, a Chat error chunk,
+    /// a JSON error body. A Responses `error` or `response.failed` event
+    /// ends the stream with no `response.completed`, so it never ends well.
+    failed: bool,
+}
+
+impl Outcome {
+    /// `sse`: the `Content-Type` says the body is a stream. Otherwise the
+    /// first byte tells: a JSON body starts with `{` or `[`, and anything
+    /// else is read as a stream, as a server may stream without saying so.
+    pub(super) fn new(sse: bool) -> Self {
+        Self { shape: if sse { Shape::Sse } else { Shape::Unknown }, ..Default::default() }
+    }
+
+    /// Whether the body is read as a stream.
+    pub(super) fn streams(&self) -> bool {
+        self.shape == Shape::Sse
+    }
+
+    /// Read a chunk of the body. True once the end of a stream's answer has
+    /// been seen, in this chunk or before: from there on the body is held.
+    pub(super) fn feed(&mut self, chunk: &[u8]) -> bool {
+        if self.shape == Shape::Unknown
+            && let Some(first) = chunk.iter().find(|b| !b.is_ascii_whitespace())
+        {
+            self.shape = if matches!(first, b'{' | b'[') { Shape::Json } else { Shape::Sse };
+        }
+        if self.shape != Shape::Sse {
+            if self.line.len() + chunk.len() <= MAX_LINE {
+                self.line.extend_from_slice(chunk);
+            } else {
+                self.overflowed = true;
+            }
+            return false;
+        }
+        self.line.extend_from_slice(chunk);
+        while let Some(pos) = self.line.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.line.drain(..=pos).collect();
+            self.observe(line.trim_ascii());
+        }
+        if self.line.len() > MAX_LINE {
+            self.line.clear();
+        }
+        self.ended
+    }
+
+    /// Each event's `data` says what it is; its `event` line repeats it.
+    fn observe(&mut self, line: &[u8]) {
+        let Some(data) = line.strip_prefix(b"data:").map(<[u8]>::trim_ascii) else { return };
+        if data == b"[DONE]" {
+            self.ended = true;
+            return;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(data) else { return };
+        self.observe_json(&v);
+    }
+
+    fn observe_json(&mut self, v: &Value) {
+        if let Some("message_stop" | "response.completed" | "response.incomplete") = v.get("type").and_then(Value::as_str) {
+            self.ended = true;
+        }
+        if v.get("error").is_some_and(|e| !e.is_null()) {
+            self.failed = true;
+        }
+        let choices = v.get("choices").and_then(Value::as_array).into_iter().flatten();
+        if choices.filter_map(|c| c.get("finish_reason")).any(|r| !r.is_null()) {
+            self.ended = true;
+        }
+    }
+
+    /// Whether the answer completed: a stream that reached its final event
+    /// with no error event, or a JSON body that is not an error.
+    pub(super) fn succeeded(&mut self) -> bool {
+        let rest = std::mem::take(&mut self.line);
+        match self.shape {
+            Shape::Sse => {
+                self.observe(rest.trim_ascii());
+                self.ended && !self.failed
+            }
+            Shape::Json if !self.overflowed => {
+                let Ok(v) = serde_json::from_slice::<Value>(&rest) else { return false };
+                self.observe_json(&v);
+                !self.failed
+            }
+            Shape::Json => true,
+            Shape::Unknown => false,
+        }
+    }
+}
+
+impl SessionModels {
+    /// Record that the session used `target` once `resp` has answered: a
+    /// 2xx response whose body completes ([`Outcome`]). A failed stream, or
+    /// a client that leaves before the end, records nothing. `None` for a
+    /// target the session can't keep, one only an alias reaches: the turn
+    /// still keeps the session active ([`SessionModels::record`]).
+    pub fn uses(self, target: Option<Target>, resp: Response) -> Response {
+        if !resp.status().is_success() {
+            return resp;
+        }
+        let sse =
+            resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.starts_with("text/event-stream"));
+        let (parts, body) = resp.into_parts();
+        let body = completion(body.into_data_stream(), Outcome::new(sse), self, target);
+        Response::from_parts(parts, Body::from_stream(body))
+    }
+}
+
+struct Relay<S> {
+    inner: S,
+    outcome: Outcome,
+    /// The end of the answer, from its final event (or, for a body that is
+    /// not a stream, its last chunk), held until the use is written.
+    held: Vec<Bytes>,
+    ready: VecDeque<Result<Bytes, axum::Error>>,
+    uses: Option<(SessionModels, Option<Target>)>,
+    done: bool,
+}
+
+fn completion<S>(
+    inner: S,
+    outcome: Outcome,
+    session: SessionModels,
+    target: Option<Target>,
+) -> impl Stream<Item = Result<Bytes, axum::Error>>
+where
+    S: Stream<Item = Result<Bytes, axum::Error>> + Unpin + Send + 'static,
+{
+    let relay = Relay { inner, outcome, held: Vec::new(), ready: VecDeque::new(), uses: Some((session, target)), done: false };
+    futures::stream::unfold(relay, |mut r| async move {
+        loop {
+            if let Some(item) = r.ready.pop_front() {
+                return Some((item, r));
+            }
+            if r.done {
+                return None;
+            }
+            match r.inner.next().await {
+                Some(Ok(chunk)) => {
+                    if r.outcome.feed(&chunk) {
+                        r.held.push(chunk);
+                    } else if r.outcome.streams() {
+                        r.ready.push_back(Ok(chunk));
+                    } else {
+                        // Not a stream: only the last chunk is held, as any chunk may be the last.
+                        r.ready.extend(r.held.drain(..).map(Ok));
+                        r.held.push(chunk);
+                    }
+                }
+                Some(Err(e)) => {
+                    r.done = true;
+                    r.ready.extend(r.held.drain(..).map(Ok));
+                    r.ready.push_back(Err(e));
+                }
+                None => {
+                    r.done = true;
+                    if r.outcome.succeeded()
+                        && let Some((session, target)) = r.uses.take()
+                    {
+                        session.record(target.as_ref()).await;
+                    }
+                    r.ready.extend(r.held.drain(..).map(Ok));
+                }
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(sse: bool, body: &str) -> bool {
+        let mut o = Outcome::new(sse);
+        // Fed a byte at a time, so that no line arrives whole.
+        for b in body.as_bytes().chunks(1) {
+            o.feed(b);
+        }
+        o.succeeded()
+    }
+
+    #[test]
+    fn a_stream_succeeds_at_its_final_event_with_no_error() {
+        let ok = [
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{}}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"an error\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            "data: [DONE]",
+        ];
+        for body in ok {
+            assert!(outcome(true, body), "{body}");
+        }
+        let failed = [
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n",
+            "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.failed\",\"response\":{}}\n\n",
+            "data: {\"type\":\"error\",\"message\":\"boom\"}\n\n",
+            "data: {\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+            "",
+        ];
+        for body in failed {
+            assert!(!outcome(true, body), "{body}");
+        }
+        assert!(outcome(false, "{\"ok\":true}"), "a JSON body");
+        assert!(!outcome(false, "{\"error\":{\"message\":\"boom\"}}"), "a JSON error");
+        assert!(!outcome(false, "{\"type\":\"error\",\"error\":{}}"));
+        assert!(!outcome(false, ""), "no body");
+        assert!(!outcome(false, "data: {\"error\":{\"message\":\"boom\"}}\n\n"), "a stream that doesn't say so");
+        assert!(outcome(false, "\n data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn a_long_final_line_and_a_long_json_body_are_still_read() {
+        let long = "x".repeat(2 * 1024 * 1024);
+        let line = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{long}\"}},\"finish_reason\":\"stop\"}}]}}\n\n");
+        let mut o = Outcome::new(true);
+        for piece in line.as_bytes().chunks(64 * 1024) {
+            o.feed(piece);
+        }
+        assert!(o.succeeded(), "a 2 MB final event, in pieces");
+
+        let mut o = Outcome::new(false);
+        o.feed(format!("{{\"error\":{{\"message\":\"{long}\"}}}}").as_bytes());
+        assert!(!o.succeeded(), "a 2 MB error body");
+
+        let mut o = Outcome::new(false);
+        o.feed(format!("{{\"text\":\"{}\"}}", "x".repeat(MAX_LINE)).as_bytes());
+        assert!(o.succeeded(), "a JSON body too long to read is taken as an answer");
+
+        // An error body in two chunks of 3 kB: their sum, not their product, is what is kept.
+        let error = format!("{{\"error\":{{\"message\":\"{}\"}}}}", "x".repeat(6000));
+        let mut o = Outcome::new(false);
+        let (a, b) = error.as_bytes().split_at(3000);
+        o.feed(a);
+        o.feed(b);
+        assert!(!o.succeeded());
+    }
+
+    #[tokio::test]
+    async fn the_client_gets_the_last_chunk_of_a_json_body_only_once_the_use_is_written() {
+        use axum::http::HeaderMap;
+        use serde_json::json;
+
+        let db = crate::db::Db::in_memory().await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", "s".parse().unwrap());
+        let body = json!({"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "a"}]});
+        let session = || SessionModels::of(&db, "p/k", None, &headers, &body).unwrap();
+        let target = Target { provider: "llama".into(), model: "busy".into() };
+        let chunks = ["{\"choices\":[{\"message\":", "{\"content\":\"hi\"}}]}"];
+        let upstream = futures::stream::iter(chunks.map(|c| Ok(Bytes::from(c))));
+        let mut relayed = Box::pin(completion(upstream, Outcome::new(false), session(), Some(target.clone())));
+        assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[0]);
+        assert!(session().kept().await.is_empty());
+        assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[1], "the last chunk");
+        assert_eq!(session().kept().await, vec![target], "is released after the use is written");
+        assert!(relayed.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_client_gets_the_final_event_only_once_the_use_is_written() {
+        use axum::http::HeaderMap;
+        use serde_json::json;
+
+        let db = crate::db::Db::in_memory().await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", "s".parse().unwrap());
+        let body = json!({"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "a"}]});
+        let session = || SessionModels::of(&db, "p/k", None, &headers, &body).unwrap();
+        let target = Target { provider: "llama".into(), model: "busy".into() };
+        let chunks = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ];
+        let upstream = futures::stream::iter(chunks.map(|c| Ok(Bytes::from(c))));
+        let mut relayed = Box::pin(completion(upstream, Outcome::new(true), session(), Some(target.clone())));
+        assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[0]);
+        assert!(session().kept().await.is_empty());
+        assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[1], "the final event");
+        assert_eq!(session().kept().await, vec![target], "is released after the use is written");
+        assert_eq!(relayed.next().await.unwrap().unwrap(), chunks[2]);
+        assert!(relayed.next().await.is_none());
+    }
+
+    #[test]
+    fn the_end_of_a_stream_is_held_from_its_final_event() {
+        let mut o = Outcome::new(true);
+        assert!(!o.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"));
+        assert!(!o.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"st"));
+        assert!(o.feed(b"op\"}]}\n\n"), "the chunk that completes the final event");
+        assert!(o.feed(b"data: [DONE]\n\n"));
+    }
+}

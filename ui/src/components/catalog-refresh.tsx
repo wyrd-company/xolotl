@@ -11,13 +11,14 @@ import {
 } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
 
+import { PricingFeedback } from "@/components/pricing-feedback";
 import { QueryError } from "@/components/layout";
 import { Button } from "@/components/ui/button";
 import { get, post, type CatalogDiscovery } from "@/lib/api";
 import { relative } from "@/lib/format";
 
 /** Reuse beside model lists and counts; scope is provider-level, including account views. */
-export function CatalogRefresh({ providers }: { providers?: string[] }) {
+export function CatalogRefresh({ providers, pricing = false }: { providers?: string[]; pricing?: boolean }) {
   const qc = useQueryClient();
   const status = useQuery({
     queryKey: ["catalog-status"],
@@ -40,7 +41,7 @@ export function CatalogRefresh({ providers }: { providers?: string[] }) {
       ),
     onSuccess: async () => {
       await Promise.all(
-        ["catalog-status", "catalog-routes", "status", "policy-view"].map(
+        ["catalog-status", "catalog-pricing", "catalog-routes", "status", "policy-view"].map(
           (key) => qc.invalidateQueries({ queryKey: [key] }),
         ),
       );
@@ -79,27 +80,33 @@ export function CatalogRefresh({ providers }: { providers?: string[] }) {
         </Button>
       </div>
       <QueryError error={status.error ?? refresh.error} />
-      <ul
-        className="text-muted-foreground flex flex-col gap-1"
-        aria-live="polite"
-      >
-        {rows.map(([provider, result]) => (
-          <li key={provider}>
-            <span className="font-mono">{provider}</span>: {result.models}{" "}
-            models
-            {result.error
-              ? ` · Discovery failed: ${result.error}${result.models ? " (cached or static models shown)" : ""}`
-              : result.refreshed_at == null
-                ? " · Not discovered yet"
-                : result.models === 0
-                  ? " · Provider returned no models"
-                  : ""}
-            {result.refreshed_at != null && (
-              <span> · refreshed {relative(result.refreshed_at)}</span>
-            )}
-          </li>
-        ))}
-      </ul>
+      <div className={pricing ? "grid gap-4 md:grid-cols-2" : undefined}>
+        <section aria-label="Provider discovery">
+          {pricing && <h2 className="mb-2 font-medium">Provider discovery</h2>}
+          <ul
+            className="text-muted-foreground flex flex-col gap-1"
+            aria-live="polite"
+          >
+            {rows.map(([provider, result]) => (
+              <li key={provider}>
+                <span className="font-mono">{provider}</span>: {result.models}{" "}
+                models
+                {result.error
+                  ? ` · Discovery failed: ${result.error}${result.models ? " (cached or static models shown)" : ""}`
+                  : result.refreshed_at == null
+                    ? " · Not discovered yet"
+                    : result.models === 0
+                      ? " · Provider returned no models"
+                      : ""}
+                {result.refreshed_at != null && (
+                  <span> · refreshed {relative(result.refreshed_at)}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+        {pricing && <PricingFeedback refreshing={refreshing} />}
+      </div>
     </div>
   );
 }

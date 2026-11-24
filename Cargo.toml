@@ -45,6 +45,7 @@ url = "2.5.8"
 uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
+opentelemetry_sdk = { version = "0.33.1", features = ["testing"] }
 pulldown-cmark = { version = "0.13.6", default-features = false }
 yaml-rust2 = { version = "0.13.0", default-features = false }
 tempfile = "3.27.0"

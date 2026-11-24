@@ -197,6 +197,10 @@ pub enum TakenBy {
 pub struct View {
     /// Plain names and aliases -> targets (aliases may have fallbacks).
     pub names: BTreeMap<String, Vec<Target>>,
+    /// The models a session keeps ([`Policy::resolve_keeping`]), which its
+    /// explicit `provider/model` form reaches too.
+    #[serde(skip)]
+    kept: Vec<Target>,
 }
 
 fn is_pool(provider: &str) -> bool {
@@ -357,8 +361,11 @@ impl Policy {
     pub fn validate(&self, known: &BTreeSet<String>, mcp: &BTreeSet<String>) -> Result<()> {
         anyhow::ensure!(valid_name(&self.name), "policy name must be lowercase letters, digits, '-' or '_' (max 63)");
         anyhow::ensure!(
-            !self.providers.is_empty() || !self.mcp_servers.is_empty() || !self.key_policies.is_empty(),
-            "policy must allow at least one provider or MCP server (use * for all), or list key_policies"
+            !self.providers.is_empty()
+                || !self.mcp_servers.is_empty()
+                || !self.key_policies.is_empty()
+                || (!self.scopes.is_empty() && self.scopes.iter().all(|s| *s == Scope::Management)),
+            "policy must allow at least one provider or MCP server (use * for all), list key_policies, or use only the management scope"
         );
         anyhow::ensure!(self.key_policies.is_empty() || self.has_scope(Scope::Keys), "key_policies needs the keys scope");
         anyhow::ensure!(!self.scopes.contains(&Scope::Keys) || !self.key_policies.is_empty(), "the keys scope needs key_policies");
@@ -462,6 +469,15 @@ impl Policy {
         self.allows_provider(provider) && self.model_rule(provider, model).0
     }
 
+    /// Whether keys may use `provider/model` in a session that keeps the
+    /// models in `kept`. A kept model stays usable after a rule, its switch or
+    /// `deny_other_models` excludes it; one whose provider the policy no
+    /// longer allows does not.
+    pub fn allows_model_keeping(&self, provider: &str, model: &str, kept: &[Target]) -> bool {
+        self.allows_provider(provider)
+            && (self.model_rule(provider, model).0 || kept.iter().any(|t| t.provider == provider && t.model == model))
+    }
+
     /// Whether the policy allows `provider/model`, and the pattern of the
     /// first rule that matched. Without one, the model's switch decides, else
     /// `deny_other_models`.
@@ -505,11 +521,11 @@ impl Policy {
 
     /// Every allowed model that keeps its plain name -> the allowed providers
     /// serving it, in precedence order. Renamed models are left out.
-    fn by_model<'a>(&self, catalog: &'a Catalog) -> BTreeMap<&'a str, Vec<&'a str>> {
+    fn by_model<'a>(&self, catalog: &'a Catalog, kept: &[Target]) -> BTreeMap<&'a str, Vec<&'a str>> {
         let mut by_model: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (provider, models) in catalog {
             for m in models {
-                if self.allows_model(provider, m) && self.rename(provider, m).is_none() {
+                if self.allows_model_keeping(provider, m, kept) && self.rename(provider, m).is_none() {
                     by_model.entry(m.as_str()).or_default().push(provider.as_str());
                 }
             }
@@ -527,7 +543,7 @@ impl Policy {
 
     /// Model names that several allowed providers serve, and which one wins each.
     pub fn shared_names(&self, catalog: &Catalog) -> Vec<SharedName> {
-        self.by_model(catalog)
+        self.by_model(catalog, &[])
             .into_iter()
             .filter(|(_, providers)| providers.len() > 1)
             .map(|(model, providers)| SharedName {
@@ -540,15 +556,23 @@ impl Policy {
 
     /// Resolve the client-visible model names for a catalog.
     pub fn resolve(&self, catalog: &Catalog) -> View {
+        self.resolve_keeping(catalog, Vec::new())
+    }
+
+    /// Resolve the names a session sees: those of [`Policy::resolve`], as if
+    /// the policy still allowed the models the session keeps. A kept model
+    /// gets back a name the exclusion took from it, and the name keeps going
+    /// to it rather than to another provider of the same model.
+    pub fn resolve_keeping(&self, catalog: &Catalog, kept: Vec<Target>) -> View {
         let mut view = View::default();
-        for (model, providers) in self.by_model(catalog) {
+        for (model, providers) in self.by_model(catalog, &kept) {
             let winner = self.winner(model, &providers);
             view.names.insert(model.to_string(), vec![Target { provider: winner.into(), model: model.into() }]);
         }
         // Renamed models shadow plain names.
         for (provider, models) in catalog {
             for m in models {
-                if let Some(name) = self.rename(provider, m).filter(|_| self.allows_model(provider, m)) {
+                if let Some(name) = self.rename(provider, m).filter(|_| self.allows_model_keeping(provider, m, &kept)) {
                     view.names.insert(name.to_string(), vec![Target { provider: provider.clone(), model: m.clone() }]);
                 }
             }
@@ -561,6 +585,7 @@ impl Policy {
                 view.names.insert(name.clone(), ts);
             }
         }
+        view.kept = kept;
         view
     }
 
@@ -596,13 +621,13 @@ impl Policy {
 
 impl View {
     /// Resolve a requested model: an exposed name, or the explicit
-    /// `provider/model` form for any model the policy allows.
+    /// `provider/model` form for any model the policy allows or the view keeps.
     pub fn lookup(&self, policy: &Policy, known: &BTreeSet<String>, requested: &str) -> Option<Vec<Target>> {
         if let Some(t) = self.names.get(requested) {
             return Some(t.clone());
         }
         let t = Target::parse(requested)?;
-        (known.contains(&t.provider) && policy.allows_model(&t.provider, &t.model)).then(|| vec![t])
+        (known.contains(&t.provider) && policy.allows_model_keeping(&t.provider, &t.model, &self.kept)).then(|| vec![t])
     }
 }
 
@@ -1038,6 +1063,69 @@ rules = [{ deny = "*-preview" }, { allow = " x " }, { allow = " " }]"#,
         assert!(toml::from_str::<Policy>("name = \"a\"\nrules = [{ allow = \"x\", deny = \"y\" }]").is_err());
     }
 
+    fn opus() -> Target {
+        Target { provider: "claude".into(), model: "claude-opus-5".into() }
+    }
+
+    /// Policies that exclude `claude/claude-opus-5` each way a policy can.
+    fn excluding_opus() -> Vec<(&'static str, Policy)> {
+        let mut rule = policy();
+        rule.rules = vec![Rule::Deny("claude-opus-*".into())];
+        let mut switch = policy();
+        switch.models.insert("claude/claude-opus-5".into(), false);
+        let mut others = policy();
+        others.rules = vec![Rule::Allow("claude-haiku-*".into())];
+        others.deny_other_models = true;
+        vec![("a rule", rule), ("a switch", switch), ("deny_other_models", others)]
+    }
+
+    #[test]
+    fn a_kept_model_outlasts_its_exclusion() {
+        let k = known();
+        for (how, p) in excluding_opus() {
+            let plain = p.resolve(&catalog());
+            assert!(plain.lookup(&p, &k, "claude-opus-5").is_none(), "{how} excludes it");
+            assert!(plain.lookup(&p, &k, "claude/claude-opus-5").is_none(), "{how} excludes it");
+            let kept = p.resolve_keeping(&catalog(), vec![opus()]);
+            assert_eq!(kept.lookup(&p, &k, "claude-opus-5"), Some(vec![opus()]), "{how}: kept");
+            assert_eq!(kept.lookup(&p, &k, "claude/claude-opus-5"), Some(vec![opus()]), "{how}: the explicit form");
+            let names: Vec<&String> = kept.names.keys().filter(|n| *n != "claude-opus-5").collect();
+            assert_eq!(names, plain.names.keys().collect::<Vec<_>>(), "{how}: the other names are as they were");
+        }
+    }
+
+    #[test]
+    fn a_kept_model_keeps_its_name_from_another_provider() {
+        let haiku = Target { provider: "claude".into(), model: "claude-haiku-5-5".into() };
+        let mut p = policy();
+        p.rules = vec![Rule::Deny("claude/claude-haiku-*".into())];
+        assert_eq!(p.resolve(&catalog()).names["claude-haiku-5-5"][0].provider, "opencode-go", "the name moves");
+        assert_eq!(p.resolve_keeping(&catalog(), vec![haiku.clone()]).names["claude-haiku-5-5"], vec![haiku]);
+
+        // A kept model keeps its rename too.
+        let mut p = policy();
+        p.renames.insert("claude/claude-opus-5".into(), "opus".into());
+        p.models.insert("claude/claude-opus-5".into(), false);
+        assert!(!p.resolve(&catalog()).names.contains_key("opus"));
+        assert_eq!(p.resolve_keeping(&catalog(), vec![opus()]).names["opus"], vec![opus()]);
+    }
+
+    #[test]
+    fn keeping_a_model_allows_nothing_else() {
+        let k = known();
+        let mut p = policy();
+        p.rules = vec![Rule::Deny("claude/*".into())];
+        let v = p.resolve_keeping(&catalog(), vec![opus()]);
+        assert!(v.lookup(&p, &k, "claude/claude-haiku-5-5").is_none(), "another excluded model");
+        assert!(!p.allows_model_keeping("claude", "claude-haiku-5-5", &[opus()]));
+
+        // A provider the policy no longer allows is not kept.
+        p.providers = vec!["codex".into(), "opencode-go".into()];
+        let v = p.resolve_keeping(&catalog(), vec![opus()]);
+        assert!(v.lookup(&p, &k, "claude-opus-5").is_none());
+        assert!(v.lookup(&p, &k, "claude/claude-opus-5").is_none());
+    }
+
     #[test]
     fn mcp_servers_and_tools() {
         let mcp: BTreeSet<String> = ["github-work", "linear"].iter().map(|s| s.to_string()).collect();
@@ -1058,6 +1146,43 @@ rules = [{ deny = "*-preview" }, { allow = " x " }, { allow = " " }]"#,
         assert!(p.validate(&known(), &mcp).unwrap_err().to_string().contains("mcp scope"));
         p.mcp_servers.clear();
         assert!(p.validate(&known(), &mcp).is_err(), "nothing allowed");
+    }
+
+    #[test]
+    fn management_only_needs_no_access_entries_but_keeps_other_validation() {
+        let mut p: Policy = toml::from_str("name = \"hub\"\nscopes = [\"management\"]").unwrap();
+        p.normalize();
+        let none = BTreeSet::new();
+        p.validate(&none, &none).unwrap();
+        assert!(p.providers.is_empty() && p.mcp_servers.is_empty() && p.key_policies.is_empty());
+        assert!(p.has_scope(Scope::Management));
+        for scope in [Scope::Proxy, Scope::Mcp, Scope::Keys, Scope::Admin] {
+            assert!(!p.has_scope(scope));
+            let mut mixed = p.clone();
+            mixed.scopes.push(scope);
+            assert!(mixed.validate(&none, &none).is_err(), "management with {scope:?} still needs access entries");
+            mixed.scopes = vec![scope];
+            assert!(mixed.validate(&none, &none).is_err(), "{scope:?} still needs access entries");
+        }
+        for (field, value, why) in [
+            ("name", json!("Bad/name"), "policy name"),
+            ("providers", json!(["unknown"]), "unknown provider"),
+            ("mcp_servers", json!(["unknown"]), "unknown MCP server"),
+            ("key_policies", json!(["dev"]), "needs the keys scope"),
+            ("accounts", json!({"codex": ["*"]}), "does not allow provider"),
+            ("aliases", json!({"fast": "codex/gpt"}), "does not allow"),
+            ("limits", json!({"requests_per_minute": 0}), "at least 1"),
+        ] {
+            let mut value_of_policy = serde_json::to_value(&p).unwrap();
+            value_of_policy[field] = value;
+            let bad: Policy = serde_json::from_value(value_of_policy).unwrap();
+            let err = bad.validate(&known(), &none).unwrap_err().to_string();
+            assert!(err.contains(why), "{field}: {err}");
+        }
+        p.scopes.clear();
+        p.normalize();
+        assert_eq!(p.scopes, vec![Scope::Proxy]);
+        assert!(p.validate(&none, &none).is_err());
     }
 
     #[test]

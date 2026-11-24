@@ -1183,8 +1183,7 @@ async fn chat_streams_report_usage_for_token_limits() {
 async fn t3code_management_endpoints() {
     let h = harness().await;
     let id = h.codex_account().await;
-    let mgmt =
-        h.key(Policy { name: "t3".into(), providers: vec!["codex".into()], scopes: vec![Scope::Management], ..Default::default() }).await;
+    let mgmt = h.key(Policy { name: "t3".into(), scopes: vec![Scope::Management], ..Default::default() }).await;
 
     let (status, body) = h.call("GET", "/v0/management/auth-files", Some(&mgmt), None).await;
     assert_eq!(status, 200);
@@ -1228,6 +1227,42 @@ async fn t3code_management_endpoints() {
     assert!(!h.state.db.get_account(&id).await.unwrap().unwrap().cooling_down(now()));
     let (status, _) = h.call("POST", "/v0/management/reset-quota", Some(&mgmt), Some(json!({"auth_index": "nope"}))).await;
     assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn management_only_policy_saves_reloads_and_cannot_cross_authorization_boundaries() {
+    let h = harness().await;
+    let p: Policy = toml::from_str("name = \"hub\"\nscopes = [\"management\"]").unwrap();
+    let (status, saved) = h.call("PUT", "/admin/policies/hub", Some(&h.admin), Some(serde_json::to_value(p).unwrap())).await;
+    assert_eq!(status, 200, "{saved}");
+    assert_eq!(saved["providers"], json!([]));
+    assert_eq!(saved["scopes"], json!(["management"]));
+    let (status, issued) = h.call("POST", "/admin/keys", Some(&h.admin), Some(json!({"policy": "hub", "name": "t3"}))).await;
+    assert_eq!(status, 201, "{issued}");
+    let rec = h.state.secrets.get("keys/hub/t3").await.unwrap().unwrap();
+    let key = rec["api_key"].as_str().unwrap();
+    h.state.keys.reload().await.unwrap();
+    let (status, loaded) = h.call("GET", "/admin/policies/hub", Some(&h.admin), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(saved, loaded);
+    assert_eq!(h.call("GET", "/v0/management/auth-files", Some(key), None).await.0, 200);
+    for (method, route, body) in [
+        ("GET", "/v1/models", None),
+        ("POST", "/v1/chat/completions", Some(json!({"model": "llama/qwen3", "messages": []}))),
+        ("POST", "/v1/messages", Some(json!({"model": "claude/claude-opus-5", "messages": []}))),
+        ("POST", "/v1/responses", Some(json!({"model": "codex/gpt-6-codex", "input": "hi"}))),
+        ("POST", "/llama/v1/chat/completions", Some(json!({"model": "qwen3", "messages": []}))),
+        ("POST", "/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))),
+        ("GET", "/admin/keys", None),
+        ("POST", "/admin/keys", Some(json!({"policy": "hub", "name": "forbidden"}))),
+        ("POST", "/admin/keys/hub/t3/rotate", Some(json!({}))),
+        ("DELETE", "/admin/keys/hub/t3", None),
+        ("GET", "/admin/status", None),
+        ("PUT", "/admin/policies/hub", Some(saved)),
+    ] {
+        let (status, body) = h.call(method, route, Some(key), body).await;
+        assert_eq!(status, 403, "{method} {route}: {body}");
+    }
 }
 
 #[tokio::test]
@@ -2137,7 +2172,7 @@ mod mcp_gateway {
         // The database is busy: the row write waits after the upstream answered.
         let held = h.state.db.hold().await;
         let hub = h.state.mcp.clone();
-        let p = crate::keys::Principal { client_id: None, policy: Arc::new(mcp_policy(&["calc"], &[])) };
+        let p = crate::keys::Principal { client_id: None, issued_at: None, policy: Arc::new(mcp_policy(&["calc"], &[])) };
         let call = tokio::spawn(async move { hub.call(&p, "calc", "whoami", Default::default()).await });
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         call.abort();
@@ -2418,7 +2453,7 @@ mod mcp_gateway {
         }
 
         fn principal() -> Principal {
-            Principal { client_id: Some("agents/client".into()), policy: Arc::new(mcp_policy(&["cloud"], &[])) }
+            Principal { client_id: Some("agents/client".into()), issued_at: None, policy: Arc::new(mcp_policy(&["cloud"], &[])) }
         }
 
         async fn whoami(hub: &McpHub) -> Result<String, String> {
@@ -2553,7 +2588,7 @@ mod mcp_gateway {
             let mut renamed = def();
             renamed.description = "new".into();
             hub.put_server("live", renamed, false).await.unwrap();
-            let p = Principal { client_id: None, policy: Arc::new(mcp_policy(&["live"], &[])) };
+            let p = Principal { client_id: None, issued_at: None, policy: Arc::new(mcp_policy(&["live"], &[])) };
             assert!(hub.call(&p, "live", "whoami", Default::default()).await.is_ok());
         }
 
@@ -2562,7 +2597,7 @@ mod mcp_gateway {
             let a = auth_server().await;
             let h = oauth_harness(&a, |_| {}).await;
             let hub = &h.state.mcp;
-            let p = Principal { client_id: None, policy: Arc::new(mcp_policy(&["live", "cloud"], &[])) };
+            let p = Principal { client_id: None, issued_at: None, policy: Arc::new(mcp_policy(&["live", "cloud"], &[])) };
             let call = |server: &'static str| hub.call(&p, server, "whoami", Default::default());
             let def = |extra: Value| {
                 let mut v = json!({"url": format!("{}/mcp", a.base), "auth": "oauth"});
@@ -2681,7 +2716,7 @@ mod mcp_gateway {
         }
 
         fn principal_for(server: &str) -> Principal {
-            Principal { client_id: None, policy: Arc::new(mcp_policy(&[server], &[])) }
+            Principal { client_id: None, issued_at: None, policy: Arc::new(mcp_policy(&[server], &[])) }
         }
     }
 }
@@ -2727,6 +2762,57 @@ async fn opencode_sessions_reach_upstream_on_native_translated_and_passthrough_r
         assert_eq!(req.headers["x-opencode-session"], if i % 4 == 0 { derived } else { "conversation-1" });
         assert_eq!(req.headers["user-agent"], concat!("xolotl/", env!("CARGO_PKG_VERSION"), " (sample-client/1.0)"));
     }
+}
+
+#[tokio::test]
+async fn pricing_status_survives_failed_background_refresh_without_catalog_rows() {
+    let h = harness_with(|cfg| cfg.catalog.static_models.clear()).await;
+    assert_eq!(h.call("GET", "/admin/catalog/pricing", None, None).await.0, 401);
+    let (status, initial) = h.call("GET", "/admin/catalog/pricing", Some(&h.admin), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(initial, json!({"enabled":true,"attempted_at":null,"fetched_at":null,"age_secs":null,"error":null}));
+
+    Mock::given(method("GET")).and(path("/metadata")).respond_with(ResponseTemplate::new(503)).mount(&h.upstream).await;
+    h.state.catalog.refresh_metadata(h.state.subs.http()).await;
+    let (_, cold_failure) = h.call("GET", "/admin/catalog/pricing", Some(&h.admin), None).await;
+    assert!(cold_failure["error"].as_str().unwrap().contains("503"));
+    assert!(cold_failure["fetched_at"].is_null());
+    assert!(cold_failure["age_secs"].is_null());
+    assert!(cold_failure["attempted_at"].as_i64().is_some());
+
+    h.upstream.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"sample":{"input_cost_per_token":0.000002}})))
+        .mount(&h.upstream)
+        .await;
+    assert_eq!(h.call("POST", "/admin/catalog/refresh", Some(&h.admin), None).await.0, 200);
+    let (_, success) = h.call("GET", "/admin/catalog/pricing", Some(&h.admin), None).await;
+    assert!(success["attempted_at"].as_i64().is_some());
+    assert!(success["fetched_at"].as_i64().is_some());
+    assert!(success["age_secs"].as_i64().unwrap() >= 0);
+    assert!(success["error"].is_null());
+
+    h.upstream.reset().await;
+    Mock::given(method("GET")).and(path("/metadata")).respond_with(ResponseTemplate::new(503)).mount(&h.upstream).await;
+    // Same refresh entry point used by the maintenance timer, without a browser POST.
+    h.state.catalog.refresh(&h.state.subs, &h.state.gateway).await;
+    let (_, failed) = h.call("GET", "/admin/catalog/pricing", Some(&h.admin), None).await;
+    assert_eq!(failed["fetched_at"], success["fetched_at"]);
+    assert!(failed["age_secs"].as_i64().unwrap() >= success["age_secs"].as_i64().unwrap());
+    assert!(failed["error"].as_str().unwrap().contains("503"));
+    assert_eq!(h.call("GET", "/admin/catalog/routes", Some(&h.admin), None).await.1, json!([]));
+    assert_eq!(h.call("GET", "/admin/catalog/pricing", Some(&h.admin), None).await.1["error"], failed["error"]);
+}
+
+#[tokio::test]
+async fn pricing_status_reports_disabled_registry() {
+    let h = harness_with(|cfg| cfg.catalog.metadata_url.clear()).await;
+    assert_eq!(h.call("POST", "/admin/catalog/refresh", Some(&h.admin), None).await.0, 200);
+    let (_, status) = h.call("GET", "/admin/catalog/pricing", Some(&h.admin), None).await;
+    assert_eq!(status["enabled"], false);
+    assert!(status["attempted_at"].is_null());
+    assert!(status["error"].is_null());
 }
 
 #[tokio::test]
@@ -3524,4 +3610,47 @@ async fn every_account_kind_is_exported_with_or_without_a_session() {
     let transcription = row("/v1/audio/transcriptions");
     assert_eq!((transcription["request"].as_str(), transcription["request_truncated"].as_bool()), (Some(""), Some(true)));
     assert_eq!(transcription["response"], r#"{"text":"hello"}"#);
+}
+
+/// The gateway initializes its optional sink before serving either router.
+#[tokio::test]
+async fn unreachable_nats_does_not_block_proxy_or_admin() {
+    use crate::config::NatsConfig;
+    use crate::export::{Exporter, nats};
+    use std::time::Duration;
+
+    // A bound TCP socket without listen refuses connections and reserves the
+    // port, so another test cannot accidentally start a service on it.
+    let refused = tokio::net::TcpSocket::new_v4().unwrap();
+    refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    for url in ["nats://xolotl-nats.invalid:4222".to_string(), format!("nats://{}", refused.local_addr().unwrap())] {
+        let mut h = harness_with(|cfg| cfg.export.nats = Some(NatsConfig { url, ..Default::default() })).await;
+        let cfg = h.state.cfg.export.nats.clone().unwrap();
+        let sink = tokio::time::timeout(Duration::from_secs(1), nats::start(cfg, None))
+            .await
+            .expect("unreachable export must not delay gateway startup")
+            .unwrap();
+        let export = Exporter::new(vec![sink]);
+        h.state.export = Some(export.clone());
+        Mock::given(method("POST"))
+            .and(path("/llama/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"choices": [], "usage": {"prompt_tokens": 3}})))
+            .expect(1)
+            .mount(&h.upstream)
+            .await;
+        let key = h.key(Policy { name: "local".into(), providers: vec!["llama".into()], ..Default::default() }).await;
+        let requests = async {
+            assert_eq!(h.call("GET", "/admin/keys", Some(&h.admin), None).await.0, 200);
+            assert_eq!(h.call("POST", "/v1/chat/completions", Some(&key), Some(json!({"model": "qwen3", "messages": []}))).await.0, 200);
+        };
+        tokio::time::timeout(Duration::from_secs(2), requests).await.expect("requests remain available");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while export.sinks()[0].queued() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the proxy exchange waits in the export queue");
+        export.shutdown().await;
+    }
 }

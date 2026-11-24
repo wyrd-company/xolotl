@@ -119,6 +119,8 @@ pub struct Metrics {
     pub account_usage: Gauge<f64>,
     pub account_available: Gauge<u64>,
     pub token_refreshes: Counter<u64>,
+    pub pricing_refreshes: Counter<u64>,
+    pub pricing_misses: Counter<u64>,
     pub unsaved_credentials: Gauge<u64>,
     pub mcp_tool_calls: Counter<u64>,
     pub mcp_tool_call_duration: Histogram<f64>,
@@ -129,6 +131,7 @@ pub struct Metrics {
     pub session_locks: Counter<u64>,
     pub tool_calls: Counter<u64>,
     pub export_rows: Counter<u64>,
+    pub export_connected: Gauge<u64>,
 }
 
 pub fn metrics() -> &'static Metrics {
@@ -151,6 +154,14 @@ pub fn metrics() -> &'static Metrics {
                 .build(),
             account_available: meter.u64_gauge("xolotl.account.available").with_description("1 when the account can take requests").build(),
             token_refreshes: meter.u64_counter("xolotl.oauth.refreshes").build(),
+            pricing_refreshes: meter
+                .u64_counter("xolotl.pricing.refreshes")
+                .with_description("Model pricing refresh attempts by result")
+                .build(),
+            pricing_misses: meter
+                .u64_counter("xolotl.pricing.misses")
+                .with_description("Requests with missing model pricing, by reason")
+                .build(),
             unsaved_credentials: meter
                 .u64_gauge("xolotl.vault.unsaved_credentials")
                 .with_description("Refreshed OAuth credentials not yet written to the vault")
@@ -176,6 +187,10 @@ pub fn metrics() -> &'static Metrics {
                 .build(),
             session_locks: meter.u64_counter("xolotl.session.locks").with_description("Context locks formed and broken").build(),
             tool_calls: meter.u64_counter("xolotl.tool_calls").with_description("Tool calls in LLM responses, by client and tool").build(),
+            export_connected: meter
+                .u64_gauge("xolotl.export.connected")
+                .with_description("1 when the export is connected to NATS, 0 while unreachable")
+                .build(),
             export_rows: meter
                 .u64_counter("xolotl.export.rows")
                 .with_description("Exported exchanges by sink and outcome: inserted or published, dropped (queue full), failed or refused")

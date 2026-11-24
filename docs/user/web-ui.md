@@ -54,11 +54,11 @@ server log has the details.
 
 | Screen | What you can do |
 |---|---|
-| Overview | Fixable failures with **Replace key** or **Log in again** links, OpenBao and SQLite health, configured account pools with state bars and usage windows, Claude and Codex reset credit totals, traffic and provider split for the last 24 hours, provider accounts, recent failed requests |
+| Overview | Reload from OpenBao with loaded counts and errors, model discovery status, fixable failures with **Replace key** or **Log in again** links, OpenBao and SQLite health, configured account pools with state bars and usage windows, Claude and Codex reset credit totals, traffic and provider split for the last 24 hours, provider accounts, recent failed requests |
 | [Accounts](accounts.md) | Pool accounts by provider with their state and cooldown reason: refresh usage, refresh models, enable or disable. Details: set priority, **Retry**, log in again (OAuth accounts) or replace the key (API-key accounts), remove, last error, Claude and Codex reset credits. Provider accounts with their kind, key state and base URL: set or replace the key, remove the ones added here. The **Providers** tab shows only provider accounts |
 | [Add account](accounts.md#add-an-account) | Every account kind. Subscriptions: Codex device or browser login, Claude login, OpenCode Go key, import of a CLI credential file. Providers: kind, name, base URL, API key or no key, extra headers |
 | [Policies](policies-and-keys.md#write-a-policy) | Providers and the accounts of each subscription provider, scopes (with `key_policies` under the `keys` scope), MCP access, rate limits (in total, per provider and per account) with the policy's consumption, and the model list (below). Each section folds away |
-| [Client keys](policies-and-keys.md#issue-a-client-key) | Issue, rotate with a grace period, enable or disable, revoke. Consumption against the policy's rate limits. Shows the OpenBao path, the `bao` command and the OpenBao policy the client needs. Never shows the key |
+| [Client keys](policies-and-keys.md#issue-a-client-key) | Issue with custom expiry, rotate with custom grace, enable or disable, revoke by row or client ID. Creation/rotation timestamps and all current usage counters, with limits where set. Shows the OpenBao path and retrieval instructions when deployment status is available. Never shows the key |
 | [MCP servers](mcp-gateway.md#in-the-web-ui) | Upstream servers: add, edit and remove runtime servers, set header secrets, OAuth sign-in, tools, recent tool calls |
 | [Models](#models) | The model catalog with each model's endpoints |
 | Usage | The request log grouped by client, account, provider or model, sessions, the tools each key called, and a link to `telemetry.dashboard_url` |
@@ -71,6 +71,21 @@ Select **Issues** there to report a problem. The link is available on every
 screen after sign-in and can be reached with Tab and opened with Enter.
 
 ### Overview
+
+In **Deployment**, select **Reload from OpenBao** after changing stored policies,
+client keys or accounts outside xolotl. The control waits for the server result,
+then shows the loaded policy, client key, pool account and provider account counts,
+including zero. It reloads stored entries; refreshing the browser only reads the
+current runtime state.
+
+A failed reload shows the underlying error. Check the deployment’s OpenBao access
+and retry. Some changes may already have loaded before the failure; the page
+refreshes its runtime data after either result.
+
+Reload completion starts background discovery; it does not mean discovery has
+completed. **Model discovery** shows the latest provider model counts, discovery
+errors and refresh times separately. Use **Refresh models** to retry discovery.
+Cached or static models remain visible when discovery fails.
 
 **Needs action** lists enabled accounts whose credentials were refused, stored
 policies that did not load, plus OpenBao and SQLite failures. Account actions
@@ -182,8 +197,8 @@ old the catalog is, and each provider's model count or discovery error.
   error. A provider that answers with an empty list shows
   **Provider returned no models**.
 - Xolotl also discovers models after account changes, provider key changes and
-  `xolotl reload`. The UI checks every 30 seconds and updates its lists when
-  that discovery completes.
+  **Reload from OpenBao** on Overview (or `xolotl reload`). The UI checks every
+  30 seconds and updates its lists when that discovery completes.
 
 ## Theme
 
@@ -191,4 +206,17 @@ The UI has a light and a dark theme. By default it follows the browser's color
 scheme. The three buttons above **Sign out** in the sidebar pick the system, light or
 dark theme. The browser keeps the choice.
 
-Model catalog rows show context, maximum output, input/output and cache prices per million tokens, with the LiteLLM key or override and last successful fetch age. Failed refreshes retain cached data. Usage and Traffic show API-equivalent USD with priced-request coverage; subscription value is not billed spend.
+Model catalog rows show context, maximum output, input/output and cache prices per million tokens, with the LiteLLM key or override and last successful fetch age. Small rates retain their precision, including cache prices such as $0.005 per million tokens.
+
+On **Models**, choose **Refresh models** to refresh provider discovery and registry prices. **Provider discovery** reports each provider's model count and discovery errors. **Pricing** reports its own result: the latest completed attempt, the last good registry fetch and the age of cached prices. A successful discovery does not mean pricing succeeded. While the refresh runs, the button is disabled and the pricing summary says **Refreshing prices…**.
+
+When pricing fails, the summary shows the underlying reason and retains any cached prices. Correct the registry or connection problem, then choose **Refresh models** again. The same summary appears when you return after a scheduled refresh; it also works when the catalog is empty. If prices have never been fetched, the page says no cached registry prices are available. Configuration overrides still apply. The latest attempt and error are kept until the server restarts; the last good registry cache survives restarts.
+
+![Models shows a pricing refresh failure, its underlying registry error and the age of retained cached prices.](assets/models-pricing.png)
+
+![Refresh models shows progress, succeeds, then reports a registry outage while keeping cached prices.](assets/models-pricing.gif)
+
+The recording shows **Refresh models**, its progress state, successful pricing,
+and a second refresh failing with cached prices retained.
+
+Usage and Traffic show API-equivalent USD with priced-request coverage; subscription value is not billed spend.

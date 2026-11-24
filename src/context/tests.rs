@@ -29,6 +29,7 @@ fn identity_comes_from_each_client_signal_in_order() {
     assert_eq!(source(&[("thread-id", "b")], body.clone()), Some("codex"));
     assert_eq!(source(&[("x-grok-session-id", "c"), ("x-opencode-session", "d")], body.clone()), Some("grok"));
     assert_eq!(source(&[("x-opencode-session", "d")], body.clone()), Some("opencode"));
+    assert_eq!(source(&[("x-opencode-session-id", "ses_d")], body.clone()), Some("opencode"), "what the OpenCode client sends");
     assert_eq!(source(&[], body.clone()), Some("prompt-cache-key"));
     // A blank signal is no signal.
     assert_eq!(source(&[("session_id", "  ")], body), Some("prompt-cache-key"));
