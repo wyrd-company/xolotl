@@ -244,7 +244,9 @@ exclude the model later, with a rule, its `models` switch or
 - A new session can't use the model. It gets a 404, or a 403 through a
   passthrough.
 - A conversation that switches to another model can't switch back to it, once
-  no other conversation of its session is on it.
+  no other conversation of its session is on it. A switch counts once the other
+  model's answer completes: if that answer fails, the conversation stays on the
+  excluded model.
 
 Xolotl tells sessions apart by the session ID each client sends: Claude Code,
 Codex, Grok and OpenCode all send one. Requests that a client sends on other

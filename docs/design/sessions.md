@@ -84,7 +84,14 @@ A session carries more than one conversation: the main one, subagents, and backg
 
 `route_json`, counting tokens and the passthroughs read the session's targets before the policy, and look the name up in a view resolved as if the policy still allowed them (`Policy::resolve_keeping`). A kept model gets back the plain name or rename the exclusion took from it, ahead of another provider that serves the same name, and its `provider/model` form works again. Its lock, if it has one, holds.
 
-A request that succeeds (a 2xx answer) moves its conversation to the target that served it. The move is written before the response goes back to the client, so that the client's next request sees it (`Conversation::served`). Every request takes a sequence number when it arrives: microseconds since the epoch, and never less than one more than the last. A move applies only over an older one, so a request that started before a switch and finishes after it doesn't move the conversation back. Counting tokens moves nothing.
+A request whose answer completes moves its conversation to the target that served it (`Conversation::moves_with`). The answer completes when it is a 2xx response and either:
+
+- a stream reaches its final event with no error event. The final event is `message_stop`, `response.completed` or `response.incomplete`, a Chat `finish_reason`, or `[DONE]`. An error event is Messages or Responses `error`, or a Chat chunk with an `error`.
+- a JSON body is not an error.
+
+A body is a stream when its `Content-Type` says so, or when it doesn't start as JSON. A provider can answer 200 and then send only an error: that moves nothing, and the session goes on with the model it was on. The end of the answer is held until the move is written: a stream from its final event on, or a JSON body's last chunk. The client can't see the answer complete before its next request would see the move. A client that leaves before the end moves nothing.
+
+Every request takes a sequence number when it arrives: microseconds since the epoch, raised past the last one. A move applies only over an older one, so a request that started before a switch and finishes after it doesn't move the conversation back. Counting tokens moves nothing.
 
 - A request keeps its target only if the policy allows the model by name, or the session keeps it already. A target only an alias reaches still moves the conversation, which then keeps nothing, so that the session can't reach that target later under a name the policy refuses. Aliases ignore model rules, so an exclusion never stops them anyway.
 - A model the policy never allowed never gets into `session_conversations`, so it stays refused in every session.
