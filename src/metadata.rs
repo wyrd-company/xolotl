@@ -84,8 +84,7 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Schema projection follows LiteLLM's current model-catalog/src/schema.rs:
-    /// object entries, provider string, integer limits, nonnegative numeric prices.
+    /// Project usable fields independently; upstream provider metadata is not used by lookup.
     pub fn parse(value: Value, at: i64) -> Result<Self> {
         let obj = value.as_object().ok_or_else(|| anyhow::anyhow!("registry must be an object"))?;
         let mut entries = BTreeMap::new();
@@ -93,20 +92,32 @@ impl Registry {
             if key == "sample_spec" || key == "fallback_generalizations" {
                 continue;
             }
-            ensure!(value.is_object(), "registry entry must be an object: {key}");
-            ensure!(value.get("litellm_provider").is_some_and(Value::is_string), "missing provider: {key}");
-            let mut m: Metadata = serde_json::from_value(value.clone())?;
-            // LiteLLM uses zero for non-generative limits. It is not a usable window.
-            if m.max_input_tokens == Some(0) {
-                m.max_input_tokens = None;
+            if !value.is_object() {
+                continue;
             }
-            if m.max_output_tokens == Some(0) {
-                m.max_output_tokens = None;
-            }
-            m.validate()?;
+            // Invalid upstream fields are unknown, without discarding valid siblings.
+            // Configuration overrides still use Metadata::validate's strict rules.
+            let limit = |field: &str| value[field].as_u64().filter(|&n| n > 0 && n <= i64::MAX as u64);
+            let price = |field: &str| value[field].as_f64().filter(|n| n.is_finite() && *n >= 0.0);
+            let m = Metadata {
+                max_input_tokens: limit("max_input_tokens"),
+                max_output_tokens: limit("max_output_tokens"),
+                input_cost_per_token: price("input_cost_per_token"),
+                output_cost_per_token: price("output_cost_per_token"),
+                cache_read_input_token_cost: price("cache_read_input_token_cost"),
+                cache_creation_input_token_cost: price("cache_creation_input_token_cost"),
+            };
             entries.insert(key.clone(), m);
         }
-        ensure!(!entries.is_empty(), "registry contains no models");
+        ensure!(
+            entries.values().any(|m| m.max_input_tokens.is_some()
+                || m.max_output_tokens.is_some()
+                || m.input_cost_per_token.is_some()
+                || m.output_cost_per_token.is_some()
+                || m.cache_read_input_token_cost.is_some()
+                || m.cache_creation_input_token_cost.is_some()),
+            "registry contains no usable model metadata"
+        );
         Ok(Self { fetched_at: Some(at), entries, error: None })
     }
 
@@ -205,28 +216,75 @@ mod tests {
     }
 
     #[test]
-    fn registry_guards_isolate_each_invalid_field() {
-        assert!(Registry::parse(json!({"sample-model":entry()}), 10).is_ok());
-        for (field, invalid) in [
-            ("max_input_tokens", json!(-1)),
-            ("max_input_tokens", json!(1.5)),
-            ("max_output_tokens", json!("8000")),
-            ("input_cost_per_token", json!(-0.1)),
-            ("output_cost_per_token", json!("free")),
-            ("cache_read_input_token_cost", json!(-1)),
-            ("cache_creation_input_token_cost", json!(-1)),
-            ("litellm_provider", json!(42)),
+    fn registry_isolates_invalid_fields_and_ignores_provider_metadata() {
+        for field in [
+            "max_input_tokens",
+            "max_output_tokens",
+            "input_cost_per_token",
+            "output_cost_per_token",
+            "cache_read_input_token_cost",
+            "cache_creation_input_token_cost",
         ] {
-            let mut e = entry();
-            e[field] = invalid;
-            assert!(Registry::parse(json!({"sample-model":e}), 10).is_err(), "{field}");
+            for invalid in [json!(-1), json!("free"), json!(true), json!([]), json!({}), Value::Null] {
+                let mut e = entry();
+                e[field] = invalid.clone();
+                let r = Registry::parse(json!({"sample-model":e, "unrelated":42}), 10).unwrap();
+                let projected = serde_json::to_value(&r.entries["sample-model"]).unwrap();
+                assert!(projected[field].is_null(), "{field}: {invalid}");
+                assert_eq!(
+                    projected[if field == "max_input_tokens" { "max_output_tokens" } else { "max_input_tokens" }],
+                    if field == "max_input_tokens" { json!(8000) } else { json!(1000000) }
+                );
+                r.entries["sample-model"].validate().unwrap();
+            }
         }
-        assert!(Registry::parse(json!([]), 10).is_err());
-        assert!(Registry::parse(json!({}), 10).is_err());
-        assert!(Registry::parse(json!({"sample-model":[]}), 10).is_err());
-        let mut e = entry();
-        e["max_input_tokens"] = json!(0);
-        assert_eq!(Registry::parse(json!({"sample-model":e}), 10).unwrap().entries["sample-model"].max_input_tokens, None);
+        for invalid in [json!(0), json!(1.5), json!(u64::MAX)] {
+            let r = Registry::parse(json!({"m":{"max_input_tokens":invalid,"output_cost_per_token":0}}), 10).unwrap();
+            assert_eq!(r.entries["m"].max_input_tokens, None);
+            assert_eq!(r.entries["m"].output_cost_per_token, Some(0.0));
+        }
+        for provider in [Value::Null, json!(42), json!({})] {
+            let mut e = entry();
+            e["litellm_provider"] = provider;
+            let r = Registry::parse(json!({"sample-model":e}), 10).unwrap();
+            assert_eq!(r.entries["sample-model"].input_cost_per_token, Some(0.000002));
+        }
+        let r = Registry::parse(json!({"sample-model":{"input_cost_per_token":0.000002}}), 10).unwrap();
+        assert_eq!(r.entries["sample-model"].input_cost_per_token, Some(0.000002));
+        for unusable in [
+            json!([]),
+            json!({}),
+            json!({"m":[]}),
+            json!({"m":{}}),
+            json!({"m":{"input_cost_per_token":-1,"max_input_tokens":0}}),
+            json!({"sample_spec":entry(),"fallback_generalizations":entry()}),
+        ] {
+            assert!(Registry::parse(unusable.clone(), 10).is_err(), "{unusable}");
+        }
+    }
+
+    #[test]
+    fn registry_preserves_each_usable_field_and_its_boundary_values() {
+        for (field, valid) in [
+            ("max_input_tokens", json!(i64::MAX)),
+            ("max_output_tokens", json!(1)),
+            ("input_cost_per_token", json!(0.0)),
+            ("output_cost_per_token", json!(0.25)),
+            ("cache_read_input_token_cost", json!(0.5)),
+            ("cache_creation_input_token_cost", json!(0.75)),
+        ] {
+            // A single valid field is enough, including a free rate.
+            let r = Registry::parse(json!({"m":{field:valid}}), 10).unwrap();
+            assert_eq!(serde_json::to_value(&r.entries["m"]).unwrap()[field], valid);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads the live default registry; run explicitly with --ignored --nocapture"]
+    async fn live_default_registry_loads() {
+        let response = reqwest::get(REGISTRY_URL).await.unwrap().error_for_status().unwrap();
+        let registry = Registry::parse(response.json().await.unwrap(), crate::db::now()).unwrap();
+        println!("Fetched {}: {} registry entries", chrono::Utc::now().to_rfc3339(), registry.entries.len());
     }
 
     #[test]
