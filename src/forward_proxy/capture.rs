@@ -310,7 +310,7 @@ impl CaptureTask {
 fn forwarded(admission: Admission, bodies: [BodyCapture; 2], terminal: &Terminal) -> (Forwarded, bool) {
     let [request, response] = bodies;
     let lost = |d: Direction| terminal.relayed[d as usize] > terminal.queued[d as usize];
-    let complete = request.complete && response.complete && !lost(Direction::Request) && !lost(Direction::Response);
+    let complete = request.complete() && response.complete() && !lost(Direction::Request) && !lost(Direction::Response);
     let observed = Observed {
         model: request.scanner.model.clone(),
         session_key: request.scanner.session.as_deref().map(|value| SessionId::sent(SESSION_SOURCE, value).key),
@@ -445,10 +445,14 @@ impl BodyCapture {
     }
 
     /// The copy, and whether it was cut or lost bytes.
-    fn into_captured(mut self, lost: bool) -> (Captured, bool) {
-        if self.scanner.overflow || self.events.skipped {
-            self.complete = false;
-        }
+    /// Whether the metadata read from this body is whole: no limit skipped
+    /// any of it, including a field the scanner dropped or an SSE event over
+    /// the scan limit.
+    fn complete(&self) -> bool {
+        self.complete && !self.scanner.overflow && !self.events.skipped
+    }
+
+    fn into_captured(self, lost: bool) -> (Captured, bool) {
         match self.copy {
             Some((mut captured, _)) => {
                 let cut = captured.truncated || lost;
@@ -756,6 +760,27 @@ mod tests {
         assert!(!cut.observed.complete);
         assert_eq!(cut.observed.usage, TokenUsage::default(), "no token counts from a cut response");
         assert_eq!(cut.observed.model.as_deref(), Some("m"));
+    }
+
+    #[tokio::test]
+    async fn metadata_a_reader_skipped_leaves_the_observation_incomplete() {
+        // An SSE event over the scan limit, then an ordinary usage event.
+        let oversized = [b"data: ".as_slice(), &vec![b'x'; MAX_JSON_SCAN + 1], b"\n\n"].concat();
+        let response = [oversized, [b"data: ".as_slice(), USAGE, b"\n\n"].concat()].concat();
+        let row = capture(br#"{"model":"m"}"#, &response).await;
+        assert!(!row.request.truncated && !row.response.truncated, "nothing was lost in the queue or the copy");
+        assert_eq!(row.observed.usage.input, Some(7), "the later event is still read");
+        assert!(!row.observed.complete, "a skipped event leaves the token counts partial");
+
+        // A `model` longer than its limit.
+        let request = format!(r#"{{"model":"{}"}}"#, "m".repeat(MAX_FIELD + 1));
+        let row = capture(request.as_bytes(), &[b"data: ".as_slice(), USAGE, b"\n\n"].concat()).await;
+        assert_eq!(row.observed.model, None);
+        assert!(!row.observed.complete);
+
+        // Without either, the same exchange is complete.
+        let row = capture(br#"{"model":"m"}"#, &[b"data: ".as_slice(), USAGE, b"\n\n"].concat()).await;
+        assert!(row.observed.complete);
     }
 
     #[tokio::test]
