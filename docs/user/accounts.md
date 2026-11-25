@@ -146,6 +146,28 @@ If a key is already stored at `providers/<name>`, for example because you moved
 the provider out of the config file, adding the account without a key keeps
 that key.
 
+To store or rotate a key in the web UI, open **Accounts** → **Providers** and
+select **Set key** or **Replace key** on the provider row. Enter the key in the
+password field and select **Save key**. The dialog confirms the OpenBao write
+and reports how many models the catalog found. If discovery fails, the dialog
+shows the upstream error, and any cached or static models remain available.
+Select **Refresh models** in the dialog to retry discovery using the saved key.
+
+You can store a key for a disabled provider. The dialog confirms the save
+without a discovery result. For a no-auth provider, Xolotl stores the key and
+continues to call the upstream without key authentication. Workload identity
+uses the provider configuration. If you submit a key for that provider, the
+dialog shows the server's rejection and points you to that configuration.
+
+![Saved provider key with an upstream discovery error and a Refresh models button](assets/provider-key-discovery-error.png)
+
+The recording shows a key save, a replacement that returns a discovery error,
+and a successful discovery retry. It also shows the workload identity rejection.
+
+![Saving and replacing a provider key, retrying discovery, and seeing a workload identity rejection](assets/provider-key-workflow.gif)
+
+To store or rotate a key from the CLI, use `providers set-key`.
+
 ```sh
 echo "$NEW_KEY" | xolotl providers set-key mistral-team   # replace the key
 xolotl accounts remove-provider mistral-team              # remove the account and its key

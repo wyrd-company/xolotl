@@ -19,6 +19,8 @@ assets:
   - assets/account-forms.gif
   - assets/account-recovery.png
   - assets/account-recovery.gif
+  - assets/provider-key-discovery-error.png
+  - assets/provider-key-workflow.gif
 products:
   xolotl:
     name: xolotl
