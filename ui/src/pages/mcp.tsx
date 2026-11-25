@@ -747,7 +747,7 @@ function CallTotals() {
           <TableBody className="font-mono text-xs">
             {usage.data.map((r) => (
               <TableRow key={r.key ?? ""}>
-                <TableCell>{r.key ?? <span className="text-muted-foreground font-sans">admin token</span>}</TableCell>
+                <TableCell className="[overflow-wrap:anywhere]">{r.key ?? <span className="text-muted-foreground font-sans">admin token</span>}</TableCell>
                 <TableCell className="text-right">{num(r.calls)}</TableCell>
                 <TableCell className="text-right">{num(r.errors)}</TableCell>
                 <TableCell className="text-right">{num(Math.round(r.avg_latency_ms))}</TableCell>
@@ -783,7 +783,7 @@ function RecentCalls() {
         </CardContent>
       )}
       {calls.isSuccess && (calls.data.length === 0 ? <Empty>No tool calls yet.</Empty> : (
-        <Table>
+        <Table className="max-sm:[&_td]:px-2 max-sm:[&_th]:px-2">
           <TableHeader>
             <TableRow>
               <TableHead>Time</TableHead>
@@ -797,10 +797,10 @@ function RecentCalls() {
             {calls.data.map((c, i) => (
               <TableRow key={`${c.ts}-${i}`}>
                 <TableCell>{clock(c.ts)}</TableCell>
-                <TableCell className="font-mono">
+                <TableCell className="font-mono [overflow-wrap:anywhere]">
                   {c.server}/{c.tool}
                 </TableCell>
-                <TableCell className="font-mono">{c.client_id ?? "-"}</TableCell>
+                <TableCell className="font-mono [overflow-wrap:anywhere]">{c.client_id ?? "-"}</TableCell>
                 <TableCell title={c.error ?? undefined}>
                   {c.status === "ok" ? (
                     <Badge variant="success">ok</Badge>
