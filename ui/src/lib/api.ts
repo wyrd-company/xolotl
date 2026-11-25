@@ -123,6 +123,13 @@ export interface UsageWindow {
   window_secs: number | null;
 }
 
+export interface AccountUsage {
+  account_id: string;
+  fetched_at: number;
+  windows: UsageWindow[];
+  raw?: unknown;
+}
+
 export interface Account {
   id: string;
   provider: SubProvider;
@@ -144,7 +151,7 @@ export interface Account {
   available: boolean;
   expires_at: number | null;
   unsaved: boolean;
-  usage: { account_id: string; fetched_at: number; windows: UsageWindow[]; raw?: { reset_credits?: number | null } | null } | null;
+  usage: AccountUsage | null;
 }
 
 export interface FlowStart {

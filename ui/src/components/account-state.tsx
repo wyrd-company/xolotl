@@ -1,6 +1,6 @@
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
-import type { Account, UsageWindow } from "@/lib/api";
+import type { Account, AccountUsage, UsageWindow } from "@/lib/api";
 import { publicUsageWindows } from "@/lib/usage-windows";
 import { relative } from "@/lib/format";
 
@@ -11,7 +11,8 @@ export function AccountStateBadge({ account }: { account: Account }) {
   const s = accountState(account);
   return (
     <div className="flex flex-col gap-1">
-      <Badge variant={s.variant}>{s.label}</Badge>
+      {(!account.unsaved || s.label !== "Available") && <Badge variant={s.variant}>{s.label}</Badge>}
+      {account.unsaved && <Badge variant="warning">Unsaved token</Badge>}
       {account.cooldown_until && account.cooldown_until > Date.now() / 1000 && (
         <span className="text-muted-foreground text-xs">
           {account.cooldown_reason || "Cooldown"} · {relative(account.cooldown_until)}
@@ -34,6 +35,23 @@ export function WindowsSummary({ windows }: { windows: UsageWindow[] | undefined
   const shown = publicUsageWindows(windows);
   if (!shown.length) return <span className="text-muted-foreground">-</span>;
   return <span className="font-mono text-xs">{shown.map((w) => `${w.name} ${Math.round(w.used_percent)}%`).join(" · ")}</span>;
+}
+
+export function AccountUsageSnapshot({ usage }: { usage: AccountUsage }) {
+  const windows = publicUsageWindows(usage.windows);
+  const diagnostics = { ...usage, windows };
+  return (
+    <div className="flex min-w-0 flex-col gap-2">
+      <div className="text-sm font-medium">Usage · fetched {relative(usage.fetched_at)}</div>
+      {windows.length > 0 && <WindowBars windows={windows} />}
+      <details className="rounded-md border px-3 py-2 text-sm">
+        <summary className="cursor-pointer font-medium">Provider usage diagnostics (returned JSON)</summary>
+        <pre className="mt-2 whitespace-pre-wrap wrap-anywhere font-mono text-xs">
+          {JSON.stringify(diagnostics, null, 2)}
+        </pre>
+      </details>
+    </div>
+  );
 }
 
 export function WindowBars({ windows, softLimit }: { windows: UsageWindow[]; softLimit?: number }) {

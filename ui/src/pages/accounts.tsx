@@ -5,7 +5,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router";
 
 import { CatalogRefresh } from "@/components/catalog-refresh";
-import { accountName, AccountStateBadge, WindowBars, WindowsSummary } from "@/components/account-state";
+import { accountName, AccountStateBadge, AccountUsageSnapshot, WindowsSummary } from "@/components/account-state";
 import { Confirm } from "@/components/confirm";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
 import { Button } from "@/components/ui/button";
@@ -15,10 +15,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { del, get, post, PROVIDER_NAMES, SUB_PROVIDERS, type Account, type AccountKindInfo, type ProviderAccount, type Status } from "@/lib/api";
+import { del, get, post, PROVIDER_NAMES, SUB_PROVIDERS, type Account, type AccountKindInfo, type AccountUsage, type ProviderAccount, type Status } from "@/lib/api";
 import { ProviderAccounts } from "@/pages/provider-accounts";
-import { publicUsageWindows } from "@/lib/usage-windows";
-import { resetCreditsSummary } from "@/lib/reset-credits";
+import { resetCredits, resetCreditsSummary } from "@/lib/reset-credits";
 import { dateTime, relative } from "@/lib/format";
 import { useAction } from "@/lib/hooks";
 import { priorityError, normalizePriority } from "@/lib/priority";
@@ -123,13 +122,16 @@ export function AccountsPage() {
 }
 
 function AccountRow({ account: a, open, onOpenChange }: { account: Account; open: boolean; onOpenChange: (open: boolean) => void }) {
+  const [lastUsage, setLastUsage] = useState<AccountUsage | null>(null);
   const inv = {
     invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"]],
   };
-  const refresh = useAction(() => post(`/admin/accounts/${a.id}/usage`), {
+  const refresh = useAction(() => post<AccountUsage>(`/admin/accounts/${a.id}/usage`), {
     ...inv,
     success: "Usage refreshed",
+    onSuccess: setLastUsage,
   });
+  const usage = a.usage && (!lastUsage || a.usage.fetched_at >= lastUsage.fetched_at) ? a.usage : lastUsage;
   const toggle = useAction(() => post(`/admin/accounts/${a.id}/${a.enabled ? "disable" : "enable"}`), {
     ...inv,
     success: a.enabled ? "Account disabled" : "Account enabled",
@@ -149,9 +151,9 @@ function AccountRow({ account: a, open, onOpenChange }: { account: Account; open
       </TableCell>
       <TableCell>
         <div className="flex flex-col gap-1">
-          <WindowsSummary windows={a.usage?.windows} />
+          <WindowsSummary windows={usage?.windows} />
           {(a.provider === "codex" || a.provider === "claude") && (
-            <span className="text-muted-foreground text-xs">{resetCreditsSummary([a])}</span>
+            <span className="text-muted-foreground text-xs">{resetCreditsSummary([{ usage }])}</span>
           )}
         </div>
       </TableCell>
@@ -159,14 +161,22 @@ function AccountRow({ account: a, open, onOpenChange }: { account: Account; open
       <TableCell className="whitespace-nowrap">{relative(a.last_used_at)}</TableCell>
       <TableCell>
         <div className="flex justify-end gap-2">
-          <Button size="sm" variant="outline" disabled={refresh.isPending || !a.enabled} onClick={() => refresh.mutate(undefined)}>
-            Refresh usage
+          <Button size="sm" variant="outline" disabled={refresh.isPending} onClick={() => refresh.mutate(undefined)}>
+            {refresh.isPending ? "Refreshing…" : "Refresh usage"}
           </Button>
           <RefreshModels account={a} />
           <Button size="sm" variant="outline" disabled={toggle.isPending} onClick={() => toggle.mutate(undefined)}>
             {a.enabled ? "Disable" : "Enable"}
           </Button>
-          <AccountDetails account={a} open={open} onOpenChange={onOpenChange} />
+          <AccountDetails
+            account={a}
+            open={open}
+            onOpenChange={onOpenChange}
+            usage={usage}
+            usageError={refresh.error}
+            refreshingUsage={refresh.isPending}
+            onRefreshUsage={() => refresh.mutate(undefined)}
+          />
         </div>
       </TableCell>
     </TableRow>
@@ -177,12 +187,19 @@ function AccountDetails({
   account: a,
   open,
   onOpenChange: setOpen,
+  usage,
+  usageError,
+  refreshingUsage,
+  onRefreshUsage,
 }: {
   account: Account;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  usage: AccountUsage | null;
+  usageError: Error | null;
+  refreshingUsage: boolean;
+  onRefreshUsage: () => void;
 }) {
-  const windows = publicUsageWindows(a.usage?.windows);
   const [priority, setPriority] = useState(a.priority_decimal);
   const inv = {
     invalidate: [["accounts"], ["status"], ["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"]],
@@ -203,7 +220,6 @@ function AccountDetails({
     success: "Account removed",
     onSuccess: () => setOpen(false),
   });
-  const coolingOrFailed = a.auth_failed || (a.cooldown_until ?? 0) > Date.now() / 1000;
 
   return (
     <Dialog
@@ -247,7 +263,7 @@ function AccountDetails({
           {(a.provider === "codex" || a.provider === "claude") && (
             <>
               <dt className="text-muted-foreground">Reset credits</dt>
-              <dd>{a.usage?.raw?.reset_credits ?? "Unknown"}</dd>
+              <dd>{resetCredits(usage) ?? "Unknown"}</dd>
             </>
           )}
           {a.cooldown_reason && (
@@ -271,7 +287,7 @@ function AccountDetails({
           {a.unsaved && (
             <>
               <dt className="text-muted-foreground">Vault</dt>
-              <dd className="text-warning">Refreshed token not saved yet; retrying</dd>
+              <dd className="text-warning">Writing the refreshed token to OpenBao failed. Xolotl is retrying.</dd>
             </>
           )}
           <dt className="text-muted-foreground">Added</dt>
@@ -281,12 +297,14 @@ function AccountDetails({
             <Mono>{a.auth_index}</Mono>
           </dd>
         </dl>
-        {a.usage && windows.length ? (
-          <div className="flex flex-col gap-2">
-            <div className="text-sm font-medium">Usage · fetched {relative(a.usage.fetched_at)}</div>
-            <WindowBars windows={windows} />
+        {usage && <AccountUsageSnapshot usage={usage} />}
+        {usageError && (
+          <div role="alert" className="bg-danger-muted text-destructive rounded-md px-4 py-3 text-sm wrap-anywhere">
+            <p className="font-medium">Usage refresh failed</p>
+            <p>{usageError.message}</p>
+            {usage && <p>The last fetched usage is still shown.</p>}
           </div>
-        ) : null}
+        )}
         <form
           className="flex flex-col gap-2"
           onSubmit={(e) => {
@@ -323,13 +341,18 @@ function AccountDetails({
           </Button>
         </form>
         <p className="text-muted-foreground text-sm">
-          Retry clears the auth failure and cooldown so this account can be tried again. It does not change the credential or reset upstream
-          quota.
+          Retry clears the auth failure and cooldown. Enabled state, credential and provider quota stay as they are.
         </p>
         {a.provider === "opencode-go" ? <ReplaceKey account={a} /> : <AccountLogin provider={a.provider} />}
+        {reset.error && (
+          <p role="alert" className="text-destructive text-sm wrap-anywhere">Account retry failed. {reset.error.message}</p>
+        )}
         <div className="flex flex-wrap gap-2 border-t pt-4">
-          <Button variant="outline" disabled={!coolingOrFailed || reset.isPending} onClick={() => reset.mutate(undefined)}>
-            Retry
+          <Button variant="outline" disabled={reset.isPending} onClick={() => reset.mutate(undefined)}>
+            {reset.isPending ? "Retrying…" : "Retry"}
+          </Button>
+          <Button variant="outline" disabled={refreshingUsage} onClick={onRefreshUsage}>
+            {refreshingUsage ? "Refreshing…" : usageError ? "Retry usage fetch" : "Refresh usage"}
           </Button>
           <Confirm
             title="Remove this account?"
