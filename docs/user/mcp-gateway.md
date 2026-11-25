@@ -231,8 +231,16 @@ shows its error and the number of tools retained from its previous list; other
 servers can still refresh successfully. Use the card's **Refresh** to retry one
 server.
 
-**Recent calls**, below the cards, lists
-the latest tool calls of every server as `server/tool`.
+On **MCP servers**, **Tool calls** shows the call count, error count and average
+latency for the last 24 hours. Use **Group by** to switch between server, tool and
+client. To change the window, enter a positive whole-number duration in
+**Look back** and select **Apply period**. Use seconds or a suffix such as
+`30s`, `15m`, `36h`, `7d` or `2w`. If the query fails, read the error and
+select **Retry totals** to rerun the current query.
+
+**Recent calls** lists the latest tool calls of every server as `server/tool`.
+Both views include recorded calls from removed servers, even when the deployment
+has no configured MCP servers. The look-back period applies to the totals.
 
 With the CLI:
 

@@ -149,7 +149,7 @@ description, headers, authentication, OAuth client/scopes and call timeout.
 | `xolotl mcp unset-secret` | `<server> <field>` | Remove secret confirmation on a placeholder or named field | Equal: confirmed removal sends a null field; completion and underlying errors appear. Headers that use the removed field lose its value. |
 | `xolotl mcp login` | `<server>` | Sign in / Sign in again | Equal: authorization URL, callback polling or pasted redirect, completion and OAuth failure reason appear. Polling HTTP errors stop the waiting state, say success is unconfirmed and offer Retry status or cancel/start again. |
 | `xolotl mcp logout` | `<server>` | Forget tokens confirmation | Equal: deletes OAuth tokens even when sign-in is already needed, including rejected/expired tokens. Shows completion, the new sign-in requirement and mutation errors. |
-| `xolotl mcp usage` | `--group-by --since` | Tool calls, last 24 hours | Partial: server/tool/client grouping, calls/errors/average latency match. Optional CLI window defaults to 24h and accepts custom durations; UI fixes 24h. The aggregate query error is not rendered, so a failure can leave an empty table. The entire calls section is hidden when no MCP servers are listed, even when past calls remain available through the CLI. Group: MCP usage queries. |
+| `xolotl mcp usage` | `--group-by --since` | Tool calls, Group by and Look back | Equal: group by server, tool or client and apply a custom positive duration, with a 24h default. Shows calls, errors and average latency, plus loading, empty results, underlying query errors and retry. Totals and recent calls remain available when no servers are configured. |
 
 ### Gap groups
 
@@ -167,7 +167,7 @@ They describe missing behavior and feedback, without deciding a screen layout.
 | Policy inspection | Complete resolved routes with endpoint types and accounts-read failures; unloaded-policy status fetch errors and deletion controls; saved warning text. |
 | MCP administration | Secret field set/removal and value handling; full tool definitions; global refresh mixed outcomes; callback polling errors; forgetting tokens that already need sign-in. |
 | Request usage queries | Implemented on Usage: arbitrary positive look-back periods, direct filters including explicit empty values, bookmark/drilldown state, invalid-input guidance, and query loading, errors and retry. |
-| MCP usage queries | Arbitrary look-back durations and visible aggregate query errors in MCP tool calls; access to past calls when no servers are listed. |
+| MCP usage queries | Implemented on MCP servers. Tool calls offers custom look-back periods, group selection, validation and aggregate errors with retry. Totals and recent calls are available with no configured servers. |
 | Pricing refresh feedback | Underlying pricing errors and an explicit pricing attempt/result summary for empty catalogs and return visits after scheduled refreshes; sufficient price precision to distinguish sub-cent per-Mtok values. |
 
 ### Maintaining parity
