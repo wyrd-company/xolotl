@@ -2,10 +2,10 @@
 // KEY_LAYOUT_URL to a standard-container URL. Requires playwright@1.58.2.
 // CI runs this in mcr.microsoft.com/playwright:v1.58.2-noble after pnpm build.
 const assert = require("node:assert/strict");
-const http = require("node:http");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { chromium } = require("playwright");
+const { serveBuild } = require("./serve-build.cjs");
 
 const limits = { requests_per_minute: 600, requests_per_day: 10000, tokens_per_minute: 200000, tokens_per_day: 10000000, per: "policy" };
 const usage = { requests_per_minute: 42, requests_per_day: 3456, tokens_per_minute: 123456, tokens_per_day: 2345678 };
@@ -48,35 +48,6 @@ const status = {
   vault_prefix: "xolotl",
   subscription: { strategy: "least-used" },
 };
-
-async function serveBuild() {
-  const dist = path.resolve(__dirname, "../dist");
-  const types = {
-    ".html": "text/html",
-    ".js": "application/javascript",
-    ".css": "text/css",
-    ".woff": "font/woff",
-    ".woff2": "font/woff2",
-    ".svg": "image/svg+xml",
-  };
-  const server = http.createServer(async (req, res) => {
-    const pathname = new URL(req.url, "http://localhost").pathname;
-    const file = path.resolve(dist, pathname === "/" ? "index.html" : "." + pathname);
-    if (!file.startsWith(dist + path.sep)) {
-      res.writeHead(404).end();
-      return;
-    }
-    try {
-      const body = await fs.readFile(file);
-      res.writeHead(200, { "content-type": types[path.extname(file)] || "application/octet-stream" });
-      res.end(body);
-    } catch {
-      res.writeHead(404).end();
-    }
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { server, url: `http://127.0.0.1:${server.address().port}` };
-}
 
 async function main() {
   const output = process.env.KEY_LAYOUT_EVIDENCE_DIR;
