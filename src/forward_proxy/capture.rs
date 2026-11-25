@@ -783,6 +783,26 @@ mod tests {
         assert!(row.observed.complete);
     }
 
+    #[test]
+    fn a_copy_cut_in_either_direction_marks_the_capture_cut() {
+        for cut_request in [true, false] {
+            let body = |direction, cut: bool| {
+                let mut body = BodyCapture::new(direction);
+                body.head(Head::new(Some(200), &headers(&[])), Some(4));
+                body.frame(if cut { b"0123456789" } else { b"{}" }, usize::MAX);
+                body.end();
+                body
+            };
+            let (request, response) = (body(Direction::Request, cut_request), body(Direction::Response, !cut_request));
+            let relayed = [if cut_request { 10 } else { 2 }, if cut_request { 2 } else { 10 }];
+            let terminal = Terminal { status: 200, error: None, relayed, queued: relayed, started_at: Utc::now(), latency_ms: 0 };
+            let admission = Admission { client_id: "c".into(), host: "h.example".into(), path: "/p".into(), trace_id: String::new() };
+            let (row, cut) = forwarded(admission, [request, response], &terminal);
+            assert!(cut, "cut request: {cut_request}");
+            assert_eq!((row.request.truncated, row.response.truncated), (cut_request, !cut_request));
+        }
+    }
+
     #[tokio::test]
     async fn bodies_are_copied_to_the_sinks_limit_and_coded_bodies_are_not_read() {
         let (tap, mut rx) = admit(Some(8));
