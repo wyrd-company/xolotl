@@ -443,7 +443,18 @@ struct ProviderFilter {
 
 async fn list_accounts(State(s): State<AppState>, h: HeaderMap, Query(q): Query<ProviderFilter>) -> Res {
     admin(&s, &h).await?;
-    ok(s.subs.accounts(q.provider).await.map_err(internal)?)
+    let accounts = s.subs.accounts(q.provider).await.map_err(internal)?;
+    let accounts: Vec<Value> = accounts
+        .into_iter()
+        .map(|account| {
+            let priority = account.row.priority.to_string();
+            let mut value = serde_json::to_value(account).expect("account serializes");
+            // Keep the numeric field for CLI clients; browsers use the exact string.
+            value["priority_decimal"] = json!(priority);
+            value
+        })
+        .collect();
+    ok(accounts)
 }
 
 async fn account_kinds(State(s): State<AppState>, h: HeaderMap) -> Res {
@@ -579,15 +590,41 @@ async fn replace_account_key(State(s): State<AppState>, h: HeaderMap, Path(id): 
 
 #[derive(Deserialize)]
 struct PriorityReq {
-    priority: i64,
+    priority: PriorityInput,
+}
+
+/// Decimal strings avoid browser rounding; integers preserve the CLI contract.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PriorityInput {
+    Decimal(String),
+    Integer(i64),
+}
+
+impl PriorityInput {
+    fn value(self) -> Result<i64, Response> {
+        const ERROR: &str = "Enter a whole number from -9223372036854775808 to 9223372036854775807.";
+        match self {
+            Self::Integer(value) => Ok(value),
+            Self::Decimal(value) => {
+                let value = value.trim();
+                let digits = value.strip_prefix('-').unwrap_or(value);
+                if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+                    return Err(json_error(StatusCode::BAD_REQUEST, ERROR));
+                }
+                value.parse::<i64>().map_err(|_| json_error(StatusCode::BAD_REQUEST, ERROR))
+            }
+        }
+    }
 }
 
 async fn set_priority(State(s): State<AppState>, h: HeaderMap, Path(id): Path<String>, Json(req): Json<PriorityReq>) -> Res {
     admin(&s, &h).await?;
-    if !s.db.set_account_priority(&id, req.priority).await.map_err(internal)? {
+    let priority = req.priority.value()?;
+    if !s.db.set_account_priority(&id, priority).await.map_err(internal)? {
         return Err(json_error(StatusCode::NOT_FOUND, "no such account"));
     }
-    ok(json!({"id": id, "priority": req.priority}))
+    ok(json!({"id": id, "priority": priority, "priority_decimal": priority.to_string()}))
 }
 
 async fn refresh_usage(State(s): State<AppState>, h: HeaderMap, Path(id): Path<String>) -> Res {

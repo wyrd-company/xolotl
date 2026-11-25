@@ -3678,3 +3678,28 @@ async fn unreachable_nats_does_not_block_proxy_or_admin() {
         export.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn account_priority_decimal_roundtrips_and_validates_signed_range() {
+    let h = harness().await;
+    let id = h.codex_account().await;
+    let path = format!("/admin/accounts/{id}/priority");
+    for value in [i64::MIN, i64::MAX, 9_007_199_254_740_993, -9_007_199_254_740_993, 0] {
+        let (status, saved) = h.call("POST", &path, Some(&h.admin), Some(json!({"priority": value.to_string()}))).await;
+        assert_eq!(status, 200, "{saved}");
+        assert_eq!(saved["priority_decimal"], value.to_string());
+        assert_eq!(h.state.db.get_account(&id).await.unwrap().unwrap().priority, value);
+        let (_, listed) = h.call("GET", "/admin/accounts", Some(&h.admin), None).await;
+        assert_eq!(listed[0]["priority_decimal"], value.to_string());
+        assert_eq!(listed[0]["priority"].as_i64(), Some(value), "CLI numeric response preserved");
+    }
+    for value in ["9223372036854775808", "-9223372036854775809", "1.5", "1e3", "", "-", "+1"] {
+        let (status, error) = h.call("POST", &path, Some(&h.admin), Some(json!({"priority": value}))).await;
+        assert_eq!(status, 400, "{value}: {error}");
+        assert!(error.to_string().contains("whole number"));
+        assert_eq!(h.state.db.get_account(&id).await.unwrap().unwrap().priority, 0, "invalid input must not mutate");
+    }
+    let (status, _) = h.call("POST", &path, Some(&h.admin), Some(json!({"priority": i64::MAX}))).await;
+    assert_eq!(status, 200, "CLI numeric request preserved");
+    assert_eq!(h.state.db.get_account(&id).await.unwrap().unwrap().priority, i64::MAX);
+}

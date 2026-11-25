@@ -55,7 +55,7 @@ server log has the details.
 | Screen | What you can do |
 |---|---|
 | Overview | Reload from OpenBao with loaded counts and errors, model discovery status, fixable failures with **Replace key** or **Log in again** links, OpenBao and SQLite health, configured account pools with state bars and usage windows, Claude and Codex reset credit totals, traffic and provider split for the last 24 hours, provider accounts, recent failed requests |
-| [Accounts](accounts.md) | Pool accounts by provider with their state and cooldown reason: refresh usage, refresh models, enable or disable. Details: set priority, **Retry**, log in again (OAuth accounts) or replace the key (API-key accounts), remove, last error, Claude and Codex reset credits. Provider accounts with their kind, key state and base URL: set or replace the key, remove the ones added here. The **Providers** tab shows only provider accounts |
+| [Accounts](accounts.md) | Pool accounts by provider with their state and cooldown reason: refresh usage, refresh models, enable or disable. Details: set exact signed 64-bit priority with inline validation, **Retry**, log in again (OAuth accounts) or replace the key (API-key accounts), remove, last error, Claude and Codex reset credits. Provider accounts with their kind, key state and base URL: set or replace the key, remove the ones added here. The **Providers** tab shows only provider accounts |
 | [Add account](accounts.md#add-an-account) | Every account kind. Subscriptions: Codex device or browser login, Claude login, OpenCode Go key, import of a CLI credential file. Providers: kind, name, base URL, API key or no key, extra headers |
 | [Policies](policies-and-keys.md#write-a-policy) | Providers and the accounts of each subscription provider, scopes (with `key_policies` under the `keys` scope), MCP access, rate limits (in total, per provider and per account) with the policy's consumption, and the model list (below). Each section folds away |
 | [Client keys](policies-and-keys.md#issue-a-client-key) | Issue with custom expiry, rotate with custom grace, enable or disable, revoke by row or client ID. Creation/rotation timestamps and all current usage counters, with limits where set. Shows the OpenBao path and retrieval instructions when deployment status is available. Never shows the key |
@@ -154,6 +154,13 @@ The **Policies** screen shows the models of a policy in two modes.
   show or hide denied models.
 - **Precedence:** set the order of the providers for shared names. See
 [Policies and client keys](policies-and-keys.md).
+
+The **Resolved routes** section lists every exposed model name, ordered targets,
+and native and translated endpoints. Below it, **Subscription accounts** shows
+allowed account IDs or an explicit empty pool. Failed account reads have a retry.
+Save warnings remain visible above the editor. Stored policies that did not load
+can be deleted beside their error after confirmation, once they have no keys.
+Status and key-list failures show their cause with **Retry**.
 
 ### Usage
 

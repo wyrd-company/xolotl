@@ -220,7 +220,13 @@ You can move a login from the Codex CLI (`~/.codex/auth.json`) or Claude Code
 (`~/.claude/.credentials.json`) into xolotl.
 
 1. Under **Import a login**, pick the **Provider**.
-2. Choose the **Credential file** and select **Import**.
+2. Enter a **Label (optional)**, such as `Work subscription`. Leave it blank to
+   use the identity from the credential file.
+3. Choose the **Credential file** and select **Import**. The label appears in
+   **Accounts**. If the file is invalid or the import fails, the entered label
+   and file stay in the form so you can correct them and retry.
+
+![Import a login with the optional Work subscription label and auth.json selected](assets/account-import.png)
 
 With the CLI:
 
@@ -272,7 +278,21 @@ On the **Accounts** screen:
 - **Disable** and **Enable** on a row take the account out of rotation and put
   it back.
 - In the account's details, set **Priority (higher is used first)**, select
-  **Retry** to clear a cooldown or re-login state, or **Remove** the account.
+  **Save priority** to save it, **Retry** to clear a cooldown or re-login state,
+  or **Remove** the account.
+
+Priority accepts whole numbers from `-9223372036854775808` to
+`9223372036854775807`, including negative values. Every digit is saved and
+shown exactly. Fractions, exponent notation such as `1e3`, blank values and
+values outside that range show an error beside the field. Your entry stays
+in place when validation or saving fails.
+
+![Account details showing the maximum signed 64-bit priority without rounding](assets/account-priority.png)
+
+This recording imports a labeled login, opens its details, saves an exact
+priority and shows the validation error for a value outside the accepted range.
+
+![Importing a labeled account and saving an exact priority, followed by an invalid priority error](assets/account-forms.gif)
 
 With the CLI:
 

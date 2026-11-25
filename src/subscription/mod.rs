@@ -775,7 +775,7 @@ impl Subscriptions {
 
         // Best tier: not soft-limited first, then highest priority.
         let soft = self.cfg.soft_limit_percent;
-        let tier = |(r, used): &(AccountRow, f64)| (*used >= soft, -r.priority);
+        let tier = |(r, used): &(AccountRow, f64)| (*used >= soft, std::cmp::Reverse(r.priority));
         let best = candidates.iter().map(tier).min().expect("non-empty");
         let group: Vec<usize> = (0..candidates.len()).filter(|&i| tier(&candidates[i]) == best).collect();
         match self.cfg.strategy {

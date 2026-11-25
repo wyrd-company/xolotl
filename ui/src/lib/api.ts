@@ -132,6 +132,8 @@ export interface Account {
   plan: string | null;
   enabled: boolean;
   priority: number;
+  /** Exact signed 64-bit value; use this for browser display and editing. */
+  priority_decimal: string;
   cooldown_until: number | null;
   cooldown_reason: string | null;
   auth_failed: boolean;
@@ -210,6 +212,8 @@ export type Consumption = Required<Allowance>;
 
 export interface PolicyView {
   policy: string;
+  /** Allowed subscription pools and their account IDs; null means the read failed. */
+  accounts: Record<string, string[]> | null;
   models: { name: string; targets: string[]; endpoints: string[]; translated_endpoints: string[]; alias: boolean }[];
   shared: { model: string; providers: string[]; winner: string }[];
   /** Every model of the allowed providers, allowed or not. */
@@ -222,6 +226,11 @@ export interface PolicyView {
   /** The same, per limited provider and per limited account. */
   provider_usage?: Record<string, Consumption>;
   account_usage?: Record<string, Consumption>;
+}
+
+/** Saving succeeds even when the server returns advisory warnings. */
+export interface SavedPolicy extends Policy {
+  warnings?: string[];
 }
 
 export interface RevokeResult {

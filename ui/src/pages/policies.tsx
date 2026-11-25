@@ -32,6 +32,7 @@ import {
   type McpServer,
   type Policy,
   type PolicyView,
+  type SavedPolicy,
   type Scope,
   type Status,
   type UnloadedPolicy,
@@ -42,6 +43,7 @@ import { cn } from "@/lib/utils";
 
 import { lines, ModelList } from "./policy-model-list";
 import { ProviderAccess } from "./policy-providers";
+import { PolicyInspection, SavedPolicyWarnings } from "./policy-inspection";
 
 /** Route segment for an unsaved policy; `+` can't appear in policy names. */
 const NEW = "+new";
@@ -55,6 +57,7 @@ const SCOPES: [Scope, string][] = [
 
 export function PoliciesPage() {
   const { name } = useParams();
+  const [saved, setSaved] = useState<SavedPolicy | null>(null);
   const policies = useQuery({ queryKey: ["policies"], queryFn: () => get<Policy[]>("/admin/policies") });
   const keys = useQuery({ queryKey: ["keys"], queryFn: () => get<KeyInfo[]>("/admin/keys") });
   const status = useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/admin/status") });
@@ -77,8 +80,11 @@ export function PoliciesPage() {
           </Link>
         </Button>
       </PageHeader>
-      <QueryError error={policies.error} />
-      <UnloadedPolicies policies={unloaded} />
+      <PolicyQueryError title="Could not load policies" error={policies.error} retry={() => policies.refetch()} pending={policies.isFetching} />
+      <PolicyQueryError title="Could not check for unloaded policies" error={status.error} retry={() => status.refetch()} pending={status.isFetching} />
+      <PolicyQueryError title="Could not check which policies have keys" error={keys.error} retry={() => keys.refetch()} pending={keys.isFetching} />
+      <UnloadedPolicies policies={unloaded} keyCount={keyCount} keysReady={keys.isSuccess && !keys.error} />
+      {saved && saved.name === name && <SavedPolicyWarnings warnings={saved.warnings ?? []} />}
       <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
         <aside aria-label="Policies" className="flex shrink-0 flex-col gap-1 lg:w-56">
           {list.map((p) => (
@@ -104,8 +110,8 @@ export function PoliciesPage() {
           )}
         </aside>
         <div className="min-w-0 flex-1">
-          {name === NEW && <PolicyEditor key={NEW} initial={null} keyCount={0} />}
-          {current && <PolicyEditor key={current.name} initial={current} keyCount={keyCount(current.name)} />}
+          {name === NEW && <PolicyEditor key={NEW} initial={null} keyCount={0} keysReady={keys.isSuccess && !keys.error} onSaved={setSaved} />}
+          {current && <PolicyEditor key={current.name} initial={current} keyCount={keyCount(current.name)} keysReady={keys.isSuccess && !keys.error} onSaved={setSaved} />}
           {name && name !== NEW && policies.isSuccess && !current && !unloaded.some((p) => p.name === name) && (
             <Empty>No policy named {name}.</Empty>
           )}
@@ -116,7 +122,7 @@ export function PoliciesPage() {
 }
 
 /** Stored policies the server could not load: they are in no list, and their keys get 401. */
-export function UnloadedPolicies({ policies }: { policies: UnloadedPolicy[] }) {
+export function UnloadedPolicies({ policies, keyCount, keysReady = false }: { policies: UnloadedPolicy[]; keyCount?: (name: string) => number; keysReady?: boolean }) {
   if (!policies.length) return null;
   return (
     <Alert variant="destructive" aria-label="Policies that did not load">
@@ -127,12 +133,39 @@ export function UnloadedPolicies({ policies }: { policies: UnloadedPolicy[] }) {
           {policies.map((p) => (
             <li key={p.name} className="break-words">
               <span className="font-mono font-medium">{p.name}</span>: {p.error}
+              {keyCount && <UnloadedPolicyDelete name={p.name} keyCount={keyCount(p.name)} keysReady={keysReady} />}
             </li>
           ))}
         </ul>
       </AlertDescription>
     </Alert>
   );
+}
+
+function UnloadedPolicyDelete({ name, keyCount, keysReady }: { name: string; keyCount: number; keysReady: boolean }) {
+  const navigate = useNavigate();
+  const { name: selected } = useParams();
+  const remove = useAction(() => del(`/admin/policies/${encodeURIComponent(name)}`), {
+    invalidate: [["policies"], ["status"]],
+    success: `Deleted policy ${name}`,
+    onSuccess: () => { if (selected === name) navigate("/policies"); },
+  });
+  return (
+    <div className="my-2 flex flex-wrap items-center gap-2">
+      <Confirm title={`Delete unloaded policy ${name}?`} description="This removes the stored policy from OpenBao. A policy with keys cannot be deleted." action="Delete policy" onConfirm={() => remove.mutate(undefined)}>
+        <Button variant="outline" disabled={!keysReady || keyCount > 0 || remove.isPending} aria-label={`Delete unloaded policy ${name}`}>
+          {remove.isPending ? "Deleting…" : "Delete policy…"}
+        </Button>
+      </Confirm>
+      {!keysReady ? <span>Key usage is unavailable until the key list loads.</span> : keyCount > 0 && <span>A policy with keys can't be deleted.</span>}
+      <QueryError error={remove.error} />
+    </div>
+  );
+}
+
+export function PolicyQueryError({ title, error, retry, pending }: { title: string; error: Error | null; retry: () => void; pending: boolean }) {
+  if (!error) return null;
+  return <Alert variant="destructive" role="alert"><AlertTitle>{title}</AlertTitle><AlertDescription><p>{error.message}</p><Button type="button" variant="outline" disabled={pending} onClick={retry}>{pending ? "Retrying…" : "Retry"}</Button></AlertDescription></Alert>;
 }
 
 export interface Draft {
@@ -249,7 +282,7 @@ function useDebounced<T>(value: T, ms: number): T {
   return v;
 }
 
-function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount: number }) {
+function PolicyEditor({ initial, keyCount, keysReady, onSaved }: { initial: Policy | null; keyCount: number; keysReady: boolean; onSaved: (policy: SavedPolicy) => void }) {
   const navigate = useNavigate();
   const isNew = initial === null;
   const [draft, setDraft] = useState<Draft>(() => toDraft(initial));
@@ -266,22 +299,28 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
 
   const policy = useMemo(() => toPolicy(draft), [draft]);
   const debounced = useDebounced(policy, 400);
+  const dirty = JSON.stringify(policy) !== JSON.stringify(toPolicy(toDraft(initial)));
+  const pristineNew = isNew && !dirty;
+  const previewHasEdits = !isNew || JSON.stringify(debounced) !== JSON.stringify(toPolicy(toDraft(null)));
   const preview = useQuery({
     queryKey: ["policy-view", debounced],
     queryFn: () => post<PolicyView>("/admin/policy-preview", debounced),
-    enabled: debounced.providers.length > 0 || (debounced.mcp_servers ?? []).length > 0,
+    enabled: previewHasEdits,
     placeholderData: (prev) => prev,
     retry: false,
   });
+  // An untouched form is not a failed policy, even if a previous visit cached a validation error.
+  const previewData = !pristineNew && previewHasEdits ? preview.data : undefined;
+  const previewError = !pristineNew && previewHasEdits ? preview.error : null;
+  const previewPending = !pristineNew && (preview.isFetching || policy !== debounced);
 
-  const dirty = JSON.stringify(policy) !== JSON.stringify(toPolicy(toDraft(initial)));
-  const save = useAction(() => put<Policy>(`/admin/policies/${policy.name}`, policy), {
-    invalidate: [["policies"]],
+  const save = useAction(() => put<SavedPolicy>(`/admin/policies/${encodeURIComponent(policy.name)}`, policy), {
+    invalidate: [["policies"], ["status"]],
     success: `Saved policy ${policy.name}`,
-    onSuccess: (p) => isNew && navigate(`/policies/${p.name}`),
+    onSuccess: (p) => { onSaved(p); if (isNew) navigate(`/policies/${p.name}`); },
   });
   const remove = useAction(() => del(`/admin/policies/${initial!.name}`), {
-    invalidate: [["policies"]],
+    invalidate: [["policies"], ["status"]],
     success: `Deleted policy ${initial?.name}`,
     onSuccess: () => navigate("/policies"),
   });
@@ -301,7 +340,7 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
       }}
     >
       <SaveToolbar label="Policy actions">
-        <Button type="submit" disabled={!dirty || !policy.name || !!preview.error || save.isPending}>
+        <Button type="submit" disabled={!dirty || !policy.name || !!previewError || save.isPending}>
           {isNew ? "Create policy" : "Save policy"}
         </Button>
         {dirty && !isNew && (
@@ -316,7 +355,7 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
             action="Delete"
             onConfirm={() => remove.mutate(undefined)}
           >
-            <Button type="button" variant="outline" className="text-destructive" disabled={keyCount > 0 || remove.isPending}>
+            <Button type="button" variant="outline" className="text-destructive" disabled={!keysReady || keyCount > 0 || remove.isPending}>
               Delete
             </Button>
           </Confirm>
@@ -379,25 +418,28 @@ function PolicyEditor({ initial, keyCount }: { initial: Policy | null; keyCount:
         </SectionContent>
       </Section>
 
-      <ProviderAccess draft={draft} set={set} known={known} accounts={accounts.data ?? []} health={health} ready={accounts.isSuccess} />
+      <PolicyQueryError title="Provider accounts could not be read" error={accounts.error} retry={() => accounts.refetch()} pending={accounts.isFetching} />
+      <ProviderAccess draft={draft} set={set} known={known} accounts={accounts.data ?? []} health={health} ready={accounts.isSuccess && !accounts.error} />
 
       <ModelList
         allowedProviders={allowed}
         draft={draft}
         set={set}
-        view={preview.data}
-        fetching={preview.isFetching}
-        error={preview.error}
+        view={previewData}
+        fetching={previewPending}
+        error={previewError}
         health={health}
         precedence={{ order, move, reset: draft.precedence.length > 0 ? () => set("precedence", []) : undefined }}
       />
 
-      <McpAccess draft={draft} set={set} tools={preview.data?.tools ?? []} />
+      <PolicyInspection view={previewData} error={previewError} pending={previewPending} retry={() => preview.refetch()} />
+
+      <McpAccess draft={draft} set={set} tools={previewData?.tools ?? []} />
 
       <PolicyLimits
         limits={draft.limits}
         onChange={(l) => set("limits", l)}
-        view={isNew ? undefined : preview.data}
+        view={isNew ? undefined : previewData}
         providers={allowed}
         accounts={(accounts.data ?? []).filter((a) => allowed.includes(a.provider) && allowsAccount(draft.accounts, a.provider, a.id))}
       />

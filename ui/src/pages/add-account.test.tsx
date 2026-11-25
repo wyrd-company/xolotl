@@ -44,6 +44,8 @@ test("add account lists pool kinds and one provider form from the server's kinds
   expect(html).toContain("Pool with a key");
   expect(html).toContain('id="add-opencode-go-key"');
   expect(html).toContain("Import a login");
+  expect(html).toContain('for="import-label"');
+  expect(html).toContain("Label (optional)");
   expect(html).toContain("Provider account");
   expect(html).toContain('id="provider-name"');
   // The first provider kind has a default URL, so the field is optional.
