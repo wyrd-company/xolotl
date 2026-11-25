@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router";
 import { toast } from "sonner";
 
+import { CatalogRefresh } from "@/components/catalog-refresh";
 import { PageHeader, QueryError } from "@/components/layout";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -175,7 +176,10 @@ function DeviceCode({ flow, name, onDone }: { flow: FlowStart; name: string; onD
   const status = useQuery({
     queryKey: ["flow", flow.flow_id],
     queryFn: () => get<FlowStatus>(`/admin/auth/flows/${flow.flow_id}`),
-    refetchInterval: (q) => (q.state.data?.status === "pending" || !q.state.data ? 3000 : false),
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    refetchInterval: (q) => q.state.error ? false : (q.state.data?.status === "pending" || !q.state.data ? 3000 : false),
   });
 
   useEffect(() => {
@@ -200,9 +204,17 @@ function DeviceCode({ flow, name, onDone }: { flow: FlowStart; name: string; onD
         <div className="text-muted-foreground text-sm">and enter</div>
         <div className="font-mono text-3xl font-medium tracking-widest select-all">{flow.user_code}</div>
       </div>
-      <div role="status" className="text-info text-sm">
-        Waiting for authorization… (the code expires after 15 minutes)
-      </div>
+      {status.error ? (
+        <div role="alert" className="text-destructive text-sm">
+          <p className="font-medium">Could not check login status</p>
+          <p>{status.error.message}. A successful login has not been confirmed. Start a new login to try again.</p>
+        </div>
+      ) : (
+        <div role="status" className="text-info text-sm">
+          Waiting for authorization… (the code expires after 15 minutes)
+        </div>
+      )}
+      {status.error && <Button className="self-start" onClick={onDone}>Start new login</Button>}
       <Button variant="ghost" className="self-start" onClick={onDone}>
         Cancel
       </Button>
@@ -492,6 +504,7 @@ function ImportLogin({ kinds }: { kinds: AccountKindInfo[] }) {
   const [file, setFile] = useState<File | null>(null);
   const [label, setLabel] = useState("");
   const [inputKey, setInputKey] = useState(0);
+  const [imported, setImported] = useState<(Account & { catalog_refresh: CatalogRefreshResult }) | null>(null);
   const loggedIn = useLoggedIn();
   const imp = useAction(
     async () => {
@@ -501,11 +514,12 @@ function ImportLogin({ kinds }: { kinds: AccountKindInfo[] }) {
       } catch {
         throw new Error("That file is not JSON.");
       }
-      return post<Account>("/admin/accounts/import", { provider, data, label: label.trim() || null });
+      return post<Account & { catalog_refresh: CatalogRefreshResult }>("/admin/accounts/import", { provider, data, label: label.trim() || null });
     },
     {
       onSuccess: (a) => {
         loggedIn(a.email);
+        setImported(a);
         setFile(null);
         setLabel("");
         setInputKey((k) => k + 1);
@@ -527,6 +541,7 @@ function ImportLogin({ kinds }: { kinds: AccountKindInfo[] }) {
         className="flex flex-col gap-4"
         onSubmit={(e) => {
           e.preventDefault();
+          setImported(null);
           imp.mutate(undefined);
         }}
       >
@@ -561,9 +576,28 @@ function ImportLogin({ kinds }: { kinds: AccountKindInfo[] }) {
         </div>
         {imp.error && <p role="alert" className="text-destructive text-sm">{imp.error.message} Your label and selected file are kept. Correct the input or retry.</p>}
         <Button type="submit" className="self-start" disabled={!file || imp.isPending}>
-          Import
+          {imp.isPending ? "Importing…" : "Import"}
         </Button>
       </form>
+      {imported && (
+        <div className="flex flex-col gap-3">
+          <div role="status" className="text-sm">
+            <p className="font-medium">Imported {imported.label || imported.email || imported.id}</p>
+            <p>Account ID: {imported.id} · provider: {imported.provider}. The imported credentials are saved.</p>
+            {!imported.catalog_refresh.error && <p>{imported.catalog_refresh.provider}: {imported.catalog_refresh.models} models found.</p>}
+          </div>
+          {imported.catalog_refresh.error && (
+            <>
+              <div role="alert" className="text-warning text-sm">
+                <p className="font-medium">Model discovery failed</p>
+                <p>{imported.catalog_refresh.provider}: {imported.catalog_refresh.error}</p>
+                <p>The imported credentials are saved. Retry Refresh models.</p>
+              </div>
+              <CatalogRefresh providers={[imported.provider]} />
+            </>
+          )}
+        </div>
+      )}
     </Section>
   );
 }
