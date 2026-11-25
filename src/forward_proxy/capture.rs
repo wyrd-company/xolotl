@@ -4,6 +4,8 @@
 //! bounded copy of each body, reads the model, session and usage from them,
 //! and submits one [`Forwarded`] to the [`CaptureSink`].
 
+mod coding;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -13,9 +15,12 @@ use http::HeaderMap;
 use opentelemetry::{KeyValue, metrics::Counter};
 use parking_lot::Mutex;
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use self::coding::Coding;
 use crate::context::SessionId;
 use crate::export::Captured;
 use crate::proxy::TokenUsage;
@@ -33,6 +38,7 @@ const MAX_TOOL_NAME: usize = 128;
 pub(crate) const SESSION_SOURCE: &str = "cloud-code";
 /// A key longer than this is never one of the keys the scanner looks for.
 const MAX_KEY: usize = 16;
+const DECODE_CHUNK: usize = 16 * 1024;
 
 /// One captured request on an intercepted host.
 #[derive(Debug, Clone)]
@@ -270,16 +276,20 @@ struct CaptureTask {
 
 impl CaptureTask {
     async fn run(mut self, hold: CaptureHold, admission: Admission) {
-        let mut bodies = [BodyCapture::new(Direction::Request), BodyCapture::new(Direction::Response)];
+        let mut bodies = [BodyInput::new(Direction::Request), BodyInput::new(Direction::Response)];
         while let Some(event) = self.rx.recv().await {
             match event {
-                Event::Head(direction, head) => bodies[direction as usize].head(head, self.body_limit),
+                Event::Head(direction, head) => {
+                    bodies[direction as usize] = BodyInput::from_head(direction, head, self.body_limit, self.max_decoded)
+                }
                 Event::Frame(direction, data) => {
+                    bodies[direction as usize].frame(&data, self.max_decoded).await;
                     self.waiting.fetch_sub(data.len(), Ordering::AcqRel);
-                    bodies[direction as usize].frame(&data, self.max_decoded);
                 }
                 Event::End(direction) => bodies[direction as usize].end(),
                 Event::Terminal(terminal) => {
+                    let [request, response] = bodies;
+                    let bodies = [request.into_capture().await, response.into_capture().await];
                     let skipped = bodies.iter().any(|body| body.skipped);
                     let (forwarded, cut) = forwarded(admission, bodies, &terminal);
                     let capture = if skipped {
@@ -310,6 +320,16 @@ fn forwarded(admission: Admission, bodies: [BodyCapture; 2], terminal: &Terminal
     let [request, response] = bodies;
     let lost = |d: Direction| terminal.relayed[d as usize] > terminal.queued[d as usize];
     let complete = request.complete() && response.complete() && !lost(Direction::Request) && !lost(Direction::Response);
+    let error = terminal.error.clone().or_else(|| {
+        let body = if request.decode_error {
+            "request"
+        } else if response.decode_error {
+            "response"
+        } else {
+            return None;
+        };
+        Some(format!("capture_error: could not decode the {body} Content-Encoding"))
+    });
     let observed = Observed {
         model: request.scanner.model.clone(),
         session_key: request.scanner.session.as_deref().map(|value| SessionId::sent(SESSION_SOURCE, value).key),
@@ -330,9 +350,94 @@ fn forwarded(admission: Admission, bodies: [BodyCapture; 2], terminal: &Terminal
         request,
         response,
         observed,
-        error: terminal.error.clone(),
+        error,
     };
     (forwarded, request_cut || response_cut)
+}
+
+enum BodyInput {
+    Plain(Box<BodyCapture>),
+    Encoded { input: Option<DuplexStream>, capture: JoinHandle<Box<BodyCapture>> },
+}
+
+impl BodyInput {
+    fn new(direction: Direction) -> Self {
+        Self::Plain(Box::new(BodyCapture::new(direction)))
+    }
+
+    fn from_head(direction: Direction, head: Head, body_limit: Option<usize>, max_decoded: usize) -> Self {
+        let mut capture = Box::new(BodyCapture::new(direction));
+        capture.head(head.sse, head.text, body_limit);
+        let Some(encoding) = head.encoding else { return Self::Plain(capture) };
+        let Some(layers) = Coding::parse(&encoding) else {
+            capture.skipped = true;
+            capture.complete = false;
+            capture.readable = false;
+            capture.copy = None;
+            return Self::Plain(capture);
+        };
+        let (input, source) = tokio::io::duplex(DECODE_CHUNK);
+        let worker = tokio::spawn(async move {
+            let mut decoder = Coding::reader(layers, source);
+            let mut buf = [0; DECODE_CHUNK];
+            loop {
+                let room = max_decoded.saturating_sub(capture.decoded);
+                // One extra byte distinguishes the exact limit from a cut.
+                let read = room.saturating_add(1).min(buf.len());
+                match decoder.read(&mut buf[..read]).await {
+                    Ok(0) => {
+                        capture.end();
+                        break;
+                    }
+                    Ok(n) => {
+                        capture.frame(&buf[..n], max_decoded);
+                        if n > room {
+                            break;
+                        }
+                        tokio::task::consume_budget().await;
+                    }
+                    Err(_) => {
+                        capture.decode_error = true;
+                        capture.mark_cut();
+                        break;
+                    }
+                }
+            }
+            capture
+        });
+        Self::Encoded { input: Some(input), capture: worker }
+    }
+
+    async fn frame(&mut self, data: &[u8], max_decoded: usize) {
+        match self {
+            Self::Plain(capture) => capture.frame(data, max_decoded),
+            Self::Encoded { input, .. } => {
+                if let Some(writer) = input
+                    && writer.write_all(data).await.is_err()
+                {
+                    // The decoder stopped at the limit, end of stream or an error.
+                    *input = None;
+                }
+            }
+        }
+    }
+
+    fn end(&mut self) {
+        match self {
+            Self::Plain(capture) => capture.end(),
+            Self::Encoded { input, .. } => *input = None,
+        }
+    }
+
+    async fn into_capture(self) -> BodyCapture {
+        match self {
+            Self::Plain(capture) => *capture,
+            Self::Encoded { input, capture } => {
+                drop(input);
+                *capture.await.expect("capture decoder task panicked")
+            }
+        }
+    }
 }
 
 /// One direction's body, as the capture task sees it.
@@ -346,6 +451,7 @@ struct BodyCapture {
     readable: bool,
     /// The body is in a coding xolotl doesn't decode.
     skipped: bool,
+    decode_error: bool,
     decoded: usize,
     scanner: Scanner,
     json: Vec<u8>,
@@ -364,6 +470,7 @@ impl BodyCapture {
             sse: false,
             readable: true,
             skipped: false,
+            decode_error: false,
             decoded: 0,
             scanner: Scanner::default(),
             json: Vec::new(),
@@ -374,21 +481,24 @@ impl BodyCapture {
         }
     }
 
-    fn head(&mut self, head: Head, body_limit: Option<usize>) {
-        self.sse = head.sse;
-        if head.encoding.is_some() {
-            // A coding xolotl doesn't decode: the body is neither copied nor read.
-            self.readable = false;
-            self.skipped = true;
-            self.complete = false;
-        }
-        self.copy = (self.readable && head.text)
-            .then_some(body_limit)
-            .flatten()
-            .map(|limit| (Captured { sse: head.sse, ..Default::default() }, limit));
+    fn head(&mut self, sse: bool, text: bool, body_limit: Option<usize>) {
+        self.sse = sse;
+        self.copy = body_limit.filter(|_| text).map(|limit| (Captured { sse, ..Default::default() }, limit));
     }
 
     fn frame(&mut self, data: &[u8], max_decoded: usize) {
+        if self.skipped {
+            self.uncopied |= !data.is_empty();
+            return;
+        }
+        let room = max_decoded.saturating_sub(self.decoded);
+        let data = if data.len() > room {
+            self.mark_cut();
+            &data[..room]
+        } else {
+            data
+        };
+        self.decoded += data.len();
         match &mut self.copy {
             Some((captured, limit)) => captured.push(data, *limit),
             None => self.uncopied |= !data.is_empty(),
@@ -396,15 +506,6 @@ impl BodyCapture {
         if !self.readable {
             return;
         }
-        let room = max_decoded.saturating_sub(self.decoded);
-        let data = if data.len() > room {
-            self.complete = false;
-            self.readable = false;
-            &data[..room]
-        } else {
-            data
-        };
-        self.decoded += data.len();
         match (self.direction, self.sse) {
             (Direction::Request, _) => self.scanner.feed(data),
             (Direction::Response, true) => {
@@ -421,6 +522,15 @@ impl BodyCapture {
                     self.json.extend_from_slice(data);
                 }
             }
+        }
+    }
+
+    fn mark_cut(&mut self) {
+        self.complete = false;
+        if let Some((copy, _)) = &mut self.copy {
+            copy.truncated = true;
+        } else {
+            self.uncopied = true;
         }
     }
 
@@ -443,7 +553,6 @@ impl BodyCapture {
         }
     }
 
-    /// The copy, and whether it was cut or lost bytes.
     /// Whether the metadata read from this body is whole: no limit skipped
     /// any of it, including a field the scanner dropped or an SSE event over
     /// the scan limit.
@@ -451,6 +560,7 @@ impl BodyCapture {
         self.complete && !self.scanner.overflow && !self.events.skipped
     }
 
+    /// The copy, and whether it was cut or lost bytes.
     fn into_captured(self, lost: bool) -> (Captured, bool) {
         match self.copy {
             Some((mut captured, _)) => {
@@ -471,7 +581,7 @@ fn observe(value: &Value, usage: &mut TokenUsage, tools: &mut Vec<String>, compl
         let count = |key: &str| metadata.get(key).and_then(Value::as_i64);
         let output = match (count("candidatesTokenCount"), count("thoughtsTokenCount")) {
             (None, None) => None,
-            (candidates, thoughts) => Some(candidates.unwrap_or(0) + thoughts.unwrap_or(0)),
+            (candidates, thoughts) => Some(candidates.unwrap_or(0).saturating_add(thoughts.unwrap_or(0))),
         };
         *usage = TokenUsage { input: count("promptTokenCount"), output, cached: count("cachedContentTokenCount"), cache_write: None };
     }
@@ -787,7 +897,7 @@ mod tests {
         for cut_request in [true, false] {
             let body = |direction, cut: bool| {
                 let mut body = BodyCapture::new(direction);
-                body.head(Head::new(Some(200), &headers(&[])), Some(4));
+                body.head(false, true, Some(4));
                 body.frame(if cut { b"0123456789" } else { b"{}" }, usize::MAX);
                 body.end();
                 body
@@ -803,10 +913,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bodies_are_copied_to_the_sinks_limit_and_coded_bodies_are_not_read() {
+    async fn bodies_are_copied_to_the_sinks_limit_and_unknown_codings_are_not_read() {
         let (tap, mut rx) = admit(Some(8));
-        tap.head(Direction::Request, Head::new(None, &headers(&[("content-type", "application/json"), ("content-encoding", "gzip")])));
-        tap.frame(Direction::Request, &Bytes::from_static(b"\x1f\x8b\x08\x00"));
+        tap.head(Direction::Request, Head::new(None, &headers(&[("content-type", "application/json"), ("content-encoding", "unknown")])));
+        tap.frame(Direction::Request, &Bytes::from_static(b"opaque"));
         tap.end(Direction::Request);
         tap.head(Direction::Response, Head::new(Some(200), &headers(&[("content-type", "application/json")])));
         tap.frame(Direction::Response, &Bytes::from_static(USAGE));
@@ -831,6 +941,88 @@ mod tests {
         assert!(row.response.bytes.is_empty());
         assert_eq!(row.observed.usage.output, Some(1));
         assert!(row.observed.complete);
+    }
+
+    async fn encode(name: &str, body: &[u8]) -> Vec<u8> {
+        use async_compression::tokio::write::{BrotliEncoder, GzipEncoder, ZlibEncoder, ZstdEncoder};
+        use tokio::io::AsyncWrite;
+
+        let mut compressed = Vec::new();
+        let mut encoder: Box<dyn AsyncWrite + Unpin + Send> = match name {
+            "gzip" | "x-gzip" => Box::new(GzipEncoder::new(&mut compressed)),
+            "deflate" => Box::new(ZlibEncoder::new(&mut compressed)),
+            "br" => Box::new(BrotliEncoder::new(&mut compressed)),
+            "zstd" => Box::new(ZstdEncoder::new(&mut compressed)),
+            _ => panic!("unknown fixture coding"),
+        };
+        encoder.write_all(body).await.unwrap();
+        encoder.shutdown().await.unwrap();
+        drop(encoder);
+        compressed
+    }
+
+    async fn coded_response(head: Head, wire: &[u8], limit: usize) -> BodyCapture {
+        let mut body = BodyInput::from_head(Direction::Response, head, Some(1024), limit);
+        for chunk in wire.chunks(3) {
+            body.frame(chunk, limit).await;
+        }
+        body.end();
+        body.into_capture().await
+    }
+
+    #[tokio::test]
+    async fn supported_encodings_are_decoded_across_frames_and_header_values() {
+        let head = |fields: &[(&'static str, &'static str)]| Head::new(Some(200), &headers(fields));
+        for (name, cap) in [("gzip", USAGE.len()), ("x-gzip", 1024), ("deflate", 1024), ("br", 1024), ("zstd", 1024)] {
+            let compressed = encode(name, USAGE).await;
+            let decoded = coded_response(head(&[("content-encoding", name)]), &compressed, cap).await;
+            assert!(decoded.complete(), "{name}");
+            assert_eq!(decoded.usage.input, Some(7), "{name}");
+            let (copy, cut) = decoded.into_captured(false);
+            assert!(!cut);
+            assert_eq!(copy.bytes, USAGE);
+        }
+
+        // A gzip body can have several members. The HTTP codings are then applied in header order.
+        let midpoint = USAGE.len() / 2;
+        let members = [encode("gzip", &USAGE[..midpoint]).await, encode("gzip", &USAGE[midpoint..]).await].concat();
+        let stacked = encode("zstd", &encode("br", &members).await).await;
+        let decoded =
+            coded_response(head(&[("content-encoding", "GZIP, identity, br"), ("content-encoding", "zstd")]), &stacked, 1024).await;
+        assert!(decoded.complete());
+        assert_eq!(decoded.usage.input, Some(7));
+        assert_eq!(decoded.into_captured(false).0.bytes, USAGE);
+    }
+
+    #[tokio::test]
+    async fn the_decoded_limit_and_invalid_codings_mark_the_copy_cut() {
+        let head = || Head::new(Some(200), &headers(&[("content-encoding", "gzip")]));
+        let compressed = encode("gzip", USAGE).await;
+        let limit = USAGE.len() - 1;
+        let bounded = coded_response(head(), &compressed, limit).await;
+        assert!(!bounded.complete());
+        assert!(!bounded.decode_error);
+        assert_eq!(bounded.usage, TokenUsage::default());
+        let (copy, cut) = bounded.into_captured(false);
+        assert!(cut && copy.truncated);
+        assert_eq!(copy.bytes, &USAGE[..limit]);
+
+        let corrupt = &compressed[..compressed.len() - 1];
+        let decoded = coded_response(head(), corrupt, 1024).await;
+        assert!(!decoded.complete());
+        assert!(decoded.decode_error);
+        let (copy, cut) = decoded.into_captured(false);
+        assert!(cut && copy.truncated);
+        assert_eq!(copy.bytes, USAGE, "retain the decoded prefix");
+
+        let mut plain = BodyCapture::new(Direction::Response);
+        plain.head(false, true, Some(1024));
+        plain.frame(USAGE, limit);
+        plain.end();
+        assert!(!plain.complete());
+        let (copy, cut) = plain.into_captured(false);
+        assert!(cut && copy.truncated);
+        assert_eq!(copy.bytes, &USAGE[..limit]);
     }
 
     #[tokio::test]

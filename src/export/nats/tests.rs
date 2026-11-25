@@ -177,7 +177,7 @@ async fn a_forwarded_exchange_uses_the_jetstream_shape_with_each_destinations_li
 #[ignore = "needs a NATS server"]
 async fn a_forwarded_exchange_reaches_jetstream_after_export_shutdown() {
     let _turn = SERVER.lock().await;
-    let Some(server) = Server::new(&[SUBJECTS], -1).await else { return };
+    let server = Server::new(&[SUBJECTS], -1).await.expect("set XOLOTL_TEST_NATS");
     let exporter = Exporter::new(vec![start(server.cfg(), None).await.unwrap()]);
     let hold = exporter.clone().hold();
     let shutdown = tokio::spawn(async move { exporter.shutdown().await });

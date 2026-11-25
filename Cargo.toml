@@ -55,6 +55,7 @@ url = "2.5.8"
 uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }
 
 x509-parser = "0.18.1"
+async-compression = { version = "0.4.54", default-features = false, features = ["tokio", "gzip", "zlib", "brotli", "zstd"] }
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.33.1", features = ["testing"] }

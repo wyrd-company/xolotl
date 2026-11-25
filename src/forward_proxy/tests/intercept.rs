@@ -35,6 +35,13 @@ fn full(body: impl Into<Bytes>) -> TestBody {
     Full::new(body.into()).map_err(|never| match never {}).boxed_unsync()
 }
 
+async fn gzip(body: &str) -> Vec<u8> {
+    let mut encoder = async_compression::tokio::write::GzipEncoder::new(Vec::new());
+    encoder.write_all(body.as_bytes()).await.unwrap();
+    encoder.shutdown().await.unwrap();
+    encoder.into_inner()
+}
+
 /// A CA of the test's own.
 fn ca(name: &str) -> CertifiedIssuer<'static, KeyPair> {
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -117,7 +124,12 @@ fn recording(seen: Arc<Mutex<Vec<Seen>>>) -> Handler {
                 .header("set-cookie", "upstream=1")
                 .header("alt-svc", "h3=\":443\"; ma=2592000");
             if target.starts_with(MODEL_PATH) {
-                builder.header("content-type", "text/event-stream").body(full(SSE_BODY)).unwrap()
+                let builder = builder.header("content-type", "text/event-stream");
+                if target.ends_with("&compressed=1") {
+                    builder.header("content-encoding", "gzip").body(full(gzip(SSE_BODY).await)).unwrap()
+                } else {
+                    builder.body(full(SSE_BODY)).unwrap()
+                }
             } else if target.starts_with("/gzip") {
                 // An opaque coded body: forwarded as sent.
                 builder
@@ -313,9 +325,13 @@ async fn model_posts_export_one_clickhouse_row_without_headers_or_oauth() {
     let s = setup(&origin, Some(export.clone()), TEST_TIMEOUT).await;
     let client = client(&s.proxy, &s.key, &[&s.pki.root, &origin.ca], false);
 
-    let model = model_request(&client).send().await.unwrap();
+    let compressed_request = gzip(REQUEST_BODY).await;
+    let mut model = model_request(&client).header("content-encoding", "gzip").body(compressed_request.clone()).build().unwrap();
+    model.url_mut().query_pairs_mut().append_pair("compressed", "1");
+    let model = client.execute(model).await.unwrap();
     assert_eq!(model.headers()["set-cookie"], "upstream=1");
-    assert_eq!(model.text().await.unwrap(), SSE_BODY);
+    assert_eq!(model.headers()["content-encoding"], "gzip");
+    assert_eq!(model.bytes().await.unwrap(), gzip(SSE_BODY).await);
     let token = client.post(format!("https://{OAUTH}/token")).body("refresh_token=oauth-fixture").send().await.unwrap();
     assert_eq!(token.text().await.unwrap(), "{}");
     let non_model = client.post(format!("https://{CAPTURE}/v1internal:loadCodeAssist")).body("non-model-fixture").send().await.unwrap();
@@ -345,7 +361,10 @@ async fn model_posts_export_one_clickhouse_row_without_headers_or_oauth() {
     assert!(row.streamed && !row.request_truncated && !row.response_truncated && row.error.is_empty());
     assert_eq!((row.output_text.as_str(), row.stop_reason.as_str()), ("PONG", "tool_use"));
     assert_eq!(row.tool_calls, ["read_file"]);
-    assert_eq!(seen.lock().unwrap().len(), 4);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4);
+    assert_eq!(seen[0].headers["content-encoding"], "gzip");
+    assert_eq!(seen[0].body, compressed_request);
 }
 
 /// An SSE response of two chunks; the second waits for `release`.
