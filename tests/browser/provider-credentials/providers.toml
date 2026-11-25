@@ -1,0 +1,18 @@
+[gateway.providers.gateway]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:36446/gateway"
+
+[gateway.providers.disabled]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:36446/disabled"
+enabled = false
+
+[gateway.providers.local]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:36446/local"
+no_auth = true
+
+[gateway.providers.federated]
+kind = "openai"
+base_url = "http://127.0.0.1:36446/federated"
+workload_identity = { token_file = "/fixture-identity-token", service_account_id = "fixture", identity_provider_id = "fixture" }
