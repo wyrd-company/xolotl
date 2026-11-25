@@ -60,8 +60,30 @@ http
         id_token: `${unsigned}.${sign("RSA-SHA256", Buffer.from(unsigned), privateKey).toString("base64url")}`,
       });
     }
+    if (url.pathname === "/oauth/token")
+      return json(res, { access_token: "synthetic-refreshed", refresh_token: "synthetic-rotated", expires_in: 3600 });
+    if (url.pathname === "/wham/usage") {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      if (mode === "recovery-usage-error")
+        return json(res, { error: "fixture usage service unavailable" }, 503);
+      if (mode === "recovery-unsaved" && req.headers.authorization !== "Bearer synthetic-refreshed")
+        return json(res, { error: "fixture access token expired" }, 401);
+      return json(res, {
+        plan_type: "team",
+        rate_limit: {
+          allowed: true,
+          primary_window: { used_percent: 18, limit_window_seconds: 18000, reset_after_seconds: 3600 },
+          secondary_window: { used_percent: 42, limit_window_seconds: 604800, reset_after_seconds: 86400 },
+        },
+        extra_diagnostics: { buckets: ["fixture", null] },
+      });
+    }
+    if (url.pathname === "/wham/rate-limit-reset-credits")
+      return json(res, { credits: Array.from({ length: 2 }, () => ({ status: "available", reset_type: "codex_rate_limits" })) });
     if (url.pathname.endsWith("/models")) {
       await new Promise((r) => setTimeout(r, 1200));
+      if (mode.startsWith("recovery-") && mode !== "recovery-model-error")
+        return json(res, { models: [{ slug: "fixture-codex-model" }] });
       return json(
         res,
         { error: { message: "fixture upstream unavailable" } },

@@ -4,7 +4,8 @@ class Proxy(BaseHTTPRequestHandler):
  def forward(self):
   with urllib.request.urlopen('http://localhost:35444/fixture/mode') as r: mode=json.load(r)['mode']
   if '/metadata/' in self.path and mode == 'slow': time.sleep(.5)
-  if '/metadata/' in self.path and mode == 'failed':
+  if ('/metadata/' in self.path and mode == 'failed') or (
+     '/data/xolotl/accounts/codex/' in self.path and self.command in ('POST', 'PUT') and mode == 'recovery-unsaved'):
    body=b'{"errors":["fixture permission denied"]}'
    self.send_response(403); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body); return
   c=http.client.HTTPConnection('127.0.0.1',35200)

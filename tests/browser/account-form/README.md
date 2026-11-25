@@ -44,6 +44,16 @@ resources in your ledger, and copy this directory's scripts there. Set
    docker exec xolotl-account-form-browser node /evidence/capture.cjs
    ```
 
+For the account recovery and usage workflow, run
+`docker exec xolotl-account-form-browser node /evidence/recovery.cjs` after
+sign-in. It imports a synthetic Codex account through the UI, polls usage while
+disabled, checks the returned diagnostics and upstream errors, and triggers an
+OAuth refresh while fixture OpenBao writes are denied. It writes
+`recovery-result.json`, desktop and phone captures, `account-recovery.png`, and
+`account-recovery.webm`. Use the FFmpeg command below with `account-recovery`
+in place of `account-forms`. Copy `account-recovery.png` and
+`account-recovery.gif` to `docs/user/assets/`.
+
 `acceptance-result.json` starts failed and becomes passed only after all assertions.
 `a11y-result.json` records axe violations for the changed import form and priority
 dialog in light/dark themes. `capture.cjs` writes `account-import.png`,
