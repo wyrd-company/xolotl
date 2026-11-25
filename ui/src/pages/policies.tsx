@@ -144,10 +144,11 @@ export function UnloadedPolicies({ policies, keyCount, keysReady = false }: { po
 
 function UnloadedPolicyDelete({ name, keyCount, keysReady }: { name: string; keyCount: number; keysReady: boolean }) {
   const navigate = useNavigate();
+  const { name: selected } = useParams();
   const remove = useAction(() => del(`/admin/policies/${encodeURIComponent(name)}`), {
     invalidate: [["policies"], ["status"]],
     success: `Deleted policy ${name}`,
-    onSuccess: () => navigate("/policies"),
+    onSuccess: () => { if (selected === name) navigate("/policies"); },
   });
   return (
     <div className="my-2 flex flex-wrap items-center gap-2">

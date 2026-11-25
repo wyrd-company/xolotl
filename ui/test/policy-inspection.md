@@ -7,6 +7,8 @@ responses; the key-use deletion refusal comes from the real server. The run firs
 opens an untouched New policy form, waits for the initial network requests to
 settle, and verifies that no invalid preview is submitted. Editing an incomplete
 draft then checks that real server validation is shown once without Retry.
+Deleting an unrelated unloaded policy must preserve the open policy route and its
+unsaved description.
 
 Seed the fixture before starting Xolotl:
 

@@ -127,6 +127,7 @@ const fault = (route, message) => route.fulfill({ status: 503, contentType: 'app
     await page.unroute('**/admin/keys');
     check('Real server rejects unloaded-policy deletion despite stale key list; cause stays visible');
 
+    await page.getByLabel('Description', { exact: true }).fill('Keep this unsaved policy description');
     const broken = page.getByRole('button', { name: 'Delete unloaded policy broken', exact: true });
     await broken.click();
     await page.getByRole('alertdialog').getByRole('button', { name: 'Cancel', exact: true }).click();
@@ -134,10 +135,13 @@ const fault = (route, message) => route.fulfill({ status: 503, contentType: 'app
     await broken.click();
     await page.getByRole('alertdialog').getByRole('button', { name: 'Delete policy', exact: true }).click();
     await broken.waitFor({ state: 'detached' });
+    assert.equal(page.url(), `${base}/#/policies/routes`);
+    assert.equal(await page.getByLabel('Description', { exact: true }).inputValue(), 'Keep this unsaved policy description');
+    await page.screenshot({ path: `${output}/navigation-preserved.png`, fullPage: true });
     await page.reload();
     await routes.waitFor();
     assert.equal(await broken.count(), 0);
-    check('Unloaded-policy deletion supports cancel, deletes through UI, and survives refresh');
+    check('Unloaded-policy deletion supports cancel, preserves unrelated unsaved editor, and survives refresh');
 
     await page.getByRole('link', { name: 'New policy', exact: true }).click();
     await page.getByLabel('Name', { exact: true }).fill('browser-hub');
