@@ -3,17 +3,20 @@
 //   implements: ../../../docs/user/web-ui.md
 // ---
 import { useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link } from "react-router";
 
+import { CatalogRefresh } from "@/components/catalog-refresh";
 import { Confirm } from "@/components/confirm";
 import { Empty, Mono } from "@/components/layout";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Dialog, DialogClose, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { del, post, type AccountKindInfo, type ProviderAccount } from "@/lib/api";
+import { del, post, type AccountKindInfo, type CatalogRefreshResult, type ProviderAccount } from "@/lib/api";
 import { useAction } from "@/lib/hooks";
 import { KeyState } from "@/pages/overview";
 
@@ -31,7 +34,7 @@ export function ProviderAccounts({ providers, kinds, loaded }: { providers: Prov
       <CardHeader className="pb-4">
         <CardTitle>Provider accounts</CardTitle>
         <CardDescription>
-          API-key upstreams. Clients address each one by its name: <Mono>name/model</Mono> and <Mono>/name/…</Mono>.
+          Upstreams that clients address by name: <Mono>name/model</Mono> and <Mono>/name/…</Mono>.
         </CardDescription>
       </CardHeader>
       <Table className="min-w-[760px]">
@@ -52,7 +55,11 @@ export function ProviderAccounts({ providers, kinds, loaded }: { providers: Prov
           ))}
         </TableBody>
       </Table>
-      {loaded && providers.length === 0 && <Empty>No provider accounts yet.</Empty>}
+      {loaded && providers.length === 0 && (
+        <Empty>
+          No provider accounts yet. <Link to="/accounts/add" className="underline">Add a provider account</Link>.
+        </Empty>
+      )}
     </Card>
   );
 }
@@ -82,7 +89,7 @@ function ProviderRow({ p, kind }: { p: ProviderAccount; kind: string }) {
       <TableCell className="text-sm">{p.source === "config" ? "Config file" : "Added here"}</TableCell>
       <TableCell>
         <div className="flex justify-end gap-2">
-          {!p.no_auth && !p.workload_identity && p.enabled && <ReplaceKey p={p} />}
+          <ReplaceKey p={p} />
           {p.source === "vault" && (
             <Confirm
               title={`Remove ${p.name}?`}
@@ -102,45 +109,93 @@ function ProviderRow({ p, kind }: { p: ProviderAccount; kind: string }) {
 }
 
 function ReplaceKey({ p }: { p: ProviderAccount }) {
-  const [open, setOpen] = useState(false);
   const [key, setKey] = useState("");
-  const save = useAction(() => post(`/admin/providers/${p.name}/key`, { api_key: key.trim() }), {
-    invalidate: PROVIDER_QUERIES,
-    success: `Saved the ${p.name} key`,
+  const qc = useQueryClient();
+  const save = useMutation({
+    networkMode: "always",
+    mutationFn: () =>
+      post<{ catalog_refresh: CatalogRefreshResult | null }>(`/admin/providers/${p.name}/key`, { api_key: key.trim() }),
     onSuccess: () => {
       setKey("");
-      setOpen(false);
+      for (const queryKey of PROVIDER_QUERIES) void qc.invalidateQueries({ queryKey });
     },
   });
   const id = `key-${p.name}`;
+  const action = p.has_key ? "Replace key" : "Set key";
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog onOpenChange={(open) => {
+      if (open) return;
+      setKey("");
+      if (!save.isPending) save.reset();
+    }}>
       <DialogTrigger asChild>
-        <Button variant="outline" size="sm">
-          {p.has_key ? "Replace key" : "Set key"}
+        <Button variant="outline" size="sm" aria-label={`${action} for ${p.name}`}>
+          {action}
         </Button>
       </DialogTrigger>
-      <DialogContent>
+      <DialogContent className="max-h-[90dvh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>{p.has_key ? "Replace" : "Set"} the key of {p.name}</DialogTitle>
-          <DialogDescription>
-            Stored in OpenBao at <Mono>{p.secret}</Mono>.
+          <DialogTitle>Save key for {p.name}</DialogTitle>
+          <DialogDescription className="wrap-anywhere">
+            OpenBao path <Mono>{p.secret}</Mono>.
           </DialogDescription>
         </DialogHeader>
-        <form
-          className="flex flex-col gap-3"
-          onSubmit={(e) => {
-            e.preventDefault();
-            save.mutate(undefined);
-          }}
-        >
-          <Label htmlFor={id}>API key</Label>
-          <Input id={id} type="password" autoComplete="off" className="font-mono" value={key} onChange={(e) => setKey(e.target.value)} />
-          <Button type="submit" className="self-start" disabled={!key.trim() || save.isPending}>
-            Save key
-          </Button>
-        </form>
+        {save.isSuccess ? (
+          <>
+            <ProviderKeyOutcome provider={p.name} discovery={save.data.catalog_refresh} />
+            <DialogClose asChild>
+              <Button variant="outline" className="justify-self-start">Done</Button>
+            </DialogClose>
+          </>
+        ) : (
+          <form
+            className="flex flex-col gap-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (key.trim() && !save.isPending) save.mutate();
+            }}
+          >
+            <Label htmlFor={id}>API key</Label>
+            <Input id={id} type="password" autoComplete="off" className="font-mono" value={key} onChange={(e) => setKey(e.target.value)} disabled={save.isPending} />
+            {save.error && (
+              <div role="alert" className="text-destructive text-sm wrap-anywhere">
+                <p className="font-medium">Key save failed</p>
+                <p>{save.error.message}</p>
+                {p.workload_identity && <p>Update the provider's workload identity configuration instead.</p>}
+              </div>
+            )}
+            <Button type="submit" className="self-start" disabled={!key.trim() || save.isPending}>
+              Save key
+            </Button>
+            <p role="status" className="text-muted-foreground text-sm empty:sr-only">
+              {save.isPending ? "Saving key and checking model discovery…" : ""}
+            </p>
+          </form>
+        )}
       </DialogContent>
     </Dialog>
+  );
+}
+
+export function ProviderKeyOutcome({ provider, discovery }: { provider: string; discovery: CatalogRefreshResult | null }) {
+  return (
+    <div className="flex flex-col gap-3 text-sm wrap-anywhere">
+      <div role="status">
+        <p className="font-medium">Key saved for {provider}</p>
+        {discovery === null
+          ? <p>No model discovery result for this provider.</p>
+          : !discovery.error && <p>{discovery.models} {discovery.models === 1 ? "model" : "models"} found.</p>}
+      </div>
+      {discovery?.error && (
+        <>
+          <div role="alert" className="text-warning">
+            <p className="font-medium">Model discovery failed</p>
+            <p>{discovery.error}</p>
+            <p>Any cached or static models remain available. Use Refresh models to retry discovery.</p>
+          </div>
+          <CatalogRefresh providers={[provider]} />
+        </>
+      )}
+    </div>
   );
 }

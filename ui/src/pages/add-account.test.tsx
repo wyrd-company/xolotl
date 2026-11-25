@@ -98,14 +98,14 @@ test("accounts lists provider accounts next to pool accounts", () => {
   expect(html.match(/>Remove</g)?.length).toBe(1);
 });
 
-test("a workload identity account needs no key", () => {
+test("a workload identity account shows its auth state and offers the key action", () => {
   const html = render(<AccountsPage />, [
     [["accounts"], []],
     [["providers"], [provider({ name: "federated", kind: "anthropic", source: "config", has_key: false, workload_identity: true })]],
   ], "/accounts?kind=providers");
   expect(html).toContain("workload identity");
   expect(html).not.toContain("missing");
-  expect(html).not.toContain("Set key");
+  expect(html).toContain('aria-label="Set key for federated"');
 });
 
 test("the providers tab shows only provider accounts", () => {

@@ -15,7 +15,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { del, get, post, PROVIDER_NAMES, SUB_PROVIDERS, type Account, type AccountKindInfo, type AccountUsage, type ProviderAccount, type Status } from "@/lib/api";
+import { del, get, post, PROVIDER_NAMES, SUB_PROVIDERS, type Account, type AccountKindInfo, type AccountUsage, type CatalogRefreshResult, type ProviderAccount, type Status } from "@/lib/api";
 import { ProviderAccounts } from "@/pages/provider-accounts";
 import { resetCredits, resetCreditsSummary } from "@/lib/reset-credits";
 import { dateTime, relative } from "@/lib/format";
@@ -210,7 +210,7 @@ function AccountDetails({
     ...inv,
     success: "Priority saved",
   });
-  const reset = useAction(() => post<{ catalog_refresh: ModelRefresh }>(`/admin/accounts/${a.id}/reset`), {
+  const reset = useAction(() => post<{ catalog_refresh: CatalogRefreshResult }>(`/admin/accounts/${a.id}/reset`), {
     ...inv,
     success: "Cooldown and auth failure cleared",
     onSuccess: (r) => showModels(r.catalog_refresh),
@@ -370,14 +370,13 @@ function AccountDetails({
   );
 }
 
-type ModelRefresh = { provider: string; models?: number; error?: string };
-function showModels(r: ModelRefresh) {
+function showModels(r: CatalogRefreshResult) {
   if (r.error) toast.error(`${r.provider}: ${r.error}`);
   else toast.success(`${r.provider}: ${r.models} models found`);
 }
 
 function RefreshModels({ account: a }: { account: Account }) {
-  const refresh = useAction(() => post<ModelRefresh>(`/admin/accounts/${a.id}/models`), {
+  const refresh = useAction(() => post<CatalogRefreshResult>(`/admin/accounts/${a.id}/models`), {
     invalidate: [["catalog"], ["catalog-routes"], ["catalog-status"], ["policy-view"], ["status"]],
     onSuccess: showModels,
   });
@@ -392,7 +391,7 @@ function ReplaceKey({ account: a }: { account: Account }) {
   const [key, setKey] = useState("");
   const replace = useAction(
     () =>
-      post<{ catalog_refresh: ModelRefresh }>(`/admin/accounts/${a.id}/key`, {
+      post<{ catalog_refresh: CatalogRefreshResult }>(`/admin/accounts/${a.id}/key`, {
         api_key: key.trim(),
       }),
     {

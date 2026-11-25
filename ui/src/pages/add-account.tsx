@@ -18,6 +18,7 @@ import {
   type Account,
   type AccountKind,
   type AccountKindInfo,
+  type CatalogRefreshResult,
   type FlowStart,
   type FlowStatus,
   type ProviderAccount,
@@ -294,12 +295,6 @@ function GrokLogin() {
       )}
     </Section>
   );
-}
-
-interface CatalogRefreshResult {
-  provider: string;
-  models?: number;
-  error?: string;
 }
 
 function reportModels(r: { catalog_refresh?: CatalogRefreshResult | null }) {

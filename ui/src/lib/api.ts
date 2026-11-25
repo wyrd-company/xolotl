@@ -464,6 +464,13 @@ export interface McpCall {
 /** Per-provider discovery attempt; failures retain the catalog's cached/static models. */
 export type CatalogDiscovery = Record<string, { refreshed_at: number | null; models: number; error: string | null }>;
 
+/** The discovery result returned with an admin action. */
+export interface CatalogRefreshResult {
+  provider: string;
+  models?: number;
+  error?: string;
+}
+
 /** Latest registry result, independent of model discovery or catalog rows. */
 export interface CatalogPricing {
   enabled: boolean;
