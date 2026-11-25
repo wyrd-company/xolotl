@@ -213,6 +213,11 @@ impl Intercepted {
         };
         let (mut parts, body) = request.into_parts();
         strip_connection_fields(&mut parts.headers, false);
+        // `names_host` checked that `Host` names the CONNECT host, which the URI
+        // now carries. Hyper sends it as `:authority` over HTTP/2 and as `Host`
+        // over HTTP/1.1. Forwarding an HTTP/1.1 client's `Host` to an HTTP/2
+        // upstream would put it beside `:authority`, and Google resets that.
+        parts.headers.remove(header::HOST);
         parts.uri = uri;
         parts.version = Version::HTTP_11;
         let outgoing = Request::from_parts(parts, ForwardBody::new(body, tap.clone(), Direction::Request, None));

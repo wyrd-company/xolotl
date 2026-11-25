@@ -1,6 +1,5 @@
 //! Interception against a local TLS origin, with certificates from the test PKI.
 
-use std::convert::Infallible;
 use std::sync::atomic::AtomicUsize;
 
 use bytes::Bytes;
@@ -55,6 +54,8 @@ fn ca(name: &str) -> CertifiedIssuer<'static, KeyPair> {
 struct Seen {
     method: String,
     target: String,
+    /// `:authority` over HTTP/2; over HTTP/1.1, an absolute-form target's.
+    authority: Option<String>,
     version: http::Version,
     headers: http::HeaderMap,
     body: Bytes,
@@ -67,8 +68,17 @@ struct Origin {
     handshakes: Arc<AtomicUsize>,
 }
 
+/// Which requests an origin resets instead of answering.
+type Refuse = fn(&HttpRequest<Incoming>) -> bool;
+
 impl Origin {
     async fn start(alpn: &[&[u8]], handler: Handler) -> Self {
+        Self::start_refusing(alpn, handler, |_| false).await
+    }
+
+    /// An origin that resets each request `refuse` picks out: over HTTP/2,
+    /// hyper resets the stream when the service fails.
+    async fn start_refusing(alpn: &[&[u8]], handler: Handler, refuse: Refuse) -> Self {
         let ca = ca("origin test CA");
         let leaf = CertificateParams::new(vec![CAPTURE.to_owned(), OAUTH.to_owned()]).unwrap();
         let key = KeyPair::generate().unwrap();
@@ -91,8 +101,13 @@ impl Origin {
                     let Ok(stream) = acceptor.accept(stream).await else { return };
                     count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let service = hyper::service::service_fn(move |request| {
-                        let response = handler(request);
-                        async move { Ok::<_, Infallible>(response.await) }
+                        let response = (!refuse(&request)).then(|| handler(request));
+                        async move {
+                            match response {
+                                Some(response) => Ok(response.await),
+                                None => Err(std::io::Error::other("the origin refused the request")),
+                            }
+                        }
                     });
                     let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
                         .serve_connection_with_upgrades(TokioIo::new(stream), service)
@@ -115,6 +130,7 @@ fn recording(seen: Arc<Mutex<Vec<Seen>>>) -> Handler {
             seen.lock().unwrap().push(Seen {
                 method: parts.method.to_string(),
                 target: target.clone(),
+                authority: parts.uri.authority().map(|a| a.to_string()),
                 version: parts.version,
                 headers: parts.headers,
                 body,
@@ -272,6 +288,9 @@ async fn intercepts_a_capture_host_and_forwards_unchanged() {
         let model = &seen[0];
         assert_eq!((model.method.as_str(), model.target.as_str()), ("POST", "/v1internal:streamGenerateContent?alt=sse"));
         assert_eq!(model.version, if http1 { http::Version::HTTP_11 } else { http::Version::HTTP_2 });
+        // The CONNECT host is the authority: `Host` over HTTP/1.1, `:authority` over HTTP/2.
+        let authority = (model.headers.get("host").map(|v| v.to_str().unwrap()), model.authority.as_deref());
+        assert_eq!(authority, if http1 { (Some(CAPTURE), None) } else { (None, Some(CAPTURE)) });
         assert_eq!(model.body, REQUEST_BODY.as_bytes());
         for (name, value) in [
             ("authorization", UPSTREAM_TOKEN),
@@ -312,6 +331,47 @@ async fn intercepts_a_capture_host_and_forwards_unchanged() {
         s.proxy.stop().await;
         drop(s.h);
     }
+}
+
+/// Google's front end resets an HTTP/2 request that carries a `host` field
+/// beside `:authority`.
+fn resets_host_over_h2(request: &HttpRequest<Incoming>) -> bool {
+    request.version() == http::Version::HTTP_2 && request.headers().contains_key("host")
+}
+
+#[tokio::test]
+async fn an_http1_client_reaches_an_h2_upstream_with_its_host_as_the_authority() {
+    // agy speaks HTTP/1.1 to the proxy, and the capture host answers over HTTP/2.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let origin = Origin::start_refusing(&[b"h2", b"http/1.1"], recording(seen.clone()), resets_host_over_h2).await;
+    let (sink, mut rows) = TestSink::new(Some(1 << 20), false);
+    let s = setup(&origin, Some(sink), TEST_TIMEOUT).await;
+    let client = client(&s.proxy, &s.key, &[&s.pki.root], true);
+
+    let loaded = client.post(format!("https://{CAPTURE}/v1internal:loadCodeAssist")).body("{}").send().await.unwrap();
+    assert_eq!(loaded.status(), 200);
+    assert_eq!(loaded.version(), http::Version::HTTP_11);
+    assert_eq!(loaded.text().await.unwrap(), "{}");
+    let port =
+        client.post(format!("https://{CAPTURE}/v1internal:loadCodeAssist")).header("host", format!("{CAPTURE}:443")).send().await.unwrap();
+    assert_eq!(port.status(), 200);
+    let model = model_request(&client).send().await.unwrap();
+    assert_eq!(model.status(), 200);
+    assert_eq!(model.text().await.unwrap(), SSE_BODY);
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 3);
+    for request in &seen {
+        assert_eq!(request.version, http::Version::HTTP_2);
+        assert_eq!(request.authority.as_deref(), Some(CAPTURE));
+        assert!(request.headers.get("host").is_none(), "host reached the origin beside :authority");
+    }
+    assert_eq!(seen[2].headers["authorization"], UPSTREAM_TOKEN);
+    assert_eq!(seen[2].body, REQUEST_BODY.as_bytes());
+    let row = next_capture(&mut rows).await;
+    assert_eq!((row.status, row.error.as_deref()), (200, None));
+    assert_eq!(row.observed.model.as_deref(), Some("gemini-3-pro"));
+    s.proxy.stop().await;
 }
 
 #[tokio::test]
