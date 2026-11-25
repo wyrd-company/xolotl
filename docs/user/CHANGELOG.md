@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.3
+
+### Features
+
+- Add an opt-in authenticated HTTPS forward proxy for Antigravity model traffic, with allowlisted interception, OpenBao-issued certificates and exchange export to NATS and ClickHouse. Other destinations remain encrypted tunnels. Configure the listener, trusted CA and restricted PKI role before enabling it; see the forward proxy documentation. OpenTelemetry reports connections, intercepted requests and certificate issuance through `xolotl.forward_proxy.connections`, `xolotl.forward_proxy.requests` and `xolotl.forward_proxy.certificates`.
+- Expand web administration with client key lifecycle, account recovery and diagnostics, policy inspection, MCP server administration and usage, request usage queries, pricing refresh feedback, and deployment reload. Updated task guides include screenshots.
+- Allow a management-only policy without model access entries, simplifying policy-based T3 Code hub access.
+- Export model pricing refresh outcomes and request pricing misses through OpenTelemetry as `xolotl.pricing.refreshes` and `xolotl.pricing.misses`, distinguishing unmatched models from missing required token rates.
+- Excluding a model in a policy no longer stops sessions that already used it. To stop those sessions, remove the provider or account from the policy, or revoke and reissue the key; rotating the key keeps its sessions. The policy checks a model when a session first uses it. Once an answer from the model completes, the session keeps it: after a rule, its `models` switch or `deny_other_models` excludes the model, the session goes on using it in any way, with no error. That covers switching away and back, subagents, background requests and compactions, on the same provider and, once it holds a context lock, the same account. A session that never used the model can't use it. This was checked against Claude Code, Codex, Grok and OpenCode. Xolotl now also reads the session ID that the OpenCode client sends (`x-opencode-session-id`), so OpenCode conversations get their own session for the context lock too. A rotated key keeps its sessions; a key revoked and issued again starts with none. Removing a provider or an account from a policy still applies to every session at once. The Policies and client keys page explains it. Upgrade note: sessions running when you upgrade keep a model only from their first completed answer from it on the new version. Excluding a model right after upgrading refuses it to a session that hasn't used it since.
+- The web UI Rotate dialog now defaults to no grace period instead of one hour: the old key stops immediately. To keep it working while clients pick up the new key, select a nonzero Grace period before rotating.
+
+### Fixes
+
+- Keep the gateway running and retry when NATS is unreachable at startup; invalid local configuration still fails fast. A missing stream or mismatched subjects now logs an error instead of stopping startup. The `xolotl.export.connected` gauge reports connection state, not stream validation; check logs for stream errors. Preserve usable model prices when unrelated registry entries are malformed.
+- Show subscription login polling errors with recovery controls, and keep imported account identity and model discovery results visible with a discovery retry. Document the feedback and browser recovery steps.
+
 ## 0.1.2
 
 ### Features
