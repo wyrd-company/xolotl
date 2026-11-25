@@ -45,6 +45,8 @@ struct TestDialer {
     upstream: Option<SocketAddr>,
     resolutions: Mutex<Vec<(String, u16)>>,
     connections: Mutex<Vec<Vec<SocketAddr>>>,
+    /// Answers for the capture host, in turn, before the public fixture address.
+    capture_answers: Mutex<std::collections::VecDeque<Vec<SocketAddr>>>,
 }
 
 #[async_trait::async_trait]
@@ -52,7 +54,8 @@ impl Dialer for TestDialer {
     async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         self.resolutions.lock().unwrap().push((host.to_owned(), port));
         match host {
-            ORIGIN | CAPTURE => Ok(vec![PUBLIC.parse().unwrap()]),
+            CAPTURE => Ok(self.capture_answers.lock().unwrap().pop_front().unwrap_or_else(|| vec![PUBLIC.parse().unwrap()])),
+            ORIGIN => Ok(vec![PUBLIC.parse().unwrap()]),
             "mixed.example" => Ok(vec![PUBLIC.parse().unwrap(), "10.0.0.1:443".parse().unwrap()]),
             "missing.example" => Err(ErrorKind::NotFound.into()),
             _ => panic!("unexpected resolution for {host}:{port}"),
@@ -76,6 +79,8 @@ struct Proxy {
 /// What a test proxy intercepts, and how it treats the upstream.
 #[derive(Default)]
 struct Interception {
+    /// Destination ports beside 443.
+    ports: Vec<u16>,
     capture_hosts: Vec<String>,
     vault: Option<crate::vault::VaultClient>,
     capture: Option<Arc<dyn CaptureSink>>,
@@ -94,7 +99,7 @@ impl Proxy {
             .then(|| crate::config::ForwardProxyPkiConfig { mount: super::testpki::MOUNT.into(), role: super::testpki::ROLE.into() });
         let config = ForwardProxyConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
-            ports: vec![443],
+            ports: [vec![443], interception.ports].concat(),
             capture_hosts: interception.capture_hosts,
             tls: tls.config.clone(),
             pki,

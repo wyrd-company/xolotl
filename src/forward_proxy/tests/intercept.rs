@@ -175,12 +175,22 @@ async fn setup(origin: &Origin, capture: Option<Arc<dyn CaptureSink>>, idle: Dur
 
 /// A proxy whose capture host is `origin`, verified against `upstream_ca`.
 async fn setup_with(origin: &Origin, capture: Option<Arc<dyn CaptureSink>>, idle: Duration, upstream_ca: CertificateDer<'static>) -> Setup {
+    let dialer = Arc::new(TestDialer { upstream: Some(origin.address), ..Default::default() });
+    setup_dialer(dialer, capture, idle, upstream_ca, vec![]).await
+}
+
+async fn setup_dialer(
+    dialer: Arc<TestDialer>,
+    capture: Option<Arc<dyn CaptureSink>>,
+    idle: Duration,
+    upstream_ca: CertificateDer<'static>,
+    ports: Vec<u16>,
+) -> Setup {
     let h = harness().await;
     let key = h.key(egress_policy()).await;
     let pki = TestPki::start(&[CAPTURE], &[CAPTURE]).await;
-    let dialer = Arc::new(TestDialer { upstream: Some(origin.address), ..Default::default() });
     let interception =
-        Interception { capture_hosts: vec![CAPTURE.into()], vault: Some(pki.vault()), capture, upstream_ca: Some(upstream_ca) };
+        Interception { ports, capture_hosts: vec![CAPTURE.into()], vault: Some(pki.vault()), capture, upstream_ca: Some(upstream_ca) };
     let proxy = Proxy::start_with(h.state.keys.clone(), dialer, idle, interception).await;
     Setup { proxy, pki, key, h }
 }
@@ -391,6 +401,7 @@ async fn a_name_outside_the_pki_role_is_tunneled_not_intercepted() {
         vault: Some(pki.vault()),
         capture: Some(sink),
         upstream_ca: Some(origin.ca.clone()),
+        ..Default::default()
     };
     let proxy = Proxy::start_with(h.state.keys.clone(), dialer, TEST_TIMEOUT, interception).await;
 
@@ -658,5 +669,41 @@ async fn a_revoked_key_closes_an_idle_intercepted_connection() {
     let read = timeout(TEST_TIMEOUT, stream.read(&mut byte)).await.unwrap();
     assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
     tokio::time::resume();
+    s.proxy.stop().await;
+}
+
+#[tokio::test]
+async fn each_upstream_connection_checks_the_address_again() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let origin = Origin::start(&[b"h2", b"http/1.1"], recording(seen.clone())).await;
+    let dialer = Arc::new(TestDialer { upstream: Some(origin.address), ..Default::default() });
+    // The CONNECT sees a public address; the upstream connection's own lookup sees a private one.
+    dialer.capture_answers.lock().unwrap().extend([vec![PUBLIC.parse().unwrap()], vec!["10.0.0.1:443".parse().unwrap()]]);
+    let (sink, mut rows) = TestSink::new(Some(1 << 20), false);
+    let s = setup_dialer(dialer.clone(), Some(sink), TEST_TIMEOUT, origin.ca.clone(), vec![]).await;
+    let client = client(&s.proxy, &s.key, &[&s.pki.root], false);
+    let response = model_request(&client).send().await.unwrap();
+    assert_eq!(response.status(), 502);
+    let row = next_capture(&mut rows).await;
+    assert_eq!(row.error.as_deref(), Some("proxy_error: can't reach the upstream: client error (Connect): refused: address"));
+    assert!(dialer.connections.lock().unwrap().is_empty(), "no private address was dialed");
+    assert_eq!(*dialer.resolutions.lock().unwrap(), vec![(CAPTURE.into(), 443); 2]);
+    assert!(seen.lock().unwrap().is_empty());
+    s.proxy.stop().await;
+}
+
+#[tokio::test]
+async fn a_capture_host_on_another_port_is_tunneled() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let origin = Origin::start(&[b"h2", b"http/1.1"], recording(seen.clone())).await;
+    let dialer = Arc::new(TestDialer { upstream: Some(origin.address), ..Default::default() });
+    let (sink, mut rows) = TestSink::new(Some(1 << 20), false);
+    let s = setup_dialer(dialer, Some(sink), TEST_TIMEOUT, origin.ca.clone(), vec![8443]).await;
+    // Trusting only the origin's CA works only through a tunnel.
+    let client = client(&s.proxy, &s.key, &[&origin.ca], false);
+    let response = client.post(format!("https://{CAPTURE}:8443{MODEL_PATH}")).body(REQUEST_BODY).send().await.unwrap();
+    assert_eq!(response.text().await.unwrap(), SSE_BODY);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(timeout(Duration::from_millis(200), rows.recv()).await.is_err(), "a tunnel is not captured");
     s.proxy.stop().await;
 }
