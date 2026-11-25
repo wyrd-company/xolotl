@@ -9,6 +9,7 @@ import { toast } from "sonner";
 
 import { Confirm } from "@/components/confirm";
 import { Empty, Mono, PageHeader, QueryError } from "@/components/layout";
+import { LookBackInput } from "@/components/look-back-input";
 import { SaveToolbar } from "@/components/save-toolbar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,7 +18,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   del,
   get,
@@ -33,6 +33,7 @@ import {
   type McpTool,
   type McpUsageRow,
 } from "@/lib/api";
+import { DURATION_ERROR, durationSeconds, formatDuration } from "@/lib/duration";
 import { clock, dateTime, num, relative } from "@/lib/format";
 import { useAction } from "@/lib/hooks";
 
@@ -41,6 +42,7 @@ const GROUPS: [McpGroupBy, string][] = [
   ["tool", "Tool"],
   ["client", "Client"],
 ];
+const DEFAULT_CALL_PERIOD = 86_400;
 
 export function McpPage() {
   const servers = useQuery({ queryKey: ["mcp-servers"], queryFn: () => get<McpServer[]>("/admin/mcp/servers"), refetchInterval: 30_000 });
@@ -88,7 +90,10 @@ export function McpPage() {
         )}
       </section>
 
-      {list.length > 0 && <Calls />}
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+        <CallTotals />
+        <RecentCalls />
+      </div>
     </>
   );
 }
@@ -671,28 +676,65 @@ export function ToolDefinition({ tool }: { tool: McpTool }) {
   );
 }
 
-function Calls() {
+function CallTotals() {
   const [group, setGroup] = useState<McpGroupBy>("server");
-  const usage = useQuery({ queryKey: ["mcp-usage", group], queryFn: () => get<McpUsageRow[]>(`/admin/mcp/usage?group_by=${group}`) });
-  const calls = useQuery({ queryKey: ["mcp-calls"], queryFn: () => get<McpCall[]>("/admin/mcp/calls?limit=25"), refetchInterval: 30_000 });
+  const [period, setPeriod] = useState(DEFAULT_CALL_PERIOD);
+  const [draft, setDraft] = useState("24h");
+  const [error, setError] = useState<string>();
+  const usage = useQuery({
+    queryKey: ["mcp-usage", group, period],
+    queryFn: () => get<McpUsageRow[]>(`/admin/mcp/usage?group_by=${group}&since_secs=${period}`),
+    retry: false,
+  });
 
   return (
-    <div className="grid gap-4 xl:grid-cols-2">
-      <Card className="gap-4 pb-0">
-        <CardHeader>
-          <CardTitle>Tool calls, last 24 hours</CardTitle>
-          <CardAction>
-            <Tabs value={group} onValueChange={(v) => setGroup(v as McpGroupBy)}>
-              <TabsList aria-label="Group by">
-                {GROUPS.map(([g, label]) => (
-                  <TabsTrigger key={g} value={g}>
-                    {label}
-                  </TabsTrigger>
-                ))}
-              </TabsList>
-            </Tabs>
-          </CardAction>
-        </CardHeader>
+    <Card className="gap-4">
+      <CardHeader>
+        <CardTitle role="heading" aria-level={2}>Tool calls</CardTitle>
+        <CardDescription>Last {period === DEFAULT_CALL_PERIOD ? "24h" : formatDuration(period)}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form className="flex flex-col items-start gap-4" onSubmit={(event) => {
+          event.preventDefault();
+          const seconds = durationSeconds(draft);
+          if (seconds === null) {
+            setError(DURATION_ERROR);
+            event.currentTarget.querySelector<HTMLInputElement>("#mcp-look-back")?.focus();
+            return;
+          }
+          setError(undefined);
+          setPeriod(seconds);
+        }}>
+          <div className="flex flex-wrap items-start gap-4">
+            <div className="flex w-36 flex-col gap-2">
+              <Label htmlFor="mcp-group-by">Group by</Label>
+              <Select value={group} onValueChange={(value: McpGroupBy) => setGroup(value)}>
+                <SelectTrigger id="mcp-group-by">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {GROUPS.map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
+            <LookBackInput id="mcp-look-back" value={draft} onChange={setDraft} error={error} />
+          </div>
+          <Button type="submit" variant="outline">Apply period</Button>
+        </form>
+      </CardContent>
+      {usage.isFetching && <CardContent role="status" className="text-muted-foreground text-sm">Loading tool-call totals…</CardContent>}
+      {usage.isError && (
+        <CardContent className="space-y-2">
+          <div role="alert" className="bg-danger-muted text-destructive rounded-md px-4 py-3 text-sm [overflow-wrap:anywhere]">
+            <p className="font-medium">Could not load tool-call totals</p>
+            <p>{usage.error.message}</p>
+          </div>
+          <Button variant="outline" disabled={usage.isFetching} onClick={() => void usage.refetch()}>Retry totals</Button>
+        </CardContent>
+      )}
+      {usage.isSuccess && (usage.data.length === 0 ? (
+        <Empty>No tool calls in this period. Change the look-back period to search again.</Empty>
+      ) : (
         <Table>
           <TableHeader>
             <TableRow>
@@ -703,7 +745,7 @@ function Calls() {
             </TableRow>
           </TableHeader>
           <TableBody className="font-mono text-xs">
-            {(usage.data ?? []).map((r) => (
+            {usage.data.map((r) => (
               <TableRow key={r.key ?? ""}>
                 <TableCell>{r.key ?? <span className="text-muted-foreground font-sans">admin token</span>}</TableCell>
                 <TableCell className="text-right">{num(r.calls)}</TableCell>
@@ -713,13 +755,34 @@ function Calls() {
             ))}
           </TableBody>
         </Table>
-        {usage.isSuccess && usage.data.length === 0 && <Empty>No tool calls in the last 24 hours.</Empty>}
-      </Card>
+      ))}
+    </Card>
+  );
+}
 
-      <Card className="gap-4 pb-0">
-        <CardHeader>
-          <CardTitle>Recent calls</CardTitle>
-        </CardHeader>
+function RecentCalls() {
+  const calls = useQuery({
+    queryKey: ["mcp-calls"],
+    queryFn: () => get<McpCall[]>("/admin/mcp/calls?limit=25"),
+    refetchInterval: 30_000,
+    retry: false,
+  });
+  return (
+    <Card className="gap-4">
+      <CardHeader>
+        <CardTitle role="heading" aria-level={2}>Recent calls</CardTitle>
+      </CardHeader>
+      {calls.isPending && <CardContent role="status" className="text-muted-foreground text-sm">Loading recent calls…</CardContent>}
+      {calls.isError && (
+        <CardContent className="space-y-2">
+          <div role="alert" className="bg-danger-muted text-destructive rounded-md px-4 py-3 text-sm [overflow-wrap:anywhere]">
+            <p className="font-medium">Could not load recent calls</p>
+            <p>{calls.error.message}</p>
+          </div>
+          <Button variant="outline" disabled={calls.isFetching} onClick={() => void calls.refetch()}>Retry recent calls</Button>
+        </CardContent>
+      )}
+      {calls.isSuccess && (calls.data.length === 0 ? <Empty>No tool calls yet.</Empty> : (
         <Table>
           <TableHeader>
             <TableRow>
@@ -731,7 +794,7 @@ function Calls() {
             </TableRow>
           </TableHeader>
           <TableBody className="text-xs">
-            {(calls.data ?? []).map((c, i) => (
+            {calls.data.map((c, i) => (
               <TableRow key={`${c.ts}-${i}`}>
                 <TableCell>{clock(c.ts)}</TableCell>
                 <TableCell className="font-mono">
@@ -752,8 +815,7 @@ function Calls() {
             ))}
           </TableBody>
         </Table>
-        {calls.isSuccess && calls.data.length === 0 && <Empty>No tool calls yet.</Empty>}
-      </Card>
-    </div>
+      ))}
+    </Card>
   );
 }
