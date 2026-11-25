@@ -10,10 +10,15 @@ upstream_timeout_secs = 600    # max idle time while reading an upstream respons
 # [forward_proxy]
 # listen = "0.0.0.0:8318"
 # ports = [443]                # allowed destination ports
+# capture_hosts = ["daily-cloudcode-pa.googleapis.com"]   # hosts to intercept; needs [forward_proxy.pki] and an export
 
 # [forward_proxy.tls]
 # cert_file = "/etc/xolotl/forward-proxy.pem"
 # key_file = "/etc/xolotl/forward-proxy-key.pem"
+
+# [forward_proxy.pki]          # the OpenBao PKI role that signs certificates for capture_hosts
+# mount = "pki_xolotl_proxy"
+# role = "xolotl-forward-proxy"
 
 [database]
 # Runtime state only (cooldowns, usage snapshots, request log). No secrets.

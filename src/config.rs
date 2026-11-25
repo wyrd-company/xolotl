@@ -25,14 +25,27 @@ pub struct Config {
     pub forward_proxy: Option<ForwardProxyConfig>,
 }
 
-/// An opt-in listener for authenticated HTTPS CONNECT tunnels.
+/// An opt-in listener for authenticated HTTPS CONNECT tunnels, which
+/// intercepts the hosts on `capture_hosts`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardProxyConfig {
     pub listen: SocketAddr,
     #[serde(default = "forward_proxy_ports")]
     pub ports: Vec<u16>,
+    /// Hosts whose TLS xolotl terminates with a certificate from `pki`.
+    #[serde(default)]
+    pub capture_hosts: Vec<String>,
     pub tls: ForwardProxyTlsConfig,
+    /// The OpenBao PKI role that signs the capture hosts' certificates.
+    pub pki: Option<ForwardProxyPkiConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardProxyPkiConfig {
+    pub mount: String,
+    pub role: String,
 }
 
 fn forward_proxy_ports() -> Vec<u16> {
@@ -815,6 +828,22 @@ impl Config {
                 "forward_proxy.ports must contain at least one nonzero port and no zero"
             );
             crate::forward_proxy::load_tls(&proxy.tls)?;
+            for (i, host) in proxy.capture_hosts.iter().enumerate() {
+                anyhow::ensure!(
+                    valid_capture_host(host),
+                    "forward_proxy.capture_hosts: {host:?} must be a lowercase DNS name of at least two labels, without a wildcard, port or trailing dot"
+                );
+                anyhow::ensure!(!proxy.capture_hosts[..i].contains(host), "forward_proxy.capture_hosts lists {host:?} twice");
+            }
+            if !proxy.capture_hosts.is_empty() {
+                let pki = proxy.pki.as_ref().context("forward_proxy.capture_hosts needs [forward_proxy.pki]")?;
+                let segment = |s: &str| !s.is_empty() && s.split('/').all(|part| !part.is_empty() && part != "." && part != "..");
+                anyhow::ensure!(segment(&pki.mount) && segment(&pki.role), "forward_proxy.pki.mount and role must be set");
+                anyhow::ensure!(
+                    self.export.clickhouse.is_some() || self.export.nats.is_some(),
+                    "forward_proxy.capture_hosts needs an export destination, [export.clickhouse] or [export.nats]"
+                );
+            }
         }
         for (name, p) in &self.gateway.providers {
             p.validate(name)?;
@@ -900,6 +929,22 @@ impl Config {
         anyhow::ensure!(matches!(self.telemetry.log_format.as_str(), "pretty" | "json"), "telemetry.log_format must be pretty or json");
         Ok(())
     }
+}
+
+/// A capture host: a lowercase ASCII DNS name of two or more labels, made of
+/// letters, digits, `-` and `.`, and not an IP address.
+fn valid_capture_host(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    host.len() <= 253
+        && labels.len() >= 2
+        && host.parse::<std::net::IpAddr>().is_err()
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 #[cfg(test)]

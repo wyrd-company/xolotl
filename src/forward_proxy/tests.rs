@@ -75,7 +75,13 @@ struct Proxy {
 impl Proxy {
     async fn start(keys: Arc<KeyManager>, dialer: Arc<TestDialer>, idle: Duration) -> Self {
         let tls = TestTls::new("127.0.0.1");
-        let config = ForwardProxyConfig { listen: "127.0.0.1:0".parse().unwrap(), ports: vec![443], tls: tls.config.clone() };
+        let config = ForwardProxyConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ports: vec![443],
+            capture_hosts: vec![],
+            tls: tls.config.clone(),
+            pki: None,
+        };
         let listener = Listener::bind(Some(&config)).await.unwrap().unwrap();
         let address = listener.tcp.local_addr().unwrap();
         let shutdown = CancellationToken::new();
@@ -365,7 +371,13 @@ async fn disabled_config_does_not_bind() {
 #[test]
 fn validates_listen_ports_and_tls_material() {
     let tls = TestTls::new("127.0.0.1");
-    let proxy = ForwardProxyConfig { listen: "127.0.0.1:8318".parse().unwrap(), ports: vec![443], tls: tls.config.clone() };
+    let proxy = ForwardProxyConfig {
+        listen: "127.0.0.1:8318".parse().unwrap(),
+        ports: vec![443],
+        capture_hosts: vec![],
+        tls: tls.config.clone(),
+        pki: None,
+    };
     let valid = Config { forward_proxy: Some(proxy.clone()), ..Default::default() };
     valid.validate().unwrap();
     let encoded = toml::to_string(&valid).unwrap().replace("ports = [443]\n", "");
@@ -396,6 +408,59 @@ fn validates_listen_ports_and_tls_material() {
 
     config.forward_proxy.as_mut().unwrap().tls.cert_file = tls.dir.path().join("missing.pem");
     assert!(config.validate().unwrap_err().to_string().contains("reading forward_proxy.tls.cert_file"));
+}
+
+#[test]
+fn validates_capture_hosts_and_pki() {
+    let tls = TestTls::new("127.0.0.1");
+    let proxy = ForwardProxyConfig {
+        listen: "127.0.0.1:8318".parse().unwrap(),
+        ports: vec![443],
+        capture_hosts: vec!["daily-cloudcode-pa.googleapis.com".into(), "second.example".into()],
+        tls: tls.config.clone(),
+        pki: Some(crate::config::ForwardProxyPkiConfig { mount: "pki_xolotl_proxy".into(), role: "xolotl-forward-proxy".into() }),
+    };
+    let mut valid = Config { forward_proxy: Some(proxy), ..Default::default() };
+    valid.export.nats = Some(crate::config::NatsConfig { url: "nats://nats:4222".into(), ..Default::default() });
+    valid.validate().unwrap();
+
+    for host in [
+        "Daily.example",
+        "example",
+        "*.example.com",
+        "example.com:443",
+        "example.com.",
+        "a..example",
+        "10.0.0.1",
+        "-a.example",
+        "a_b.example",
+        "bücher.example",
+    ] {
+        let mut config = valid.clone();
+        config.forward_proxy.as_mut().unwrap().capture_hosts = vec![host.into()];
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("forward_proxy.capture_hosts"), "{host}: {error}");
+    }
+    let mut config = valid.clone();
+    config.forward_proxy.as_mut().unwrap().capture_hosts = vec!["a.example".into(), "a.example".into()];
+    assert!(config.validate().unwrap_err().to_string().contains("twice"));
+
+    config = valid.clone();
+    config.forward_proxy.as_mut().unwrap().pki = None;
+    assert!(config.validate().unwrap_err().to_string().contains("needs [forward_proxy.pki]"));
+    config = valid.clone();
+    config.forward_proxy.as_mut().unwrap().pki.as_mut().unwrap().role = "../root".into();
+    assert!(config.validate().unwrap_err().to_string().contains("forward_proxy.pki"));
+    config = valid.clone();
+    config.export.nats = None;
+    assert!(config.validate().unwrap_err().to_string().contains("needs an export destination"));
+
+    // Without capture hosts, neither PKI nor an export is needed.
+    config.forward_proxy.as_mut().unwrap().capture_hosts.clear();
+    config.forward_proxy.as_mut().unwrap().pki = None;
+    config.validate().unwrap();
+    let parsed: Config = toml::from_str(&toml::to_string(&valid).unwrap()).unwrap();
+    assert_eq!(parsed.forward_proxy.unwrap().capture_hosts.len(), 2);
 }
 
 #[tokio::test]
