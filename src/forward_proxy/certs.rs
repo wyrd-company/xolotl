@@ -371,7 +371,8 @@ mod tests {
     async fn issues_from_a_live_openbao() {
         let Ok(spec) = std::env::var("XOLOTL_TEST_BAO_PKI") else { return };
         let [address, role_id, secret_id, root] = spec.split_whitespace().collect::<Vec<_>>()[..] else {
-            panic!("XOLOTL_TEST_BAO_PKI: {spec}")
+            // The setting holds a secret ID: name its fields, never its value.
+            panic!("XOLOTL_TEST_BAO_PKI must be four fields: <address> <role id> <secret id> <trusted root PEM file>")
         };
         let mut config = crate::config::VaultConfig { address: address.into(), ..Default::default() };
         config.approle.role_id = Some(role_id.into());
