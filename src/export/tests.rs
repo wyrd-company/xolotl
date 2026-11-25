@@ -5,6 +5,7 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use super::clickhouse::{Client, create_table_sql};
 use super::*;
 use crate::config::ClickHouseConfig;
+use crate::forward_proxy::capture::Observed;
 
 /// An exporter with ClickHouse as its one destination.
 fn start(cfg: ClickHouseConfig, user: Option<String>, password: Option<String>) -> anyhow::Result<Arc<Exporter>> {
@@ -242,20 +243,40 @@ async fn inserts_into_a_real_clickhouse() {
                event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
                event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n";
     let tools = vec!["Read".to_string()];
-    capture.submit(finished(&record("/v1/messages", 200), &tools, Some(Captured { bytes: sse.into(), sse: true, truncated: false })));
-    capture.submit(finished(
-        &record("/v1/messages", 429),
-        &[],
-        Some(Captured { bytes: b"{\"error\":{\"message\":\"slow\"}}".to_vec(), ..Default::default() }),
-    ));
+    // Keep the fixture inside the table's seven-day TTL.
+    let started_at = Utc::now();
+    let ok = record("/v1/messages", 200);
+    let reply = Captured { bytes: sse.into(), sse: true, truncated: false };
+    capture.submit(Finished { started_at, ..finished(&ok, &tools, Some(reply)) });
+    let failed = record("/v1/messages", 429);
+    let error = Captured { bytes: b"{\"error\":{\"message\":\"slow\"}}".to_vec(), ..Default::default() };
+    capture.submit(Finished { started_at, ..finished(&failed, &[], Some(error)) });
+    let request = r#"{"model":"gemini","request":{"contents":[{"parts":[{"text":"PING!"}]}]}}"#;
+    let response = concat!(
+        "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"PO\"}]}}]}}\n\n",
+        "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"NG!\"}]},\"finishReason\":\"STOP\"}]}}\n\n",
+    );
+    exporter.clone().hold().submit(Forwarded {
+        client_id: "team/laptop".into(),
+        host: "daily-cloudcode-pa.googleapis.com".into(),
+        path: "/v1internal:streamGenerateContent".into(),
+        status: 200,
+        started_at,
+        latency_ms: 12,
+        trace_id: String::new(),
+        request: Captured { bytes: request.into(), ..Default::default() },
+        response: Captured { bytes: response.into(), sse: true, truncated: false },
+        observed: Observed { model: Some("gemini".into()), complete: true, ..Default::default() },
+        error: None,
+    });
     exporter.shutdown().await;
 
     let client = Client { http: reqwest::Client::new(), url: base.to_string(), user, password };
     let mut url = url::Url::parse(&client.url).unwrap();
     let select = format!(
-        "SELECT status, session_key, output_text, tool_calls, cache_write_tokens, streamed, error, \
+        "SELECT status, account_kind, provider, model, request, response, session_key, output_text, tool_calls, cache_write_tokens, streamed, error, \
          JSONExtractString(request, 'messages', 1, 'content') AS first, toString(started_at) AS started \
-         FROM xolotl.{table} ORDER BY status FORMAT JSONEachRow"
+         FROM xolotl.{table} ORDER BY status, account_kind FORMAT JSONEachRow"
     );
     url.query_pairs_mut().append_pair("query", &select);
     let mut req = client.http.get(url);
@@ -268,15 +289,21 @@ async fn inserts_into_a_real_clickhouse() {
     let text = req.send().await.unwrap().text().await.unwrap();
     let _ = client.query(&format!("DROP TABLE xolotl.{table}"), bytes::Bytes::new(), &[]).await;
     let rows: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {text}"))).collect();
-    assert_eq!(rows.len(), 2, "{text}");
+    assert_eq!(rows.len(), 3, "{text}");
     assert_eq!(rows[0]["output_text"], "ok");
     assert_eq!(rows[0]["error"], "api_error: upstream stream ended before the response completed");
     assert_eq!(rows[0]["tool_calls"], json!(["Read"]));
     assert_eq!(rows[0]["cache_write_tokens"], Value::Null);
     assert_eq!(rows[0]["streamed"], true);
     assert_eq!(rows[0]["first"], "héllo");
-    assert_eq!(rows[0]["started"], "2026-11-07 10:00:00.250");
-    assert_eq!(rows[1]["error"], "rate_limit_error: slow");
+    assert_eq!(rows[0]["started"], timestamp(started_at));
+    assert_eq!(rows[1]["account_kind"], "forward-proxy");
+    assert_eq!(rows[1]["provider"], "daily-cloudcode-pa.googleapis.com");
+    assert_eq!(rows[1]["model"], "gemini");
+    assert_eq!(rows[1]["request"], request);
+    assert_eq!(rows[1]["response"], response);
+    assert_eq!(rows[1]["output_text"], "PONG!");
+    assert_eq!(rows[2]["error"], "rate_limit_error: slow");
 }
 
 #[tokio::test]
