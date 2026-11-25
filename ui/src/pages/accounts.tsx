@@ -305,6 +305,9 @@ function AccountDetails({
             {usage && <p>The last fetched usage is still shown.</p>}
           </div>
         )}
+        <Button className="self-start" variant="outline" disabled={refreshingUsage} onClick={onRefreshUsage}>
+          {refreshingUsage ? "Refreshing…" : usageError ? "Retry usage fetch" : "Refresh usage"}
+        </Button>
         <form
           className="flex flex-col gap-2"
           onSubmit={(e) => {
@@ -341,7 +344,7 @@ function AccountDetails({
           </Button>
         </form>
         <p className="text-muted-foreground text-sm">
-          Retry clears the auth failure and cooldown. Enabled state, credential and provider quota stay as they are.
+          Retry clears Xolotl’s auth failure and cooldown so it can try the current credential when the account is enabled.
         </p>
         {a.provider === "opencode-go" ? <ReplaceKey account={a} /> : <AccountLogin provider={a.provider} />}
         {reset.error && (
@@ -350,9 +353,6 @@ function AccountDetails({
         <div className="flex flex-wrap gap-2 border-t pt-4">
           <Button variant="outline" disabled={reset.isPending} onClick={() => reset.mutate(undefined)}>
             {reset.isPending ? "Retrying…" : "Retry"}
-          </Button>
-          <Button variant="outline" disabled={refreshingUsage} onClick={onRefreshUsage}>
-            {refreshingUsage ? "Refreshing…" : usageError ? "Retry usage fetch" : "Refresh usage"}
           </Button>
           <Confirm
             title="Remove this account?"
