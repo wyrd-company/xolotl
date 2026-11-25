@@ -6,9 +6,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { expect, test } from "vitest";
-import type { AccountKindInfo, ProviderAccount } from "@/lib/api";
+import type { Account, AccountKindInfo, FlowStart, ProviderAccount } from "@/lib/api";
 import { AccountsPage } from "./accounts";
-import { AddAccountPage, parseHeaders } from "./add-account";
+import { AddAccountPage, DeviceCode, ImportOutcome, parseHeaders } from "./add-account";
 
 const kind = (change: Partial<AccountKindInfo>): AccountKindInfo => ({
   kind: "codex",
@@ -115,4 +115,33 @@ test("the providers tab shows only provider accounts", () => {
   ], "/accounts?kind=providers");
   expect(html).toContain("Provider accounts");
   expect(html).not.toContain("No subscription accounts yet");
+});
+
+
+const flow: FlowStart = { flow_id: "expired", provider: "codex", needs_code: false, url: "https://example.test/device", user_code: "CODE", instructions: "Authorize" };
+
+test("device poll HTTP failure replaces waiting and does not confirm success", () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retryOnMount: false, staleTime: Infinity } } });
+  client.getQueryCache().build(client, { queryKey: ["flow", flow.flow_id] })
+    .setState({ status: "error", error: new Error("unknown or expired flow") });
+  const html = renderToStaticMarkup(<QueryClientProvider client={client}><DeviceCode flow={flow} name="Codex" onDone={() => {}} onRestart={() => {}} /></QueryClientProvider>);
+  for (const value of ['role="alert"', "Could not check login status", "unknown or expired flow", "A successful login has not been confirmed", "Start new login", "Cancel"]) expect(html).toContain(value);
+  expect(html).not.toContain("Waiting for authorization");
+});
+
+const imported = { id: "codex-work", provider: "codex", label: "Work subscription", email: "work@example.test" } as Account;
+
+test.each([ ["Work subscription", "work@example.test", "Work subscription"], ["", "work@example.test", "work@example.test"], ["", null, "codex-work"] ])(
+  "saved import shows label %s or identity %s and zero models",
+  (label, email, identity) => {
+    const html = render(<ImportOutcome account={{ ...imported, label, email, catalog_refresh: { provider: "codex", models: 0 } }} />, []);
+    for (const value of [`Imported ${identity}`, "Account ID: codex-work", "provider: codex", "The imported credentials are saved", "codex: 0 models found"]) expect(html).toContain(value);
+    expect(html).not.toContain("Model discovery failed");
+  },
+);
+
+test("saved import keeps the discovery error and offers Refresh models", () => {
+  const html = render(<ImportOutcome account={{ ...imported, catalog_refresh: { provider: "codex", error: "Upstream returned 503" } }} />, [[["catalog-status"], {}]]);
+  for (const value of ["Imported Work subscription", "Account ID: codex-work", "provider: codex", "The imported credentials are saved", 'role="alert"', "Model discovery failed", "Upstream returned 503", "Refresh models"]) expect(html).toContain(value);
+  expect(html).not.toContain("models found");
 });

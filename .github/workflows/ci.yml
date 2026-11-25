@@ -39,14 +39,15 @@ jobs:
         working-directory: ui
       - run: pnpm build
         working-directory: ui
-      - name: Check client key layout and MCP usage in Chromium
+      - name: Check UI regressions in Chromium
         run: |
           docker run --rm --ipc=host -v "$PWD/ui:/ui:ro" -w /runner \
             mcr.microsoft.com/playwright:v1.58.2-noble \
             sh -c 'npm install --ignore-scripts --no-package-lock playwright@1.58.2 &&
               export NODE_PATH=/runner/node_modules &&
               node /ui/test/key-layout.browser.cjs &&
-              node /ui/test/mcp-usage.browser.cjs'
+              node /ui/test/mcp-usage.browser.cjs &&
+              node /ui/test/account-login.browser.cjs'
 
   published-copies:
     runs-on: ubuntu-latest

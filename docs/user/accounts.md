@@ -41,9 +41,9 @@ screen has one section per provider.
 For Codex and Grok device logins, **Waiting for authorization…** means xolotl
 is checking the login. If **Could not check login status** appears, the check
 failed and polling stops. The reason is shown, and a successful login has not
-been confirmed. Select **Start new login**, then start the device login again,
-or **Cancel** to leave it. The same feedback appears in **Log in again** in
-account details.
+been confirmed. Select **Start new login** to get a fresh device code and
+start checking that login, or **Cancel** to leave it. The same feedback appears
+in **Log in again** in account details.
 
 ### Codex
 

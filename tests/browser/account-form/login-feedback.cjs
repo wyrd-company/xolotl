@@ -4,6 +4,7 @@ const { default: AxeBuilder } = require('/runner/node_modules/@axe-core/playwrig
 const fs = require('node:fs');
 const out = '/evidence', origin = 'http://localhost:35317', checks = [];
 const result = `${out}/login-feedback-result.json`;
+const revision = process.env.ACCOUNT_FEEDBACK_HEAD || 'unrecorded';
 const assert = (ok, message) => { if (!ok) throw Error(message); };
 (async () => {
   fs.writeFileSync(result, JSON.stringify({ status: 'failed', reason: 'not completed' }));
@@ -66,10 +67,16 @@ const assert = (ok, message) => { if (!ok) throw Error(message); };
     await page.screenshot({ path: `${out}/account-login-phone-${scheme}.png`, fullPage: true });
   }
   await page.setViewportSize({ width: 1440, height: 1100 });
-  await codex.getByRole('button', { name: 'Start new login', exact: true }).click();
   await page.unroute('**/admin/auth/flows/*');
+  const restarted = page.waitForResponse(r => r.url().endsWith('/admin/auth/codex/start') && r.request().method() === 'POST');
+  await codex.getByRole('button', { name: 'Start new login', exact: true }).click();
+  const freshFlow = await (await restarted).json();
+  assert(freshFlow.flow_id !== new URL(pending.url()).pathname.split('/').at(-1), 'Restart did not create a fresh flow');
+  await codex.getByRole('status').filter({ hasText: 'Waiting for authorization' }).waitFor();
+  assert(await codex.getByRole('alert').count() === 0, 'Old polling error remained after restart');
+  await codex.getByRole('button', { name: 'Cancel', exact: true }).click();
   await codex.getByRole('button', { name: 'Start device login', exact: true }).waitFor();
-  checks.push('HTTP error after pending stops poll/retry, replaces waiting, retains unconfirmed guidance, and offers new login; phone light/dark axe checks passed');
+  checks.push('HTTP error after pending stops poll/retry, replaces waiting, retains unconfirmed guidance, and starts a fresh device login directly; phone light/dark axe checks passed');
   // Expired flow on the first poll takes the same recovery path.
   await page.route('**/admin/auth/flows/*', r => r.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: { message: 'unknown or expired flow' } }) }));
   await codex.getByRole('button', { name: 'Start device login', exact: true }).click();
@@ -91,6 +98,6 @@ const assert = (ok, message) => { if (!ok) throw Error(message); };
   await context.close();
   await video.saveAs(`${out}/account-login-feedback.webm`);
   await browser.close();
-  fs.writeFileSync(result, JSON.stringify({ status: 'passed', checks }, null, 2));
-  console.log(JSON.stringify({ status: 'passed', checks }, null, 2));
-})().catch(error => { fs.writeFileSync(result, JSON.stringify({ status: 'failed', checks, error: String(error) }, null, 2)); console.error(error); process.exit(1); });
+  fs.writeFileSync(result, JSON.stringify({ status: 'passed', revision, checks }, null, 2));
+  console.log(JSON.stringify({ status: 'passed', revision, checks }, null, 2));
+})().catch(error => { fs.writeFileSync(result, JSON.stringify({ status: 'failed', revision, checks, error: String(error) }, null, 2)); console.error(error); process.exit(1); });

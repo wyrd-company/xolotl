@@ -106,3 +106,14 @@ The scratch directory must be the browser's `/evidence` mount and contain
 that disposable app, proves that discarding the import result and continuing
 polling after an HTTP error each fail a behavioral assertion, and restores the
 source and normal image in `finally`. Rerun acceptance after the mutation run.
+
+
+CI also runs `ui/test/account-login.browser.cjs` against the built UI with synthetic
+admin responses. It checks request counts after polling errors, direct Codex and
+Grok restart, cancellation, and retained import identity/count/error outcomes.
+`ui/src/pages/add-account.test.tsx` covers the rendered error and saved outcomes
+in the ordinary Vitest suite. To prove the CI regression detects disabled guards,
+run `node ui/test/account-login-mutations.mjs <absolute-scratch-output-dir>`.
+It builds the UI for each mutant and invokes the same Chromium script as CI,
+then restores the source and normal build. Its fail-first
+`account-login-ci-mutations.json` names the assertion that caught each mutant.

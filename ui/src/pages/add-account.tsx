@@ -133,7 +133,11 @@ function useFlow(provider: "codex" | "claude" | "grok") {
   const start = useAction((device: boolean) => post<FlowStart>(`/admin/auth/${provider}/start`, { device }), {
     onSuccess: (f) => setFlow(f),
   });
-  return { flow, setFlow, start };
+  const restart = () => {
+    setFlow(null);
+    start.mutate(true);
+  };
+  return { flow, setFlow, start, restart };
 }
 
 function PasteCode({ flow, onDone, placeholder }: { flow: FlowStart; onDone: () => void; placeholder: string }) {
@@ -171,7 +175,7 @@ function PasteCode({ flow, onDone, placeholder }: { flow: FlowStart; onDone: () 
 }
 
 /** A device-code flow: shows the code and polls until the server finishes the login. */
-function DeviceCode({ flow, name, onDone }: { flow: FlowStart; name: string; onDone: () => void }) {
+export function DeviceCode({ flow, name, onDone, onRestart }: { flow: FlowStart; name: string; onDone: () => void; onRestart: () => void }) {
   const loggedIn = useLoggedIn();
   const status = useQuery({
     queryKey: ["flow", flow.flow_id],
@@ -214,7 +218,7 @@ function DeviceCode({ flow, name, onDone }: { flow: FlowStart; name: string; onD
           Waiting for authorization… (the code expires after 15 minutes)
         </div>
       )}
-      {status.error && <Button className="self-start" onClick={onDone}>Start new login</Button>}
+      {status.error && <Button className="self-start" onClick={onRestart}>Start new login</Button>}
       <Button variant="ghost" className="self-start" onClick={onDone}>
         Cancel
       </Button>
@@ -223,7 +227,7 @@ function DeviceCode({ flow, name, onDone }: { flow: FlowStart; name: string; onD
 }
 
 function CodexLogin() {
-  const { flow, setFlow, start } = useFlow("codex");
+  const { flow, setFlow, start, restart } = useFlow("codex");
   return (
     <Section
       title="Codex (ChatGPT)"
@@ -239,7 +243,7 @@ function CodexLogin() {
           </Button>
         </div>
       )}
-      {flow && !flow.needs_code && <DeviceCode flow={flow} name="Codex" onDone={() => setFlow(null)} />}
+      {flow && !flow.needs_code && <DeviceCode flow={flow} name="Codex" onDone={() => setFlow(null)} onRestart={restart} />}
       {flow?.needs_code && (
         <>
           <p className="text-sm leading-relaxed">
@@ -275,7 +279,7 @@ function ClaudeLogin() {
 }
 
 function GrokLogin() {
-  const { flow, setFlow, start } = useFlow("grok");
+  const { flow, setFlow, start, restart } = useFlow("grok");
   return (
     <Section
       title="Grok Build (xAI)"
@@ -286,7 +290,7 @@ function GrokLogin() {
           Start device login
         </Button>
       ) : (
-        <DeviceCode flow={flow} name="Grok" onDone={() => setFlow(null)} />
+        <DeviceCode flow={flow} name="Grok" onDone={() => setFlow(null)} onRestart={restart} />
       )}
     </Section>
   );
@@ -579,25 +583,30 @@ function ImportLogin({ kinds }: { kinds: AccountKindInfo[] }) {
           {imp.isPending ? "Importing…" : "Import"}
         </Button>
       </form>
-      {imported && (
-        <div className="flex flex-col gap-3">
-          <div role="status" className="text-sm">
-            <p className="font-medium">Imported {imported.label || imported.email || imported.id}</p>
-            <p>Account ID: {imported.id} · provider: {imported.provider}. The imported credentials are saved.</p>
-            {!imported.catalog_refresh.error && <p>{imported.catalog_refresh.provider}: {imported.catalog_refresh.models} models found.</p>}
-          </div>
-          {imported.catalog_refresh.error && (
-            <>
-              <div role="alert" className="text-warning text-sm">
-                <p className="font-medium">Model discovery failed</p>
-                <p>{imported.catalog_refresh.provider}: {imported.catalog_refresh.error}</p>
-                <p>The imported credentials are saved. Retry Refresh models.</p>
-              </div>
-              <CatalogRefresh providers={[imported.provider]} />
-            </>
-          )}
-        </div>
-      )}
+      {imported && <ImportOutcome account={imported} />}
     </Section>
+  );
+}
+
+/** The saved credential result remains separate from current discovery status. */
+export function ImportOutcome({ account }: { account: Account & { catalog_refresh: CatalogRefreshResult } }) {
+  return (
+    <div className="flex flex-col gap-3">
+      <div role="status" className="text-sm">
+        <p className="font-medium">Imported {account.label || account.email || account.id}</p>
+        <p>Account ID: {account.id} · provider: {account.provider}. The imported credentials are saved.</p>
+        {!account.catalog_refresh.error && <p>{account.catalog_refresh.provider}: {account.catalog_refresh.models} models found.</p>}
+      </div>
+      {account.catalog_refresh.error && (
+        <>
+          <div role="alert" className="text-warning text-sm">
+            <p className="font-medium">Model discovery failed</p>
+            <p>{account.catalog_refresh.provider}: {account.catalog_refresh.error}</p>
+            <p>The imported credentials are saved. Retry Refresh models.</p>
+          </div>
+          <CatalogRefresh providers={[account.provider]} />
+        </>
+      )}
+    </div>
   );
 }
