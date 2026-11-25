@@ -33,6 +33,9 @@ page() {
   browser open "$XOLOTL_DEMO_URL/#$1"
   browser wait --text "$2"
 }
+wait_for_animations() {
+  browser wait --fn 'document.getAnimations().every(animation => animation.playState !== "running")'
+}
 capture() {
   local name=$1
   shift
@@ -72,6 +75,8 @@ browser find label Name fill build-agents --exact
 browser find label Description fill 'Build and test the project' --exact
 browser find role checkbox check --name 'local gateway' --exact
 browser wait 'form button[type="submit"]:enabled'
+# The enabled button can still be transitioning out of its disabled colors.
+wait_for_animations
 capture new-policy
 browser find role checkbox check --name codex --exact
 click checkbox 'Use Team subscription'
@@ -83,7 +88,7 @@ browser wait --text 'devcontainer/workstation'
 click button Rotate…
 choose 'Grace period' Custom
 browser find label 'Custom grace' fill 45m --exact
-browser wait --fn 'document.getAnimations().every(animation => animation.playState !== "running")'
+wait_for_animations
 capture client-key-rotate '[role="dialog"]'
 click button Cancel
 browser wait '[role="dialog"]' --state detached
