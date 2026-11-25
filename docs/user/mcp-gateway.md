@@ -89,6 +89,8 @@ lists the header placeholder fields as **set** or **not set**. Enter a value and
 select **Save secret**. Surrounding whitespace is removed; stored values are never
 shown, and the password field clears after a successful save.
 
+![The project-notes server card marks its token secret as set and shows the empty entry field](assets/mcp-header-secret.png)
+
 Use **Other secret field name** to save or remove any named field, including one
 that is not used by a header yet. To delete a stored value, select **Remove
 secret…** and confirm. Headers that use that field will then have no value.
@@ -237,6 +239,8 @@ client. To change the window, enter a positive whole-number duration in
 **Look back** and select **Apply period**. Use seconds or a suffix such as
 `30s`, `15m`, `36h`, `7d` or `2w`. If the query fails, read the error and
 select **Retry totals** to rerun the current query.
+
+![Tool calls grouped by tool for the last 36 hours with one call to project-notes/find_notes](assets/mcp-tool-calls.png)
 
 **Recent calls** lists the latest tool calls of every server as `server/tool`.
 Both views include recorded calls from removed servers, even when the deployment

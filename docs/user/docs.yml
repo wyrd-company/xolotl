@@ -21,6 +21,16 @@ assets:
   - assets/account-recovery.gif
   - assets/provider-key-discovery-error.png
   - assets/provider-key-workflow.gif
+  - assets/deployment-reload.png
+  - assets/accounts-list.png
+  - assets/add-account.png
+  - assets/add-provider-account.png
+  - assets/new-policy.png
+  - assets/client-key-issued.png
+  - assets/client-key-rotate.png
+  - assets/mcp-header-secret.png
+  - assets/mcp-tool-calls.png
+  - assets/models-catalog.png
 products:
   xolotl:
     name: xolotl

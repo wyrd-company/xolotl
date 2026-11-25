@@ -87,6 +87,8 @@ completed. **Model discovery** shows the latest provider model counts, discovery
 errors and refresh times separately. Use **Refresh models** to retry discovery.
 Cached or static models remain visible when discovery fails.
 
+![Overview shows a completed reload with the counts OpenBao returned and a separate model discovery panel](assets/deployment-reload.png)
+
 **Needs action** lists enabled accounts whose credentials were refused, stored
 policies that did not load, plus OpenBao and SQLite failures. Account actions
 open that account's details. See
@@ -207,13 +209,9 @@ old the catalog is, and each provider's model count or discovery error.
   **Reload from OpenBao** on Overview (or `xolotl reload`). The UI checks every
   30 seconds and updates its lists when that discovery completes.
 
-## Theme
-
-The UI has a light and a dark theme. By default it follows the browser's color
-scheme. The three buttons above **Sign out** in the sidebar pick the system, light or
-dark theme. The browser keeps the choice.
-
 Model catalog rows show context, maximum output, input/output and cache prices per million tokens, with the LiteLLM key or override and last successful fetch age. Small rates retain their precision, including cache prices such as $0.005 per million tokens.
+
+![Models lists the catalog with provider discovery, pricing status and model endpoints](assets/models-catalog.png)
 
 On **Models**, choose **Refresh models** to refresh provider discovery and registry prices. **Provider discovery** reports each provider's model count and discovery errors. **Pricing** reports its own result: the latest completed attempt, the last good registry fetch and the age of cached prices. A successful discovery does not mean pricing succeeded. While the refresh runs, the button is disabled and the pricing summary says **Refreshing prices…**.
 
@@ -227,3 +225,9 @@ The recording shows **Refresh models**, its progress state, successful pricing,
 and a second refresh failing with cached prices retained.
 
 Usage and Traffic show API-equivalent USD with priced-request coverage; subscription value is not billed spend.
+
+## Theme
+
+The UI has a light and a dark theme. By default it follows the browser's color
+scheme. The three buttons above **Sign out** in the sidebar pick the system, light or
+dark theme. The browser keeps the choice.

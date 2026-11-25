@@ -38,6 +38,8 @@ come from the config file (see
 Open **Accounts** in the [web UI](web-ui.md) and select **Add account**. The
 screen has one section per provider.
 
+![Add an account shows the Codex, Claude, Grok Build and OpenCode Go subscription forms](assets/add-account.png)
+
 For Codex and Grok device logins, **Waiting for authorization…** means xolotl
 is checking the login. If **Could not check login status** appears, the check
 failed and polling stops. The reason is shown, and a successful login has not
@@ -123,6 +125,11 @@ to keep conversations apart. The same ID keeps the session on one account.
 The upstream user agent is `xolotl/<version> (<client user agent>)`.
 
 ### Provider accounts
+
+Under **Providers** on the **Add an account** screen, choose the **Kind** and
+enter the provider name, base URL and authentication details.
+
+![OpenAI-compatible provider account form with name, base URL, API key and extra headers](assets/add-provider-account.png)
 
 ```sh
 echo "$MISTRAL_KEY" | xolotl accounts add-provider mistral-team --kind mistral
@@ -282,8 +289,12 @@ xolotl accounts import claude ~/.claude/.credentials.json --label work
 ## See your accounts
 
 The **Accounts** screen lists the accounts by provider, with their plan, state,
-usage windows, priority and last use. Select **Refresh usage** on the row or in
-**Details** to fetch usage for an enabled or disabled account. Details shows the
+usage windows, priority and last use.
+
+![Accounts lists a Codex subscription with its state and actions above the provider accounts](assets/accounts-list.png)
+
+Select **Refresh usage** on the row or in **Details** to fetch usage for an
+enabled or disabled account. Details shows the
 fetch age, public usage windows and reset credits for Claude and Codex. Expand
 **Provider usage diagnostics (returned JSON)** to inspect the full snapshot,
 including any provider-specific fields.

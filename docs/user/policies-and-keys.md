@@ -21,6 +21,8 @@ belongs to a policy. The policy decides what the key can do.
    **Save policy**. A model you exclude keeps serving the sessions already
    on it; see [Exclude a model](#exclude-a-model).
 
+![New policy with the build-agents name, proxy scope and local provider selected](assets/new-policy.png)
+
 The editor warns when a subscription provider has no accounts: the provider
 looks allowed, but its requests get a 403.
 
@@ -152,7 +154,7 @@ claude = ["*"]                                    # every account, also new ones
   listed accounts are disabled, cooling down or at a limit, the pool answers
   as it does for a pool with no usable accounts.
 
-![The policy editor warning under claude, which has an account that is not checked](assets/policy-no-accounts.png)
+![The policy editor warns that keys cannot use Codex while its Team subscription account is unchecked](assets/policy-no-accounts.png)
 
 ### Policies from before 0.4.0
 
@@ -381,6 +383,8 @@ status cannot load, retrieval instructions stay unavailable; use **Retry**
 to load the correct vault mount and prefix. If policies cannot load, retry
 the policy list before issuing a key.
 
+![Issued client key shows its expiry, the OpenBao retrieval command and the read policy](assets/client-key-issued.png)
+
 With the CLI:
 
 ```sh
@@ -419,6 +423,9 @@ a failed query says **Unavailable** and offers **Retry**. On a row:
   which the old key keeps working, so the client can pick up the new one.
   The default is zero: the old key stops immediately. Choose **Custom** for
   a nonnegative duration such as `45m` or `0s`, using the same units as expiry.
+
+  ![Rotate client key dialog with a custom grace period of 45 minutes](assets/client-key-rotate.png)
+
 - **Disable** and **Enable** stop and restart the key.
 - **Revoke** stops the key at once and destroys every stored version of it.
 
