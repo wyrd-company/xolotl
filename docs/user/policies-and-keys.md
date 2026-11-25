@@ -104,7 +104,7 @@ A model's switch in the editor writes `models`.
 |---|---|
 | `proxy` | The LLM endpoints (`/v1/...`) and the passthroughs |
 | `mcp` | The MCP gateway at `/mcp` |
-| `egress` | HTTPS CONNECT tunnels on the [forward proxy](configuration.md#forward_proxy) |
+| `egress` | HTTPS CONNECT on the [forward proxy](forward-proxy.md) |
 | `management` | The T3 Code hubs endpoints (`/v0/management/...`) |
 | `keys` | Issue, revoke, disable and list client keys under the policies in `key_policies` |
 | `admin` | The admin API, the same as the bootstrap admin token |

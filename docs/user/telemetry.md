@@ -57,6 +57,9 @@ The OpenBao values win over `[telemetry.otlp_headers]`.
 | `xolotl.session.locks` | event (`formed`, `broken`), provider, and reason when broken | Context locks. See [Context lock](accounts.md#context-lock) |
 | `xolotl.tool_calls` | client, tool | Tool calls named in LLM responses |
 | `xolotl.export.connected` | sink (`nats`) | 0 before connection and while disconnected; 1 while connected to NATS. Stream validation errors are logged separately |
+| `xolotl.forward_proxy.connections` | outcome, client, and reason when refused | CONNECTs to the [forward proxy](forward-proxy.md): `tunnel`, `intercept`, `fallback` (a capture host tunneled because it has no valid certificate) or `refused`, with the `reason` |
+| `xolotl.forward_proxy.requests` | host, status, capture | Requests on intercepted connections. `capture`: `none` (not a model request, or no export), `full`, `skipped` (a body in a content coding xolotl doesn't read) or `cut` (a copy or a limit cut it short) |
+| `xolotl.forward_proxy.certificates` | host, outcome (`issued`, `failed`) | Certificate issuances and renewals for the capture hosts. A failure is also logged at warn level with OpenBao's error |
 | `xolotl.export.rows` | sink (`clickhouse`, `nats`), outcome | Exchanges exported. ClickHouse: `inserted`, `dropped` (queue full) or `failed` (ClickHouse refused the batch). NATS: `published`, `dropped` (queue full) or `refused` (too large for the stream). See [ClickHouse export](clickhouse-export.md) and [NATS export](nats-export.md) |
 
 Pricing refresh results describe each attempted download of the model pricing

@@ -64,26 +64,46 @@ Omit the section to keep it off.
 [forward_proxy]
 listen = "0.0.0.0:8318"
 ports = [443]
+capture_hosts = ["daily-cloudcode-pa.googleapis.com"]
 
 [forward_proxy.tls]
 cert_file = "/etc/xolotl/forward-proxy.pem"
 key_file = "/etc/xolotl/forward-proxy-key.pem"
+
+[forward_proxy.pki]
+mount = "pki_xolotl_proxy"
+role = "xolotl-forward-proxy"
 ```
 
 - `listen` is required and must differ from `server.listen`.
 - `ports` lists the permitted destination ports and defaults to `[443]`.
   List one or more ports between 1 and 65535.
+- `capture_hosts` lists the hosts whose traffic Xolotl reads, and defaults to
+  none. Each entry is a lowercase DNS name of at least two labels, made of
+  letters, digits, `-` and `.`, listed once: no wildcard, port, trailing dot or
+  IP address. Every other host passes through an encrypted tunnel. A non-empty
+  list needs `[forward_proxy.pki]` and an export destination,
+  [`[export.clickhouse]`](clickhouse-export.md) or [`[export.nats]`](nats-export.md).
+  Change the list in the file and restart Xolotl.
 - `cert_file` and `key_file` are required PEM files for a valid certificate
   chain and its matching private key. Use a certificate for the proxy hostname
   issued by a CA your clients trust. Restart Xolotl after replacing the files.
-- `server.upstream_timeout_secs` also sets the idle timeout for a tunnel.
+- `[forward_proxy.pki]` names the OpenBao PKI mount and the role on it that
+  signs a certificate for each capture host. Xolotl signs with the AppRole it
+  already logs in with, so that role's policy needs `update` on
+  `<mount>/sign/<role>`. [Forward proxy](forward-proxy.md) gives the OpenBao
+  setup.
+- `server.upstream_timeout_secs` also sets the idle timeout for a tunnel, and
+  how long an intercepted request waits for the upstream.
 
 Point the client’s `HTTPS_PROXY` at
 `https://client:<client-key>@xolotl.example.lan:8318`. Replace `<client-key>`
 with a client key from a policy with [the `egress` scope](policies-and-keys.md#scopes).
 The proxy uses the password from the URL as the key. It permits CONNECT to public
 addresses on the configured ports. Traffic through each tunnel stays encrypted
-end to end and bypasses Xolotl’s exchange exports.
+end to end and bypasses Xolotl’s exchange exports. Traffic to a capture host is
+intercepted, forwarded unchanged and captured, as [Forward proxy](forward-proxy.md)
+explains.
 
 ## `[database]`
 

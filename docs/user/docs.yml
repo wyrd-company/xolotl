@@ -81,7 +81,7 @@ products:
           - group: Providers and keys
             pages: [accounts, policies-and-keys]
           - group: Clients and tools
-            pages: [clients, mcp-gateway]
+            pages: [clients, mcp-gateway, forward-proxy]
       - section: Operate
         groups:
           - group: Administer
