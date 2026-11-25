@@ -168,8 +168,10 @@ and the names of the tools called. It never copies a header, so
 `authorization`, cookies and `x-goog-*` headers stay out, and it records the
 path without its query string. Sign-in traffic to `oauth2.googleapis.com`,
 `accounts.google.com` or any other host off the list is a tunnel that xolotl
-can't read. A body sent in a content coding such as gzip is forwarded as sent,
-but not copied or read.
+can't read. The proxy forwards coded bodies as sent and decodes gzip, x-gzip,
+deflate, Brotli and zstd for the export. A body with an unsupported coding or
+more than four stacked codings is skipped. Rows carry the
+[`forward-proxy` account kind](clickhouse-export.md#forward-proxy-exchanges).
 
 The capture works beside forwarding: a slow or failing export never holds up
 or breaks a request. It reads at most 8 MiB of a request's frames that it has

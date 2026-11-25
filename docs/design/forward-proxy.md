@@ -208,7 +208,7 @@ For each captured request, the export is held open from the moment the request i
 
 It works on each direction's body in three steps, separately for each direction:
 
-1. **Decode.** It decodes `gzip`, `x-gzip`, `deflate`, `br` and `zstd`, alone or stacked, from the body's `Content-Encoding`, and stops at `server.max_body_bytes` of output (64 MiB). A body in another coding is neither copied nor read. The client always gets the bytes the upstream sent.
+1. **Decode.** It decodes `gzip`, `x-gzip`, `deflate`, `br` and `zstd` from the body's `Content-Encoding`, reversing the order of up to four stacked codings. It processes up to `server.max_body_bytes` of decoded output (64 MiB by default), then marks excess output as cut. An invalid compressed body keeps the decoded prefix, marks the copy as cut and records a capture error. The client always gets the bytes the upstream sent.
 2. **Copy.** When a destination takes bodies, it keeps the decoded body up to the capture's `max_body_bytes`, the largest any destination wants ([Destinations](export.md#destinations)). A body is copied when its `Content-Type` passes `proxy::is_text`, as on the gateway: text, JSON or XML, or absent or empty.
 3. **Read metadata** into `Observed`, whatever the copies keep:
    - **From the request:** a streaming JSON scanner keeps only the top-level `model` and `request.session_id`. `request.session_id` becomes the session digest at once: the truncated SHA-256 of source `cloud-code` and the value ([Session identity](sessions.md#session-identity)).
@@ -220,7 +220,7 @@ These limits bound the capture. Every limit marked † skips metadata, which set
 |---|---|
 | Frames waiting in the queue † | 8 MiB per request |
 | Decoded bytes per body † | `server.max_body_bytes` |
-| A coding xolotl doesn't decode † | Any but the five above |
+| Coding layers † | Up to four of the supported codings |
 | The body copy | The capture's `max_body_bytes` |
 | One SSE event, or a JSON response, read for metadata † | 4 MiB, the gateway's `MAX_JSON_SCAN` |
 | `model` and `request.session_id` † | 256 bytes each |
@@ -267,7 +267,7 @@ pub trait CaptureSink: Send + Sync {
     fn body_limit(&self) -> Option<usize>;
     /// Hold the sink open for one request, from admission until its rows are
     /// queued. Shutdown waits for every hold.
-    fn hold(&self) -> CaptureHold;
+    fn hold(self: Arc<Self>) -> CaptureHold;
 }
 
 /// Keeps the export open for one request's capture.
@@ -302,11 +302,11 @@ impl CaptureHold {
 | `tool_calls` | `Observed.tool_calls` |
 | `request`, `response`, `*_truncated` | A destination with `bodies = true`: its own decoded copies and flags. A destination with `bodies = false`: empty bodies and both flags false. |
 | `output`, `output_text`, `stop_reason` | Assembled from the destination's own response copy; empty with `bodies = false` |
-| `error` | `Forwarded.error` in every row; in a row with the body, else `translate::upstream_error` on a response that isn't 2xx, or the error the assembled body reports |
+| `error` | The forwarding or capture failure in `Forwarded.error` in every row. When that field is empty, a row with a response copy uses `translate::upstream_error` for non-2xx status or the error reported by assembly for 2xx. |
 
 `forward-proxy` is a label in the `account_kind` column, not an `AccountKind`. These requests don't pass through `Accounting`, so they write no request log row, count against no rate limit and record no session. The Usage screen doesn't show them. Their record is the exported row and the [forward-proxy metrics](#telemetry).
 
-`translate::cloudcode` decodes a Code Assist body, the SSE stream or one JSON object, into an `ir::Response`, and `translate::assemble` runs it for these rows.
+`translate::cloudcode::assemble` decodes a Code Assist body, the SSE stream or one JSON object, into an `ir::Response` for these rows.
 - **The envelope:** each SSE `data:` is `{"response": <GenerateContentResponse>, "traceId": ...}`.
 - **Blocks:** in the candidate's `content.parts`, `text` becomes text, and `text` with `thought: true` becomes reasoning, without the opaque `thoughtSignature`. `functionCall` becomes a tool call with its `name`, `args` and `id`.
 - **The stop reason** comes from `finishReason`:

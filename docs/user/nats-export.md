@@ -28,6 +28,13 @@ tables: this page gives the commands, and you run them once.
    at-least-once. The target table is a `ReplacingMergeTree` with `id` in its
    sort key, so a message delivered twice is merged into one row.
 
+Each captured forward-proxy model request publishes one message under the
+proxy key's client ID. Its `account_kind` is `forward-proxy`, its `provider`
+is the upstream hostname, and `account_id` is empty. The row carries the
+model, the Code Assist session digest when present and the observed usage, plus
+the decoded bodies and assembled reply when the NATS destination takes bodies.
+[Forward-proxy exchange fields](clickhouse-export.md#forward-proxy-exchanges)
+
 Needs:
 
 - NATS 2.10 or later, with JetStream.

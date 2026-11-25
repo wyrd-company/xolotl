@@ -1,6 +1,6 @@
 # Exchange export
 
-Each request that a client key sends to an account becomes a row: its request log fields, the kind of the account, the request and response bodies, and the response assembled into one format. Rows go to one or more destinations: `[export.clickhouse]` inserts them into a ClickHouse table, and `[export.nats]` publishes them to a NATS JetStream stream that ClickHouse loads. `src/export/mod.rs` holds the row, the capture and the queues; `src/export/clickhouse.rs` and `src/export/nats.rs` hold the destinations. User documentation: [ClickHouse export](../user/clickhouse-export.md) and [NATS export](../user/nats-export.md).
+Each request that a client key sends to an account, or each model request that the forward proxy captures, becomes a row with metadata, request and response bodies, and the reply assembled into one format. Rows go to one or more destinations. `[export.clickhouse]` inserts them into a ClickHouse table, and `[export.nats]` publishes them to a NATS JetStream stream that ClickHouse loads. `src/export/mod.rs` holds the row, the capture and the queues. `src/export/clickhouse.rs` and `src/export/nats.rs` hold the destinations. [ClickHouse export](../user/clickhouse-export.md) · [NATS export](../user/nats-export.md)
 
 ## Capture
 
@@ -18,6 +18,10 @@ The handler passes the capture to the pool or the gateway next to the session, a
 `account_kind` is the `AccountKind` name of the account that served the attempt ([Accounts and account kinds](accounts.md)). A provider account is its own provider, so its row has the account's name in `provider` and an empty `account_id`; `account_kind` tells a provider account from a pool.
 
 The row's `endpoint` and `response` are the upstream's, and `client_endpoint` and `request` the client's. They differ for a translated request. The request is kept as the client sent it because that is the conversation as the client knows it. The response is kept as the upstream sent it because that is what the tap sees, and it holds what translation drops.
+
+### Forward proxy
+
+`Exporter` also implements `CaptureSink`. Its hold starts when the forward proxy admits a model request and lasts through enqueueing. The capture task submits the metadata it observed while forwarding and the decoded body copies. All destinations for a submission share the exchange ID. Each destination that takes bodies gets the reply assembled by `translate::cloudcode` from its own bounded copy. A metadata-only row keeps the observed fields, including `streamed`, under the same ID. The row has `account_kind = 'forward-proxy'`, the upstream hostname in `provider`, and a `cloud-code` session digest when the request carries a session. [Forward proxy row format](forward-proxy.md#the-row)
 
 ## Assembly
 

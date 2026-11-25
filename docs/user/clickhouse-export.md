@@ -35,7 +35,7 @@ Each row has:
   empty for a request without a session: one on an endpoint that is not an
   LLM conversation, such as embeddings;
 - `request`: the body the client sent, before translation and before xolotl
-  adds anything for the upstream. Headers, and so credentials, are never exported;
+  adds anything for the upstream. The export excludes HTTP headers;
 - `response`: the body the upstream sent, as JSON or as the SSE stream;
 - `output`, `output_text`, `stop_reason` and `tool_calls`: the response
   assembled from the stream, in one format whatever the provider. `output` is a
@@ -46,6 +46,24 @@ Each row has:
 `client_endpoint` is the endpoint the client called and `endpoint` the one the
 upstream served. They differ when xolotl translated the request, and then
 `response` is in the upstream's format.
+
+### Forward-proxy exchanges
+
+Each captured [forward-proxy](forward-proxy.md) model request adds one row with
+`account_kind = 'forward-proxy'`. Filter on that value to find these exchanges.
+`provider` is the upstream hostname, and `account_id` is empty. The proxy key
+supplies `client_id`. Both model fields hold the model from the request, and
+both endpoint fields hold the path without the query string.
+
+`session_key` holds the digest of the Code Assist session ID when present,
+with `session_source = 'cloud-code'`. The row includes observed input, output
+and cached tokens when capture is complete. Cost and context columns are null.
+With `bodies = true`, the row carries the decoded request and response bodies up
+to the destination's limit and the reply assembled from the retained response.
+`bodies = false` retains the metadata, including whether the reply streamed.
+Export covers the model calls only. HTTP headers and OAuth traffic stay out.
+
+### Partial exchanges
 
 Some responses are not read whole, and their rows have less:
 
