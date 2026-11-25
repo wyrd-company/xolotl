@@ -279,7 +279,7 @@ second table shows the provider accounts: name, kind, where each is defined
 | `re-login` | Re-login needed | An OAuth account whose refresh token the provider refused. It is out of rotation | Log in to the account again |
 | `re-login` | Key rejected | An API-key account whose key the provider refused with a 401. It is out of rotation | Replace the key |
 | `re-login` | Refused | An API-key account whose last recorded error is another 4xx | Read the last error. Replace the key, or **Retry** |
-| `UNSAVED` | Unsaved token | A refreshed token could not be written to OpenBao. Xolotl serves from memory and retries every 15 seconds | Fix OpenBao and wait for the badge to clear before restarting Xolotl |
+| `UNSAVED` | Unsaved token | A refreshed token could not be written to OpenBao. Xolotl serves from memory and retries every 15 seconds | Fix OpenBao and wait for the unsaved state to clear before restarting Xolotl. Restarting while the token is unsaved loses the refreshed token. |
 | `disabled` | Disabled | You disabled it | **Enable** (`xolotl accounts enable <id>`) |
 
 ## Manage accounts
@@ -325,8 +325,8 @@ The web UI's overview lists accounts that need attention. Each entry has a
 - **API-key accounts** (OpenCode Go) show the last error and a
   **Replace key** form. The account keeps its ID, label, priority, enabled
   state and usage history.
-- **Retry** clears cooldown and re-login state on any account. Xolotl can try
-  the current credential again when the account is in rotation. Select
+- **Retry** clears Xolotl’s cooldown and re-login state on any account. It
+  preserves the account’s enabled state, credential and provider quota. Select
   **Enable** to put a disabled account back in rotation. The CLI equivalent
   of **Retry** is `xolotl accounts reset <id>`.
 

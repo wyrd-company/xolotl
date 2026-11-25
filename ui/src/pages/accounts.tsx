@@ -344,7 +344,7 @@ function AccountDetails({
           </Button>
         </form>
         <p className="text-muted-foreground text-sm">
-          Retry clears Xolotl’s auth failure and cooldown so it can try the current credential when the account is enabled.
+          Retry clears Xolotl’s auth failure and cooldown. It preserves the account’s enabled state, credential and provider quota.
         </p>
         {a.provider === "opencode-go" ? <ReplaceKey account={a} /> : <AccountLogin provider={a.provider} />}
         {reset.error && (

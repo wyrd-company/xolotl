@@ -84,6 +84,7 @@ async function run(browser) {
     await action(page, toggle("Enable"), "/enable");
   await badge("Available").waitFor();
   await open.click();
+  await dialog.getByText("Retry clears Xolotl’s auth failure and cooldown. It preserves the account’s enabled state, credential and provider quota.", { exact: true }).waitFor();
   assert.equal((await action(page, retry, "/reset")).catalog_refresh.models, 1);
   await dialog.getByText("Available", { exact: true }).waitFor();
   await page.getByText("Cooldown and auth failure cleared", { exact: true }).waitFor();
@@ -95,7 +96,7 @@ async function run(browser) {
   await dialog.getByText(/Discovery failed: HTTP status server error \(503 Service Unavailable\)/).waitFor();
   await mode("recovery-ok");
   await page.keyboard.press("Escape");
-  checks.push("Healthy account Retry succeeds and reports both discovery success and discovery failure separately");
+  checks.push("Retry explains enabled-state, credential and quota preservation. Healthy account Retry succeeds and reports discovery separately");
 
   await action(page, toggle("Disable"), "/disable");
   await badge("Disabled").waitFor();
