@@ -363,6 +363,35 @@ mod tests {
         assert!(format!("{error:#}").contains("name constraint"), "{error:#}");
     }
 
+    /// The setup of the forward proxy page on a real OpenBao, through
+    /// AppRole: `XOLOTL_TEST_BAO_PKI` is `<address> <role id> <secret id>
+    /// <trusted root PEM file>`.
+    #[tokio::test]
+    #[ignore = "needs an OpenBao server with the forward proxy PKI setup"]
+    async fn issues_from_a_live_openbao() {
+        let Ok(spec) = std::env::var("XOLOTL_TEST_BAO_PKI") else { return };
+        let [address, role_id, secret_id, root] = spec.split_whitespace().collect::<Vec<_>>()[..] else {
+            panic!("XOLOTL_TEST_BAO_PKI: {spec}")
+        };
+        let mut config = crate::config::VaultConfig { address: address.into(), ..Default::default() };
+        config.approle.role_id = Some(role_id.into());
+        config.approle.secret_id = Some(secret_id.into());
+        let signer =
+            PkiSigner { vault: VaultClient::new(&config).unwrap(), mount: "pki_xolotl_proxy".into(), role: "xolotl-forward-proxy".into() };
+        let root = CertificateDer::from_pem_file(root).unwrap();
+        let host = "daily-cloudcode-pa.googleapis.com";
+
+        let issued = issue(&signer, host).await.unwrap();
+        let lifetime = issued.valid_until - issued.not_before;
+        assert!(lifetime <= chrono::Duration::hours(24) + chrono::Duration::minutes(1), "{lifetime}");
+        let chain = handshake(issued.tls.clone(), &root, host).await.unwrap();
+        assert_eq!(chain.len(), 2, "the leaf and the intermediate");
+        assert!(!chain.contains(&root));
+        assert!(handshake(issued.tls, &root, "other.example").await.is_err());
+        let error = issue(&signer, "other.example").await.err().unwrap();
+        assert!(format!("{error:#}").contains("common name other.example not allowed by this role"), "{error:#}");
+    }
+
     #[test]
     fn dns_name_constraints_follow_rfc_5280() {
         let check = |permitted: &[&str], excluded: &[&str], host: &str| {
