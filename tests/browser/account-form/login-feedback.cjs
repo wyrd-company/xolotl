@@ -58,6 +58,8 @@ const assert = (ok, message) => { if (!ok) throw Error(message); };
   for (const scheme of ['light', 'dark']) {
     await page.emulateMedia({ colorScheme: scheme });
     await page.setViewportSize({ width: 390, height: 844 });
+    // Theme colors transition; measure the settled rendering, as the other fixture checks do.
+    await page.waitForTimeout(500);
     assert(!(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)), 'Phone overflow');
     const axe = await new AxeBuilder({ page }).include('main').analyze();
     assert(axe.violations.length === 0, `Accessibility violations: ${JSON.stringify(axe.violations)}`);
