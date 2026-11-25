@@ -5,6 +5,7 @@ use tokio::net::TcpStream;
 
 use super::Refusal;
 
+#[derive(Clone)]
 pub(super) struct Destination {
     pub host: String,
     pub port: u16,

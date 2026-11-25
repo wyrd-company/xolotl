@@ -3,7 +3,6 @@
 //! queue bounded by bytes, and never waits for it. The capture task keeps a
 //! bounded copy of each body, reads the model, session and usage from them,
 //! and submits one [`Forwarded`] to the [`CaptureSink`].
-#![expect(dead_code, reason = "the interception commit feeds the capture")]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

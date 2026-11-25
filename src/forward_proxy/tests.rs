@@ -17,6 +17,7 @@ use crate::policy::Policy;
 use crate::server::tests::harness;
 
 const ORIGIN: &str = "origin.example";
+const CAPTURE: &str = "daily-cloudcode-pa.googleapis.com";
 const PUBLIC: &str = "8.8.8.8:443";
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_ENV: &str = "XOLOTL_TUNNEL_TEST_TRUST";
@@ -51,7 +52,7 @@ impl Dialer for TestDialer {
     async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         self.resolutions.lock().unwrap().push((host.to_owned(), port));
         match host {
-            ORIGIN => Ok(vec![PUBLIC.parse().unwrap()]),
+            ORIGIN | CAPTURE => Ok(vec![PUBLIC.parse().unwrap()]),
             "mixed.example" => Ok(vec![PUBLIC.parse().unwrap(), "10.0.0.1:443".parse().unwrap()]),
             "missing.example" => Err(ErrorKind::NotFound.into()),
             _ => panic!("unexpected resolution for {host}:{port}"),
@@ -72,20 +73,42 @@ struct Proxy {
     task: JoinHandle<Result<()>>,
 }
 
+/// What a test proxy intercepts, and how it treats the upstream.
+#[derive(Default)]
+struct Interception {
+    capture_hosts: Vec<String>,
+    vault: Option<crate::vault::VaultClient>,
+    capture: Option<Arc<dyn CaptureSink>>,
+    /// The CA the upstream verifier trusts.
+    upstream_ca: Option<CertificateDer<'static>>,
+}
+
 impl Proxy {
     async fn start(keys: Arc<KeyManager>, dialer: Arc<TestDialer>, idle: Duration) -> Self {
+        Self::start_with(keys, dialer, idle, Interception::default()).await
+    }
+
+    async fn start_with(keys: Arc<KeyManager>, dialer: Arc<TestDialer>, idle: Duration, interception: Interception) -> Self {
         let tls = TestTls::new("127.0.0.1");
+        let pki = (!interception.capture_hosts.is_empty())
+            .then(|| crate::config::ForwardProxyPkiConfig { mount: super::testpki::MOUNT.into(), role: super::testpki::ROLE.into() });
         let config = ForwardProxyConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             ports: vec![443],
-            capture_hosts: vec![],
+            capture_hosts: interception.capture_hosts,
             tls: tls.config.clone(),
-            pki: None,
+            pki,
         };
-        let listener = Listener::bind(Some(&config)).await.unwrap().unwrap();
+        let listener = Listener::bind(Some(&config), interception.vault.as_ref()).await.unwrap().unwrap();
         let address = listener.tcp.local_addr().unwrap();
         let shutdown = CancellationToken::new();
-        let task = tokio::spawn(listener.run_with(keys, idle, shutdown.clone(), dialer));
+        let upstream_ca =
+            interception.upstream_ca.unwrap_or_else(|| generate_simple_self_signed(vec!["unused".into()]).unwrap().cert.der().clone());
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let verifier = tokio_rustls::rustls::client::WebPkiServerVerifier::builder(Arc::new(roots)).build().unwrap();
+        let services = Services { keys, idle_timeout: idle, max_body_bytes: 64 * 1024 * 1024, capture: interception.capture };
+        let task = tokio::spawn(listener.run_with(services, shutdown.clone(), dialer, verifier));
         Self { address, tls, shutdown, task }
     }
 
@@ -363,7 +386,7 @@ async fn idle_and_slow_connections_close() {
 #[tokio::test]
 async fn disabled_config_does_not_bind() {
     let config: Config = toml::from_str("").unwrap();
-    assert!(Listener::bind(config.forward_proxy.as_ref()).await.unwrap().is_none());
+    assert!(Listener::bind(config.forward_proxy.as_ref(), None).await.unwrap().is_none());
     let missing_tls = "[forward_proxy]\nlisten = \"127.0.0.1:8318\"";
     assert!(toml::from_str::<Config>(missing_tls).unwrap_err().to_string().contains("missing field `tls`"));
 }
@@ -475,3 +498,5 @@ async fn egress_policy_rejects_administrative_scopes() {
     assert!(!Principal::operator().has_scope(Scope::Egress));
     assert!(egress_policy().grants_only_client_use());
 }
+
+mod intercept;

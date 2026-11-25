@@ -3,9 +3,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep_until};
-use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -14,9 +12,11 @@ use crate::keys::KeyManager;
 
 const KEY_SWEEP: Duration = Duration::from_secs(15);
 
+/// Copy bytes both ways until either side closes, the tunnel idles, the key
+/// stops passing or xolotl shuts down.
 pub(super) async fn run(
-    mut client_stream: TlsStream<TcpStream>,
-    mut upstream: TcpStream,
+    mut client_stream: impl AsyncRead + AsyncWrite + Unpin,
+    mut upstream: impl AsyncRead + AsyncWrite + Unpin,
     buffered: &[u8],
     client: &Client,
     keys: &KeyManager,
@@ -29,7 +29,7 @@ pub(super) async fn run(
     let mut received = 0;
     {
         let (client_read, mut client_write) = tokio::io::split(&mut client_stream);
-        let (upstream_read, mut upstream_write) = upstream.split();
+        let (upstream_read, mut upstream_write) = tokio::io::split(&mut upstream);
         let send = async {
             write(&mut upstream_write, buffered, &activity, &mut sent).await?;
             copy(client_read, upstream_write, &activity, &mut sent).await
@@ -87,7 +87,8 @@ async fn wait_for_idle(activity: &Mutex<Instant>, idle_timeout: Duration) {
     }
 }
 
-async fn wait_for_revocation(keys: &KeyManager, key_hash: &str) {
+/// Returns once the key stops passing, checked every [`KEY_SWEEP`].
+pub(super) async fn wait_for_revocation(keys: &KeyManager, key_hash: &str) {
     let mut interval = tokio::time::interval_at(Instant::now() + KEY_SWEEP, KEY_SWEEP);
     loop {
         interval.tick().await;

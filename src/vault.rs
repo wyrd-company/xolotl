@@ -150,7 +150,6 @@ impl VaultClient {
 
     /// Have the PKI role `<mount>/sign/<role>` sign `csr` for `common_name`.
     /// The private key stays with the caller.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the interception commit signs through it"))]
     pub(crate) async fn pki_sign(&self, mount: &str, role: &str, csr: &str, common_name: &str) -> Result<crate::forward_proxy::Signed> {
         let path = format!("{}/sign/{}", mount.trim_matches('/'), role.trim_matches('/'));
         let (status, body) = self.request(Method::POST, &path, Some(&json!({"csr": csr, "common_name": common_name}))).await?;

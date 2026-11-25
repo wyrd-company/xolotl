@@ -103,9 +103,13 @@ pub fn router(state: AppState) -> Router {
 
 pub async fn serve(state: AppState) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(state.cfg.server.listen).await?;
-    let forward_proxy = crate::forward_proxy::Listener::bind(state.cfg.forward_proxy.as_ref()).await?;
-    let keys = state.keys.clone();
-    let idle_timeout = Duration::from_secs(state.cfg.server.upstream_timeout_secs);
+    let forward_proxy = crate::forward_proxy::Listener::bind(state.cfg.forward_proxy.as_ref(), state.vault.as_ref()).await?;
+    let services = crate::forward_proxy::Services {
+        keys: state.keys.clone(),
+        idle_timeout: Duration::from_secs(state.cfg.server.upstream_timeout_secs),
+        max_body_bytes: state.cfg.server.max_body_bytes,
+        capture: None,
+    };
     let shutdown = tokio_util::sync::CancellationToken::new();
     tracing::info!(addr = %state.cfg.server.listen, "xolotl listening");
     let main_shutdown = shutdown.clone();
@@ -120,7 +124,7 @@ pub async fn serve(state: AppState) -> Result<()> {
     };
     let forward = async {
         if let Some(listener) = forward_proxy {
-            listener.run(keys, idle_timeout, shutdown.clone()).await?;
+            listener.run(services, shutdown.clone()).await?;
         }
         Ok(())
     };

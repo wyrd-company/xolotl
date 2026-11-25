@@ -1,6 +1,5 @@
 //! Certificates for the capture hosts, signed through the OpenBao PKI and held
 //! in memory only.
-#![cfg_attr(not(test), expect(dead_code, reason = "the interception commit serves these certificates"))]
 
 use std::collections::HashMap;
 use std::fmt;

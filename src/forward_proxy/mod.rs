@@ -1,8 +1,11 @@
-//! The optional TLS listener for authenticated HTTP/1.1 CONNECT tunnels.
+//! The optional TLS listener for authenticated HTTP/1.1 CONNECT requests:
+//! a tunnel to every destination, except the capture hosts, which are
+//! intercepted ([`intercept`]) and their model requests captured ([`capture`]).
 
 pub(crate) mod capture;
 mod certs;
 mod destination;
+mod intercept;
 mod tunnel;
 
 use std::io::ErrorKind;
@@ -23,10 +26,15 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use self::capture::CaptureSink;
 pub(crate) use self::certs::Signed;
+use self::certs::{PkiSigner, Store};
 use self::destination::{Destination, Dialer, TcpDialer};
+use self::intercept::Interceptor;
 use crate::config::{ForwardProxyConfig, ForwardProxyTlsConfig};
 use crate::keys::{KeyManager, Principal, Scope, sha256_hex};
+use crate::vault::VaultClient;
+use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 
 const PHASE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEAD: usize = 16 * 1024;
@@ -36,6 +44,20 @@ pub(crate) struct Listener {
     tls: TlsAcceptor,
     expires_at: i64,
     ports: Vec<u16>,
+    /// The capture hosts' certificates, when there are capture hosts.
+    certs: Option<Arc<Store>>,
+}
+
+/// What the listener needs from the rest of xolotl.
+pub(crate) struct Services {
+    pub keys: Arc<KeyManager>,
+    /// `server.upstream_timeout_secs`: the longest a tunnel idles, and an
+    /// intercepted request waits for the upstream.
+    pub idle_timeout: Duration,
+    /// `server.max_body_bytes`: the most of a body the capture reads.
+    pub max_body_bytes: usize,
+    /// Receives the model requests on capture hosts.
+    pub capture: Option<Arc<dyn CaptureSink>>,
 }
 
 pub(crate) fn load_tls(config: &ForwardProxyTlsConfig) -> Result<(ServerConfig, i64)> {
@@ -63,36 +85,52 @@ pub(crate) fn load_tls(config: &ForwardProxyTlsConfig) -> Result<(ServerConfig, 
 }
 
 impl Listener {
-    pub(crate) async fn bind(config: Option<&ForwardProxyConfig>) -> Result<Option<Self>> {
+    pub(crate) async fn bind(config: Option<&ForwardProxyConfig>, vault: Option<&VaultClient>) -> Result<Option<Self>> {
         let Some(config) = config else {
             return Ok(None);
         };
         let (tls, expires_at) = load_tls(&config.tls)?;
+        let certs = match (&config.pki, config.capture_hosts.is_empty()) {
+            (_, true) => None,
+            (Some(pki), false) => {
+                let vault = vault.context("forward_proxy.capture_hosts needs the vault")?.clone();
+                let signer = PkiSigner { vault, mount: pki.mount.clone(), role: pki.role.clone() };
+                Some(Store::new(&config.capture_hosts, Arc::new(signer)))
+            }
+            (None, false) => anyhow::bail!("forward_proxy.capture_hosts needs [forward_proxy.pki]"),
+        };
         let tcp = TcpListener::bind(config.listen).await.with_context(|| format!("binding forward_proxy.listen {}", config.listen))?;
-        Ok(Some(Self { tcp, tls: TlsAcceptor::from(Arc::new(tls)), expires_at, ports: config.ports.clone() }))
+        Ok(Some(Self { tcp, tls: TlsAcceptor::from(Arc::new(tls)), expires_at, ports: config.ports.clone(), certs }))
     }
 
-    pub(crate) async fn run(self, keys: Arc<KeyManager>, idle_timeout: Duration, shutdown: CancellationToken) -> Result<()> {
-        self.run_with(keys, idle_timeout, shutdown, Arc::new(TcpDialer)).await
+    pub(crate) async fn run(self, services: Services, shutdown: CancellationToken) -> Result<()> {
+        let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+        let verifier = rustls_platform_verifier::Verifier::new(provider).context("loading the system roots for upstream TLS")?;
+        self.run_with(services, shutdown, Arc::new(TcpDialer), Arc::new(verifier)).await
     }
 
     async fn run_with(
         self,
-        keys: Arc<KeyManager>,
-        idle_timeout: Duration,
+        services: Services,
         shutdown: CancellationToken,
         dialer: Arc<dyn Dialer>,
+        verifier: Arc<dyn ServerCertVerifier>,
     ) -> Result<()> {
         let address = self.tcp.local_addr()?;
         info!(%address, "forward proxy listening");
         let mut daily = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
         let connections = opentelemetry::global::meter("xolotl").u64_counter("xolotl.forward_proxy.connections").build();
+        let certificates = self.certs.clone().map(|store| tokio::spawn(store.run(shutdown.clone())));
+        let Services { keys, idle_timeout, max_body_bytes, capture } = services;
+        let interceptor = Arc::new(Interceptor::new(keys.clone(), dialer.clone(), verifier, idle_timeout, capture, max_body_bytes));
         let context = Arc::new(ConnectionContext {
             tls: self.tls,
             ports: self.ports,
             idle_timeout,
             keys,
             dialer,
+            certs: self.certs,
+            interceptor,
             connections,
             shutdown: shutdown.clone(),
         });
@@ -122,6 +160,9 @@ impl Listener {
         }
         drop(self.tcp);
         while tasks.join_next().await.is_some() {}
+        if let Some(certificates) = certificates {
+            let _ = certificates.await;
+        }
         Ok(())
     }
 }
@@ -132,8 +173,16 @@ struct ConnectionContext {
     idle_timeout: Duration,
     keys: Arc<KeyManager>,
     dialer: Arc<dyn Dialer>,
+    certs: Option<Arc<Store>>,
+    interceptor: Arc<Interceptor>,
     connections: Counter<u64>,
     shutdown: CancellationToken,
+}
+
+/// What a CONNECT that passed the checks becomes.
+enum Route {
+    Tunnel(TcpStream),
+    Intercept(Arc<ServerConfig>),
 }
 
 struct Client {
@@ -179,17 +228,22 @@ impl ConnectionContext {
         else {
             return;
         };
-        let (upstream, buffered, client) = prepared;
-        tunnel::run(stream, upstream, &buffered, &client, &self.keys, self.idle_timeout, &self.shutdown).await;
+        let (route, buffered, client, destination) = prepared;
+        match route {
+            Route::Tunnel(upstream) => {
+                tunnel::run(stream, upstream, &buffered, &client, &self.keys, self.idle_timeout, &self.shutdown).await;
+            }
+            Route::Intercept(tls) => self.interceptor.serve(stream, buffered, tls, &destination, &client, &self.shutdown).await,
+        }
     }
 
-    async fn prepare(&self, stream: &mut TlsStream<TcpStream>) -> Result<(TcpStream, Vec<u8>, Client), Refusal> {
+    async fn prepare(&self, stream: &mut TlsStream<TcpStream>) -> Result<(Route, Vec<u8>, Client, Destination), Refusal> {
         let request = timeout(PHASE_TIMEOUT, read_connect(stream)).await.unwrap_or(Err(Refusal::HeadTimeout));
-        let (destination, password, buffered) = request.inspect_err(|refused| self.record(None, None, Some(*refused)))?;
-        let client = self.authorize(password).await.inspect_err(|refused| self.record(Some(&destination), None, Some(*refused)))?;
-        let result = self.connect(&destination).await;
-        self.record(Some(&destination), Some(&client.id), result.as_ref().err().copied());
-        Ok((result?, buffered, client))
+        let (destination, password, buffered) = request.inspect_err(|refused| self.record(None, None, Err(*refused)))?;
+        let client = self.authorize(password).await.inspect_err(|refused| self.record(Some(&destination), None, Err(*refused)))?;
+        let result = self.route(&destination).await;
+        self.record(Some(&destination), Some(&client.id), result.as_ref().map(|(_, outcome)| *outcome).map_err(|refused| *refused));
+        Ok((result?.0, buffered, client, destination))
     }
 
     async fn authorize(&self, password: Option<String>) -> Result<Client, Refusal> {
@@ -199,17 +253,33 @@ impl ConnectionContext {
         Ok(Client { id, key_hash: sha256_hex(password.trim()) })
     }
 
-    async fn connect(&self, destination: &Destination) -> Result<TcpStream, Refusal> {
+    /// Check the destination, then intercept a capture host that has a
+    /// certificate, and tunnel to anything else.
+    async fn route(&self, destination: &Destination) -> Result<(Route, &'static str), Refusal> {
         if !self.ports.contains(&destination.port) {
             return Err(Refusal::Port);
         }
         let addresses =
             timeout(PHASE_TIMEOUT, destination.checked_addresses(self.dialer.as_ref())).await.map_err(|_| Refusal::Resolve)??;
-        timeout(PHASE_TIMEOUT, self.dialer.connect(&addresses)).await.map_err(|_| Refusal::Connect)?.map_err(|_| Refusal::Connect)
+        let mut outcome = "tunnel";
+        if let Some(certs) = &self.certs
+            && destination.port == 443
+            && certs.is_capture_host(&destination.host)
+        {
+            if let Some(tls) = certs.get(&destination.host).await {
+                return Ok((Route::Intercept(tls), "intercept"));
+            }
+            warn!(host = %destination.host, "forward proxy has no valid certificate for the capture host; tunneling it");
+            outcome = "fallback";
+        }
+        let upstream =
+            timeout(PHASE_TIMEOUT, self.dialer.connect(&addresses)).await.map_err(|_| Refusal::Connect)?.map_err(|_| Refusal::Connect)?;
+        Ok((Route::Tunnel(upstream), outcome))
     }
 
-    fn record(&self, destination: Option<&Destination>, client: Option<&str>, refusal: Option<Refusal>) {
-        let outcome = if refusal.is_some() { "refused" } else { "tunnel" };
+    fn record(&self, destination: Option<&Destination>, client: Option<&str>, outcome: Result<&'static str, Refusal>) {
+        let refusal = outcome.err();
+        let outcome = outcome.unwrap_or("refused");
         let mut attributes = vec![KeyValue::new("outcome", outcome)];
         if let Some(client) = client {
             attributes.push(KeyValue::new("client", client.to_owned()));
