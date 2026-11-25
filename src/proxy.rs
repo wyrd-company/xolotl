@@ -497,7 +497,7 @@ pub fn is_sse(headers: &reqwest::header::HeaderMap) -> bool {
 
 /// Whether a body is text, as its `Content-Type` says. A body without one
 /// counts as text.
-fn is_text(headers: &reqwest::header::HeaderMap) -> bool {
+pub(crate) fn is_text(headers: &reqwest::header::HeaderMap) -> bool {
     let Some(ct) = headers.get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) else { return true };
     let ct = ct.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
     ct.starts_with("text/") || ct.ends_with("json") || ct.ends_with("xml") || ct.is_empty()

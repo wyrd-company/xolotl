@@ -49,6 +49,11 @@ pub struct SessionId {
 }
 
 impl SessionId {
+    /// The session of an identifier a client sent, from `source`.
+    pub(crate) fn sent(source: &'static str, value: &str) -> Self {
+        Self::new(source, &[source.as_bytes(), value.as_bytes()])
+    }
+
     fn new(source: &'static str, parts: &[&[u8]]) -> Self {
         let mut hash = Sha256::new();
         for part in parts {
@@ -67,7 +72,7 @@ const OPENCODE_CLIENT_HEADER: &str = "x-opencode-session-id";
 /// The identity of an LLM request: what the client says, else a digest of the
 /// system prompt and first user turn. `None` for a body with neither.
 pub fn resolve(headers: &HeaderMap, body: &Value) -> Option<SessionId> {
-    let sent = |source, value: String| Some(SessionId::new(source, &[source.as_bytes(), value.as_bytes()]));
+    let sent = |source, value: String| Some(SessionId::sent(source, &value));
     if let Some(value) = claude::session_key(headers, body).filter(|v| !v.is_empty()) {
         return sent("claude-code", value);
     }

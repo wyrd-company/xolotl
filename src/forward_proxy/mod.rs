@@ -1,5 +1,6 @@
 //! The optional TLS listener for authenticated HTTP/1.1 CONNECT tunnels.
 
+pub(crate) mod capture;
 mod certs;
 mod destination;
 mod tunnel;
