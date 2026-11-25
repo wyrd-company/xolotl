@@ -5,6 +5,8 @@ use serde_json::json;
 
 use super::*;
 use crate::export::{Captured, Exporter};
+use crate::forward_proxy::capture::{CaptureSink, Forwarded, Observed};
+use crate::proxy::TokenUsage;
 
 fn row(id: &str) -> Exchange {
     Exchange {
@@ -92,6 +94,106 @@ fn collecting(bodies: bool, max: usize) -> (Sink, tokio::sync::mpsc::UnboundedRe
         }
     });
     (sink, rx)
+}
+
+const CODE_ASSIST_REQUEST: &str = r#"{"model":"gemini","request":{"contents":[{"text":"éé"}]}}"#;
+const FIRST_EVENT: &str = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"PO\"}]}}]}}\n\n";
+const LAST_EVENT: &str =
+    "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"NG!\"}]},\"finishReason\":\"STOP\"}]}}\n\n";
+
+fn forwarded() -> Forwarded {
+    let path = "/v1internal:streamGenerateContent";
+    Forwarded {
+        client_id: "team/laptop".into(),
+        host: "daily-cloudcode-pa.googleapis.com".into(),
+        path: path.into(),
+        status: 200,
+        started_at: "2026-11-07T10:00:00.250Z".parse().unwrap(),
+        latency_ms: 1500,
+        trace_id: "0123456789abcdef0123456789abcdef".into(),
+        request: Captured { bytes: CODE_ASSIST_REQUEST.as_bytes().to_vec(), ..Default::default() },
+        response: Captured { bytes: [FIRST_EVENT, LAST_EVENT].concat().into_bytes(), sse: true, truncated: false },
+        observed: Observed {
+            model: Some("gemini".into()),
+            session_key: Some("session-digest".into()),
+            usage: TokenUsage { input: Some(7), output: Some(3), cached: Some(1), cache_write: None },
+            complete: true,
+            ..Default::default()
+        },
+        error: None,
+    }
+}
+
+#[tokio::test]
+async fn a_forwarded_exchange_uses_the_jetstream_shape_with_each_destinations_limit() {
+    let limit = CODE_ASSIST_REQUEST.find('é').unwrap() + 1;
+    let (small, mut small_rx) = collecting(true, limit);
+    let (large, mut large_rx) = collecting(true, 1 << 20);
+    let (metadata, mut metadata_rx) = collecting(false, 1 << 20);
+    let exporter = Exporter::new(vec![small, large, metadata]);
+    exporter.clone().hold().submit(forwarded());
+    let mut payloads = Vec::new();
+    for rx in [&mut small_rx, &mut large_rx, &mut metadata_rx] {
+        let row = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(subject(&row.client_id), "xolotl.exchanges.team/laptop");
+        let (payload, cut) = encode(&row, 1 << 20).unwrap();
+        assert!(!cut);
+        payloads.push(serde_json::from_slice::<Exchange>(&payload).unwrap());
+        assert!(rx.try_recv().is_err());
+    }
+    let [small, large, bare] = payloads.as_slice() else { unreachable!() };
+    for row in [small, large, bare] {
+        assert_eq!(row.id, large.id);
+        assert_eq!(row.account_kind, "forward-proxy");
+        assert_eq!((row.started_at.as_str(), row.finished_at.as_str()), ("2026-11-07 10:00:00.250", "2026-11-07 10:00:01.750"));
+        assert_eq!((row.input_tokens, row.output_tokens, row.cached_tokens), (Some(7), Some(3), Some(1)));
+        assert_eq!((row.session_key.as_str(), row.session_source.as_str()), ("session-digest", "cloud-code"));
+        assert_eq!(row.model, "gemini");
+        assert!(row.streamed);
+    }
+    assert_eq!(large.request, CODE_ASSIST_REQUEST);
+    assert_eq!(large.response, [FIRST_EVENT, LAST_EVENT].concat());
+    assert!(!large.request_truncated && !large.response_truncated);
+    assert_eq!(large.output_text, "PONG!");
+    assert_eq!(large.stop_reason, "end");
+    assert_eq!(serde_json::from_str::<Value>(&large.output).unwrap(), json!([{"type": "text", "text": "PONG!"}]));
+    assert_eq!(small.request, &CODE_ASSIST_REQUEST[..limit - 1]);
+    assert!(small.request_truncated && small.response_truncated);
+    assert_eq!(small.response, &FIRST_EVENT[..limit]);
+    assert!(small.output_text.is_empty(), "the retained response stops within the first SSE event");
+    assert!(bare.request.is_empty() && bare.response.is_empty() && bare.output.is_empty() && bare.error.is_empty());
+    assert!(!bare.request_truncated && !bare.response_truncated);
+
+    let mut partial = forwarded();
+    partial.observed.complete = false;
+    partial.error = Some("incomplete: forwarding ended early".into());
+    exporter.hold().submit(partial);
+    let row = large_rx.recv().await.unwrap();
+    assert_eq!((row.input_tokens, row.output_tokens, row.cached_tokens), (None, None, None));
+    assert_eq!(row.error, "incomplete: forwarding ended early");
+}
+
+#[tokio::test]
+#[ignore = "needs a NATS server"]
+async fn a_forwarded_exchange_reaches_jetstream_after_export_shutdown() {
+    let _turn = SERVER.lock().await;
+    let Some(server) = Server::new(&[SUBJECTS], -1).await else { return };
+    let exporter = Exporter::new(vec![start(server.cfg(), None).await.unwrap()]);
+    let hold = exporter.clone().hold();
+    let shutdown = tokio::spawn(async move { exporter.shutdown().await });
+    tokio::task::yield_now().await;
+    assert!(!shutdown.is_finished(), "shutdown waits for the capture hold");
+    hold.submit(forwarded());
+    shutdown.await.unwrap();
+    let messages = server.messages().await;
+    let [(subject, id, body)] = messages.as_slice() else { panic!("expected one JetStream message, got {messages:?}") };
+    assert_eq!(subject, "xolotl.exchanges.team/laptop");
+    assert_eq!(body["id"], json!(id));
+    assert_eq!(body["account_kind"], "forward-proxy");
+    assert_eq!(body["request"], CODE_ASSIST_REQUEST);
+    assert_eq!(body["response"], [FIRST_EVENT, LAST_EVENT].concat());
+    assert_eq!(body["output_text"], "PONG!");
+    server.delete().await;
 }
 
 #[tokio::test]

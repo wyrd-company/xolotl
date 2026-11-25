@@ -176,7 +176,7 @@ impl Intercepted {
                     path: path.clone(),
                     trace_id: crate::telemetry::current_trace_id().unwrap_or_default(),
                 };
-                let tap = Tap::admit(sink.as_ref(), admission, interceptor.max_decoded, interceptor.requests.clone());
+                let tap = Tap::admit(sink.clone(), admission, interceptor.max_decoded, interceptor.requests.clone());
                 tap.head(Direction::Request, Head::new(None, request.headers()));
                 Some(tap)
             }

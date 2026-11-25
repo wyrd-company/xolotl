@@ -30,13 +30,12 @@ const MAX_JSON_SCAN: usize = 4 * 1024 * 1024;
 const MAX_FIELD: usize = 256;
 const MAX_TOOL_CALLS: usize = 256;
 const MAX_TOOL_NAME: usize = 128;
-const SESSION_SOURCE: &str = "cloud-code";
+pub(crate) const SESSION_SOURCE: &str = "cloud-code";
 /// A key longer than this is never one of the keys the scanner looks for.
 const MAX_KEY: usize = 16;
 
 /// One captured request on an intercepted host.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "the export builds its rows from these fields"))]
 pub struct Forwarded {
     pub client_id: String,
     pub host: String,
@@ -75,7 +74,7 @@ pub trait CaptureSink: Send + Sync {
     fn body_limit(&self) -> Option<usize>;
     /// Hold the sink open for one request, from admission until its rows are
     /// queued. Shutdown waits for every hold.
-    fn hold(&self) -> CaptureHold;
+    fn hold(self: Arc<Self>) -> CaptureHold;
 }
 
 /// Keeps the export open for one request's capture.
@@ -86,7 +85,6 @@ pub struct CaptureHold {
 impl CaptureHold {
     /// A hold whose `submit` runs `f`. Dropping the hold without submitting
     /// drops `f`, which releases whatever it holds.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the export makes the holds"))]
     pub fn new(f: impl FnOnce(Forwarded) + Send + 'static) -> Self {
         Self { submit: Some(Box::new(f)) }
     }
@@ -187,11 +185,12 @@ struct GuardState {
 
 impl Tap {
     /// Admit a request: take a hold from the sink, and start its capture task.
-    pub fn admit(sink: &dyn CaptureSink, admission: Admission, max_decoded: usize, requests: Counter<u64>) -> Self {
+    pub fn admit(sink: Arc<dyn CaptureSink>, admission: Admission, max_decoded: usize, requests: Counter<u64>) -> Self {
+        let body_limit = sink.body_limit();
         let hold = sink.hold();
         let (tx, rx) = mpsc::unbounded_channel();
         let waiting = Arc::new(AtomicUsize::new(0));
-        let task = CaptureTask { rx, waiting: waiting.clone(), body_limit: sink.body_limit(), max_decoded, requests };
+        let task = CaptureTask { rx, waiting: waiting.clone(), body_limit, max_decoded, requests };
         tokio::spawn(task.run(hold, admission));
         let inner = Guard {
             tx,
@@ -684,7 +683,7 @@ mod tests {
             self.limit
         }
 
-        fn hold(&self) -> CaptureHold {
+        fn hold(self: Arc<Self>) -> CaptureHold {
             let tx = self.tx.clone();
             CaptureHold::new(move |forwarded| tx.send(forwarded).unwrap())
         }
@@ -698,7 +697,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let admission = Admission { client_id: "c".into(), host: "h.example".into(), path: "/p".into(), trace_id: String::new() };
         let requests = opentelemetry::global::meter("test").u64_counter("test").build();
-        (Tap::admit(&Sink { limit, tx }, admission, 64 * 1024 * 1024, requests), rx)
+        (Tap::admit(Arc::new(Sink { limit, tx }), admission, 64 * 1024 * 1024, requests), rx)
     }
 
     /// Frames for `body`, cut into pieces of at most `size`.

@@ -9,6 +9,7 @@
 //! before it reaches the translator.
 
 mod chat;
+pub(crate) mod cloudcode;
 pub mod ir;
 mod messages;
 mod responses;

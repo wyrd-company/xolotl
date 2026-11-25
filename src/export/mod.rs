@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::catalog::Wire;
 use crate::db::RequestRecord;
+use crate::forward_proxy::capture::{CaptureHold, CaptureSink, Forwarded, SESSION_SOURCE};
 use crate::proxy::TokenUsage;
 use crate::telemetry::metrics;
 use crate::translate::{self, ir};
@@ -48,7 +49,7 @@ pub struct Exchange {
     pub session_source: String,
     pub provider: String,
     pub account_id: String,
-    /// The kind of the account that served the request ([`crate::accounts::AccountKind`]).
+    /// The account kind ([`crate::accounts::AccountKind`]), or `forward-proxy`.
     pub account_kind: String,
     /// The model name the client asked for.
     pub model: String,
@@ -84,6 +85,28 @@ pub struct Exchange {
 }
 
 impl Exchange {
+    fn set_response(&mut self, resp: Captured, assemble: impl FnOnce(&[u8], bool) -> Option<Assembled>) {
+        self.streamed = resp.sse;
+        self.response_truncated = resp.truncated;
+        if (200..300).contains(&self.status) {
+            if let Some((out, error)) = assemble(&resp.bytes, resp.sse) {
+                match error {
+                    Some((kind, message)) if self.error.is_empty() => self.error = error_text(&kind, &message),
+                    Some(_) => {}
+                    None => self.stop_reason = stop_reason(out.stop).to_string(),
+                }
+                self.output_text = output_text(&out);
+                self.output = output_json(&out).to_string();
+            }
+        } else if self.error.is_empty() {
+            let status = http::StatusCode::from_u16(self.status).unwrap_or(http::StatusCode::BAD_GATEWAY);
+            let (kind, message) = translate::upstream_error(status, &resp.bytes);
+            self.error = error_text(&kind, &message);
+        }
+        // The captured bytes become the column: a valid body is not copied.
+        self.response = String::from_utf8(resp.bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    }
+
     /// Roughly the bytes the row holds: every string, and a fixed allowance for the rest.
     fn size(&self) -> usize {
         let strings = [
@@ -158,6 +181,7 @@ impl std::fmt::Debug for Capture {
 /// the row is built in another task.
 pub struct Pending {
     capture: Arc<Capture>,
+    _hold: InFlight,
 }
 
 impl Pending {
@@ -166,9 +190,11 @@ impl Pending {
     }
 }
 
-impl Drop for Pending {
+struct InFlight(Arc<Exporter>);
+
+impl Drop for InFlight {
     fn drop(&mut self) {
-        self.capture.exporter.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -195,8 +221,7 @@ impl Capture {
     /// Hold the exporter open for a row that is being built: shutdown waits
     /// for it before the destinations send what is queued.
     pub fn pending(self: &Arc<Self>) -> Pending {
-        self.exporter.in_flight.fetch_add(1, Ordering::AcqRel);
-        Pending { capture: self.clone() }
+        Pending { capture: self.clone(), _hold: self.exporter.hold_row() }
     }
 
     /// Build the row and queue it. A destination that keeps less than the
@@ -254,32 +279,41 @@ impl Capture {
             request_truncated,
             ..Default::default()
         };
-        let Some(resp) = response else { return row };
-        row.streamed = resp.sse;
-        row.response_truncated = resp.truncated;
-        let success = (200..300).contains(&r.status);
-        let path = r.endpoint.split('?').next().unwrap_or_default();
-        match Wire::for_path(path) {
-            Some(wire) if success => {
-                let (out, error) = translate::assemble(wire, &resp.bytes, resp.sse);
-                match error {
-                    Some((kind, message)) => row.error = error_text(&kind, &message),
-                    None => row.stop_reason = stop_reason(out.stop).to_string(),
-                }
-                row.output_text = output_text(&out);
-                row.output = output_json(&out).to_string();
-            }
-            _ if !success => {
-                let status = axum::http::StatusCode::from_u16(r.status).unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-                let (kind, message) = translate::upstream_error(status, &resp.bytes);
-                row.error = error_text(&kind, &message);
-            }
-            _ => {}
+        if let Some(resp) = response {
+            let path = r.endpoint.split('?').next().unwrap_or_default();
+            row.set_response(resp, |body, sse| Wire::for_path(path).map(|wire| translate::assemble(wire, body, sse)));
         }
-        // The captured bytes become the column: a valid body is not copied.
-        row.response = String::from_utf8(resp.bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         row
     }
+}
+
+type Assembled = (ir::Response, Option<(String, String)>);
+
+/// Drop a partial UTF-8 character from a captured prefix before converting it.
+fn trim_partial_char(captured: &mut Captured) {
+    if captured.truncated
+        && let Err(error) = std::str::from_utf8(&captured.bytes)
+        && error.error_len().is_none()
+    {
+        captured.bytes.truncate(error.valid_up_to());
+    }
+}
+
+fn forwarded_bodies(mut row: Exchange, mut request: Captured, mut response: Captured, limit: usize) -> Exchange {
+    trim_partial_char(&mut request);
+    trim_partial_char(&mut response);
+    let (body, cut) = truncate(String::from_utf8_lossy(&request.bytes).into_owned(), limit);
+    row.request = body;
+    row.request_truncated = request.truncated || cut;
+    if !response.bytes.is_empty() {
+        row.set_response(response, |body, sse| Some(translate::cloudcode::assemble(body, sse)));
+        let (body, cut) = truncate(row.response, limit);
+        row.response = body;
+        row.response_truncated |= cut;
+    } else {
+        row.response_truncated = response.truncated;
+    }
+    row
 }
 
 /// `kind: message`, short: an error body without a message is all message.
@@ -440,11 +474,16 @@ pub struct Exporter {
     /// The distinct `(bodies, max_body_bytes)` of the destinations, the
     /// capture's own first.
     settings: Vec<(bool, usize)>,
-    /// Rows taken but not yet queued ([`Pending`]).
+    /// Rows taken but not yet queued.
     in_flight: AtomicUsize,
 }
 
 impl Exporter {
+    fn hold_row(self: &Arc<Self>) -> InFlight {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        InFlight(self.clone())
+    }
+
     pub fn new(mut sinks: Vec<Sink>) -> Arc<Self> {
         let bodies = sinks.iter().any(|s| s.bodies);
         let max_body_bytes = sinks.iter().filter(|s| s.bodies).map(|s| s.max_body_bytes).max().unwrap_or(0);
@@ -484,6 +523,46 @@ impl Exporter {
         }
     }
 
+    fn submit_forwarded(&self, f: Forwarded) {
+        let usage = if f.observed.complete { f.observed.usage } else { TokenUsage::default() };
+        let session_source = if f.observed.session_key.is_some() { SESSION_SOURCE } else { "" };
+        let model = f.observed.model.unwrap_or_default();
+        let finished = f.started_at + chrono::Duration::milliseconds(f.latency_ms as i64);
+        let base = Exchange {
+            id: uuid::Uuid::now_v7().to_string(),
+            started_at: timestamp(f.started_at),
+            finished_at: timestamp(finished),
+            trace_id: f.trace_id,
+            client_id: f.client_id,
+            session_key: f.observed.session_key.unwrap_or_default(),
+            session_source: session_source.to_string(),
+            provider: f.host,
+            account_kind: "forward-proxy".to_string(),
+            model: model.clone(),
+            upstream_model: model,
+            client_endpoint: f.path.clone(),
+            endpoint: f.path,
+            status: f.status,
+            latency_ms: f.latency_ms,
+            streamed: f.response.sse,
+            input_tokens: usage.input,
+            output_tokens: usage.output,
+            cached_tokens: usage.cached,
+            tool_calls: f.observed.tool_calls,
+            error: truncate(f.error.unwrap_or_default(), MAX_ERROR_BYTES).0,
+            ..Default::default()
+        };
+        let mut rows = Vec::with_capacity(self.settings.len());
+        for &(bodies, max) in self.settings.iter().skip(1) {
+            let row =
+                if bodies { forwarded_bodies(base.clone(), f.request.limited(max), f.response.limited(max), max) } else { base.clone() };
+            rows.push(Arc::new(row));
+        }
+        let row = if self.bodies { forwarded_bodies(base, f.request, f.response, self.max_body_bytes) } else { base };
+        rows.insert(0, Arc::new(row));
+        self.enqueue(&rows);
+    }
+
     /// Queue one row, as built, for every destination.
     #[cfg(test)]
     fn enqueue_row(&self, row: Exchange) {
@@ -513,6 +592,17 @@ impl Exporter {
                 tracing::warn!(sink = sink.name, "export did not finish before shutdown; queued rows are lost");
             }
         }
+    }
+}
+
+impl CaptureSink for Exporter {
+    fn body_limit(&self) -> Option<usize> {
+        self.bodies.then_some(self.max_body_bytes)
+    }
+
+    fn hold(self: Arc<Self>) -> CaptureHold {
+        let hold = self.hold_row();
+        CaptureHold::new(move |forwarded| hold.0.submit_forwarded(forwarded))
     }
 }
 #[cfg(test)]

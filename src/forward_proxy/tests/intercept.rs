@@ -63,7 +63,7 @@ struct Origin {
 impl Origin {
     async fn start(alpn: &[&[u8]], handler: Handler) -> Self {
         let ca = ca("origin test CA");
-        let leaf = CertificateParams::new(vec![CAPTURE.to_owned()]).unwrap();
+        let leaf = CertificateParams::new(vec![CAPTURE.to_owned(), OAUTH.to_owned()]).unwrap();
         let key = KeyPair::generate().unwrap();
         let leaf = leaf.signed_by(&key, &ca).unwrap();
         let mut tls = tokio_rustls::rustls::ServerConfig::builder()
@@ -152,7 +152,7 @@ impl CaptureSink for TestSink {
         self.limit
     }
 
-    fn hold(&self) -> CaptureHold {
+    fn hold(self: Arc<Self>) -> CaptureHold {
         self.holds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (tx, panic) = (self.tx.clone(), self.panic);
         CaptureHold::new(move |forwarded| {
@@ -302,6 +302,52 @@ async fn intercepts_a_capture_host_and_forwards_unchanged() {
     }
 }
 
+#[tokio::test]
+async fn model_posts_export_one_clickhouse_row_without_headers_or_oauth() {
+    let clickhouse = wiremock::MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).expect(1).mount(&clickhouse).await;
+    let cfg = crate::config::ClickHouseConfig { url: clickhouse.uri(), create_table: false, flush_secs: 3600, ..Default::default() };
+    let export = Exporter::new(vec![crate::export::clickhouse::start(cfg, None, None).unwrap()]);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let origin = Origin::start(&[b"h2", b"http/1.1"], recording(seen.clone())).await;
+    let s = setup(&origin, Some(export.clone()), TEST_TIMEOUT).await;
+    let client = client(&s.proxy, &s.key, &[&s.pki.root, &origin.ca], false);
+
+    let model = model_request(&client).send().await.unwrap();
+    assert_eq!(model.headers()["set-cookie"], "upstream=1");
+    assert_eq!(model.text().await.unwrap(), SSE_BODY);
+    let token = client.post(format!("https://{OAUTH}/token")).body("refresh_token=oauth-fixture").send().await.unwrap();
+    assert_eq!(token.text().await.unwrap(), "{}");
+    let non_model = client.post(format!("https://{CAPTURE}/v1internal:loadCodeAssist")).body("non-model-fixture").send().await.unwrap();
+    assert_eq!(non_model.text().await.unwrap(), "{}");
+    let options = client.request(reqwest::Method::OPTIONS, format!("https://{CAPTURE}{MODEL_PATH}")).send().await.unwrap();
+    assert_eq!(options.status(), 200);
+    s.proxy.stop().await;
+    export.shutdown().await;
+
+    let inserts = clickhouse.received_requests().await.unwrap();
+    assert_eq!(inserts.len(), 1);
+    let insert = &inserts[0];
+    assert!(insert.url.query_pairs().any(|(key, value)| key == "query" && value.ends_with("FORMAT JSONEachRow")));
+    let body = std::str::from_utf8(&insert.body).unwrap();
+    assert_eq!(body.lines().count(), 1);
+    for private in ["ya29", "cookie-fixture", "gl-node", "upstream=1", "checked", "alt=sse", "oauth-fixture", "non-model-fixture", &s.key] {
+        assert!(!body.contains(private), "{private} in export");
+    }
+    let row: crate::export::Exchange = serde_json::from_str(body).unwrap();
+    assert_eq!((row.client_id.as_str(), row.provider.as_str(), row.account_kind.as_str()), ("egress/client", CAPTURE, "forward-proxy"));
+    assert!(row.account_id.is_empty() && row.context_window.is_none() && row.cost.is_none());
+    assert_eq!((row.client_endpoint.as_str(), row.endpoint.as_str()), (MODEL_PATH, MODEL_PATH));
+    assert_eq!((row.model.as_str(), row.upstream_model.as_str()), ("gemini-3-pro", "gemini-3-pro"));
+    assert_eq!((row.session_source.as_str(), row.session_key), ("cloud-code", SessionId::sent("cloud-code", "sess-1").key));
+    assert_eq!((row.input_tokens, row.output_tokens, row.cached_tokens), (Some(10), Some(5), Some(4)));
+    assert_eq!((row.request.as_str(), row.response.as_str()), (REQUEST_BODY, SSE_BODY));
+    assert!(row.streamed && !row.request_truncated && !row.response_truncated && row.error.is_empty());
+    assert_eq!((row.output_text.as_str(), row.stop_reason.as_str()), ("PONG", "tool_use"));
+    assert_eq!(row.tool_calls, ["read_file"]);
+    assert_eq!(seen.lock().unwrap().len(), 4);
+}
+
 /// An SSE response of two chunks; the second waits for `release`.
 fn two_chunks(release: oneshot::Receiver<()>) -> Handler {
     let release = Arc::new(Mutex::new(Some(release)));
@@ -343,6 +389,55 @@ async fn streamed_chunks_reach_the_client_as_they_arrive() {
         assert!(rest.is_empty(), "{rest:?}");
     }
     assert_eq!(next_capture(&mut rows).await.response.bytes, b"data: {\"n\":1}\n\ndata: {\"n\":2}\n\n");
+    s.proxy.stop().await;
+}
+
+#[tokio::test]
+async fn failed_export_does_not_interrupt_the_next_live_stream() {
+    let clickhouse = wiremock::MockServer::start().await;
+    let (attempts, mut observed) = mpsc::unbounded_channel();
+    Mock::given(method("POST"))
+        .respond_with(move |_: &wiremock::Request| {
+            let _ = attempts.send(());
+            ResponseTemplate::new(500)
+        })
+        .mount(&clickhouse)
+        .await;
+    let cfg = crate::config::ClickHouseConfig { url: clickhouse.uri(), create_table: false, batch_rows: 1, ..Default::default() };
+    // Reserve an unlistening port so the NATS destination remains disconnected.
+    let refused = tokio::net::TcpSocket::new_v4().unwrap();
+    refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let nats = crate::config::NatsConfig { url: format!("nats://{}", refused.local_addr().unwrap()), ..Default::default() };
+    let export = Exporter::new(vec![
+        crate::export::clickhouse::start(cfg, None, None).unwrap(),
+        crate::export::nats::start(nats, None).await.unwrap(),
+    ]);
+    let (release, wait) = oneshot::channel();
+    let streaming = two_chunks(wait);
+    let origin = Origin::start(
+        &[b"h2", b"http/1.1"],
+        Arc::new(move |request| {
+            if request.uri().query() == Some("prime=1") {
+                Box::pin(async { HttpResponse::builder().header("content-type", "text/event-stream").body(full(SSE_BODY)).unwrap() })
+            } else {
+                streaming(request)
+            }
+        }),
+    )
+    .await;
+    let s = setup(&origin, Some(export.clone()), TEST_TIMEOUT).await;
+    let client = client(&s.proxy, &s.key, &[&s.pki.root], false);
+
+    let mut live = model_request(&client).send().await.unwrap();
+    assert_eq!(live.status(), 200);
+    assert_eq!(live.chunk().await.unwrap().unwrap(), "data: {\"n\":1}\n\n");
+    let prime = client.post(format!("https://{CAPTURE}{MODEL_PATH}?prime=1")).body(REQUEST_BODY).send().await.unwrap();
+    assert_eq!(prime.text().await.unwrap(), SSE_BODY);
+    timeout(TEST_TIMEOUT, observed.recv()).await.unwrap().unwrap();
+    assert!(export.sinks()[1].queued() > 0, "the disconnected NATS destination holds the earlier row");
+
+    release.send(()).unwrap();
+    assert_eq!(live.bytes().await.unwrap(), "data: {\"n\":2}\n\n");
     s.proxy.stop().await;
 }
 

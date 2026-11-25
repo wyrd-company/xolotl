@@ -108,7 +108,7 @@ pub async fn serve(state: AppState) -> Result<()> {
         keys: state.keys.clone(),
         idle_timeout: Duration::from_secs(state.cfg.server.upstream_timeout_secs),
         max_body_bytes: state.cfg.server.max_body_bytes,
-        capture: None,
+        capture: state.export.clone().map(|exporter| exporter as Arc<dyn crate::forward_proxy::capture::CaptureSink>),
     };
     let shutdown = tokio_util::sync::CancellationToken::new();
     tracing::info!(addr = %state.cfg.server.listen, "xolotl listening");

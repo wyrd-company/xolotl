@@ -17,6 +17,7 @@ use crate::policy::Policy;
 use crate::server::tests::harness;
 
 const ORIGIN: &str = "origin.example";
+const OAUTH: &str = "oauth2.googleapis.com";
 const CAPTURE: &str = "daily-cloudcode-pa.googleapis.com";
 const PUBLIC: &str = "8.8.8.8:443";
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -55,7 +56,7 @@ impl Dialer for TestDialer {
         self.resolutions.lock().unwrap().push((host.to_owned(), port));
         match host {
             CAPTURE => Ok(self.capture_answers.lock().unwrap().pop_front().unwrap_or_else(|| vec![PUBLIC.parse().unwrap()])),
-            ORIGIN => Ok(vec![PUBLIC.parse().unwrap()]),
+            ORIGIN | OAUTH => Ok(vec![PUBLIC.parse().unwrap()]),
             "mixed.example" => Ok(vec![PUBLIC.parse().unwrap(), "10.0.0.1:443".parse().unwrap()]),
             "missing.example" => Err(ErrorKind::NotFound.into()),
             _ => panic!("unexpected resolution for {host}:{port}"),
