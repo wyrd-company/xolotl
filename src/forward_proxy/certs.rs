@@ -270,7 +270,8 @@ mod tests {
 
     const HOST: &str = "capture.example";
 
-    async fn handshake(tls: Arc<ServerConfig>, root: &CertificateDer<'static>, sni: &str) -> std::io::Result<()> {
+    /// The chain the server presented, after a handshake as `sni`.
+    async fn handshake(tls: Arc<ServerConfig>, root: &CertificateDer<'static>, sni: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
             let mut stream = TlsAcceptor::from(tls).accept(server).await?;
@@ -283,10 +284,11 @@ mod tests {
         let name = ServerName::try_from(sni.to_owned()).unwrap();
         let result = async {
             let mut stream = TlsConnector::from(Arc::new(config)).connect(name, client).await?;
+            let chain = stream.get_ref().1.peer_certificates().unwrap_or_default().to_vec();
             let mut reply = Vec::new();
             stream.read_to_end(&mut reply).await?;
             assert_eq!(reply, b"ok");
-            Ok(())
+            Ok(chain)
         }
         .await;
         let _ = server.await.unwrap();
@@ -304,7 +306,10 @@ mod tests {
         let tls = store.get(HOST).await.expect("a certificate within the wait");
         assert!(store.get("other.example").await.is_none());
 
-        handshake(tls.clone(), &pki.root, HOST).await.unwrap();
+        let chain = handshake(tls.clone(), &pki.root, HOST).await.unwrap();
+        // The leaf and the intermediate; the client already has the root.
+        assert_eq!(chain.len(), 2);
+        assert!(!chain.contains(&pki.root));
         handshake(tls.clone(), &pki.root, "CAPTURE.example").await.unwrap();
         // A client asking for another name gets no certificate.
         assert!(handshake(tls, &pki.root, "other.example").await.is_err());

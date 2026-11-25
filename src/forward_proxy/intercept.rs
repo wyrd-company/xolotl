@@ -329,10 +329,11 @@ fn google_error(status: StatusCode, grpc: &str, message: &str) -> Response<Proxy
 
 /// Whether the request's `Host` and `:authority` name `host`, on port 443 or none.
 fn names_host<B>(request: &Request<B>, host: &str) -> bool {
+    // A capture host is a DNS name, so an IP literal never matches it.
     let names = |authority: &str| {
         let (name, port) = match authority.rsplit_once(':') {
-            Some((name, port)) if !name.ends_with(']') || name.starts_with('[') => (name, Some(port)),
-            _ => (authority, None),
+            Some((name, port)) => (name, Some(port)),
+            None => (authority, None),
         };
         let name = name.strip_suffix('.').unwrap_or(name);
         name.eq_ignore_ascii_case(host) && port.is_none_or(|port| port == "443")

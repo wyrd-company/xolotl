@@ -438,13 +438,21 @@ async fn only_the_connect_host_is_served() {
     let name = ServerName::try_from("other.example").unwrap();
     assert!(timeout(TEST_TIMEOUT, TlsConnector::from(Arc::new(tls)).connect(name, stream)).await.unwrap().is_err());
 
-    // A request whose Host names another host is misdirected.
+    // A request whose Host names another host, or another port, is misdirected.
     let client = client(&s.proxy, &s.key, &[&s.pki.root], true);
-    let response = client.get(format!("https://{CAPTURE}/v1internal:loadCodeAssist")).header("host", "other.example").send().await.unwrap();
-    assert_eq!(response.status(), 421);
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["error"]["code"], 421);
+    for host in ["other.example".to_owned(), format!("{CAPTURE}:8443"), "[::1]:443".to_owned()] {
+        let response = client.get(format!("https://{CAPTURE}/v1internal:loadCodeAssist")).header("host", &host).send().await.unwrap();
+        assert_eq!(response.status(), 421, "{host}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], 421);
+    }
     assert!(seen.lock().unwrap().is_empty());
+    for host in [format!("{CAPTURE}:443"), format!("{}.", CAPTURE.to_ascii_uppercase())] {
+        let response = client.get(format!("https://{CAPTURE}/v1internal:loadCodeAssist")).header("host", &host).send().await.unwrap();
+        assert_eq!(response.status(), 200, "{host}");
+    }
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    seen.lock().unwrap().clear();
 
     // A key that stops passing gets 403 on its next request, and the connection closes.
     assert_eq!(client.get(format!("https://{CAPTURE}/v1internal:loadCodeAssist")).send().await.unwrap().status(), 200);
@@ -466,6 +474,8 @@ async fn an_upgrade_is_joined_as_a_tunnel() {
         Box::pin(async move {
             assert_eq!(request.headers()["upgrade"], "websocket");
             assert_eq!(request.headers()["connection"], "upgrade");
+            assert_eq!(request.headers()["host"], CAPTURE, "a request without Host gets the CONNECT host");
+            assert_eq!(request.uri(), MODEL_PATH);
             let upgrade = hyper::upgrade::on(&mut request);
             tokio::spawn(async move {
                 let mut io = TokioIo::new(upgrade.await.unwrap());
@@ -494,8 +504,9 @@ async fn an_upgrade_is_joined_as_a_tunnel() {
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     let stream = TlsConnector::from(Arc::new(tls)).connect(ServerName::try_from(CAPTURE).unwrap(), stream).await.unwrap();
     let mut stream = BufReader::new(stream);
+    // An absolute-form target with no Host header.
     let request =
-        format!("POST {MODEL_PATH} HTTP/1.1\r\nHost: {CAPTURE}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nContent-Length: 0\r\n\r\n");
+        format!("POST https://{CAPTURE}{MODEL_PATH} HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nContent-Length: 0\r\n\r\n");
     stream.get_mut().write_all(request.as_bytes()).await.unwrap();
     let mut head = String::new();
     while !head.ends_with("\r\n\r\n") {
