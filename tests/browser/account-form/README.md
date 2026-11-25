@@ -84,3 +84,25 @@ To start clean, recreate only this fixture's vault and app and rerun setup.
 Cleanup: remove the three named containers (`docker rm -fv` for the app to remove
 its anonymous data volume), stop the exact fixture/proxy processes you started,
 and remove the scratch directory. Do not remove another task's resources.
+
+
+For subscription login polling and import discovery feedback, run
+`docker exec xolotl-account-form-browser node /evidence/login-feedback.cjs`
+after sign-in. It uses the real import/start-login handlers and synthetic upstream
+model/device endpoints. Only HTTP polling faults (503 after pending and 404 on
+first poll) are injected at the browser boundary. It verifies stopped polling,
+new-login/cancel recovery, upstream rejection and successful device login,
+saved import identity on discovery failure, Refresh models recovery, counts
+including zero, and phone light/dark layout and axe accessibility. It writes
+`login-feedback-result.json`, `account-import-discovery.png`,
+`account-login-polling.png`, phone captures and `account-login-feedback.webm`.
+Copy the two desktop PNGs to `docs/user/assets/` when updating the user guide.
+
+With that synthetic fixture running under names `xolotl-account-login-app` and
+`xolotl-account-login-browser`, run
+`node tests/browser/account-form/login-feedback-mutations.mjs <absolute-scratch-dir>`.
+The scratch directory must be the browser's `/evidence` mount and contain
+`config.toml`, `signin.cjs` and `login-feedback.cjs`. The runner replaces only
+that disposable app, proves that discarding the import result and continuing
+polling after an HTTP error each fail a behavioral assertion, and restores the
+source and normal image in `finally`. Rerun acceptance after the mutation run.

@@ -38,6 +38,13 @@ come from the config file (see
 Open **Accounts** in the [web UI](web-ui.md) and select **Add account**. The
 screen has one section per provider.
 
+For Codex and Grok device logins, **Waiting for authorization…** means xolotl
+is checking the login. If **Could not check login status** appears, the check
+failed and polling stops. The reason is shown, and a successful login has not
+been confirmed. Select **Start new login**, then start the device login again,
+or **Cancel** to leave it. The same feedback appears in **Log in again** in
+account details.
+
 ### Codex
 
 1. Under **Codex (ChatGPT)**, select **Start device login**.
@@ -227,6 +234,16 @@ You can move a login from the Codex CLI (`~/.codex/auth.json`) or Claude Code
    and file stay in the form so you can correct them and retry.
 
 ![Import a login with the optional Work subscription label and auth.json selected](assets/account-import.png)
+
+The result shows the saved account's label or identity, account ID and provider,
+plus how many models were found, including zero. If model discovery fails,
+the imported credentials are still saved. Read the discovery error and select
+**Refresh models** to retry discovery without importing the file again. The
+current discovery result appears below the original import outcome.
+
+![Saved import with its model discovery error and Refresh models recovery](assets/account-import-discovery.png)
+
+![Device login polling error showing that success is unconfirmed and offering a new login](assets/account-login-polling.png)
 
 With the CLI:
 

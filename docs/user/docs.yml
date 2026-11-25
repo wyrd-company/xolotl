@@ -13,6 +13,8 @@ assets:
   - assets/models-pricing.png
   - assets/models-pricing.gif
   - assets/account-import.png
+  - assets/account-import-discovery.png
+  - assets/account-login-polling.png
   - assets/account-priority.png
   - assets/account-forms.gif
   - assets/account-recovery.png

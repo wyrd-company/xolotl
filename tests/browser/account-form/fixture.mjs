@@ -60,6 +60,18 @@ http
         id_token: `${unsigned}.${sign("RSA-SHA256", Buffer.from(unsigned), privateKey).toString("base64url")}`,
       });
     }
+    if (url.pathname === "/api/accounts/deviceauth/usercode")
+      return json(res, { device_auth_id: "fixture-device", user_code: "DEMO-CODE", interval: "1" });
+    if (url.pathname === "/api/accounts/deviceauth/token") {
+      if (mode === "login-complete") return json(res, { authorization_code: "fixture", code_verifier: "fixture" });
+      if (mode === "login-rejected") return json(res, { error: "fixture authorization denied" }, 400);
+      return json(res, {}, 403);
+    }
+    if (url.pathname === "/oauth/token" && mode === "login-complete")
+      return json(res, {
+        access_token: "synthetic-device", refresh_token: "synthetic-device-refresh", expires_in: 3600,
+        id_token: `h.${b64({ email: "device@example.test", "https://api.openai.com/auth": { chatgpt_account_id: "fixture-device" } })}.s`,
+      });
     if (url.pathname === "/oauth/token")
       return json(res, { access_token: "synthetic-refreshed", refresh_token: "synthetic-rotated", expires_in: 3600 });
     if (url.pathname === "/wham/usage") {
@@ -82,8 +94,8 @@ http
       return json(res, { credits: Array.from({ length: 2 }, () => ({ status: "available", reset_type: "codex_rate_limits" })) });
     if (url.pathname.endsWith("/models")) {
       await new Promise((r) => setTimeout(r, 1200));
-      if (mode.startsWith("recovery-") && mode !== "recovery-model-error")
-        return json(res, { models: [{ slug: "fixture-codex-model" }] });
+      if (mode === "import-models-ok" || mode === "import-models-empty" || mode === "login-complete" || (mode.startsWith("recovery-") && mode !== "recovery-model-error"))
+        return json(res, { models: mode === "import-models-empty" ? [] : [{ slug: "fixture-codex-model" }] });
       return json(
         res,
         { error: { message: "fixture upstream unavailable" } },
