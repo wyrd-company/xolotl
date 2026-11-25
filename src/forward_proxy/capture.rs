@@ -15,7 +15,7 @@ use http::HeaderMap;
 use opentelemetry::{KeyValue, metrics::Counter};
 use parking_lot::Mutex;
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -121,21 +121,26 @@ pub(super) struct Head {
     status: Option<u16>,
     text: bool,
     sse: bool,
-    encoding: Option<String>,
+    /// Identity or one supported coding. An error skips the body copy.
+    encoding: Result<Option<Coding>, ()>,
 }
 
 impl Head {
     pub fn new(status: Option<u16>, headers: &HeaderMap) -> Self {
         let content_type = headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default();
         let sse = content_type.split(';').next().unwrap_or_default().trim().eq_ignore_ascii_case("text/event-stream");
-        let encoding: Vec<&str> = headers
+        let mut codings = headers
             .get_all(http::header::CONTENT_ENCODING)
             .iter()
             .flat_map(|v| v.to_str().unwrap_or("unreadable").split(','))
             .map(str::trim)
-            .filter(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"))
-            .collect();
-        let encoding = (!encoding.is_empty()).then(|| encoding.join(", "));
+            .filter(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"));
+        // A single coding uses one decoder and produces only one decoded stream.
+        let encoding = match codings.next() {
+            None => Ok(None),
+            Some(name) if codings.next().is_none() => Coding::parse(name).map(Some).ok_or(()),
+            Some(_) => Err(()),
+        };
         Self { status, text: crate::proxy::is_text(headers), sse, encoding }
     }
 }
@@ -321,9 +326,10 @@ fn forwarded(admission: Admission, bodies: [BodyCapture; 2], terminal: &Terminal
     let lost = |d: Direction| terminal.relayed[d as usize] > terminal.queued[d as usize];
     let complete = request.complete() && response.complete() && !lost(Direction::Request) && !lost(Direction::Response);
     let error = terminal.error.clone().or_else(|| {
-        let body = if request.decode_error {
+        // A capture gap can make a valid coded stream end early.
+        let body = if request.decode_error && !lost(Direction::Request) {
             "request"
-        } else if response.decode_error {
+        } else if response.decode_error && !lost(Direction::Response) {
             "response"
         } else {
             return None;
@@ -357,7 +363,7 @@ fn forwarded(admission: Admission, bodies: [BodyCapture; 2], terminal: &Terminal
 
 enum BodyInput {
     Plain(Box<BodyCapture>),
-    Encoded { input: Option<DuplexStream>, capture: JoinHandle<Box<BodyCapture>> },
+    Encoded { direction: Direction, sse: bool, input: Option<DuplexStream>, capture: JoinHandle<Box<BodyCapture>> },
 }
 
 impl BodyInput {
@@ -368,17 +374,25 @@ impl BodyInput {
     fn from_head(direction: Direction, head: Head, body_limit: Option<usize>, max_decoded: usize) -> Self {
         let mut capture = Box::new(BodyCapture::new(direction));
         capture.head(head.sse, head.text, body_limit);
-        let Some(encoding) = head.encoding else { return Self::Plain(capture) };
-        let Some(layers) = Coding::parse(&encoding) else {
-            capture.skipped = true;
-            capture.complete = false;
-            capture.readable = false;
-            capture.copy = None;
-            return Self::Plain(capture);
+        let coding = match head.encoding {
+            Ok(Some(coding)) => coding,
+            Ok(None) => return Self::Plain(capture),
+            Err(()) => {
+                capture.skipped = true;
+                capture.complete = false;
+                capture.readable = false;
+                capture.copy = None;
+                return Self::Plain(capture);
+            }
         };
         let (input, source) = tokio::io::duplex(DECODE_CHUNK);
         let worker = tokio::spawn(async move {
-            let mut decoder = Coding::reader(layers, source);
+            let mut source = BufReader::new(source);
+            // An empty HTTP body can still have a Content-Encoding header.
+            if matches!(source.fill_buf().await, Ok([])) {
+                return capture;
+            }
+            let mut decoder = coding.reader(source);
             let mut buf = [0; DECODE_CHUNK];
             loop {
                 let room = max_decoded.saturating_sub(capture.decoded);
@@ -405,7 +419,7 @@ impl BodyInput {
             }
             capture
         });
-        Self::Encoded { input: Some(input), capture: worker }
+        Self::Encoded { direction, sse: head.sse, input: Some(input), capture: worker }
     }
 
     async fn frame(&mut self, data: &[u8], max_decoded: usize) {
@@ -432,9 +446,18 @@ impl BodyInput {
     async fn into_capture(self) -> BodyCapture {
         match self {
             Self::Plain(capture) => *capture,
-            Self::Encoded { input, capture } => {
+            Self::Encoded { direction, sse, input, capture } => {
                 drop(input);
-                *capture.await.expect("capture decoder task panicked")
+                match capture.await {
+                    Ok(capture) => *capture,
+                    Err(_) => {
+                        let mut capture = BodyCapture::new(direction);
+                        capture.sse = sse;
+                        capture.decode_error = true;
+                        capture.mark_cut();
+                        capture
+                    }
+                }
             }
         }
     }
@@ -971,11 +994,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supported_encodings_are_decoded_across_frames_and_header_values() {
+    async fn each_supported_encoding_decodes_at_the_exact_budget() {
         let head = |fields: &[(&'static str, &'static str)]| Head::new(Some(200), &headers(fields));
-        for (name, cap) in [("gzip", USAGE.len()), ("x-gzip", 1024), ("deflate", 1024), ("br", 1024), ("zstd", 1024)] {
+        for name in ["gzip", "x-gzip", "deflate", "br", "zstd"] {
             let compressed = encode(name, USAGE).await;
-            let decoded = coded_response(head(&[("content-encoding", name)]), &compressed, cap).await;
+            let decoded = coded_response(head(&[("content-encoding", name)]), &compressed, USAGE.len()).await;
             assert!(decoded.complete(), "{name}");
             assert_eq!(decoded.usage.input, Some(7), "{name}");
             let (copy, cut) = decoded.into_captured(false);
@@ -983,15 +1006,42 @@ mod tests {
             assert_eq!(copy.bytes, USAGE);
         }
 
-        // A gzip body can have several members. The HTTP codings are then applied in header order.
+        // A gzip body can have several members within the single HTTP coding.
         let midpoint = USAGE.len() / 2;
         let members = [encode("gzip", &USAGE[..midpoint]).await, encode("gzip", &USAGE[midpoint..]).await].concat();
-        let stacked = encode("zstd", &encode("br", &members).await).await;
-        let decoded =
-            coded_response(head(&[("content-encoding", "GZIP, identity, br"), ("content-encoding", "zstd")]), &stacked, 1024).await;
+        let decoded = coded_response(head(&[("content-encoding", "GZIP"), ("content-encoding", "identity")]), &members, 1024).await;
         assert!(decoded.complete());
         assert_eq!(decoded.usage.input, Some(7));
         assert_eq!(decoded.into_captured(false).0.bytes, USAGE);
+    }
+
+    #[tokio::test]
+    async fn stacked_codings_skip_body_capture_and_metadata() {
+        let encoded = encode("br", &encode("gzip", USAGE).await).await;
+        for fields in [headers(&[("content-encoding", "gzip, br")]), headers(&[("content-encoding", "gzip"), ("content-encoding", "br")])] {
+            let body = coded_response(Head::new(Some(200), &fields), &encoded, 1024).await;
+            assert!(body.skipped);
+            assert_eq!(body.decoded, 0);
+            assert!(!body.complete());
+            assert!(!body.decode_error);
+            assert_eq!(body.usage, TokenUsage::default());
+            let (copy, _) = body.into_captured(false);
+            assert!(copy.truncated);
+            assert!(copy.bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_coded_body_has_no_decode_error_or_cut() {
+        for name in ["gzip", "x-gzip", "deflate", "br", "zstd"] {
+            let head = Head::new(Some(503), &headers(&[("content-encoding", name)]));
+            let body = coded_response(head, b"", 1024).await;
+            assert!(body.complete(), "{name}");
+            assert!(!body.decode_error, "{name}");
+            let (copy, _) = body.into_captured(false);
+            assert!(copy.bytes.is_empty());
+            assert!(!copy.truncated);
+        }
     }
 
     #[tokio::test]
@@ -1023,6 +1073,69 @@ mod tests {
         let (copy, cut) = plain.into_captured(false);
         assert!(cut && copy.truncated);
         assert_eq!(copy.bytes, &USAGE[..limit]);
+    }
+
+    #[tokio::test]
+    async fn exports_decode_errors_and_preserves_the_forwarding_outcome() {
+        use crate::export::{Exporter, Sink};
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let exporter = Exporter::new(vec![Sink::spawn("test", true, 1024, 1, |mut queue| async move {
+            while let Some(row) = queue.rx.recv().await {
+                queue.done(&row);
+                tx.send(row).unwrap();
+            }
+        })]);
+        let compressed = encode("gzip", USAGE).await;
+        let without_trailer = &compressed[..compressed.len() - 1];
+        for (direction, frame_lost, forwarding_error, expected) in [
+            (Direction::Request, false, None, "capture_error: could not decode the request Content-Encoding"),
+            (Direction::Response, false, None, "capture_error: could not decode the response Content-Encoding"),
+            (Direction::Response, true, None, ""),
+            (Direction::Response, false, Some("proxy_error: upstream read failed"), "proxy_error: upstream read failed"),
+        ] {
+            let mut bodies = [BodyCapture::new(Direction::Request), BodyCapture::new(Direction::Response)];
+            let head = Head::new(None, &headers(&[("content-encoding", "gzip")]));
+            let mut body = BodyInput::from_head(direction, head, Some(1024), 1024);
+            body.frame(without_trailer, 1024).await;
+            body.end();
+            bodies[direction as usize] = body.into_capture().await;
+
+            let mut queued = [0; 2];
+            queued[direction as usize] = without_trailer.len() as u64;
+            let mut relayed = queued;
+            relayed[direction as usize] += u64::from(frame_lost);
+            let terminal = Terminal {
+                status: 200,
+                error: forwarding_error.map(str::to_owned),
+                relayed,
+                queued,
+                started_at: Utc::now(),
+                latency_ms: 0,
+            };
+            let admission =
+                Admission { client_id: "c".into(), host: "h.example".into(), path: MODEL_PATHS[1].into(), trace_id: String::new() };
+            let (row, cut) = forwarded(admission, bodies, &terminal);
+            assert!(cut && !row.observed.complete);
+            exporter.clone().hold().submit(row);
+            let row =
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("capture enqueues an exchange").unwrap();
+            assert_eq!(row.error, expected);
+            assert_eq!(row.request_truncated, direction == Direction::Request);
+            assert_eq!(row.response_truncated, direction == Direction::Response);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_decoder_task_keeps_the_exchange_capture() {
+        let capture = tokio::spawn(std::future::pending());
+        capture.abort();
+        let input = BodyInput::Encoded { direction: Direction::Response, sse: true, input: None, capture };
+        let body = input.into_capture().await;
+        assert!(body.decode_error);
+        assert!(!body.complete());
+        let (copy, _) = body.into_captured(false);
+        assert!(copy.sse && copy.truncated);
     }
 
     #[tokio::test]

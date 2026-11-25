@@ -208,7 +208,7 @@ For each captured request, the export is held open from the moment the request i
 
 It works on each direction's body in three steps, separately for each direction:
 
-1. **Decode.** It decodes `gzip`, `x-gzip`, `deflate`, `br` and `zstd` from the body's `Content-Encoding`, reversing the order of up to four stacked codings. It processes up to `server.max_body_bytes` of decoded output (64 MiB by default), then marks excess output as cut. An invalid compressed body keeps the decoded prefix, marks the copy as cut and records a capture error. The client always gets the bytes the upstream sent.
+1. **Decode.** For each nonempty body, capture accepts identity or one of `gzip`, `x-gzip`, `deflate`, `br` and `zstd`. It skips an unsupported coding or a stack of codings, so each body uses at most one decoder and has no intermediate decoded stream. It processes up to `server.max_body_bytes` of decoded output (64 MiB by default), then marks excess output as cut. Invalid compressed data keeps the decoded prefix and marks the copy as cut. The row records a decode error when capture received all frames in that direction and forwarding supplied no error. The client always gets the bytes the upstream sent.
 2. **Copy.** When a destination takes bodies, it keeps the decoded body up to the capture's `max_body_bytes`, the largest any destination wants ([Destinations](export.md#destinations)). A body is copied when its `Content-Type` passes `proxy::is_text`, as on the gateway: text, JSON or XML, or absent or empty.
 3. **Read metadata** into `Observed`, whatever the copies keep:
    - **From the request:** a streaming JSON scanner keeps only the top-level `model` and `request.session_id`. `request.session_id` becomes the session digest at once: the truncated SHA-256 of source `cloud-code` and the value ([Session identity](sessions.md#session-identity)).
@@ -220,7 +220,7 @@ These limits bound the capture. Every limit marked † skips metadata, which set
 |---|---|
 | Frames waiting in the queue † | 8 MiB per request |
 | Decoded bytes per body † | `server.max_body_bytes` |
-| Coding layers † | Up to four of the supported codings |
+| Coding layers † | One supported coding per body |
 | The body copy | The capture's `max_body_bytes` |
 | One SSE event, or a JSON response, read for metadata † | 4 MiB, the gateway's `MAX_JSON_SCAN` |
 | `model` and `request.session_id` † | 256 bytes each |
