@@ -170,7 +170,9 @@ path without its query string. Sign-in traffic to `oauth2.googleapis.com`,
 `accounts.google.com` or any other host off the list is a tunnel that xolotl
 can't read. The proxy forwards coded bodies as sent and decodes a single
 gzip, x-gzip, deflate, Brotli or zstd coding for the export. An unsupported or
-stacked coding skips the body copy and its metadata. Rows carry the
+stacked coding skips the body copy and its metadata. Capture marks the copy
+as cut when decoded bytes exceed `server.max_body_bytes` or compressed input
+exceeds that limit plus 64 KiB for compression framing. Rows carry the
 [`forward-proxy` account kind](clickhouse-export.md#forward-proxy-exchanges).
 
 The capture works beside forwarding: a slow or failing export never holds up

@@ -39,6 +39,8 @@ pub(crate) const SESSION_SOURCE: &str = "cloud-code";
 /// A key longer than this is never one of the keys the scanner looks for.
 const MAX_KEY: usize = 16;
 const DECODE_CHUNK: usize = 16 * 1024;
+/// Leave room for compression framing when the decoded body fits its budget.
+const CODED_FRAMING_ALLOWANCE: usize = 64 * 1024;
 
 /// One captured request on an intercepted host.
 #[derive(Debug, Clone)]
@@ -282,10 +284,11 @@ struct CaptureTask {
 impl CaptureTask {
     async fn run(mut self, hold: CaptureHold, admission: Admission) {
         let mut bodies = [BodyInput::new(Direction::Request), BodyInput::new(Direction::Response)];
+        let max_coded = self.max_decoded.saturating_add(CODED_FRAMING_ALLOWANCE);
         while let Some(event) = self.rx.recv().await {
             match event {
                 Event::Head(direction, head) => {
-                    bodies[direction as usize] = BodyInput::from_head(direction, head, self.body_limit, self.max_decoded)
+                    bodies[direction as usize] = BodyInput::from_head(direction, head, self.body_limit, self.max_decoded, max_coded)
                 }
                 Event::Frame(direction, data) => {
                     bodies[direction as usize].frame(&data, self.max_decoded).await;
@@ -363,7 +366,15 @@ fn forwarded(admission: Admission, bodies: [BodyCapture; 2], terminal: &Terminal
 
 enum BodyInput {
     Plain(Box<BodyCapture>),
-    Encoded { direction: Direction, sse: bool, input: Option<DuplexStream>, capture: JoinHandle<Box<BodyCapture>> },
+    Encoded {
+        direction: Direction,
+        sse: bool,
+        input: Option<DuplexStream>,
+        remaining: usize,
+        input_cut: bool,
+        ended: bool,
+        capture: JoinHandle<Box<BodyCapture>>,
+    },
 }
 
 impl BodyInput {
@@ -371,7 +382,7 @@ impl BodyInput {
         Self::Plain(Box::new(BodyCapture::new(direction)))
     }
 
-    fn from_head(direction: Direction, head: Head, body_limit: Option<usize>, max_decoded: usize) -> Self {
+    fn from_head(direction: Direction, head: Head, body_limit: Option<usize>, max_decoded: usize, max_coded: usize) -> Self {
         let mut capture = Box::new(BodyCapture::new(direction));
         capture.head(head.sse, head.text, body_limit);
         let coding = match head.encoding {
@@ -419,17 +430,26 @@ impl BodyInput {
             }
             capture
         });
-        Self::Encoded { direction, sse: head.sse, input: Some(input), capture: worker }
+        Self::Encoded {
+            direction,
+            sse: head.sse,
+            input: Some(input),
+            remaining: max_coded,
+            input_cut: false,
+            ended: false,
+            capture: worker,
+        }
     }
 
     async fn frame(&mut self, data: &[u8], max_decoded: usize) {
         match self {
             Self::Plain(capture) => capture.frame(data, max_decoded),
-            Self::Encoded { input, .. } => {
-                if let Some(writer) = input
-                    && writer.write_all(data).await.is_err()
-                {
-                    // The decoder stopped at the limit, end of stream or an error.
+            Self::Encoded { input, remaining, input_cut, .. } => {
+                let Some(writer) = input else { return };
+                let len = data.len().min(*remaining);
+                *remaining -= len;
+                *input_cut = len < data.len();
+                if writer.write_all(&data[..len]).await.is_err() || *input_cut {
                     *input = None;
                 }
             }
@@ -439,17 +459,29 @@ impl BodyInput {
     fn end(&mut self) {
         match self {
             Self::Plain(capture) => capture.end(),
-            Self::Encoded { input, .. } => *input = None,
+            Self::Encoded { input, ended, .. } => {
+                *ended = true;
+                *input = None;
+            }
         }
     }
 
     async fn into_capture(self) -> BodyCapture {
         match self {
             Self::Plain(capture) => *capture,
-            Self::Encoded { direction, sse, input, capture } => {
+            Self::Encoded { direction, sse, input, input_cut, ended, capture, .. } => {
                 drop(input);
                 match capture.await {
-                    Ok(capture) => *capture,
+                    Ok(mut capture) => {
+                        if input_cut {
+                            capture.mark_cut();
+                        }
+                        // An early upstream response can end capture before the upload completes.
+                        if input_cut || (direction == Direction::Request && !ended) {
+                            capture.decode_error = false;
+                        }
+                        *capture
+                    }
                     Err(_) => {
                         let mut capture = BodyCapture::new(direction);
                         capture.sse = sse;
@@ -984,10 +1016,10 @@ mod tests {
         compressed
     }
 
-    async fn coded_response(head: Head, wire: &[u8], limit: usize) -> BodyCapture {
-        let mut body = BodyInput::from_head(Direction::Response, head, Some(1024), limit);
+    async fn coded_response(head: Head, wire: &[u8], max_decoded: usize, max_coded: usize) -> BodyCapture {
+        let mut body = BodyInput::from_head(Direction::Response, head, Some(1024), max_decoded, max_coded);
         for chunk in wire.chunks(3) {
-            body.frame(chunk, limit).await;
+            body.frame(chunk, max_decoded).await;
         }
         body.end();
         body.into_capture().await
@@ -998,7 +1030,7 @@ mod tests {
         let head = |fields: &[(&'static str, &'static str)]| Head::new(Some(200), &headers(fields));
         for name in ["gzip", "x-gzip", "deflate", "br", "zstd"] {
             let compressed = encode(name, USAGE).await;
-            let decoded = coded_response(head(&[("content-encoding", name)]), &compressed, USAGE.len()).await;
+            let decoded = coded_response(head(&[("content-encoding", name)]), &compressed, USAGE.len(), 1024).await;
             assert!(decoded.complete(), "{name}");
             assert_eq!(decoded.usage.input, Some(7), "{name}");
             let (copy, cut) = decoded.into_captured(false);
@@ -1009,7 +1041,7 @@ mod tests {
         // A gzip body can have several members within the single HTTP coding.
         let midpoint = USAGE.len() / 2;
         let members = [encode("gzip", &USAGE[..midpoint]).await, encode("gzip", &USAGE[midpoint..]).await].concat();
-        let decoded = coded_response(head(&[("content-encoding", "GZIP"), ("content-encoding", "identity")]), &members, 1024).await;
+        let decoded = coded_response(head(&[("content-encoding", "GZIP"), ("content-encoding", "identity")]), &members, 1024, 1024).await;
         assert!(decoded.complete());
         assert_eq!(decoded.usage.input, Some(7));
         assert_eq!(decoded.into_captured(false).0.bytes, USAGE);
@@ -1019,7 +1051,7 @@ mod tests {
     async fn stacked_codings_skip_body_capture_and_metadata() {
         let encoded = encode("br", &encode("gzip", USAGE).await).await;
         for fields in [headers(&[("content-encoding", "gzip, br")]), headers(&[("content-encoding", "gzip"), ("content-encoding", "br")])] {
-            let body = coded_response(Head::new(Some(200), &fields), &encoded, 1024).await;
+            let body = coded_response(Head::new(Some(200), &fields), &encoded, 1024, 1024).await;
             assert!(body.skipped);
             assert_eq!(body.decoded, 0);
             assert!(!body.complete());
@@ -1035,7 +1067,7 @@ mod tests {
     async fn an_empty_coded_body_has_no_decode_error_or_cut() {
         for name in ["gzip", "x-gzip", "deflate", "br", "zstd"] {
             let head = Head::new(Some(503), &headers(&[("content-encoding", name)]));
-            let body = coded_response(head, b"", 1024).await;
+            let body = coded_response(head, b"", 1024, 1024).await;
             assert!(body.complete(), "{name}");
             assert!(!body.decode_error, "{name}");
             let (copy, _) = body.into_captured(false);
@@ -1049,7 +1081,7 @@ mod tests {
         let head = || Head::new(Some(200), &headers(&[("content-encoding", "gzip")]));
         let compressed = encode("gzip", USAGE).await;
         let limit = USAGE.len() - 1;
-        let bounded = coded_response(head(), &compressed, limit).await;
+        let bounded = coded_response(head(), &compressed, limit, 1024).await;
         assert!(!bounded.complete());
         assert!(!bounded.decode_error);
         assert_eq!(bounded.usage, TokenUsage::default());
@@ -1058,7 +1090,7 @@ mod tests {
         assert_eq!(copy.bytes, &USAGE[..limit]);
 
         let corrupt = &compressed[..compressed.len() - 1];
-        let decoded = coded_response(head(), corrupt, 1024).await;
+        let decoded = coded_response(head(), corrupt, 1024, 1024).await;
         assert!(!decoded.complete());
         assert!(decoded.decode_error);
         let (copy, cut) = decoded.into_captured(false);
@@ -1076,6 +1108,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_coded_input_budget_applies_even_before_any_output() {
+        let head = || Head::new(Some(200), &headers(&[("content-encoding", "deflate")]));
+        let empty = encode("deflate", b"").await;
+        let ordinary = encode("deflate", USAGE).await;
+        let wire = [empty.as_slice(), ordinary.as_slice()].concat();
+
+        let exact = coded_response(head(), &empty, 1024, empty.len()).await;
+        assert!(exact.complete() && !exact.decode_error);
+        assert!(!exact.into_captured(false).0.truncated);
+        let full = coded_response(head(), &wire, 1024, wire.len()).await;
+        assert!(full.complete());
+        assert_eq!(full.into_captured(false).0.bytes, USAGE);
+
+        // Stop at the first member's end or just before its trailer completes.
+        for max_coded in [empty.len(), empty.len() - 1] {
+            let body = coded_response(head(), &wire, 1024, max_coded).await;
+            assert_eq!(body.decoded, 0);
+            assert!(!body.complete() && !body.decode_error);
+            let (copy, cut) = body.into_captured(false);
+            assert!(cut && copy.truncated);
+            assert!(copy.bytes.is_empty(), "the second member stayed outside the decoder");
+        }
+    }
+
+    #[tokio::test]
     async fn exports_decode_errors_and_preserves_the_forwarding_outcome() {
         use crate::export::{Exporter, Sink};
 
@@ -1088,31 +1145,42 @@ mod tests {
         })]);
         let compressed = encode("gzip", USAGE).await;
         let without_trailer = &compressed[..compressed.len() - 1];
-        for (direction, frame_lost, forwarding_error, expected) in [
-            (Direction::Request, false, None, "capture_error: could not decode the request Content-Encoding"),
-            (Direction::Response, false, None, "capture_error: could not decode the response Content-Encoding"),
-            (Direction::Response, true, None, ""),
-            (Direction::Response, false, Some("proxy_error: upstream read failed"), "proxy_error: upstream read failed"),
+        let refusal = br#"{"error":{"message":"upstream refused the upload"}}"#;
+        for (direction, frame_lost, ended, forwarding_error, expected) in [
+            (Direction::Request, false, true, None, "capture_error: could not decode the request Content-Encoding"),
+            (Direction::Response, false, true, None, "capture_error: could not decode the response Content-Encoding"),
+            (Direction::Request, true, true, None, ""),
+            (Direction::Response, true, true, None, ""),
+            (Direction::Response, false, true, Some("proxy_error: upstream read failed"), "proxy_error: upstream read failed"),
+            (Direction::Request, false, false, None, "invalid_request_error: upstream refused the upload"),
         ] {
             let mut bodies = [BodyCapture::new(Direction::Request), BodyCapture::new(Direction::Response)];
             let head = Head::new(None, &headers(&[("content-encoding", "gzip")]));
-            let mut body = BodyInput::from_head(direction, head, Some(1024), 1024);
+            let mut body = BodyInput::from_head(direction, head, Some(1024), 1024, 1024);
             body.frame(without_trailer, 1024).await;
-            body.end();
+            if ended {
+                body.end();
+            }
             bodies[direction as usize] = body.into_capture().await;
 
+            let status = if ended {
+                200
+            } else {
+                let response = &mut bodies[Direction::Response as usize];
+                response.head(false, true, Some(1024));
+                response.frame(refusal, 1024);
+                response.end();
+                400
+            };
             let mut queued = [0; 2];
             queued[direction as usize] = without_trailer.len() as u64;
+            if !ended {
+                queued[Direction::Response as usize] = refusal.len() as u64;
+            }
             let mut relayed = queued;
             relayed[direction as usize] += u64::from(frame_lost);
-            let terminal = Terminal {
-                status: 200,
-                error: forwarding_error.map(str::to_owned),
-                relayed,
-                queued,
-                started_at: Utc::now(),
-                latency_ms: 0,
-            };
+            let terminal =
+                Terminal { status, error: forwarding_error.map(str::to_owned), relayed, queued, started_at: Utc::now(), latency_ms: 0 };
             let admission =
                 Admission { client_id: "c".into(), host: "h.example".into(), path: MODEL_PATHS[1].into(), trace_id: String::new() };
             let (row, cut) = forwarded(admission, bodies, &terminal);
@@ -1130,7 +1198,15 @@ mod tests {
     async fn a_failed_decoder_task_keeps_the_exchange_capture() {
         let capture = tokio::spawn(std::future::pending());
         capture.abort();
-        let input = BodyInput::Encoded { direction: Direction::Response, sse: true, input: None, capture };
+        let input = BodyInput::Encoded {
+            direction: Direction::Response,
+            sse: true,
+            input: None,
+            remaining: 1024,
+            input_cut: false,
+            ended: false,
+            capture,
+        };
         let body = input.into_capture().await;
         assert!(body.decode_error);
         assert!(!body.complete());
