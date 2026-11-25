@@ -131,7 +131,7 @@ Each request on the connection is forwarded on its own:
   - `connection`, `keep-alive`, `proxy-authorization`, `proxy-authenticate`, `proxy-connection`, `te` other than `te: trailers`, `transfer-encoding` and `upgrade`;
   - every field that the message's own `connection` header names.
 
-  Responses also drop `alt-svc`.
+  Responses also drop `alt-svc`. A request names the CONNECT host as its authority in the upstream's own form: `:authority` over HTTP/2, `Host` over HTTP/1.1. The client's `Host`, already checked against that host, is not forwarded, because Google's front end resets an HTTP/2 request that carries `host` beside `:authority`. HTTP/1.1 clients such as `agy` reach an HTTP/2 upstream this way.
 - **Bodies:** sent frame by frame, data and trailers, as the sender encoded them, each written to the other side as it arrives. A streamed reply reaches the client chunk by chunk. Xolotl imposes no body size limit here.
 - **Upgrades:** an HTTP/1.1 request with `Upgrade` is forwarded on an HTTP/1.1 upstream connection of its own. It keeps `upgrade` and a `connection: upgrade` naming only that field. The upstream's `101` reaches the client with the selected `upgrade` and `connection: upgrade`. After the switch, the two connections are joined and copied as bytes, under the tunnel rules, and are not captured.
 

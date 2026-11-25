@@ -33,7 +33,9 @@ anyone who can read the export can read those conversations. See
    connection of its own, whose certificate xolotl checks against the system
    roots. Headers, bodies and status pass through as sent, chunk by chunk;
    only the hop-by-hop fields of the HTTP connection (such as `connection` and
-   `proxy-authorization`), and `alt-svc` on responses, are left out.
+   `proxy-authorization`), and `alt-svc` on responses, are left out. The host
+   name goes on in the form of the HTTP version the host speaks, so a client
+   on HTTP/1.1, such as `agy`, works with a host that answers over HTTP/2.
 4. For any other host, xolotl answers `200` and copies the encrypted bytes both
    ways.
 
