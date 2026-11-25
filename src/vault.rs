@@ -147,6 +147,24 @@ impl VaultClient {
     pub async fn health(&self) -> Result<()> {
         self.token(false).await.map(|_| ())
     }
+
+    /// Have the PKI role `<mount>/sign/<role>` sign `csr` for `common_name`.
+    /// The private key stays with the caller.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the interception commit signs through it"))]
+    pub(crate) async fn pki_sign(&self, mount: &str, role: &str, csr: &str, common_name: &str) -> Result<crate::forward_proxy::Signed> {
+        let path = format!("{}/sign/{}", mount.trim_matches('/'), role.trim_matches('/'));
+        let (status, body) = self.request(Method::POST, &path, Some(&json!({"csr": csr, "common_name": common_name}))).await?;
+        if !status.is_success() {
+            anyhow::bail!("vault sign {path}: {status}: {}", errors(&body));
+        }
+        let data = body.get("data").context("vault sign response has no data")?;
+        let certificate = data.get("certificate").and_then(Value::as_str).context("vault sign response has no certificate")?.to_owned();
+        let ca_chain = match data.get("ca_chain").and_then(Value::as_array) {
+            Some(chain) => chain.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+            None => data.get("issuing_ca").and_then(Value::as_str).map(str::to_owned).into_iter().collect(),
+        };
+        Ok(crate::forward_proxy::Signed { certificate, ca_chain })
+    }
 }
 
 #[async_trait::async_trait]

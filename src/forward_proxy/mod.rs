@@ -1,5 +1,6 @@
 //! The optional TLS listener for authenticated HTTP/1.1 CONNECT tunnels.
 
+mod certs;
 mod destination;
 mod tunnel;
 
@@ -21,6 +22,7 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+pub(crate) use self::certs::Signed;
 use self::destination::{Destination, Dialer, TcpDialer};
 use crate::config::{ForwardProxyConfig, ForwardProxyTlsConfig};
 use crate::keys::{KeyManager, Principal, Scope, sha256_hex};
@@ -322,5 +324,7 @@ fn proxy_password(headers: &[httparse::Header<'_>]) -> Option<String> {
     Some(password.to_owned())
 }
 
+#[cfg(test)]
+mod testpki;
 #[cfg(test)]
 mod tests;
