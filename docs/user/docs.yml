@@ -15,6 +15,8 @@ assets:
   - assets/account-import.png
   - assets/account-priority.png
   - assets/account-forms.gif
+  - assets/account-recovery.png
+  - assets/account-recovery.gif
 products:
   xolotl:
     name: xolotl

@@ -243,10 +243,21 @@ xolotl accounts import claude ~/.claude/.credentials.json --label work
 ## See your accounts
 
 The **Accounts** screen lists the accounts by provider, with their plan, state,
-usage windows, priority and last use. **Refresh usage** fetches the usage
-windows from the provider now. The details button at the end of a row shows
-the label, cooldown reason, last error, token expiry, reset credits and the
-date it was added.
+usage windows, priority and last use. Select **Refresh usage** on the row or in
+**Details** to fetch usage for an enabled or disabled account. Details shows the
+fetch age, public usage windows and reset credits for Claude and Codex. Expand
+**Provider usage diagnostics (returned JSON)** to inspect the full snapshot,
+including any provider-specific fields.
+
+If the provider poll fails, open **Details** to see the reason. The last fetched
+usage stays visible if available. Select **Retry usage fetch** to try again.
+
+![Disabled account details with usage windows, reset credits and provider diagnostics](assets/account-recovery.png)
+
+The recording shows how to refresh usage on a disabled account, open its
+details and expand the returned JSON.
+
+![Refreshing usage on a disabled account and expanding its provider diagnostics](assets/account-recovery.gif)
 
 With the CLI:
 
@@ -268,7 +279,7 @@ second table shows the provider accounts: name, kind, where each is defined
 | `re-login` | Re-login needed | An OAuth account whose refresh token the provider refused. It is out of rotation | Log in to the account again |
 | `re-login` | Key rejected | An API-key account whose key the provider refused with a 401. It is out of rotation | Replace the key |
 | `re-login` | Refused | An API-key account whose last recorded error is another 4xx | Read the last error. Replace the key, or **Retry** |
-| `UNSAVED` | | A refreshed token could not be written to OpenBao. Xolotl serves from memory and retries every 15 seconds | Fix OpenBao. Do not restart xolotl until the state clears, or the token is lost |
+| `UNSAVED` | Unsaved token | A refreshed token could not be written to OpenBao. Xolotl serves from memory and retries every 15 seconds | Fix OpenBao and wait for the badge to clear before restarting Xolotl |
 | `disabled` | Disabled | You disabled it | **Enable** (`xolotl accounts enable <id>`) |
 
 ## Manage accounts
@@ -314,10 +325,10 @@ The web UI's overview lists accounts that need attention. Each entry has a
 - **API-key accounts** (OpenCode Go) show the last error and a
   **Replace key** form. The account keeps its ID, label, priority, enabled
   state and usage history.
-- **Retry** clears the cooldown and the re-login state, so xolotl tries the
-  account again with the same credential. It does not change the credential
-  and does not reset the provider's quota. A disabled account stays disabled.
-  `xolotl accounts reset <id>` does the same.
+- **Retry** clears cooldown and re-login state on any account. Xolotl can try
+  the current credential again when the account is in rotation. Select
+  **Enable** to put a disabled account back in rotation. The CLI equivalent
+  of **Retry** is `xolotl accounts reset <id>`.
 
 Adding an OpenCode Go key that another account already has updates that
 account instead of adding a second one. A replacement key that another account
