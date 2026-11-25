@@ -55,9 +55,13 @@ startup, and warns daily from 14 days before the certificate expires.
 ### The OpenBao PKI
 
 The certificates for the capture hosts come from an intermediate CA on a mount
-of its own. The CA your clients trust signs it, with a name constraint that
-limits it to the capture hosts. The mount holds one role, xolotl's. Run these
-once, with `TRUSTED_CA_MOUNT` set to the mount of the CA your clients trust:
+of its own. The CA your clients trust signs it, with a DNS name constraint for
+the capture hosts. A client then accepts a certificate from this intermediate
+only for a capture host or a name below one, so even a mis-issued certificate
+can't stand in for another site. Two more limits keep issuance to the exact
+names: the mount's one role, xolotl's, signs only the hosts it lists, and
+xolotl asks it only for the hosts on `capture_hosts`. Run these once, with
+`TRUSTED_CA_MOUNT` set to the mount of the CA your clients trust:
 
 ```sh
 TRUSTED_CA_MOUNT=pki
