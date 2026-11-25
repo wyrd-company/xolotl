@@ -17,6 +17,28 @@ const fault = (route, message) => route.fulfill({ status: 503, contentType: 'app
   try {
     page = await browser.newPage({ storageState: process.env.SESSION_FILE || `${output}/session.json`, viewport: { width: 1440, height: 1000 } });
     page.on('pageerror', error => result.errors.push(error.message));
+    const previewRequests = [];
+    page.on('request', request => { if (request.url().endsWith('/admin/policy-preview')) previewRequests.push(request); });
+    await page.goto(`${base}/#/policies/+new`);
+    await page.getByLabel('Name', { exact: true }).waitFor();
+    await page.waitForLoadState('networkidle');
+    assert.equal(previewRequests.length, 0, 'Untouched New policy must not submit an invalid preview');
+    assert.equal(await page.getByRole('alert').filter({ hasText: 'Could not resolve policy' }).count(), 0);
+    assert.equal(await page.getByText(/policy must allow at least one provider/).count(), 0);
+    assert(await page.getByRole('button', { name: 'Create policy', exact: true }).isDisabled());
+    await page.screenshot({ path: `${output}/new-policy-untouched.png`, fullPage: true });
+    check('Untouched New policy has no preview request, validation error or retry failure');
+
+    const invalidPreview = page.waitForResponse(response => response.url().endsWith('/admin/policy-preview'));
+    await page.getByLabel('Name', { exact: true }).fill('incomplete');
+    assert.equal((await invalidPreview).status(), 400);
+    await page.getByText(/policy must allow at least one provider/).waitFor();
+    assert.equal(await page.getByText(/policy must allow at least one provider/).count(), 1);
+    assert.equal(await page.getByRole('alert').filter({ hasText: 'Could not resolve policy' }).count(), 0);
+    assert.equal(await page.getByRole('button', { name: 'Retry', exact: true }).count(), 0);
+    await page.screenshot({ path: `${output}/draft-validation.png`, fullPage: true });
+    check('Edited invalid draft shows validation once without a retryable failure');
+
     await page.goto(`${base}/#/policies/routes`);
     const routes = page.getByRole('table', { name: 'Resolved model routes' });
     await routes.waitFor();

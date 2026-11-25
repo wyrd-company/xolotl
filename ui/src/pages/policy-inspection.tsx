@@ -4,7 +4,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import type { PolicyView } from "@/lib/api";
+import { ApiError, type PolicyView } from "@/lib/api";
 
 export function SavedPolicyWarnings({ warnings }: { warnings: string[] }) {
   if (!warnings.length) return null;
@@ -18,11 +18,14 @@ export function SavedPolicyWarnings({ warnings }: { warnings: string[] }) {
 
 /** Server-resolved draft, including aliases and qualified names, just like policies view. */
 export function PolicyInspection({ view, error, pending, retry }: { view?: PolicyView; error: Error | null; pending: boolean; retry: () => void }) {
+  const validationError = error instanceof ApiError && error.status === 400;
   return (
     <Section id="policy-routes" title="Resolved routes" description="The model names keys see and their ordered targets. Endpoints are those of the first target. This preview includes unsaved changes.">
       <SectionContent className="flex flex-col gap-4" aria-busy={pending}>
         {pending && <p role="status" className="text-muted-foreground text-sm">Resolving policy…</p>}
-        {error ? (
+        {validationError ? (
+          <p className="text-muted-foreground text-sm">Correct the policy validation message above to resolve routes.</p>
+        ) : error ? (
           <Alert variant="destructive" role="alert"><AlertTitle>Could not resolve policy</AlertTitle><AlertDescription><p>{error.message}</p><Button type="button" variant="outline" disabled={pending} onClick={retry}>Retry</Button></AlertDescription></Alert>
         ) : view && (
           <>
@@ -49,6 +52,7 @@ export function PolicyInspection({ view, error, pending, retry }: { view?: Polic
             ) : <p className="text-muted-foreground text-sm">No subscription providers allowed.</p>}
           </>
         )}
+        {!error && !view && !pending && <p className="text-muted-foreground text-sm">Configure the policy to preview its routes.</p>}
       </SectionContent>
     </Section>
   );

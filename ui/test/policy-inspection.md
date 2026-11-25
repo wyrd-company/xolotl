@@ -3,7 +3,10 @@
 `policy-inspection.browser.cjs` checks the production UI in the standard Xolotl
 container, with synthetic OIDC sign-in and an isolated OpenBao fixture. Product
 mutations use browser controls. Read failures are injected into the browser's
-responses; the key-use deletion refusal comes from the real server.
+responses; the key-use deletion refusal comes from the real server. The run first
+opens an untouched New policy form, waits for the initial network requests to
+settle, and verifies that no invalid preview is submitted. Editing an incomplete
+draft then checks that real server validation is shown once without Retry.
 
 Seed the fixture before starting Xolotl:
 
@@ -31,7 +34,7 @@ node policy-inspection.browser.cjs
 outside the script directory. The output `acceptance.json` starts failed and
 becomes passed only after every assertion completes. It records each completed
 check and runtime errors. Screenshots include resolved routes, status/account
-failures, rejected deletion and save warnings. `policy-routes.png` regenerates
+failures, rejected deletion, save warnings, the untouched form and draft validation. `policy-routes.png` regenerates
 `docs/user/assets/policy-routes.png` at a 1440px desktop viewport.
 
 The run deletes `broken` and creates `browser-hub` and `browser-warned`. Recreate

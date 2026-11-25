@@ -298,14 +298,21 @@ function PolicyEditor({ initial, keyCount, keysReady, onSaved }: { initial: Poli
 
   const policy = useMemo(() => toPolicy(draft), [draft]);
   const debounced = useDebounced(policy, 400);
+  const dirty = JSON.stringify(policy) !== JSON.stringify(toPolicy(toDraft(initial)));
+  const pristineNew = isNew && !dirty;
+  const previewHasEdits = !isNew || JSON.stringify(debounced) !== JSON.stringify(toPolicy(toDraft(null)));
   const preview = useQuery({
     queryKey: ["policy-view", debounced],
     queryFn: () => post<PolicyView>("/admin/policy-preview", debounced),
+    enabled: previewHasEdits,
     placeholderData: (prev) => prev,
     retry: false,
   });
+  // An untouched form is not a failed policy, even if a previous visit cached a validation error.
+  const previewData = !pristineNew && previewHasEdits ? preview.data : undefined;
+  const previewError = !pristineNew && previewHasEdits ? preview.error : null;
+  const previewPending = !pristineNew && (preview.isFetching || policy !== debounced);
 
-  const dirty = JSON.stringify(policy) !== JSON.stringify(toPolicy(toDraft(initial)));
   const save = useAction(() => put<SavedPolicy>(`/admin/policies/${encodeURIComponent(policy.name)}`, policy), {
     invalidate: [["policies"], ["status"]],
     success: `Saved policy ${policy.name}`,
@@ -332,7 +339,7 @@ function PolicyEditor({ initial, keyCount, keysReady, onSaved }: { initial: Poli
       }}
     >
       <SaveToolbar label="Policy actions">
-        <Button type="submit" disabled={!dirty || !policy.name || !!preview.error || save.isPending}>
+        <Button type="submit" disabled={!dirty || !policy.name || !!previewError || save.isPending}>
           {isNew ? "Create policy" : "Save policy"}
         </Button>
         {dirty && !isNew && (
@@ -417,21 +424,21 @@ function PolicyEditor({ initial, keyCount, keysReady, onSaved }: { initial: Poli
         allowedProviders={allowed}
         draft={draft}
         set={set}
-        view={preview.data}
-        fetching={preview.isFetching}
-        error={preview.error}
+        view={previewData}
+        fetching={previewPending}
+        error={previewError}
         health={health}
         precedence={{ order, move, reset: draft.precedence.length > 0 ? () => set("precedence", []) : undefined }}
       />
 
-      <PolicyInspection view={preview.data} error={preview.error} pending={preview.isFetching || policy !== debounced} retry={() => preview.refetch()} />
+      <PolicyInspection view={previewData} error={previewError} pending={previewPending} retry={() => preview.refetch()} />
 
-      <McpAccess draft={draft} set={set} tools={preview.data?.tools ?? []} />
+      <McpAccess draft={draft} set={set} tools={previewData?.tools ?? []} />
 
       <PolicyLimits
         limits={draft.limits}
         onChange={(l) => set("limits", l)}
-        view={isNew ? undefined : preview.data}
+        view={isNew ? undefined : previewData}
         providers={allowed}
         accounts={(accounts.data ?? []).filter((a) => allowed.includes(a.provider) && allowsAccount(draft.accounts, a.provider, a.id))}
       />
