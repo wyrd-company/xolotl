@@ -486,8 +486,11 @@ async fn an_upgrade_is_joined_as_a_tunnel() {
             HttpResponse::builder()
                 .status(101)
                 .header("upgrade", "websocket")
-                .header("connection", "upgrade")
+                .header("connection", "upgrade, x-hop")
+                .header("x-hop", "dropped")
+                .header("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
                 .header("x-origin", "kept")
+                .header("alt-svc", "h3=\":443\"")
                 .body(full(""))
                 .unwrap()
         })
@@ -515,6 +518,10 @@ async fn an_upgrade_is_joined_as_a_tunnel() {
     assert!(head.starts_with("HTTP/1.1 101 "), "{head}");
     let lower = head.to_ascii_lowercase();
     assert!(lower.contains("\r\nupgrade: websocket\r\n") && lower.contains("\r\nconnection: upgrade\r\n"), "{head}");
+    // The origin's application headers reach the client; its connection-specific ones don't.
+    assert!(lower.contains("\r\nsec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo=\r\n"), "{head}");
+    assert!(lower.contains("\r\nx-origin: kept\r\n"), "{head}");
+    assert!(!lower.contains("x-hop") && !lower.contains("alt-svc"), "{head}");
     stream.get_mut().write_all(b"ping").await.unwrap();
     let mut pong = [0; 4];
     timeout(TEST_TIMEOUT, stream.read_exact(&mut pong)).await.unwrap().unwrap();

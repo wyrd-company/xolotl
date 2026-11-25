@@ -299,7 +299,15 @@ impl Intercepted {
             );
         }
         let upstream_upgrade = hyper::upgrade::on(&mut response);
-        let selected = response.headers().get(header::UPGRADE).cloned();
+        // The origin's 101, with its application headers, such as
+        // `sec-websocket-accept`; only the fields of the switch itself are reset.
+        let (mut parts, _) = response.into_parts();
+        let selected = parts.headers.get(header::UPGRADE).cloned();
+        strip_connection_fields(&mut parts.headers, true);
+        if let Some(selected) = selected {
+            parts.headers.insert(header::UPGRADE, selected);
+        }
+        parts.headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
         let keys = interceptor.keys.clone();
         let client = Client { id: self.client.id.clone(), key_hash: self.client.key_hash.clone() };
         let idle = interceptor.idle_timeout;
@@ -308,13 +316,7 @@ impl Intercepted {
             let (Ok(client_io), Ok(upstream_io)) = tokio::join!(client_upgrade, upstream_upgrade) else { return };
             tunnel::run(TokioIo::new(client_io), TokioIo::new(upstream_io), &[], &client, &keys, idle, &shutdown).await;
         });
-        let mut out = Response::new(Full::new(Bytes::new()).map_err(|never| match never {}).boxed_unsync());
-        *out.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-        if let Some(selected) = selected {
-            out.headers_mut().insert(header::UPGRADE, selected);
-        }
-        out.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
-        out
+        Response::from_parts(parts, Full::new(Bytes::new()).map_err(|never| match never {}).boxed_unsync())
     }
 }
 
