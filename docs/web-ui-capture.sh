@@ -73,6 +73,7 @@ click link 'New policy'
 browser wait '#p-name:enabled'
 browser find label Name fill build-agents --exact
 browser find label Description fill 'Build and test the project' --exact
+browser wait --text 'egress (forward proxy)'
 browser find role checkbox check --name 'local gateway' --exact
 browser wait 'form button[type="submit"]:enabled'
 # The enabled button can still be transitioning out of its disabled colors.
@@ -116,6 +117,14 @@ browser wait --text 'Last 36h'
 browser wait '[data-slot="card"]:has(#mcp-look-back) tbody tr'
 capture mcp-tool-calls '[data-slot="card"]:has(#mcp-look-back)'
 
+browser set viewport 1440 980
+page /usage 'Usage'
+browser wait 'main > [data-slot="card"] tbody tr'
+browser wait 'section[aria-labelledby="sessions-heading"] tbody tr'
+browser wait 'section[aria-labelledby="tools-heading"] tbody tr'
+capture usage-sessions
+
+browser set viewport 1440 900
 page /models 'qwen3-coder'
 browser wait --text 'Pricing refresh succeeded'
 capture models-catalog main

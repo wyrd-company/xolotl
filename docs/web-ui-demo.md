@@ -43,12 +43,13 @@ from run to run.
 | `accounts-list.png` | Account list with the sample subscription and provider |
 | `add-account.png` | Add account with subscription login and import controls |
 | `add-provider-account.png` | Provider account form |
-| `new-policy.png` | New policy with the name, description and provider selected |
+| `new-policy.png` | New policy with the name, description, available scopes and selected provider |
 | `policy-no-accounts.png` | Codex selected with its account unchecked |
 | `client-key-issued.png` | Issued client key with an expiry and OpenBao retrieval instructions |
 | `client-key-rotate.png` | Rotation dialog with a custom grace period |
 | `mcp-header-secret.png` | Upstream MCP server with a configured header secret and tool list |
 | `mcp-tool-calls.png` | Tool calls grouped by tool over 36 hours |
+| `usage-sessions.png` | Requests grouped by client, with a recorded session and tool call |
 | `models-catalog.png` | Model catalog with provider discovery and sample pricing |
 
 For a repeat capture, set `XOLOTL_DEMO_IMAGE` to a prebuilt local tag from this

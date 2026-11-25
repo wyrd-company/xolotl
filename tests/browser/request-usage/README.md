@@ -44,7 +44,9 @@ look-back boundaries use the container API and seeded SQLite rows. `axe.json`
 contains the main-page WCAG A/AA scan. Screenshots show desktop, phone, invalid
 input and query failure. The script also checks keyboard operation at phone width.
 
-`filters-desktop.png` regenerates `docs/user/assets/usage-sessions.png`.
+`filters-desktop.png` shows all four request filters applied. The
+[web UI demo recipe](../../../docs/web-ui-demo.md) captures `usage-sessions.png`
+with rows in Requests, Sessions, and Tools called.
 `usage-queries.gif` regenerates `docs/user/assets/usage-queries.gif`. The GIF shows
 applying a custom window and client filter, then correcting an invalid duration.
 Copy these outputs to the documentation assets when intentionally updating them.
