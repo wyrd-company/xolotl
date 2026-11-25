@@ -103,8 +103,28 @@ pub fn router(state: AppState) -> Router {
 
 pub async fn serve(state: AppState) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(state.cfg.server.listen).await?;
+    let forward_proxy = crate::forward_proxy::Listener::bind(state.cfg.forward_proxy.as_ref()).await?;
+    let keys = state.keys.clone();
+    let idle_timeout = Duration::from_secs(state.cfg.server.upstream_timeout_secs);
+    let shutdown = tokio_util::sync::CancellationToken::new();
     tracing::info!(addr = %state.cfg.server.listen, "xolotl listening");
-    axum::serve(listener, router(state)).with_graceful_shutdown(shutdown_signal()).await?;
+    let main_shutdown = shutdown.clone();
+    let main = async {
+        axum::serve(listener, router(state))
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                main_shutdown.cancel();
+            })
+            .await?;
+        anyhow::Ok(())
+    };
+    let forward = async {
+        if let Some(listener) = forward_proxy {
+            listener.run(keys, idle_timeout, shutdown.clone()).await?;
+        }
+        Ok(())
+    };
+    tokio::try_join!(main, forward)?;
     Ok(())
 }
 
@@ -943,4 +963,4 @@ async fn opencode_go_passthrough(State(state): State<AppState>, Path(rest): Path
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

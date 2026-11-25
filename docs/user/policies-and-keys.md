@@ -104,11 +104,17 @@ A model's switch in the editor writes `models`.
 |---|---|
 | `proxy` | The LLM endpoints (`/v1/...`) and the passthroughs |
 | `mcp` | The MCP gateway at `/mcp` |
+| `egress` | HTTPS CONNECT tunnels on the [forward proxy](configuration.md#forward_proxy) |
 | `management` | The T3 Code hubs endpoints (`/v0/management/...`) |
 | `keys` | Issue, revoke, disable and list client keys under the policies in `key_policies` |
 | `admin` | The admin API, the same as the bootstrap admin token |
 
 A policy that allows MCP servers or lists `key_policies` needs no `providers`.
+
+A forward proxy key may use a policy with `egress` alone and empty provider and
+MCP server lists. To share a key, add `egress` to a policy with `proxy` or `mcp`.
+The policy editor offers **egress (forward proxy)** under **Scopes**.
+`egress` is incompatible with `admin`, `management` and `keys`.
 
 For a T3 Code hub credential, use only the `management` scope. This minimal
 policy needs no providers, MCP servers or delegated key policies:
@@ -493,10 +499,9 @@ its bearer token.
 itself. Give each host or tool its own policy to issue under, so that it can't
 reach the keys of another.
 
-A key can't manage keys of a listed policy that has any scope other than `proxy`
-or `mcp`. Such a key could do more than the key that issued it. The request gets
-a 403, also if you change the listed policy later. The same applies to a listed
-policy that did not load, because its scopes can't be read.
+A key can manage keys of a listed policy whose scopes are limited to `proxy`,
+`mcp` and `egress`. A request for a listed policy with other scopes or a policy
+that failed to load gets a 403, including after a policy change.
 
 ### Safe to repeat
 

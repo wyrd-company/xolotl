@@ -24,13 +24,13 @@ use crate::subscription::{Credential, SubProvider, auth_index};
 mod api_accounts;
 mod context;
 
-struct Harness {
-    state: AppState,
+pub(crate) struct Harness {
+    pub(crate) state: AppState,
     admin: String,
-    upstream: MockServer,
+    pub(crate) upstream: MockServer,
 }
 
-async fn harness() -> Harness {
+pub(crate) async fn harness() -> Harness {
     harness_with(|_| {}).await
 }
 
@@ -136,14 +136,14 @@ impl Harness {
         (status, v)
     }
 
-    async fn call(&self, method: &str, uri: &str, key: Option<&str>, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn call(&self, method: &str, uri: &str, key: Option<&str>, body: Option<Value>) -> (u16, Value) {
         let auth = key.map(|k| format!("Bearer {k}"));
         let headers: Vec<(&str, &str)> = auth.iter().map(|a| ("authorization", a.as_str())).collect();
         self.call_with(method, uri, &headers, body).await
     }
 
     /// Create the policy and issue a key under it; returns the key read from the vault.
-    async fn key(&self, p: Policy) -> String {
+    pub(crate) async fn key(&self, p: Policy) -> String {
         let name = p.name.clone();
         self.state.keys.put_policy(p, &self.state.catalog.known_providers(), &self.state.mcp.server_names()).await.unwrap();
         let issued = self.state.keys.issue(IssueRequest { policy: name, name: "client".into(), ..Default::default() }).await.unwrap();

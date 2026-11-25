@@ -1,10 +1,19 @@
 # Xolotl example configuration. Every section is optional; defaults shown.
 
 [server]
-listen = "0.0.0.0:8317"        # the only listener: LLM endpoints, MCP, T3 Code hubs, admin API, web UI
+listen = "0.0.0.0:8317"        # LLM endpoints, MCP, T3 Code hubs, admin API, web UI
 max_body_bytes = 67108864      # 64 MiB (OCR / batch uploads)
 upstream_timeout_secs = 600    # max idle time while reading an upstream response
 # public_url = "https://xolotl.example.lan"   # where browsers reach xolotl; lets OAuth logins finish by themselves
+
+# Optional HTTPS CONNECT listener. Clients need a key with the egress scope.
+# [forward_proxy]
+# listen = "0.0.0.0:8318"
+# ports = [443]                # allowed destination ports
+
+# [forward_proxy.tls]
+# cert_file = "/etc/xolotl/forward-proxy.pem"
+# key_file = "/etc/xolotl/forward-proxy-key.pem"
 
 [database]
 # Runtime state only (cooldowns, usage snapshots, request log). No secrets.

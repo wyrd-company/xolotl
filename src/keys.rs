@@ -44,7 +44,9 @@ pub enum Scope {
     /// Issue, revoke, disable and list client keys under the policies in the
     /// policy's `key_policies`.
     Keys,
-    /// Full administration. Implies every other scope.
+    /// Open authenticated HTTPS tunnels on the forward proxy.
+    Egress,
+    /// Full administration, except for the forward proxy.
     Admin,
 }
 
@@ -327,7 +329,7 @@ impl KeyManager {
         None
     }
 
-    fn lookup(&self, hash: &str) -> Option<Principal> {
+    pub(crate) fn lookup(&self, hash: &str) -> Option<Principal> {
         let st = self.state.read();
         if st.bootstrap_hash.as_deref().is_some_and(|b| ct_eq(b.as_bytes(), hash.as_bytes())) {
             return Some(Principal::operator());
@@ -406,8 +408,8 @@ impl KeyManager {
     /// loaded now: its own policy may have changed since it authenticated.
     ///
     /// An `admin` caller may manage any. A `keys` caller may manage the ones
-    /// its policy lists, unless such a key could do more than use the LLM and
-    /// MCP endpoints. A listed policy that is not loaded can't be checked, so
+    /// its policy lists, limited to policies for the LLM, MCP and forward
+    /// proxy endpoints. A listed policy that is not loaded can't be checked, so
     /// only a missing one passes: it has no scopes to grant.
     pub fn may_manage(&self, caller: &Principal, policy: &str) -> bool {
         if caller.client_id.is_none() {

@@ -168,7 +168,7 @@ export type FlowStatus =
   | { status: "complete"; account_id: string; email: string | null }
   | { status: "failed"; error: string };
 
-export type Scope = "proxy" | "management" | "mcp" | "keys" | "admin";
+export type Scope = "proxy" | "management" | "mcp" | "egress" | "keys" | "admin";
 
 export interface Policy {
   name: string;

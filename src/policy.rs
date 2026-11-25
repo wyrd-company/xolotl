@@ -236,6 +236,7 @@ pub fn from_stored(mut stored: Map<String, Value>) -> Result<(Policy, bool)> {
     let upgraded = upgrade_stored(&mut stored)?;
     let mut policy: Policy = serde_json::from_value(Value::Object(stored))?;
     policy.normalize();
+    policy.validate_egress()?;
     Ok((policy, upgraded))
 }
 
@@ -287,7 +288,7 @@ fn upgrade_stored(stored: &mut Map<String, Value>) -> Result<bool> {
 }
 
 impl Policy {
-    /// The implicit policy of the bootstrap admin token: everything allowed.
+    /// The implicit policy of the bootstrap admin token.
     pub fn unrestricted() -> Self {
         Policy {
             name: "_admin".into(),
@@ -360,12 +361,13 @@ impl Policy {
 
     pub fn validate(&self, known: &BTreeSet<String>, mcp: &BTreeSet<String>) -> Result<()> {
         anyhow::ensure!(valid_name(&self.name), "policy name must be lowercase letters, digits, '-' or '_' (max 63)");
+        self.validate_egress()?;
         anyhow::ensure!(
             !self.providers.is_empty()
                 || !self.mcp_servers.is_empty()
                 || !self.key_policies.is_empty()
-                || (!self.scopes.is_empty() && self.scopes.iter().all(|s| *s == Scope::Management)),
-            "policy must allow at least one provider or MCP server (use * for all), list key_policies, or use only the management scope"
+                || (!self.scopes.is_empty() && self.scopes.iter().all(|s| *s == Scope::Management || *s == Scope::Egress)),
+            "policy must allow at least one provider or MCP server (use * for all), list key_policies, or use only the management or egress scope"
         );
         anyhow::ensure!(self.key_policies.is_empty() || self.has_scope(Scope::Keys), "key_policies needs the keys scope");
         anyhow::ensure!(!self.scopes.contains(&Scope::Keys) || !self.key_policies.is_empty(), "the keys scope needs key_policies");
@@ -430,15 +432,23 @@ impl Policy {
         Ok(())
     }
 
+    fn validate_egress(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.scopes.contains(&Scope::Egress) || self.grants_only_client_use(),
+            "the egress scope cannot be combined with admin, management or keys"
+        );
+        Ok(())
+    }
+
     pub fn has_scope(&self, scope: Scope) -> bool {
-        self.scopes.contains(&Scope::Admin) || self.scopes.contains(&scope)
+        self.scopes.contains(&scope) || (scope != Scope::Egress && self.scopes.contains(&Scope::Admin))
     }
 
     /// Whether a `keys` key may manage this policy's keys, when it lists this
-    /// policy. A key under it can do nothing beyond the LLM and MCP endpoints.
+    /// policy. Its keys may use the LLM, MCP and forward proxy endpoints.
     /// `management` reaches accounts, and `keys` could list wider policies.
     pub fn grants_only_client_use(&self) -> bool {
-        self.scopes.iter().all(|s| matches!(s, Scope::Proxy | Scope::Mcp))
+        self.scopes.iter().all(|s| matches!(s, Scope::Proxy | Scope::Mcp | Scope::Egress))
     }
 
     pub fn allows_provider(&self, provider: &str) -> bool {

@@ -22,6 +22,28 @@ pub struct Config {
     pub ui: UiConfig,
     pub sessions: SessionsConfig,
     pub export: ExportConfig,
+    pub forward_proxy: Option<ForwardProxyConfig>,
+}
+
+/// An opt-in listener for authenticated HTTPS CONNECT tunnels.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardProxyConfig {
+    pub listen: SocketAddr,
+    #[serde(default = "forward_proxy_ports")]
+    pub ports: Vec<u16>,
+    pub tls: ForwardProxyTlsConfig,
+}
+
+fn forward_proxy_ports() -> Vec<u16> {
+    vec![443]
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardProxyTlsConfig {
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
 }
 
 /// Copies of LLM exchanges sent elsewhere for analysis.
@@ -786,6 +808,14 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(proxy) = &self.forward_proxy {
+            anyhow::ensure!(proxy.listen != self.server.listen, "forward_proxy.listen must differ from server.listen");
+            anyhow::ensure!(
+                !proxy.ports.is_empty() && !proxy.ports.contains(&0),
+                "forward_proxy.ports must contain at least one nonzero port and no zero"
+            );
+            crate::forward_proxy::load_tls(&proxy.tls)?;
+        }
         for (name, p) in &self.gateway.providers {
             p.validate(name)?;
         }

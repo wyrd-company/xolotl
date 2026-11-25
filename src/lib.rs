@@ -7,6 +7,7 @@ pub mod config;
 pub mod context;
 pub mod db;
 pub mod export;
+mod forward_proxy;
 pub mod gateway;
 pub mod keys;
 pub mod limits;

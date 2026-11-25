@@ -51,9 +51,11 @@ const SCOPES: [Scope, string][] = [
   ["proxy", "proxy"],
   ["management", "management (T3Code hubs)"],
   ["mcp", "mcp (MCP gateway)"],
+  ["egress", "egress (forward proxy)"],
   ["keys", "keys (issue client keys)"],
   ["admin", "admin"],
 ];
+const ADMINISTRATIVE_SCOPES: Scope[] = ["management", "keys", "admin"];
 
 export function PoliciesPage() {
   const { name } = useParams();
@@ -392,6 +394,10 @@ function PolicyEditor({ initial, keyCount, keysReady, onSaved }: { initial: Poli
                 <label key={s} className="flex items-center gap-2 text-sm">
                   <Checkbox
                     checked={draft.scopes.includes(s)}
+                    disabled={
+                      (s === "egress" && draft.scopes.some((scope) => ADMINISTRATIVE_SCOPES.includes(scope))) ||
+                      (ADMINISTRATIVE_SCOPES.includes(s) && draft.scopes.includes("egress"))
+                    }
                     onCheckedChange={(c) => set("scopes", c === true ? [...draft.scopes, s] : draft.scopes.filter((x) => x !== s))}
                   />
                   {label}
@@ -410,8 +416,8 @@ function PolicyEditor({ initial, keyCount, keysReady, onSaved }: { initial: Poli
                 onChange={(e) => set("keyPolicies", e.target.value)}
               />
               <p className="text-muted-foreground text-xs">
-                The policies whose client keys this policy's keys may issue, revoke, disable and list. A listed policy with a scope other
-                than proxy or mcp is refused when a key uses it.
+                The policies whose client keys this policy's keys may issue, revoke, disable and list. A listed policy can grant proxy, mcp
+                or egress.
               </p>
             </div>
           )}
