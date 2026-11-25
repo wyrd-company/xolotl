@@ -338,8 +338,8 @@ function KeyRow({ k, requests, onRevoked }: { k: KeyInfo; requests: number | nul
   const grace = k.previous_expires_at && Date.parse(k.previous_expires_at) > Date.now();
   return (
     <TableRow>
-      <TableCell>
-        <Mono className="font-medium whitespace-nowrap">{k.client_id}</Mono>
+      <TableCell className="wrap-anywhere">
+        <Mono className="font-medium">{k.client_id}</Mono>
         <div className="text-muted-foreground text-sm">{k.description}</div>
       </TableCell>
       <TableCell className="min-w-56 max-w-64 text-sm">
@@ -351,7 +351,7 @@ function KeyRow({ k, requests, onRevoked }: { k: KeyInfo; requests: number | nul
         </div>
         <div>Expires: {k.expires_at ? timestamp(k.expires_at) : "never"}</div>
       </TableCell>
-      <TableCell className="font-mono text-xs whitespace-nowrap">{k.vault_path}</TableCell>
+      <TableCell className="font-mono text-xs wrap-anywhere">{k.vault_path}</TableCell>
       <TableCell className="text-sm">
         <LimitUsage k={k} />
       </TableCell>
