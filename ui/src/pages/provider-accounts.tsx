@@ -189,11 +189,11 @@ export function ProviderKeyOutcome({ provider, discovery }: { provider: string; 
       {discovery?.error && (
         <>
           <div role="alert" className="text-warning">
-            <p className="font-medium">Model discovery failed</p>
+            <p className="font-medium">Model discovery failed after key save</p>
             <p>{discovery.error}</p>
             <p>Any cached or static models remain available. Use Refresh models to retry discovery.</p>
           </div>
-          <CatalogRefresh providers={[provider]} />
+          <CatalogRefresh providers={[provider]} reportedError={discovery.error} />
         </>
       )}
     </div>

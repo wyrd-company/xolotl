@@ -18,7 +18,7 @@ import { get, post, type CatalogDiscovery } from "@/lib/api";
 import { relative } from "@/lib/format";
 
 /** Reuse beside model lists and counts; scope is provider-level, including account views. */
-export function CatalogRefresh({ providers, pricing = false }: { providers?: string[]; pricing?: boolean }) {
+export function CatalogRefresh({ providers, pricing = false, reportedError }: { providers?: string[]; pricing?: boolean; reportedError?: string }) {
   const qc = useQueryClient();
   const status = useQuery({
     queryKey: ["catalog-status"],
@@ -91,13 +91,13 @@ export function CatalogRefresh({ providers, pricing = false }: { providers?: str
               <li key={provider}>
                 <span className="font-mono">{provider}</span>: {result.models}{" "}
                 models
-                {result.error
-                  ? ` · Discovery failed: ${result.error}${result.models ? " (cached or static models shown)" : ""}`
-                  : result.refreshed_at == null
+                {result.error && result.error !== reportedError && ` · Discovery failed: ${result.error}`}
+                {result.error && result.models > 0 && " (cached or static models shown)"}
+                {!result.error && (result.refreshed_at == null
                     ? " · Not discovered yet"
                     : result.models === 0
                       ? " · Provider returned no models"
-                      : ""}
+                      : "")}
                 {result.refreshed_at != null && (
                   <span> · refreshed {relative(result.refreshed_at)}</span>
                 )}

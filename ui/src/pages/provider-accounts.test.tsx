@@ -4,12 +4,14 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { expect, test } from "vitest";
 
-import type { ProviderAccount } from "@/lib/api";
+import type { CatalogDiscovery, ProviderAccount } from "@/lib/api";
 import { ProviderAccounts, ProviderKeyOutcome } from "./provider-accounts";
 
-function render(node: ReactNode) {
+function render(node: ReactNode, catalog?: CatalogDiscovery) {
+  const client = new QueryClient();
+  if (catalog) client.setQueryData(["catalog-status"], catalog);
   return renderToStaticMarkup(
-    <QueryClientProvider client={new QueryClient()}>
+    <QueryClientProvider client={client}>
       <MemoryRouter>{node}</MemoryRouter>
     </QueryClientProvider>,
   );
@@ -57,12 +59,16 @@ test("a key save without discovery still confirms the write", () => {
   expect(html).not.toContain("Refresh models");
 });
 
-test("failed discovery shows the upstream reason and a retry alongside the successful write", () => {
-  const html = render(<ProviderKeyOutcome provider="gateway" discovery={{ provider: "gateway", error: "Upstream returned 503" }} />);
+test("failed discovery shows the upstream reason once and offers a retry alongside the successful write", () => {
+  const error = "Upstream returned 503";
+  const html = render(
+    <ProviderKeyOutcome provider="gateway" discovery={{ provider: "gateway", error }} />,
+    { gateway: { refreshed_at: null, models: 1, error } },
+  );
   expect(html).toContain("Key saved for gateway");
   expect(html).toContain('role="alert"');
   expect(html).toContain("Model discovery failed");
-  expect(html).toContain("Upstream returned 503");
+  expect(html.match(/Upstream returned 503/g)).toHaveLength(1);
   expect(html).toContain("cached or static models remain available");
   expect(html).toContain("Refresh models");
   expect(html).not.toContain("models found");
